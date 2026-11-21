@@ -988,245 +988,318 @@ void AssignDuckDBNames(std::vector<CatalogColumn> &columns) {
 	}
 }
 
-CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables, const BoundaryCheck &check,
-							   const CatalogScope &scope) {
-	CatalogModel model;
-	const SystemTable classes = ReadSystemTable(store, tables, "sysclsobjs");
-	{
-		const size_t cls = classes.Column("class"), id = classes.Column("id"), name = classes.Column("name");
-		for (size_t r = 0; r < classes.rows.size(); r++) {
-			if (classes.Int(r, cls) == CLASS_SCHEMA) {
-				CatalogSchema s;
-				s.id = static_cast<int32_t>(classes.Int(r, id));
-				s.name = classes.Text(r, name);
-				model.schemas.push_back(std::move(s));
-			}
+namespace {
+
+//! What a table's rowsets say of it, gathered as they are read.
+struct RowsetSummary {
+	bool heap = false;
+	bool columnstore = false;
+	std::map<int32_t, int64_t> delta_rows;	// a columnstore's delta store rows, by partition
+	std::unordered_map<uint64_t, const SysRowset *> rowset_of;
+};
+
+//! The catalog model built from the base tables: what every object's description reads from (the schemas,
+//! the types, the module texts, the partition catalog, the added columns' defaults) read once, then one
+//! table or view at a time.
+class ModelBuilder {
+public:
+	ModelBuilder(const PageStore &store, const BootstrapTables &tables, const BoundaryCheck &check,
+				 const CatalogScope &scope)
+		: store_(store), tables_(tables), check_(check), scope_(scope) {}
+	CatalogModel Build();
+
+private:
+	void ReadSchemas(const SystemTable &classes);
+	void ReadTypes();
+	void ReadTexts();
+	void ReadDefaults();
+	std::string SchemaOf(const SysObject &o, std::string &reason) const;
+	CatalogColumn DescribeColumn(const SysObject &o, const SysColumn &c);
+	void AddRowset(const SysRowset &r, CatalogTable &t, RowsetSummary &summary) const;
+	CatalogTable Describe(const SysObject &o, const std::string &schema_name, const std::string &schema_reason);
+	CatalogView DescribeView(const SysObject &o, std::string schema_name, std::string schema_reason) const;
+
+	const PageStore &store_;
+	const BootstrapTables &tables_;
+	const BoundaryCheck &check_;
+	const CatalogScope &scope_;
+	CatalogModel model_;
+	std::unordered_map<int32_t, std::string> type_names_;
+	std::unordered_map<int32_t, int32_t> type_schemas_;	 // a type's schema id (sysscalartypes.schid)
+	std::map<int32_t, std::vector<const SysColumn *>> columns_of_;
+	// A Pending page of sysobjvalues / sysseobjvalues may hold any of their rows: what they define is named
+	// as unreadable, on the objects that need it, instead of failing the whole model (D13). The base
+	// tables the model is built from (bootstrap, sysclsobjs, ...) still fail it: they are read whole.
+	std::map<ModuleKey, ModuleDefinition> texts_;
+	std::string texts_pending_;
+	PartitionCatalog partition_catalog_;
+	AddedDefaults defaults_;
+};
+
+void ModelBuilder::ReadSchemas(const SystemTable &classes) {
+	const size_t cls = classes.Column("class"), id = classes.Column("id"), name = classes.Column("name");
+	for (size_t r = 0; r < classes.rows.size(); r++) {
+		if (classes.Int(r, cls) == CLASS_SCHEMA) {
+			CatalogSchema s;
+			s.id = static_cast<int32_t>(classes.Int(r, id));
+			s.name = classes.Text(r, name);
+			model_.schemas.push_back(std::move(s));
 		}
-		std::sort(model.schemas.begin(), model.schemas.end(),
-				  [](const CatalogSchema &a, const CatalogSchema &b) { return a.id < b.id; });
 	}
-	std::unordered_map<int32_t, std::string> type_names;
-	std::unordered_map<int32_t, int32_t> type_schemas;	// a type's schema id (sysscalartypes.schid)
-	{
-		const SystemTable types = ReadSystemTable(store, tables, "sysscalartypes");
-		const size_t id = types.Column("id"), name = types.Column("name"), schid = types.Column("schid");
-		for (size_t r = 0; r < types.rows.size(); r++) {
-			type_names[static_cast<int32_t>(types.Int(r, id))] = types.Text(r, name);
-			type_schemas[static_cast<int32_t>(types.Int(r, id))] = static_cast<int32_t>(types.Int(r, schid));
+	std::sort(model_.schemas.begin(), model_.schemas.end(),
+			  [](const CatalogSchema &a, const CatalogSchema &b) { return a.id < b.id; });
+}
+
+void ModelBuilder::ReadTypes() {
+	const SystemTable types = ReadSystemTable(store_, tables_, "sysscalartypes");
+	const size_t id = types.Column("id"), name = types.Column("name"), schid = types.Column("schid");
+	for (size_t r = 0; r < types.rows.size(); r++) {
+		type_names_[static_cast<int32_t>(types.Int(r, id))] = types.Text(r, name);
+		type_schemas_[static_cast<int32_t>(types.Int(r, id))] = static_cast<int32_t>(types.Int(r, schid));
+	}
+}
+
+void ModelBuilder::ReadTexts() {
+	try {
+		texts_ = ReadModuleTexts(store_, tables_);
+	} catch (PendingPageError &e) {
+		texts_.clear();
+		texts_pending_ = std::string("sysobjvalues cannot be read: ") + e.what();
+	}
+}
+
+void ModelBuilder::ReadDefaults() {
+	try {
+		defaults_.values = ReadAddedDefaults(store_, tables_, defaults_.ambiguous);
+	} catch (PendingPageError &e) {
+		defaults_.values.clear();
+		defaults_.ambiguous.clear();
+		defaults_.pending = std::string("sysseobjvalues cannot be read: ") + e.what();
+	}
+}
+
+//! The object's schema; one sysclsobjs does not list is named on the object, not the model.
+std::string ModelBuilder::SchemaOf(const SysObject &o, std::string &reason) const {
+	const std::string name = model_.SchemaName(o.schema_id);
+	if (!name.empty()) {
+		return name;
+	}
+	reason = "its schema " + std::to_string(o.schema_id) + " is not in sysclsobjs";
+	return "schema " + std::to_string(o.schema_id);
+}
+
+CatalogColumn ModelBuilder::DescribeColumn(const SysObject &o, const SysColumn &c) {
+	CatalogColumn col;
+	col.column_id = c.column_id;
+	col.name = c.name;
+	col.system_type_id = c.xtype;
+	col.user_type_id = c.user_type;
+	auto type = type_names_.find(c.user_type);
+	// A type with no sysscalartypes row keeps an empty name: the column is read by its xtype, or as
+	// its stored bytes (ReadingOf), never refused by its type (owner, 2026-11-11).
+	if (type != type_names_.end()) {
+		col.type_name = type->second;
+		col.type_schema = model_.SchemaName(type_schemas_[c.user_type]);
+	}
+	// A CLR type (xtype 240) has no row of its xtype: the system ones are known by their user type.
+	const int32_t system_id = c.xtype == 240 ? (c.user_type < 256 ? c.user_type : -1) : c.xtype;
+	auto system = type_names_.find(system_id);
+	col.system_type_name = system == type_names_.end() ? std::string() : system->second;
+	col.max_length = c.length;
+	col.precision = c.precision;
+	col.scale = c.scale;
+	col.collation_id = c.collation_id;
+	col.is_nullable = !(c.status & COLUMN_NOT_NULL);
+	col.is_ansi_padded = (c.status & COLUMN_ANSI_PADDED) != 0;
+	col.is_identity = (c.status & COLUMN_IDENTITY) != 0;
+	col.is_rowguidcol = (c.status & COLUMN_ROWGUIDCOL) != 0;
+	col.is_computed = (c.status & COLUMN_COMPUTED) != 0;
+	col.is_persisted = (c.status & COLUMN_PERSISTED) != 0;
+	col.is_sparse = (c.status & COLUMN_SPARSE) != 0;
+	col.is_column_set = (c.status & COLUMN_SET) != 0;
+	if (col.is_computed && !texts_pending_.empty()) {
+		col.definition = Unreadable(texts_pending_);
+	} else if (col.is_computed) {
+		auto text = texts_.find(ModuleKey{2, o.id, c.column_id});
+		if (text != texts_.end()) {
+			col.definition = text->second;
 		}
 	}
-	std::map<int32_t, std::vector<const SysColumn *>> columns_of;
-	for (const auto &c : tables.columns) {
+	return col;
+}
+
+//! Rowset `r` of the table: its allocation units, and for its base rowset (index 0 or 1 with an in-row
+//! unit) its partition, its delta store's rows and its share of the row count.
+void ModelBuilder::AddRowset(const SysRowset &r, CatalogTable &t, RowsetSummary &summary) const {
+	for (const SysAllocUnit *a : tables_.UnitsOf(r.rowset_id)) {
+		CatalogUnit u;
+		u.unit = *a;
+		u.index_id = r.index_id;
+		u.partition_number = r.partition_number;
+		u.compression = r.compression;
+		t.units.push_back(u);
+	}
+	const SysAllocUnit *in_row = r.index_id == 0 || r.index_id == 1 ? tables_.FindInRowUnit(r.rowset_id) : nullptr;
+	if (!in_row) {
+		return;	 // another index, or a deferred drop
+	}
+	summary.heap = summary.heap || r.index_id == 0;
+	summary.columnstore = summary.columnstore || r.compression >= 3;
+	if (r.owner_type == OWNER_PARTITION) {
+		summary.rowset_of[r.rowset_id] = &r;
+		CatalogPartition p;
+		p.rowset_id = r.rowset_id;
+		p.partition_number = r.partition_number;
+		AddRowCount(p.rows, r.rows);
+		p.compression = r.compression;
+		p.filegroup_id = in_row->filegroup_id;
+		auto fg = partition_catalog_.filegroups.find(in_row->filegroup_id);
+		p.filegroup = fg == partition_catalog_.filegroups.end() ? std::string() : fg->second;
+		t.partitions.push_back(std::move(p));
+	}
+	if (r.owner_type == OWNER_DELTA_STORE) {
+		AddRowCount(summary.delta_rows[r.partition_number], r.rows);
+	}
+	if (r.owner_type == OWNER_PARTITION || r.owner_type == OWNER_DELTA_STORE) {
+		// The file's counts, a statistic: a negative one (an upgraded database can hold one until
+		// DBCC UPDATEUSAGE), or a sum past int64, leaves the count unknown -- never UB, and the
+		// table's rows are read all the same.
+		if (t.row_count_known && (r.rows < 0 || r.rows > std::numeric_limits<int64_t>::max() - t.row_count)) {
+			t.row_count_known = false;
+			t.row_count = 0;
+		} else if (t.row_count_known) {
+			t.row_count += r.rows;
+		}
+	}
+}
+
+//! A table, or an indexed view's stored rows (task 16f: its clustered index is a rowset of the view's
+//! object, laid out as a clustered table's): its columns, allocation units, partitions, shape,
+//! partitioning, and whether the scan reads it.
+CatalogTable ModelBuilder::Describe(const SysObject &o, const std::string &schema_name,
+									const std::string &schema_reason) {
+	CatalogTable t;
+	t.object_id = o.id;
+	t.schema_id = o.schema_id;
+	t.schema_name = schema_name;
+	t.reason = schema_reason;
+	t.name = o.name;
+	t.created = o.created;
+	t.modified = o.modified;
+	std::vector<const SysColumn *> &cols = columns_of_[o.id];
+	std::sort(cols.begin(), cols.end(),
+			  [](const SysColumn *a, const SysColumn *b) { return a->column_id < b->column_id; });
+	for (const SysColumn *c : cols) {
+		t.columns.push_back(DescribeColumn(o, *c));
+	}
+	AssignDuckDBNames(t.columns);
+	RowsetSummary summary;
+	for (const SysRowset *r : tables_.RowsetsOf(o.id)) {
+		AddRowset(*r, t, summary);
+	}
+	for (auto &p : t.partitions) {
+		auto delta = summary.delta_rows.find(p.partition_number);
+		if (delta == summary.delta_rows.end()) {
+			continue;
+		}
+		if (delta->second < 0) {
+			p.rows = -1;
+		} else {
+			AddRowCount(p.rows, delta->second);
+		}
+	}
+	std::sort(t.partitions.begin(), t.partitions.end(), [](const CatalogPartition &a, const CatalogPartition &b) {
+		return a.partition_number < b.partition_number;
+	});
+	t.shape = summary.columnstore ? TableShape::Columnstore : summary.heap ? TableShape::Heap : TableShape::Clustered;
+	DescribePartitioning(partition_catalog_, type_names_, summary.heap ? 0 : 1, check_, t);
+	DecideDecodable(tables_, defaults_, summary.rowset_of, t);
+	return t;
+}
+
+CatalogView ModelBuilder::DescribeView(const SysObject &o, std::string schema_name, std::string schema_reason) const {
+	CatalogView v;
+	v.object_id = o.id;
+	v.schema_id = o.schema_id;
+	v.schema_name = std::move(schema_name);
+	v.reason = std::move(schema_reason);
+	v.name = o.name;
+	v.created = o.created;
+	v.modified = o.modified;
+	v.is_encrypted = (o.status & VIEW_ENCRYPTED) != 0;
+	auto text = texts_.find(ModuleKey{1, o.id, 0});
+	if (!v.is_encrypted && !texts_pending_.empty()) {
+		v.definition = Unreadable(texts_pending_);
+	} else if (!v.is_encrypted && text != texts_.end()) {
+		v.definition = text->second;
+	}
+	// An indexed view (task 16f): a unique clustered index on the view stores its rows, a rowset
+	// of index 1 of the view's object with its in-row unit (none: a deferred drop, as for a table).
+	for (const SysRowset *r : tables_.RowsetsOf(o.id)) {
+		v.indexed = v.indexed || (r->index_id == 1 && tables_.FindInRowUnit(r->rowset_id));
+	}
+	return v;
+}
+
+CatalogModel ModelBuilder::Build() {
+	const SystemTable classes = ReadSystemTable(store_, tables_, "sysclsobjs");
+	ReadSchemas(classes);
+	ReadTypes();
+	for (const auto &c : tables_.columns) {
 		if (c.number == 0) {
-			columns_of[c.object_id].push_back(&c);
+			columns_of_[c.object_id].push_back(&c);
 		}
 	}
 	std::vector<const SysObject *> user_tables, views;
-	for (const auto &o : tables.objects) {
+	for (const auto &o : tables_.objects) {
 		if (IsUserTable(o)) {
 			user_tables.push_back(&o);
 		} else if (IsUserView(o)) {
 			views.push_back(&o);
 		}
 	}
-	// A Pending page of sysobjvalues / sysseobjvalues may hold any of their rows: what they define is named
-	// as unreadable, on the objects that need it, instead of failing the whole model (D13). The base
-	// tables the model is built from (bootstrap, sysclsobjs, ...) still fail it: they are read whole.
-	std::map<ModuleKey, ModuleDefinition> texts;
-	std::string texts_pending;
-	try {
-		texts = ReadModuleTexts(store, tables);
-	} catch (PendingPageError &e) {
-		texts.clear();
-		texts_pending = std::string("sysobjvalues cannot be read: ") + e.what();
-	}
-	const PartitionCatalog partition_catalog = ReadPartitionCatalog(store, tables, classes);
-	AddedDefaults defaults;
-	try {
-		defaults.values = ReadAddedDefaults(store, tables, defaults.ambiguous);
-	} catch (PendingPageError &e) {
-		defaults.values.clear();
-		defaults.ambiguous.clear();
-		defaults.pending = std::string("sysseobjvalues cannot be read: ") + e.what();
-	}
-	// The object's schema; one sysclsobjs does not list is named on the object, not the model.
-	auto schema_of = [&](const SysObject &o, std::string &reason) {
-		const std::string name = model.SchemaName(o.schema_id);
-		if (!name.empty()) {
-			return name;
-		}
-		reason = "its schema " + std::to_string(o.schema_id) + " is not in sysclsobjs";
-		return "schema " + std::to_string(o.schema_id);
-	};
-	// A table, or an indexed view's stored rows (task 16f: its clustered index is a rowset of the view's
-	// object, laid out as a clustered table's): its columns, allocation units, partitions, shape,
-	// partitioning, and whether the scan reads it.
-	auto describe = [&](const SysObject &o, const std::string &schema_name, const std::string &schema_reason) {
-		CatalogTable t;
-		t.object_id = o.id;
-		t.schema_id = o.schema_id;
-		t.schema_name = schema_name;
-		t.reason = schema_reason;
-		t.name = o.name;
-		t.created = o.created;
-		t.modified = o.modified;
-		std::vector<const SysColumn *> &cols = columns_of[o.id];
-		std::sort(cols.begin(), cols.end(),
-				  [](const SysColumn *a, const SysColumn *b) { return a->column_id < b->column_id; });
-		for (const SysColumn *c : cols) {
-			CatalogColumn col;
-			col.column_id = c->column_id;
-			col.name = c->name;
-			col.system_type_id = c->xtype;
-			col.user_type_id = c->user_type;
-			auto type = type_names.find(c->user_type);
-			// A type with no sysscalartypes row keeps an empty name: the column is read by its xtype, or as
-			// its stored bytes (ReadingOf), never refused by its type (owner, 2026-11-11).
-			if (type != type_names.end()) {
-				col.type_name = type->second;
-				col.type_schema = model.SchemaName(type_schemas[c->user_type]);
-			}
-			// A CLR type (xtype 240) has no row of its xtype: the system ones are known by their user type.
-			const int32_t system_id = c->xtype == 240 ? (c->user_type < 256 ? c->user_type : -1) : c->xtype;
-			auto system = type_names.find(system_id);
-			col.system_type_name = system == type_names.end() ? std::string() : system->second;
-			col.max_length = c->length;
-			col.precision = c->precision;
-			col.scale = c->scale;
-			col.collation_id = c->collation_id;
-			col.is_nullable = !(c->status & COLUMN_NOT_NULL);
-			col.is_ansi_padded = (c->status & COLUMN_ANSI_PADDED) != 0;
-			col.is_identity = (c->status & COLUMN_IDENTITY) != 0;
-			col.is_rowguidcol = (c->status & COLUMN_ROWGUIDCOL) != 0;
-			col.is_computed = (c->status & COLUMN_COMPUTED) != 0;
-			col.is_persisted = (c->status & COLUMN_PERSISTED) != 0;
-			col.is_sparse = (c->status & COLUMN_SPARSE) != 0;
-			col.is_column_set = (c->status & COLUMN_SET) != 0;
-			if (col.is_computed && !texts_pending.empty()) {
-				col.definition = Unreadable(texts_pending);
-			} else if (col.is_computed) {
-				auto text = texts.find(ModuleKey{2, o.id, c->column_id});
-				if (text != texts.end()) {
-					col.definition = text->second;
-				}
-			}
-			t.columns.push_back(std::move(col));
-		}
-		AssignDuckDBNames(t.columns);
-		bool heap = false, columnstore = false;
-		std::map<int32_t, int64_t> delta_rows;	// a columnstore's delta store rows, by partition
-		std::unordered_map<uint64_t, const SysRowset *> rowset_of;
-		for (const SysRowset *r : tables.RowsetsOf(o.id)) {
-			for (const SysAllocUnit *a : tables.UnitsOf(r->rowset_id)) {
-				CatalogUnit u;
-				u.unit = *a;
-				u.index_id = r->index_id;
-				u.partition_number = r->partition_number;
-				u.compression = r->compression;
-				t.units.push_back(u);
-			}
-			const SysAllocUnit *in_row =
-				r->index_id == 0 || r->index_id == 1 ? tables.FindInRowUnit(r->rowset_id) : nullptr;
-			if (!in_row) {
-				continue;  // another index, or a deferred drop
-			}
-			heap = heap || r->index_id == 0;
-			columnstore = columnstore || r->compression >= 3;
-			if (r->owner_type == OWNER_PARTITION) {
-				rowset_of[r->rowset_id] = r;
-				CatalogPartition p;
-				p.rowset_id = r->rowset_id;
-				p.partition_number = r->partition_number;
-				AddRowCount(p.rows, r->rows);
-				p.compression = r->compression;
-				p.filegroup_id = in_row->filegroup_id;
-				auto fg = partition_catalog.filegroups.find(in_row->filegroup_id);
-				p.filegroup = fg == partition_catalog.filegroups.end() ? std::string() : fg->second;
-				t.partitions.push_back(std::move(p));
-			}
-			if (r->owner_type == OWNER_DELTA_STORE) {
-				AddRowCount(delta_rows[r->partition_number], r->rows);
-			}
-			if (r->owner_type == OWNER_PARTITION || r->owner_type == OWNER_DELTA_STORE) {
-				// The file's counts, a statistic: a negative one (an upgraded database can hold one until
-				// DBCC UPDATEUSAGE), or a sum past int64, leaves the count unknown -- never UB, and the
-				// table's rows are read all the same.
-				if (t.row_count_known && (r->rows < 0 || r->rows > std::numeric_limits<int64_t>::max() - t.row_count)) {
-					t.row_count_known = false;
-					t.row_count = 0;
-				} else if (t.row_count_known) {
-					t.row_count += r->rows;
-				}
-			}
-		}
-		for (auto &p : t.partitions) {
-			auto delta = delta_rows.find(p.partition_number);
-			if (delta == delta_rows.end()) {
-				continue;
-			}
-			if (delta->second < 0) {
-				p.rows = -1;
-			} else {
-				AddRowCount(p.rows, delta->second);
-			}
-		}
-		std::sort(t.partitions.begin(), t.partitions.end(), [](const CatalogPartition &a, const CatalogPartition &b) {
-			return a.partition_number < b.partition_number;
-		});
-		t.shape = columnstore ? TableShape::Columnstore : heap ? TableShape::Heap : TableShape::Clustered;
-		DescribePartitioning(partition_catalog, type_names, heap ? 0 : 1, check, t);
-		DecideDecodable(tables, defaults, rowset_of, t);
-		return t;
-	};
+	ReadTexts();
+	partition_catalog_ = ReadPartitionCatalog(store_, tables_, classes);
+	ReadDefaults();
 	for (const SysObject *o : user_tables) {
 		std::string schema_reason;
-		std::string schema_name = schema_of(*o, schema_reason);
-		if (!scope.WantsTable(schema_name, o->name)) {
+		std::string schema_name = SchemaOf(*o, schema_reason);
+		if (!scope_.WantsTable(schema_name, o->name)) {
 			continue;
 		}
-		model.tables.push_back(describe(*o, schema_name, schema_reason));
+		model_.tables.push_back(Describe(*o, schema_name, schema_reason));
 	}
 	for (const SysObject *o : views) {
 		std::string schema_reason;
-		std::string schema_name = schema_of(*o, schema_reason);
-		if (!scope.WantsView(schema_name, o->name)) {
+		std::string schema_name = SchemaOf(*o, schema_reason);
+		if (!scope_.WantsView(schema_name, o->name)) {
 			continue;
 		}
-		CatalogView v;
-		v.object_id = o->id;
-		v.schema_id = o->schema_id;
-		v.schema_name = std::move(schema_name);
-		v.reason = std::move(schema_reason);
-		v.name = o->name;
-		v.created = o->created;
-		v.modified = o->modified;
-		v.is_encrypted = (o->status & VIEW_ENCRYPTED) != 0;
-		auto text = texts.find(ModuleKey{1, o->id, 0});
-		if (!v.is_encrypted && !texts_pending.empty()) {
-			v.definition = Unreadable(texts_pending);
-		} else if (!v.is_encrypted && text != texts.end()) {
-			v.definition = text->second;
-		}
-		// An indexed view (task 16f): a unique clustered index on the view stores its rows, a rowset
-		// of index 1 of the view's object with its in-row unit (none: a deferred drop, as for a table).
-		for (const SysRowset *r : tables.RowsetsOf(o->id)) {
-			v.indexed = v.indexed || (r->index_id == 1 && tables.FindInRowUnit(r->rowset_id));
-		}
+		CatalogView v = DescribeView(*o, std::move(schema_name), std::move(schema_reason));
 		if (v.indexed) {
-			model.indexed_views.push_back(describe(*o, v.schema_name, v.reason));
+			model_.indexed_views.push_back(Describe(*o, v.schema_name, v.reason));
 		}
-		model.views.push_back(std::move(v));
+		model_.views.push_back(std::move(v));
 	}
-	std::sort(model.tables.begin(), model.tables.end(), [](const CatalogTable &a, const CatalogTable &b) {
+	std::sort(model_.tables.begin(), model_.tables.end(), [](const CatalogTable &a, const CatalogTable &b) {
 		return ByName(a.schema_name, a.name, b.schema_name, b.name);
 	});
-	std::sort(model.views.begin(), model.views.end(), [](const CatalogView &a, const CatalogView &b) {
+	std::sort(model_.views.begin(), model_.views.end(), [](const CatalogView &a, const CatalogView &b) {
 		return ByName(a.schema_name, a.name, b.schema_name, b.name);
 	});
-	std::sort(model.indexed_views.begin(), model.indexed_views.end(), [](const CatalogTable &a, const CatalogTable &b) {
-		return ByName(a.schema_name, a.name, b.schema_name, b.name);
-	});
-	return model;
+	std::sort(model_.indexed_views.begin(), model_.indexed_views.end(),
+			  [](const CatalogTable &a, const CatalogTable &b) {
+				  return ByName(a.schema_name, a.name, b.schema_name, b.name);
+			  });
+	return std::move(model_);
+}
+
+}  // namespace
+
+CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables, const BoundaryCheck &check,
+							   const CatalogScope &scope) {
+	ModelBuilder builder(store, tables, check, scope);
+	return builder.Build();
 }
 
 }  // namespace backup
