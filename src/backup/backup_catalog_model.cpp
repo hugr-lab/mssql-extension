@@ -467,123 +467,147 @@ std::string Reason(const std::string &message) {
 	return message.compare(0, 8, "backup: ") == 0 ? message.substr(8) : message;
 }
 
+// The partition functions (sysclsobjs class 30) and the data spaces (class 31: a partition scheme is
+// 'PS'; filegroups 'FG' and the others -- FILESTREAM 'FD', memory-optimized 'FX' -- hold a partition's
+// pages).
+void ReadDataSpaces(const SystemTable &classes, PartitionCatalog &out) {
+	const size_t cls = classes.Column("class"), id = classes.Column("id"), name = classes.Column("name"),
+				 status = classes.Column("status"), type = classes.Column("type"), intprop = classes.Column("intprop");
+	for (size_t r = 0; r < classes.rows.size(); r++) {
+		const int64_t c = classes.Int(r, cls);
+		const int32_t i = static_cast<int32_t>(classes.Int(r, id));
+		if (c == 30) {
+			PartitionCatalog::Function f;
+			f.name = classes.Text(r, name);
+			f.range_right = (classes.Int(r, status) & 1) != 0;
+			f.fanout = static_cast<int32_t>(classes.Int(r, intprop));
+			if (!out.functions.emplace(i, f).second) {
+				out.functions_twice.insert(i);
+			}
+		} else if (c == 31) {
+			const std::string t = classes.Text(r, type);
+			const bool scheme = t == "PS";
+			if (out.schemes.count(i) || out.filegroups.count(i)) {
+				out.data_spaces_twice.insert(i);
+			}
+			(scheme ? out.schemes : out.filegroups)[i] = classes.Text(r, name);
+		}
+	}
+}
+
+// Each partition function's parameter (systypedsubobjs class 30, subid 1).
+void ReadFunctionParameters(const PageStore &store, const BootstrapTables &tables, PartitionCatalog &out) {
+	const SystemTable typed = ReadSystemTable(store, tables, "systypedsubobjs");
+	const size_t tc = typed.Column("class"), major = typed.Column("idmajor"), sub = typed.Column("subid"),
+				 xtype = typed.Column("xtype"), utype = typed.Column("utype"), length = typed.Column("length"),
+				 prec = typed.Column("prec"), scale = typed.Column("scale"), coll = typed.Column("collationid");
+	for (size_t r = 0; r < typed.rows.size(); r++) {
+		if (typed.Int(r, tc) != 30 || typed.Int(r, sub) != 1) {
+			continue;
+		}
+		PartitionCatalog::Parameter p;
+		p.xtype = static_cast<uint8_t>(typed.Int(r, xtype));
+		p.user_type = static_cast<int32_t>(typed.Int(r, utype));
+		p.length = static_cast<int16_t>(typed.Int(r, length));
+		p.precision = static_cast<uint8_t>(typed.Int(r, prec));
+		p.scale = static_cast<uint8_t>(typed.Int(r, scale));
+		p.collation = static_cast<uint32_t>(typed.Int(r, coll));
+		const int32_t f = static_cast<int32_t>(typed.Int(r, major));
+		if (!out.parameters.emplace(f, p).second) {
+			out.parameters_twice.insert(f);
+		}
+	}
+}
+
+// syssingleobjrefs: a scheme's function (class 31), its destinations (30), an index's data space (7).
+void ReadObjectReferences(const PageStore &store, const BootstrapTables &tables, PartitionCatalog &out) {
+	const SystemTable refs = ReadSystemTable(store, tables, "syssingleobjrefs");
+	const size_t rc = refs.Column("class"), dep = refs.Column("depid"), depsub = refs.Column("depsubid"),
+				 indep = refs.Column("indepid");
+	for (size_t r = 0; r < refs.rows.size(); r++) {
+		const int64_t c = refs.Int(r, rc);
+		const int32_t d = static_cast<int32_t>(refs.Int(r, dep)), ds = static_cast<int32_t>(refs.Int(r, depsub)),
+					  in = static_cast<int32_t>(refs.Int(r, indep));
+		if (c == 31) {
+			if (!out.scheme_function.emplace(d, in).second) {
+				out.schemes_twice.insert(d);
+			}
+		} else if (c == 30) {
+			if (!out.destinations[d].emplace(ds, in).second) {
+				out.destinations_twice.insert(std::make_pair(d, ds));
+			}
+		} else if (c == 7) {
+			if (!out.data_space.emplace(std::make_pair(d, ds), in).second) {
+				out.data_space_twice.insert(std::make_pair(d, ds));
+			}
+		}
+	}
+}
+
+// Each index's partitioning column (sysiscols, partition ordinal 1).
+void ReadPartitionColumns(const PageStore &store, const BootstrapTables &tables, PartitionCatalog &out) {
+	const SystemTable iscols = ReadSystemTable(store, tables, "sysiscols");
+	const size_t im = iscols.Column("idmajor"), in = iscols.Column("idminor"), ip = iscols.Column("intprop"),
+				 t2 = iscols.Column("tinyprop2");
+	for (size_t r = 0; r < iscols.rows.size(); r++) {
+		if (iscols.Int(r, t2) == 1) {
+			const auto key =
+				std::make_pair(static_cast<int32_t>(iscols.Int(r, im)), static_cast<int32_t>(iscols.Int(r, in)));
+			if (!out.partition_column.emplace(key, static_cast<int32_t>(iscols.Int(r, ip))).second) {
+				out.partition_column_twice.insert(key);
+			}
+		}
+	}
+}
+
+// The partition functions' boundary values (sysobjvalues valclass 30), by function and boundary id.
+void ReadBoundaryValues(const PageStore &store, const BootstrapTables &tables, PartitionCatalog &out) {
+	const SysObject *object = tables.SystemObject("sysobjvalues");
+	if (!object) {
+		throw FormatError("backup: the database has no system table sysobjvalues");
+	}
+	RowsetLayout layout = tables.BaseLayout(object->id);
+	layout.table = "sysobjvalues";
+	const size_t vc = layout.IndexOf("valclass"), oid = layout.IndexOf("objid"), sid = layout.IndexOf("subobjid"),
+				 vn = layout.IndexOf("valnum"), value = layout.IndexOf("value");
+	ForEachRowsetRow(store, tables.InRowUnit(layout.rowset_id, "sysobjvalues"), layout, [&](const SystemRow &row) {
+		// valclass 30 of a partition function only, as ObjectValueFilter keeps them (DQ-11).
+		if (ValueInt(layout, vc, row.values[vc]) != 30 || ValueInt(layout, vn, row.values[vn]) != 1) {
+			return;
+		}
+		const int32_t f = static_cast<int32_t>(ValueInt(layout, oid, row.values[oid]));
+		if (!out.functions.count(f)) {
+			return;
+		}
+		const int32_t b = static_cast<int32_t>(ValueInt(layout, sid, row.values[sid]));
+		if (row.values[value].off_row) {
+			out.boundaries_off_row.insert(f);  // a sql_variant is never off-row: refused for its function
+			return;
+		}
+		PartitionBoundary boundary;
+		boundary.is_null = row.values[value].is_null;  // a NULL boundary is legal: the lowest value
+		boundary.bytes = row.values[value].bytes;
+		if (!out.boundaries[f].emplace(b, std::move(boundary)).second) {
+			out.boundaries_twice.insert(std::make_pair(f, b));
+		}
+	});
+}
+
 }  // namespace
 
 PartitionCatalog ReadPartitionCatalog(const PageStore &store, const BootstrapTables &tables,
 									  const SystemTable &classes) {
 	PartitionCatalog out;
 	try {
-		const size_t cls = classes.Column("class"), id = classes.Column("id"), name = classes.Column("name"),
-					 status = classes.Column("status"), type = classes.Column("type"),
-					 intprop = classes.Column("intprop");
-		for (size_t r = 0; r < classes.rows.size(); r++) {
-			const int64_t c = classes.Int(r, cls);
-			const int32_t i = static_cast<int32_t>(classes.Int(r, id));
-			if (c == 30) {
-				PartitionCatalog::Function f;
-				f.name = classes.Text(r, name);
-				f.range_right = (classes.Int(r, status) & 1) != 0;
-				f.fanout = static_cast<int32_t>(classes.Int(r, intprop));
-				if (!out.functions.emplace(i, f).second) {
-					out.functions_twice.insert(i);
-				}
-			} else if (c == 31) {
-				// A partition scheme is 'PS'; filegroups ('FG') and the other data spaces (FILESTREAM 'FD',
-				// memory-optimized 'FX') hold a partition's pages.
-				const std::string t = classes.Text(r, type);
-				const bool scheme = t == "PS";
-				if (out.schemes.count(i) || out.filegroups.count(i)) {
-					out.data_spaces_twice.insert(i);
-				}
-				(scheme ? out.schemes : out.filegroups)[i] = classes.Text(r, name);
-			}
-		}
+		ReadDataSpaces(classes, out);
 		if (out.schemes.empty()) {
 			return out;	 // no partition scheme: no table is partitioned, nothing more to read
 		}
-		const SystemTable typed = ReadSystemTable(store, tables, "systypedsubobjs");
-		const size_t tc = typed.Column("class"), major = typed.Column("idmajor"), sub = typed.Column("subid"),
-					 xtype = typed.Column("xtype"), utype = typed.Column("utype"), length = typed.Column("length"),
-					 prec = typed.Column("prec"), scale = typed.Column("scale"), coll = typed.Column("collationid");
-		for (size_t r = 0; r < typed.rows.size(); r++) {
-			if (typed.Int(r, tc) != 30 || typed.Int(r, sub) != 1) {
-				continue;
-			}
-			PartitionCatalog::Parameter p;
-			p.xtype = static_cast<uint8_t>(typed.Int(r, xtype));
-			p.user_type = static_cast<int32_t>(typed.Int(r, utype));
-			p.length = static_cast<int16_t>(typed.Int(r, length));
-			p.precision = static_cast<uint8_t>(typed.Int(r, prec));
-			p.scale = static_cast<uint8_t>(typed.Int(r, scale));
-			p.collation = static_cast<uint32_t>(typed.Int(r, coll));
-			const int32_t f = static_cast<int32_t>(typed.Int(r, major));
-			if (!out.parameters.emplace(f, p).second) {
-				out.parameters_twice.insert(f);
-			}
-		}
-		const SystemTable refs = ReadSystemTable(store, tables, "syssingleobjrefs");
-		const size_t rc = refs.Column("class"), dep = refs.Column("depid"), depsub = refs.Column("depsubid"),
-					 indep = refs.Column("indepid");
-		for (size_t r = 0; r < refs.rows.size(); r++) {
-			const int64_t c = refs.Int(r, rc);
-			const int32_t d = static_cast<int32_t>(refs.Int(r, dep)), ds = static_cast<int32_t>(refs.Int(r, depsub)),
-						  in = static_cast<int32_t>(refs.Int(r, indep));
-			if (c == 31) {
-				if (!out.scheme_function.emplace(d, in).second) {
-					out.schemes_twice.insert(d);
-				}
-			} else if (c == 30) {
-				if (!out.destinations[d].emplace(ds, in).second) {
-					out.destinations_twice.insert(std::make_pair(d, ds));
-				}
-			} else if (c == 7) {
-				if (!out.data_space.emplace(std::make_pair(d, ds), in).second) {
-					out.data_space_twice.insert(std::make_pair(d, ds));
-				}
-			}
-		}
+		ReadFunctionParameters(store, tables, out);
+		ReadObjectReferences(store, tables, out);
 		out.data_spaces_read = true;
-		const SystemTable iscols = ReadSystemTable(store, tables, "sysiscols");
-		const size_t im = iscols.Column("idmajor"), in = iscols.Column("idminor"), ip = iscols.Column("intprop"),
-					 t2 = iscols.Column("tinyprop2");
-		for (size_t r = 0; r < iscols.rows.size(); r++) {
-			if (iscols.Int(r, t2) == 1) {
-				const auto key =
-					std::make_pair(static_cast<int32_t>(iscols.Int(r, im)), static_cast<int32_t>(iscols.Int(r, in)));
-				if (!out.partition_column.emplace(key, static_cast<int32_t>(iscols.Int(r, ip))).second) {
-					out.partition_column_twice.insert(key);
-				}
-			}
-		}
-		const SysObject *object = tables.SystemObject("sysobjvalues");
-		if (!object) {
-			throw FormatError("backup: the database has no system table sysobjvalues");
-		}
-		RowsetLayout layout = tables.BaseLayout(object->id);
-		layout.table = "sysobjvalues";
-		const size_t vc = layout.IndexOf("valclass"), oid = layout.IndexOf("objid"), sid = layout.IndexOf("subobjid"),
-					 vn = layout.IndexOf("valnum"), value = layout.IndexOf("value");
-		ForEachRowsetRow(store, tables.InRowUnit(layout.rowset_id, "sysobjvalues"), layout, [&](const SystemRow &row) {
-			// valclass 30 of a partition function only, as ObjectValueFilter keeps them (DQ-11).
-			if (ValueInt(layout, vc, row.values[vc]) != 30 || ValueInt(layout, vn, row.values[vn]) != 1) {
-				return;
-			}
-			const int32_t f = static_cast<int32_t>(ValueInt(layout, oid, row.values[oid]));
-			if (!out.functions.count(f)) {
-				return;
-			}
-			const int32_t b = static_cast<int32_t>(ValueInt(layout, sid, row.values[sid]));
-			if (row.values[value].off_row) {
-				out.boundaries_off_row.insert(f);  // a sql_variant is never off-row: refused for its function
-				return;
-			}
-			PartitionBoundary boundary;
-			boundary.is_null = row.values[value].is_null;  // a NULL boundary is legal: the lowest value
-			boundary.bytes = row.values[value].bytes;
-			if (!out.boundaries[f].emplace(b, std::move(boundary)).second) {
-				out.boundaries_twice.insert(std::make_pair(f, b));
-			}
-		});
+		ReadPartitionColumns(store, tables, out);
+		ReadBoundaryValues(store, tables, out);
 	} catch (FormatError &e) {
 		out.reason = "the partitioning tables: " + Reason(e.what());
 	}
