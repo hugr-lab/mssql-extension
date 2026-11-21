@@ -925,15 +925,216 @@ hugeint_t LsnNumber(const Lsn &lsn) {
 		   hugeint_t(static_cast<int64_t>(lsn.slot));
 }
 
+//! What a call is reserving, for a refusal's words: a chunk's decoding (`row` empty), or the row whose
+//! values stored off row are being reserved, as a refusal names it.
+struct Reserving {
+	std::string row;
+	uint64_t bytes = 0;
+};
+
+//! The row being reserved, named only when refused: by its _mssql_rid and place, and what it holds off row.
+void DescribeReserving(const ScanBindData &data, const ScanLocalState &local, const RowRecord &row,
+					   const RowLocation &at, uint16_t slot, uint64_t bytes, Reserving &reserving) {
+	static const char *digits = "0123456789ABCDEF";
+	std::string rid = "0x";
+	for (unsigned char b : RowId(data, *local.cursor, row, at)) {
+		rid.push_back(digits[b >> 4]);
+		rid.push_back(digits[b & 15]);
+	}
+	reserving.row = "the row of _mssql_rid " + rid + " (page " + local.page.header.page_id.ToString() + " slot " +
+					std::to_string(slot) + "), whose values stored off row (" + local.stager->DescribePrepared() + "),";
+	reserving.bytes = bytes;
+}
+
+//! What the scan does next: a slot to read, something to look at again (the next page, the next unit),
+//! or the chunk's end.
+enum class SlotStep { Row, Again, Stop };
+
+//! The next slot of the unit being read into `slot`.
+SlotStep NextSlot(ClientContext &context, const ScanBindData &data, ScanGlobalState &global, ScanLocalState &local,
+				  uint16_t &slot) {
+	if (!local.have_unit) {
+		// A chunk holds one unit's rows: its batch index is the unit's. The next unit is claimed
+		// by the next call, after DuckDB has taken this chunk's index.
+		if (local.stager->Count() > 0 || !ClaimUnit(data, global, local)) {
+			return SlotStep::Stop;
+		}
+	}
+	if (!local.have_page && !NextPage(context, data, local)) {
+		local.have_unit = false;
+		return SlotStep::Again;
+	}
+	if (local.next_slot >= local.offsets.size()) {
+		local.have_page = false;
+		return SlotStep::Again;
+	}
+	slot = local.next_slot++;
+	return local.offsets[slot] == 0 ? SlotStep::Again : SlotStep::Row;	// 0: a freed slot
+}
+
+//! The record of `slot` as a row (`row` points into `fixed` or the local state's CD row): false for one
+//! that is no live row. `at` is where the row is, or was before it was forwarded.
+bool ReadScanRow(const ScanBindData &data, ScanLocalState &local, const RowsetLayout &layout, uint16_t slot,
+				 RecordView &fixed, RowRecord &row, RowLocation &at) {
+	at.page = local.page.header.page_id;
+	at.slot = slot;
+	uint32_t record_end = 0;
+	if (layout.compression == 1 || layout.compression == 2) {
+		// ROW compression (spec 086 PR 1): a CD record, its values put in the uncompressed form; PAGE (PR 2)
+		// the same, its symbols and prefixes resolved through the page's compression information.
+		CdRecord &cd = local.cd_record;
+		ReadCdRecord(local.page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * local.page.header.slot_count,
+					 local.offsets[slot], data.table.c_str(), cd);
+		if (cd.kind == CdRecord::Kind::Ghost || cd.kind == CdRecord::Kind::Stub) {
+			return false;  // ghosts, stubs (the row is read where it lives)
+		}
+		if (cd.kind == CdRecord::Kind::Forwarded) {
+			cd.BackPointer(at.page.page, at.page.file, at.slot);
+		}
+		local.cd_row.Read(cd, layout, &local.cd_needed, layout.compression == 2 ? &local.page_ci : nullptr);
+		row = RowRecord::Compressed(cd, local.cd_row);
+		record_end = cd.end;
+	} else {
+		fixed = ReadSlot(local.page.bytes.data(), PAGE_SIZE, local.page.header.slot_count, slot, data.table.c_str());
+		if (fixed.Type() != RECORD_PRIMARY && fixed.Type() != RECORD_FORWARDED) {
+			return false;  // ghosts, stubs (the row is read where it lives), index and LOB records
+		}
+		if (fixed.Type() == RECORD_FORWARDED) {
+			at = ForwardedFrom(fixed, layout.table);
+		}
+		row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
+		record_end = fixed.End();
+	}
+	if (static_cast<uint32_t>(local.offsets[slot]) + record_end > local.bounds[slot]) {
+		throw FormatError("backup: page " + local.page.header.page_id.ToString() + " has a record at offset " +
+						  std::to_string(local.offsets[slot]) + " that runs past the next record's start (" +
+						  std::to_string(local.bounds[slot]) + ")");
+	}
+	return true;
+}
+
+//! A row's values stored off row (`need`) reserved before it is staged (D17, PR 3 S4). Never while
+//! waiting holding another reservation: a refusal with rows staged closes the chunk before this row
+//! (false: its slot is read again by the next call); with none, the chunk's reservation is given back
+//! and taken again with the row's, in one wait.
+bool ReserveOffRow(const ScanBindData &data, const ScanGlobalState &global, ScanLocalState &local,
+				   CallReservations &held, const OffRowNeed &need, const RowRecord &row, const RowLocation &at,
+				   uint16_t slot, Reserving &reserving) {
+	bool fits = false;
+	try {
+		// False is "not now": others hold or wait, or DuckDB has no room (alone, the Acquire
+		// below names it); a row past the whole budget throws ReservationRefused instead,
+		// since no release can make room: named here.
+		fits = held.TryAcquire(need.Total(), need.Ours());
+	} catch (ReservationRefused &) {
+		DescribeReserving(data, local, row, at, slot, need.Total(), reserving);
+		throw;
+	}
+	if (fits) {
+		return true;
+	}
+	if (local.stager->Count() > 0) {
+		local.next_slot = slot;
+		return false;
+	}
+	DescribeReserving(data, local, row, at, slot, global.chunk_bytes + need.Total(), reserving);
+	held.ReleaseAll();
+	held.Acquire(global.chunk_bytes + need.Total(), global.chunk_bytes + need.Ours());
+	reserving.row.clear();
+	reserving.bytes = global.chunk_bytes;
+	return true;
+}
+
+//! The virtual columns' values of the row just staged, kept for WriteVirtual.
+void KeepVirtual(const ScanBindData &data, const ScanGlobalState &global, ScanLocalState &local, const RowRecord &row,
+				 const RowLocation &at) {
+	if (global.page_output != DConstants::INVALID_INDEX) {
+		local.page_keys.push_back(PageKey(local.page.header.page_id));
+	}
+	if (global.rid_output != DConstants::INVALID_INDEX) {
+		local.rids.push_back(RowId(data, *local.cursor, row, at));
+	}
+	if (global.lsn_output != DConstants::INVALID_INDEX) {
+		local.lsns.push_back(LsnNumber(local.page.header.lsn));
+	}
+	if (global.lob_output != DConstants::INVALID_INDEX) {
+		local.lob_maps.push_back(local.stager->LastRowLobMap());
+	}
+}
+
+//! Rows staged until the chunk is full, its unit is read, or a row's off-row values must wait.
+void StageRows(ClientContext &context, const ScanBindData &data, ScanGlobalState &global, ScanLocalState &local,
+			   CallReservations &held, Reserving &reserving) {
+	while (!local.stager->Full()) {
+		uint16_t slot = 0;
+		const SlotStep step = NextSlot(context, data, global, local, slot);
+		if (step == SlotStep::Stop) {
+			break;
+		}
+		if (step == SlotStep::Again) {
+			continue;
+		}
+		const RowsetLayout &layout = data.entry->Layout(*local.cursor->partition);
+		RowLocation at;
+		RecordView fixed;
+		RowRecord row;
+		if (!ReadScanRow(data, local, layout, slot, fixed, row, at)) {
+			continue;
+		}
+		const OffRowNeed need = local.stager->PrepareRow(row);
+		if (need.Total() > 0 && !ReserveOffRow(data, global, local, held, need, row, at, slot, reserving)) {
+			break;
+		}
+		local.stager->Append(row);
+		local.pending_appended = local.stager->PendingValues();
+		KeepVirtual(data, global, local, row, at);
+	}
+}
+
+//! Once a scan: a value stored off row on a Pending page was read as NULL (fuzzy := 'warn').
+void WarnPendingValues(ClientContext &context, const ScanBindData &data, ScanGlobalState &global,
+					   const ScanLocalState &local) {
+	if (local.pending_appended > 0 && !global.pending_values_warned.load() &&
+		FuzzyModeOf(context, data.fuzzy, FUNCTION) == FuzzyMode::Warn && !global.pending_values_warned.exchange(true)) {
+		DUCKDB_LOG_WARNING(context,
+						   "%s: %s.%s: a value stored off row is read as NULL, its row read: %s (a fuzzy backup: "
+						   "spec 090 replays the tail; further such values of the table are NULL without another "
+						   "WARNING; fuzzy := 'error' refuses the table)",
+						   FUNCTION, data.schema, data.table, local.stager->FirstPending().c_str());
+	}
+}
+
+//! A reservation refused, in the scan's words: past the scan's budget (InvalidInput), or DuckDB with no
+//! room for it (OutOfMemory).
+[[noreturn]] void ThrowRefused(ClientContext &context, const ScanBindData &data, const ScanGlobalState &global,
+							   const Reserving &reserving, const ReservationRefused &e) {
+	auto &buffers = BufferManager::GetBufferManager(context);
+	const std::string temp =
+		buffers.HasTemporaryDirectory() ? "'" + buffers.GetTemporaryDirectory() + "'" : "none (nothing spills)";
+	const std::string need = StringUtil::BytesToHumanReadableString(reserving.bytes);
+	const std::string what = reserving.row.empty() ? std::string("decoding a chunk") : reserving.row;
+	const std::string max = StringUtil::BytesToHumanReadableString(global.max_memory);
+	if (e.past_budget) {
+		throw InvalidInputException(
+			"%s: %s.%s: %s need%s up to %s, past the scan's half (%s) of "
+			"max_memory %s; raise max_memory or memory_limit (temp_directory %s)",
+			FUNCTION, data.schema, data.table, what, reserving.row.empty() ? "s" : "", need,
+			StringUtil::BytesToHumanReadableString(global.gate->Budget()), max, temp);
+	}
+	throw OutOfMemoryException(
+		"%s: %s.%s: %s need%s up to %s and DuckDB cannot make room for it "
+		"with nothing else of the scan held (max_memory %s, temp_directory %s): %s",
+		FUNCTION, data.schema, data.table, what, reserving.row.empty() ? "s" : "", need, max, temp, e.duckdb_reason);
+}
+
 void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<ScanBindData>();
 	auto &global = input.global_state->Cast<ScanGlobalState>();
 	auto &local = input.local_state->Cast<ScanLocalState>();
 	// Every page this call reads, through the statement's files (the backup's state may be cached, D9).
 	BindFiles bound(data.catalog->Binding());
-	// What the call is reserving, for a refusal's words: a chunk's decoding, or a row's values stored off row.
-	std::string reserving_row;	// empty: a chunk's decoding; else the row being reserved, as a refusal names it
-	uint64_t reserving_bytes = global.chunk_bytes;
+	Reserving reserving;
+	reserving.bytes = global.chunk_bytes;
 	try {
 		// A unit first: the call that finds none left returns no rows and reserves nothing.
 		if (!local.have_unit && !ClaimUnit(data, global, local)) {
@@ -955,132 +1156,10 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		local.rids.clear();
 		local.lsns.clear();
 		local.lob_maps.clear();
-		while (!local.stager->Full()) {
-			if (!local.have_unit) {
-				// A chunk holds one unit's rows: its batch index is the unit's. The next unit is claimed
-				// by the next call, after DuckDB has taken this chunk's index.
-				if (local.stager->Count() > 0 || !ClaimUnit(data, global, local)) {
-					break;
-				}
-			}
-			if (!local.have_page && !NextPage(context, data, local)) {
-				local.have_unit = false;
-				continue;
-			}
-			if (local.next_slot >= local.offsets.size()) {
-				local.have_page = false;
-				continue;
-			}
-			const uint16_t slot = local.next_slot++;
-			if (local.offsets[slot] == 0) {
-				continue;  // a freed slot
-			}
-			const RowsetLayout &layout = data.entry->Layout(*local.cursor->partition);
-			RowLocation at;
-			at.page = local.page.header.page_id;
-			at.slot = slot;
-			RecordView fixed;
-			RowRecord row;
-			uint32_t record_end = 0;
-			if (layout.compression == 1 || layout.compression == 2) {
-				// ROW compression (spec 086 PR 1): a CD record, its values put in the uncompressed form; PAGE (PR 2)
-				// the same, its symbols and prefixes resolved through the page's compression information.
-				CdRecord &cd = local.cd_record;
-				ReadCdRecord(local.page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * local.page.header.slot_count,
-							 local.offsets[slot], data.table.c_str(), cd);
-				if (cd.kind == CdRecord::Kind::Ghost || cd.kind == CdRecord::Kind::Stub) {
-					continue;  // ghosts, stubs (the row is read where it lives)
-				}
-				if (cd.kind == CdRecord::Kind::Forwarded) {
-					cd.BackPointer(at.page.page, at.page.file, at.slot);
-				}
-				local.cd_row.Read(cd, layout, &local.cd_needed, layout.compression == 2 ? &local.page_ci : nullptr);
-				row = RowRecord::Compressed(cd, local.cd_row);
-				record_end = cd.end;
-			} else {
-				fixed = ReadSlot(local.page.bytes.data(), PAGE_SIZE, local.page.header.slot_count, slot,
-								 data.table.c_str());
-				if (fixed.Type() != RECORD_PRIMARY && fixed.Type() != RECORD_FORWARDED) {
-					continue;  // ghosts, stubs (the row is read where it lives), index and LOB records
-				}
-				if (fixed.Type() == RECORD_FORWARDED) {
-					at = ForwardedFrom(fixed, layout.table);
-				}
-				row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
-				record_end = fixed.End();
-			}
-			if (static_cast<uint32_t>(local.offsets[slot]) + record_end > local.bounds[slot]) {
-				throw FormatError("backup: page " + local.page.header.page_id.ToString() + " has a record at offset " +
-								  std::to_string(local.offsets[slot]) + " that runs past the next record's start (" +
-								  std::to_string(local.bounds[slot]) + ")");
-			}
-			// A row's values stored off row are reserved before it is staged (D17, PR 3 S4). Never while
-			// waiting holding another reservation: a refusal with rows staged closes the chunk before this
-			// row (its slot is read again by the next call); with none, the chunk's reservation is given back
-			// and taken again with the row's, in one wait.
-			const OffRowNeed need = local.stager->PrepareRow(row);
-			if (need.Total() > 0) {
-				// Named only when refused: the row by its _mssql_rid and place, and what it holds off row.
-				auto describe = [&](uint64_t bytes) {
-					static const char *digits = "0123456789ABCDEF";
-					std::string rid = "0x";
-					for (unsigned char b : RowId(data, *local.cursor, row, at)) {
-						rid.push_back(digits[b >> 4]);
-						rid.push_back(digits[b & 15]);
-					}
-					reserving_row = "the row of _mssql_rid " + rid + " (page " + local.page.header.page_id.ToString() +
-									" slot " + std::to_string(slot) + "), whose values stored off row (" +
-									local.stager->DescribePrepared() + "),";
-					reserving_bytes = bytes;
-				};
-				bool fits = false;
-				try {
-					// False is "not now": others hold or wait, or DuckDB has no room (alone, the Acquire
-					// below names it); a row past the whole budget throws ReservationRefused instead,
-					// since no release can make room: named here.
-					fits = held.TryAcquire(need.Total(), need.Ours());
-				} catch (ReservationRefused &) {
-					describe(need.Total());
-					throw;
-				}
-				if (!fits) {
-					if (local.stager->Count() > 0) {
-						local.next_slot = slot;
-						break;
-					}
-					describe(global.chunk_bytes + need.Total());
-					held.ReleaseAll();
-					held.Acquire(global.chunk_bytes + need.Total(), global.chunk_bytes + need.Ours());
-					reserving_row.clear();
-					reserving_bytes = global.chunk_bytes;
-				}
-			}
-			local.stager->Append(row);
-			local.pending_appended = local.stager->PendingValues();
-			if (global.page_output != DConstants::INVALID_INDEX) {
-				local.page_keys.push_back(PageKey(local.page.header.page_id));
-			}
-			if (global.rid_output != DConstants::INVALID_INDEX) {
-				local.rids.push_back(RowId(data, *local.cursor, row, at));
-			}
-			if (global.lsn_output != DConstants::INVALID_INDEX) {
-				local.lsns.push_back(LsnNumber(local.page.header.lsn));
-			}
-			if (global.lob_output != DConstants::INVALID_INDEX) {
-				local.lob_maps.push_back(local.stager->LastRowLobMap());
-			}
-		}
+		StageRows(context, data, global, local, held, reserving);
 		const idx_t count = local.stager->Count();
 		global.rows_read += count;
-		if (local.pending_appended > 0 && !global.pending_values_warned.load() &&
-			FuzzyModeOf(context, data.fuzzy, FUNCTION) == FuzzyMode::Warn &&
-			!global.pending_values_warned.exchange(true)) {
-			DUCKDB_LOG_WARNING(context,
-							   "%s: %s.%s: a value stored off row is read as NULL, its row read: %s (a fuzzy backup: "
-							   "spec 090 replays the tail; further such values of the table are NULL without another "
-							   "WARNING; fuzzy := 'error' refuses the table)",
-							   FUNCTION, data.schema, data.table, local.stager->FirstPending().c_str());
-		}
+		WarnPendingValues(context, data, global, local);
 		local.stager->FinalizeChunk();
 		WriteVirtual(global, local, output, count);
 		for (idx_t c : global.empty_outputs) {
@@ -1098,24 +1177,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 	} catch (ReservationInterrupted &) {
 		throw InterruptException();
 	} catch (ReservationRefused &e) {
-		auto &buffers = BufferManager::GetBufferManager(context);
-		const std::string temp =
-			buffers.HasTemporaryDirectory() ? "'" + buffers.GetTemporaryDirectory() + "'" : "none (nothing spills)";
-		const std::string need = StringUtil::BytesToHumanReadableString(reserving_bytes);
-		const std::string reserving = reserving_row.empty() ? std::string("decoding a chunk") : reserving_row;
-		const std::string max = StringUtil::BytesToHumanReadableString(global.max_memory);
-		if (e.past_budget) {
-			throw InvalidInputException(
-				"%s: %s.%s: %s need%s up to %s, past the scan's half (%s) of "
-				"max_memory %s; raise max_memory or memory_limit (temp_directory %s)",
-				FUNCTION, data.schema, data.table, reserving, reserving_row.empty() ? "s" : "", need,
-				StringUtil::BytesToHumanReadableString(global.gate->Budget()), max, temp);
-		}
-		throw OutOfMemoryException(
-			"%s: %s.%s: %s need%s up to %s and DuckDB cannot make room for it "
-			"with nothing else of the scan held (max_memory %s, temp_directory %s): %s",
-			FUNCTION, data.schema, data.table, reserving, reserving_row.empty() ? "s" : "", need, max, temp,
-			e.duckdb_reason);
+		ThrowRefused(context, data, global, reserving, e);
 	}
 }
 
