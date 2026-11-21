@@ -1,5 +1,5 @@
 # name: test/sql/backup/mssql_backup_catalog.test
-# description: mssql_backup_catalog over the committed samples (spec 085 PR 2b): the allow-listed base tables, their rows, _mssql_page / _mssql_rid
+# description: mssql_backup_catalog over the committed samples (spec 085 PR 2b): every system base table, its rows, _mssql_page / _mssql_rid
 # group: [mssql]
 #
 # The samples are synthetic (test/backup/gen/samples.sql). No SQL Server is needed.
@@ -10,25 +10,32 @@ require mssql
 statement ok
 CREATE MACRO le(h, n) AS list_reduce(list_transform(range(n), lambda i: substr(h, (n - i - 1) * 2 + 1, 2)), lambda a, b: a || b);
 
-# The base tables served, each with its rowset's row count (= the rows served), NULL for the two
-# served by value class.
+# Every system base table with a unique clustered key, each with its rowset's row count (= the rows
+# served): no allow-list (spec 085 § Security, revised by the owner 2026-11-21).
+query II
+SELECT count(*), count(row_count) FROM mssql_backup_catalog('test/data/backup/full.bak');
+----
+70	70
+
 query TT
-SELECT base_table, CASE WHEN row_count IS NULL THEN 'filtered' WHEN row_count > 0 THEN 'rows' ELSE 'empty' END
-FROM mssql_backup_catalog('test/data/backup/full.bak') ORDER BY base_table;
+SELECT base_table, CASE WHEN row_count > 0 THEN 'rows' ELSE 'empty' END
+FROM mssql_backup_catalog('test/data/backup/full.bak')
+WHERE base_table IN ('sysallocunits', 'sysobjvalues', 'sysowners', 'sysschobjs', 'sysseobjvalues', 'systypedsubobjs')
+ORDER BY base_table;
 ----
 sysallocunits	rows
-sysclsobjs	rows
-syscolpars	rows
-sysidxstats	rows
-sysiscols	rows
-sysobjvalues	filtered
-sysrowsets	rows
-sysrscols	rows
-sysscalartypes	rows
+sysobjvalues	rows
+sysowners	rows
 sysschobjs	rows
-sysseobjvalues	filtered
-syssingleobjrefs	rows
+sysseobjvalues	empty
 systypedsubobjs	empty
+
+# Each listed table reads whole: its count the rowset's.
+query T
+SELECT bool_and(l.row_count = (SELECT count(*) FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysowners')))
+FROM mssql_backup_catalog('test/data/backup/full.bak') l WHERE l.base_table = 'sysowners';
+----
+true
 
 query T
 SELECT bool_and(l.row_count = (SELECT count(*) FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysschobjs')))
@@ -96,20 +103,29 @@ JOIN mssql_backup_tables('test/data/backup/full.bak') t ON t.object_id = o.id WH
 ----
 true
 
-# sysobjvalues only by value class: definitions (1, of views and defaults), computed columns (2),
-# partition boundaries (30), each checked against its object. The samples have none of them, so none of
-# its 242 rows is served: no module source, no other class (the oracle lane checks the catalog
-# fixture's set against the server's).
+# sysobjvalues whole: all 242 rows, module source included (whoever holds the backup may read it).
 query I
 SELECT count(*) FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysobjvalues');
 ----
+242
+
+# A system table whose shape the reader does not serve -- sysfiles1 and sysxmitqueue are heaps, with
+# no key for _mssql_rid -- is left out of the listing and refused by name.
+query I
+SELECT count(*) FROM mssql_backup_catalog('test/data/backup/full.bak') WHERE base_table IN ('sysfiles1', 'sysxmitqueue');
+----
 0
 
-# Anything else is refused by name.
 statement error
-SELECT * FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysowners');
+SELECT * FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysfiles1');
 ----
-sysowners is not a base table the reader serves
+sysfiles1 is not read: it has no clustered key, which _mssql_rid needs
+
+# A name that is no system table of the database is refused by name.
+statement error
+SELECT * FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysnothing');
+----
+the database has no system table sysnothing
 
 statement error
 SELECT * FROM mssql_backup_catalog('test/data/backup/full.bak', NULL::VARCHAR);

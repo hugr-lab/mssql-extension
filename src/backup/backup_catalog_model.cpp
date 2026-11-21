@@ -82,8 +82,8 @@ ModuleDefinition DefinitionOf(const SystemRow &row, size_t value, size_t imageva
 	}
 }
 
-// The texts the model keeps: the rows of valclass 1 and 2 the audited ObjectValueFilter lets leave (DQ-11),
-// so the model and mssql_backup_catalog keep one rule.
+// The texts the model keeps: the rows of valclass 1 and 2 ObjectValueFilter names (a readable view's or a
+// default's definition, a user table's computed column), the ones the model describes.
 std::map<ModuleKey, ModuleDefinition> ReadModuleTexts(const PageStore &store, const BootstrapTables &tables) {
 	std::map<ModuleKey, ModuleDefinition> out;
 	const ObjectValueFilter filter(tables, std::set<int32_t>());
@@ -522,7 +522,7 @@ PartitionCatalog ReadPartitionCatalog(const PageStore &store, const BootstrapTab
 		const size_t vc = layout.IndexOf("valclass"), oid = layout.IndexOf("objid"), sid = layout.IndexOf("subobjid"),
 					 vn = layout.IndexOf("valnum"), value = layout.IndexOf("value");
 		ForEachRowsetRow(store, tables.InRowUnit(layout.rowset_id, "sysobjvalues"), layout, [&](const SystemRow &row) {
-			// valclass 30 of a partition function only, as ObjectValueFilter keeps them (DQ-11).
+			// valclass 30 of a partition function only, as ObjectValueFilter names them.
 			if (ValueInt(layout, vc, row.values[vc]) != 30 || ValueInt(layout, vn, row.values[vn]) != 1) {
 				return;
 			}
@@ -807,18 +807,6 @@ bool ObjectValueFilter::Keep(int64_t valclass, int32_t object_id, int64_t sub_id
 	default:
 		return false;
 	}
-}
-
-std::set<int32_t> ReadPartitionFunctions(const PageStore &store, const BootstrapTables &tables) {
-	std::set<int32_t> out;
-	const SystemTable classes = ReadSystemTable(store, tables, "sysclsobjs");
-	const size_t cls = classes.Column("class"), id = classes.Column("id");
-	for (size_t r = 0; r < classes.rows.size(); r++) {
-		if (classes.Int(r, cls) == 30) {
-			out.insert(static_cast<int32_t>(classes.Int(r, id)));
-		}
-	}
-	return out;
 }
 
 std::string SqlTypeText(const std::string &type_name, const std::string &system_type_name, uint8_t system_type_id,

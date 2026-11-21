@@ -1,18 +1,19 @@
 // Spec 085 PR 2b step 7b (task 17): mssql_backup_catalog(path [, base_table]) -- a full backup's system
 // base tables as stored, for an importer to mirror (022 D3). [DuckDB]
 //
-// With no base_table: the allow-listed base tables (name, object id, rows, columns). With one: its
-// rows, its columns typed by its own description (sysrscols, named by syscolpars) through D6's map
+// With no base_table: the base tables it reads (name, object id, rows, columns) -- every system base
+// table of the database (sysschobjs type 'S') whose shape it reads. With one: its rows, its columns
+// typed by its own description (sysrscols, named by syscolpars) through D6's map
 // (MSSQLColumnInfo::MapSQLServerTypeToDuckDB, native types off), sql_variant as its raw bytes (BLOB:
 // a VARIANT is spec 086's), plus the virtual columns of D8: _mssql_page (the row's page, '01' + 4 hex
 // digits of file + 8 of page) and _mssql_rid (0x01, then per clustered key column in ordkey order u16
-// length and its stored bytes, 0xFFFF for NULL). The allow-list is spec 085 § Security's, plus
-// sysscalartypes (the type names an alias column needs). Two tables are served by value class only,
-// each row checked against the object it belongs to (DQ-11: module source never leaves):
-// sysobjvalues' valclass 1 of a view (not one WITH ENCRYPTION) or a default, with subobjid and valnum
-// 0; valclass 2 of a computed column of a user table; valclass 30 of a partition function; and
-// sysseobjvalues' valclass 1 (an added column's default, the one class measured). Any other table,
-// such as sysowners (password hashes), is refused by name.
+// length and its stored bytes, 0xFFFF for NULL). Every row of every table, sysobjvalues' module source
+// and sysowners' password hashes included: whoever holds the backup -- and an encrypted one's key --
+// may read all of it (spec 085 § Security, revised by the owner 2026-11-21; there was an allow-list).
+// A table whose shape the reader does not serve (a heap, a non-unique clustered index, a bit key: no
+// _mssql_rid) is refused by name, and left out of the listing. A value it cannot give (an off-row one
+// past its bound or the call's, bytes not of their type) is NULL with one WARNING a column, its row
+// read (owner, 2026-11-20).
 //
 // The rows are produced a page at a time: the global state holds the unit's IAM-listed pages and a
 // cursor, never the table; an off-row value is read as its row is produced, within one value's bound
@@ -30,6 +31,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "mssql_function_docs.hpp"
 #include "utf8proc_wrapper.hpp"
@@ -37,7 +39,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <set>
 
 namespace duckdb {
 namespace mssql {
@@ -47,23 +48,8 @@ namespace {
 
 const char *const FUNCTION = "mssql_backup_catalog";
 
-// spec 085 § Security: the mirror set of E1§4.8, sysobjvalues (by value class), sysidxstats,
-// sysiscols, the partitioning tables of E7; and sysscalartypes.
-const char *const ALLOWED[] = {"sysallocunits",	  "sysrowsets",		  "sysschobjs",	   "syscolpars",  "sysrscols",
-							   "sysseobjvalues",  "sysclsobjs",		  "sysobjvalues",  "sysidxstats", "sysiscols",
-							   "systypedsubobjs", "syssingleobjrefs", "sysscalartypes"};
-
 const column_t PAGE_COLUMN = VIRTUAL_COLUMN_START;
 const column_t RID_COLUMN = VIRTUAL_COLUMN_START + 1;
-
-bool Allowed(const std::string &name) {
-	for (const char *a : ALLOWED) {
-		if (name == a) {
-			return true;
-		}
-	}
-	return false;
-}
 
 //! The system type names of the xtypes a base table holds (sys.types' names, for D6's map).
 const char *SystemTypeName(uint8_t xtype) {
@@ -120,60 +106,52 @@ LogicalType TypeOf(const RowsetLayout &layout, const PhysicalColumn &c) {
 													 MSSQLDatetime2Read::Nanoseconds);
 }
 
-std::string AllowedList() {
-	std::string out;
-	for (const char *a : ALLOWED) {
-		out += (out.empty() ? "" : ", ") + std::string(a);
+//! Why the reader does not serve a base table of this layout ("" when it does): _mssql_rid needs a
+//! unique clustered key whose stored bytes it keeps.
+std::string NotServed(const RowsetLayout &layout) {
+	if (layout.columns.size() > MAX_SYSTEM_TABLE_COLUMNS) {
+		return "it is described with " + std::to_string(layout.columns.size()) +
+			   " physical columns, more than the reader takes";
 	}
-	return out;
+	bool keyed = false;
+	for (const auto &c : layout.columns) {
+		if (c.Uniquifier()) {
+			return "its clustered index is not unique, which the reader does not serve";
+		}
+		if (!c.Dropped() && c.ordkey > 0) {
+			if (c.xtype == XTYPE_BIT) {
+				return "its key column " + c.name + " is a bit, whose stored byte the reader does not keep";
+			}
+			keyed = true;
+		}
+	}
+	return keyed ? std::string() : std::string("it has no clustered key, which _mssql_rid needs");
 }
 
-//! The rows a base table may serve: every row, but sysobjvalues' by ObjectValueFilter (DQ-11) and
-//! sysseobjvalues' by its valclass 1.
-struct RowFilter {
-	enum class Kind : uint8_t { All, ObjectValues, AddedDefaults } kind = Kind::All;
-	size_t valclass = 0, objid = 0, subobjid = 0, valnum = 0;
-	std::unique_ptr<ObjectValueFilter> object_values;
-
-	bool Keep(const RowsetLayout &layout, const SystemRow &row) const {
-		if (kind == Kind::All) {
-			return true;
+//! The system base tables of the database whose shape the reader serves, by name.
+std::vector<const SysObject *> ServedTables(const BootstrapTables &tables) {
+	std::vector<const SysObject *> out;
+	for (const auto &o : tables.objects) {
+		if (o.type != "S " || tables.SystemObject(o.name) != &o) {
+			continue;
 		}
-		const int64_t cls = ValueInt(layout, valclass, row.values[valclass], -1);
-		if (kind == Kind::AddedDefaults) {
-			return cls == 1;
+		try {
+			if (NotServed(tables.BaseLayout(o.id)).empty()) {
+				out.push_back(&o);
+			}
+		} catch (FormatError &) {
+			// A table described in a way the reader does not take: named when it is asked for (Bind).
 		}
-		return object_values->Keep(cls, static_cast<int32_t>(ValueInt(layout, objid, row.values[objid], 0)),
-								   ValueInt(layout, subobjid, row.values[subobjid], -1),
-								   ValueInt(layout, valnum, row.values[valnum], -1));
 	}
-};
-
-RowFilter FilterFor(const PageStore &store, const BootstrapTables &tables, const std::string &table,
-					const RowsetLayout &layout) {
-	RowFilter f;
-	if (table == "sysseobjvalues") {
-		f.kind = RowFilter::Kind::AddedDefaults;
-		f.valclass = layout.IndexOf("valclass");
-		return f;
-	}
-	if (table != "sysobjvalues") {
-		return f;
-	}
-	f.kind = RowFilter::Kind::ObjectValues;
-	f.valclass = layout.IndexOf("valclass");
-	f.objid = layout.IndexOf("objid");
-	f.subobjid = layout.IndexOf("subobjid");
-	f.valnum = layout.IndexOf("valnum");
-	f.object_values.reset(new ObjectValueFilter(tables, ReadPartitionFunctions(store, tables)));
-	return f;
+	std::sort(out.begin(), out.end(), [](const SysObject *a, const SysObject *b) { return a->name < b->name; });
+	return out;
 }
 
 struct BaseTableBindData : public TableFunctionData {
 	vector<std::string> paths;
 	vector<std::string> diff;  // task 24
 	BackupAt at;			   // task 24b
-	std::string table;		   // "" lists the allow-listed tables
+	std::string table;		   // "" lists the tables served
 	std::shared_ptr<OpenedCatalog> catalog;
 	RowsetLayout layout;			 // the table's
 	std::vector<size_t> columns;	 // its served columns: layout indexes (not dropped, not the uniquifier)
@@ -205,7 +183,7 @@ struct BaseTableBindData : public TableFunctionData {
 
 struct BaseTableState : public GlobalTableFunctionState {
 	std::vector<column_t> column_ids;
-	RowFilter filter;
+	std::vector<const SysObject *> listed;	// the listing's tables
 	const SysAllocUnit *unit = nullptr;
 	const SysAllocUnit *lob = nullptr;
 	std::vector<PagePointer> pages;	 // the unit's IAM-listed pages
@@ -214,6 +192,19 @@ struct BaseTableState : public GlobalTableFunctionState {
 	size_t next_row = 0;
 	uint64_t off_row_bytes = 0;
 	size_t next_listed = 0;	 // the listing's cursor
+	//! A value the reader cannot give is NULL, never a refusal of the table (owner, 2026-11-20): per
+	//! output column (and _mssql_rid last) how many, the first's reason, and whether its WARNING is said.
+	struct Unread {
+		uint64_t count = 0;
+		std::string first;
+		bool warned = false;
+	};
+	std::vector<Unread> unread;
+	void NoteUnread(size_t at, const std::string &why) {
+		if (unread[at].count++ == 0) {
+			unread[at].first = why;
+		}
+	}
 };
 
 LogicalType ListingColumnType() {
@@ -239,10 +230,6 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 			throw InvalidInputException("%s: the base table is NULL", FUNCTION);
 		}
 		data->table = input.inputs[1].ToString();
-		if (!Allowed(data->table)) {
-			throw InvalidInputException("%s: %s is not a base table the reader serves (it serves %s)", FUNCTION,
-										data->table, AllowedList());
-		}
 	}
 	try {
 		data->catalog =
@@ -268,17 +255,13 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		throw InvalidInputException("%s: %s", FUNCTION, e.what());
 	}
 	data->layout.table = data->table;
-	if (data->layout.columns.size() > MAX_SYSTEM_TABLE_COLUMNS) {
-		throw InvalidInputException("%s: %s is described with %d physical columns, more than the reader takes",
-									FUNCTION, data->table, static_cast<int>(data->layout.columns.size()));
+	const std::string why = NotServed(data->layout);
+	if (!why.empty()) {
+		throw InvalidInputException("%s: %s is not read: %s", FUNCTION, data->table, why);
 	}
 	std::vector<std::pair<int16_t, size_t>> key;
 	for (size_t i = 0; i < data->layout.columns.size(); i++) {
 		const PhysicalColumn &c = data->layout.columns[i];
-		if (c.Uniquifier()) {
-			throw InvalidInputException("%s: %s's clustered index is not unique, which the reader does not serve",
-										FUNCTION, data->table);
-		}
 		if (c.Dropped()) {
 			continue;
 		}
@@ -287,16 +270,8 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		names.emplace_back(c.name);
 		return_types.push_back(data->types.back());
 		if (c.ordkey > 0) {
-			if (c.xtype == XTYPE_BIT) {
-				throw InvalidInputException(
-					"%s: %s's key column %s is a bit, whose stored byte the reader does not keep", FUNCTION,
-					data->table, c.name);
-			}
 			key.emplace_back(c.ordkey, i);
 		}
-	}
-	if (key.empty()) {
-		throw InvalidInputException("%s: %s has no clustered key, which _mssql_rid needs", FUNCTION, data->table);
 	}
 	std::sort(key.begin(), key.end());
 	for (const auto &k : key) {
@@ -319,14 +294,15 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInpu
 	const auto &data = input.bind_data->Cast<BaseTableBindData>();
 	auto state = make_uniq<BaseTableState>();
 	state->column_ids = input.column_ids;
+	state->unread.resize(data.columns.size() + 1);
 	if (data.table.empty()) {
+		state->listed = ServedTables(*data.catalog->tables);
 		return std::move(state);
 	}
 	BindFiles bound(data.catalog->Binding());
 	const BootstrapTables &tables = *data.catalog->tables;
 	const PageStore &store = *data.catalog->pages->store;
 	try {
-		state->filter = FilterFor(store, tables, data.table, data.layout);
 		state->unit = &tables.InRowUnit(data.layout.rowset_id, data.table);
 		state->lob = tables.FindLobUnit(data.layout.rowset_id);
 		state->pages = UnitPages(store, *state->unit);
@@ -348,29 +324,34 @@ bool LoadNextPage(const BaseTableBindData &data, BaseTableState &state) {
 		state.pending.clear();
 		state.next_row = 0;
 		ForEachPageRow(page, data.layout, [&](const SystemRow &row) {
-			if (!state.filter.Keep(data.layout, row)) {
-				return;
-			}
 			SystemRow kept = row;
-			// An off-row value (a long definition) read in full, within its bound and the call's.
-			for (size_t i : data.columns) {
+			// An off-row value (a long definition) read in full, within its bound and the call's; one that
+			// cannot be read, or past either bound, is NULL with a WARNING (Execute), its row read.
+			for (size_t o = 0; o < data.columns.size(); o++) {
+				const size_t i = data.columns[o];
 				SystemValue &v = kept.values[i];
 				if (v.is_null || !v.off_row) {
 					continue;
 				}
 				const std::string what = data.table + "." + data.layout.columns[i].name + " at " + row.page.ToString() +
 										 " slot " + std::to_string(row.slot);
-				if (!state.lob) {
-					throw FormatError("backup: " + what + " is stored off-row, and the table has no LOB unit");
+				try {
+					if (!state.lob) {
+						throw FormatError("backup: " + what + " is stored off-row, and the table has no LOB unit");
+					}
+					std::string bytes = ReadLobValue(store, v.bytes, state.lob->auid, what, MAX_MODULE_TEXT_BYTES);
+					if (state.off_row_bytes + bytes.size() > MAX_CALL_OFF_ROW_BYTES) {
+						throw FormatError("backup: " + what + ": the call's off-row values would pass " +
+										  std::to_string(MAX_CALL_OFF_ROW_BYTES) + " bytes in all");
+					}
+					state.off_row_bytes += bytes.size();
+					v.bytes = std::move(bytes);
+				} catch (FormatError &e) {
+					v.is_null = true;
+					v.bytes.clear();
+					state.NoteUnread(o, e.what());
 				}
-				v.bytes = ReadLobValue(store, v.bytes, state.lob->auid, what, MAX_MODULE_TEXT_BYTES);
 				v.off_row = false;
-				state.off_row_bytes += v.bytes.size();
-				if (state.off_row_bytes > MAX_CALL_OFF_ROW_BYTES) {
-					throw FormatError("backup: " + data.table + "'s off-row values pass " +
-									  std::to_string(MAX_CALL_OFF_ROW_BYTES) +
-									  " bytes in all, more than one call reads");
-				}
 			}
 			state.pending.push_back(std::move(kept));
 		});
@@ -453,22 +434,16 @@ Value CellValue(const BaseTableBindData &data, size_t layout_index, const Logica
 void ExecuteListing(const BaseTableBindData &data, BaseTableState &state, DataChunk &output) {
 	const BootstrapTables &tables = *data.catalog->tables;
 	idx_t count = 0;
-	for (; state.next_listed < sizeof(ALLOWED) / sizeof(ALLOWED[0]) && count < STANDARD_VECTOR_SIZE;
-		 state.next_listed++) {
-		const std::string name = ALLOWED[state.next_listed];
-		const SysObject *object = tables.SystemObject(name);
-		if (!object) {
-			continue;  // not in this version
-		}
+	for (; state.next_listed < state.listed.size() && count < STANDARD_VECTOR_SIZE; state.next_listed++) {
+		const SysObject *object = state.listed[state.next_listed];
+		const std::string &name = object->name;
 		RowsetLayout layout = tables.BaseLayout(object->id);
 		layout.table = name;
-		// The rowset's own count; for a table served by value class it is not the rows served: NULL.
+		// The rowset's own count: the rows served.
 		Value rows(LogicalType::BIGINT);
-		if (name != "sysobjvalues" && name != "sysseobjvalues") {
-			for (const SysRowset *r : tables.RowsetsOf(object->id)) {
-				if (r->rowset_id == layout.rowset_id) {
-					rows = Value::BIGINT(r->rows);
-				}
+		for (const SysRowset *r : tables.RowsetsOf(object->id)) {
+			if (r->rowset_id == layout.rowset_id) {
+				rows = Value::BIGINT(r->rows);
 			}
 		}
 		vector<Value> columns;
@@ -495,7 +470,23 @@ void ExecuteListing(const BaseTableBindData &data, BaseTableState &state, DataCh
 	output.SetChildCardinality(count);
 }
 
-void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+//! One WARNING a column a call, as its first value read as NULL is met.
+void SurfaceUnread(ClientContext &context, const BaseTableBindData &data, BaseTableState &state) {
+	for (size_t o = 0; o < state.unread.size(); o++) {
+		auto &u = state.unread[o];
+		if (u.count == 0 || u.warned) {
+			continue;
+		}
+		u.warned = true;
+		const std::string column = o < data.columns.size() ? data.layout.columns[data.columns[o]].name : "_mssql_rid";
+		DUCKDB_LOG_WARNING(context,
+						   "%s: %s.%s: a value the reader cannot give is read as NULL, its row read (further ones of "
+						   "the column without another WARNING): %s",
+						   FUNCTION, data.table, column, u.first);
+	}
+}
+
+void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<BaseTableBindData>();
 	auto &state = input.global_state->Cast<BaseTableState>();
 	BindFiles bound(data.catalog->Binding());
@@ -515,17 +506,28 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 				if (id == PAGE_COLUMN) {
 					output.data[c].SetValue(count, Value(PageKey(row.page)));
 				} else if (id == RID_COLUMN) {
-					const std::string rid = RowId(data, row);
-					output.data[c].SetValue(count,
-											Value::BLOB(reinterpret_cast<const_data_ptr_t>(rid.data()), rid.size()));
+					try {
+						const std::string rid = RowId(data, row);
+						output.data[c].SetValue(
+							count, Value::BLOB(reinterpret_cast<const_data_ptr_t>(rid.data()), rid.size()));
+					} catch (FormatError &e) {
+						output.data[c].SetValue(count, Value(LogicalType::BLOB));
+						state.NoteUnread(data.columns.size(), e.what());
+					}
 				} else if (id < data.columns.size()) {
 					const size_t index = data.columns[id];
-					output.data[c].SetValue(count, CellValue(data, index, data.types[id], row.values[index]));
+					try {
+						output.data[c].SetValue(count, CellValue(data, index, data.types[id], row.values[index]));
+					} catch (FormatError &e) {
+						output.data[c].SetValue(count, Value(data.types[id]));
+						state.NoteUnread(id, e.what());
+					}
 				}
 			}
 			count++;
 		}
 		output.SetChildCardinality(count);
+		SurfaceUnread(context, data, state);
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FUNCTION, e.what());
 	}
@@ -555,9 +557,8 @@ void RegisterBackupCatalogFunction(ExtensionLoader &loader) {
 		{{},
 		 "Reads a system base table of the database in a SQL Server full backup, as stored, for an importer to "
 		 "mirror the catalog: its rows, its columns typed by its own description, and the virtual _mssql_page "
-		 "(the row's page) and _mssql_rid (its clustered key). With no table, lists the base tables it serves "
-		 "(an allow-list; sysobjvalues only by value class: view, default and computed-column definitions and "
-		 "partition boundaries, never module source).",
+		 "(the row's page) and _mssql_rid (its clustered key). With no table, lists the base tables it reads: "
+		 "every system base table with a unique clustered key, all its rows.",
 		 {"SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak')",
 		  "SELECT _mssql_page, id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs')"},
 		 {"backup"}});

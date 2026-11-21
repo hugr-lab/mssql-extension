@@ -196,13 +196,13 @@ SHA-256), on backups made by SQL Server 2017 to 2025.
 for a tool that mirrors the catalog: its rows, its columns typed by its own description (a
 `sql_variant` column as its raw bytes), and two virtual columns that `SELECT *` leaves out:
 `_mssql_page`, the row's page (`'01'`, then the file and page number in hex), and `_mssql_rid`, the
-row's clustered key. With no `base_table` it lists the tables it serves: `sysallocunits`,
-`sysrowsets`, `sysschobjs`, `syscolpars`, `sysrscols`, `sysseobjvalues`, `sysclsobjs`,
-`sysobjvalues`, `sysidxstats`, `sysiscols`, `systypedsubobjs`, `syssingleobjrefs` and
-`sysscalartypes`. Any other is refused by name. `sysobjvalues` gives only the definitions of views
-(not encrypted ones), defaults and the computed columns of tables, and partition boundaries -- never
-the source of a procedure, function or trigger -- and `sysseobjvalues` only the defaults of columns
-added after rows were written; the listing's `row_count` is NULL for these two.
+row's clustered key. With no `base_table` it lists the tables it reads: every system base table of
+the database with a unique clustered key (`sysschobjs`, `syscolpars`, `sysobjvalues`, `sysowners`,
+...), each with its rowset's `row_count`. A table is read whole: `sysobjvalues` holds module source
+and `sysowners` contained users' password hashes. Whoever holds the backup can read all of it anyway;
+protecting a backup is encryption's job. A system table without such a key is refused by name. A
+value it cannot give (one stored off row past 64 MiB, or past 1 GiB of them in one call; bytes not of
+their type) is NULL, with one WARNING in `duckdb_logs` for the column, and its row is read.
 
 ```sql
 SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak');

@@ -1516,7 +1516,7 @@ flowchart BT
   iam --> sys["system base tables<br/>bootstrap five by literal layouts,<br/>checked against sysrscols;<br/>any other by its own description"]
   sys --> model["CatalogModel<br/>schemas, tables, columns,<br/>layouts + defaults, partitioning, views"]
   model --> tables["mssql_backup_tables<br/>mssql_backup_views"]
-  sys --> basetables["mssql_backup_catalog<br/>(allow-list; sysobjvalues by DQ-11)"]
+  sys --> basetables["mssql_backup_catalog<br/>(every system base table, whole)"]
   model --> rec["records of a partition's in-row unit<br/>RecordView, LocateValue (types 0 / 1)"]
   rec --> stager["RecordStager<br/>codec staging + family kernels<br/>(FinalizeStagedColumn, shared with RowStager)"]
   rec --> lob["backup_lob (PR 2b; rows in PR 3)<br/>off-row pointer → LOB tree / row-overflow,<br/>every node checked; _mssql_lob map"]

@@ -72,12 +72,13 @@ bool IsReadableView(const SysObject &o);
 //! A default constraint (type 'D '), not MS-shipped.
 bool IsUserDefault(const SysObject &o);
 
-//! The sysobjvalues rows that may leave the reader (DQ-11: module source never does), each checked
-//! against the object it belongs to: valclass 1 of a readable view or a default, with subobjid and
-//! valnum 0; valclass 2 (a computed column's definition) of a computed column of a user table -- not by
+//! The sysobjvalues rows the model describes (a view's, a default's, a computed column's definition; a
+//! partition boundary), each checked against the object it belongs to: valclass 1 of a readable view or a default, with
+//! subobjid and valnum 0; valclass 2 (a computed column's definition) of a computed column of a user table -- not by
 //! the class alone, since a multi-statement function's return table can have a computed column and its
 //! definition is a valclass 2 row of the function (measured: an encrypted TVF's); valclass 30 of a
-//! partition function (sysclsobjs class 30). Any other row is kept back.
+//! partition function (sysclsobjs class 30). Any other row is not the model's (mssql_backup_catalog
+//! gives the table whole: spec 085 § Security, revised 2026-11-21).
 class ObjectValueFilter {
 public:
 	ObjectValueFilter(const BootstrapTables &tables, std::set<int32_t> partition_functions);
@@ -88,9 +89,6 @@ private:
 	std::set<std::pair<int32_t, int32_t>> computed_;
 	std::set<int32_t> partition_functions_;
 };
-
-//! The partition functions of the database: sysclsobjs class 30, read through `store`.
-std::set<int32_t> ReadPartitionFunctions(const PageStore &store, const BootstrapTables &tables);
 
 //! A module's text (a view's definition, a computed column's): read when in row; an off-row one is
 //! kept as its LOB root and read on demand (ReadModuleDefinition), so listing a catalog never reads

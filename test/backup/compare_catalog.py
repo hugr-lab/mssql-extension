@@ -13,8 +13,9 @@ to the microsecond); per column: id, name, type name (sql_type's base, or an ali
 type's schema (type_schema),
 system type id, length, precision, scale, collation, nullable, identity, computed, sparse; per view:
 object id, encrypted, and the definition's length and SHA-256 over UTF-16LE (sys.sql_modules'
-nvarchar). mssql_backup_catalog: every base table it lists read whole, its count the rowset's, and the
-sysobjvalues rows it serves exactly <set>.modules.txt's (DQ-11: no module source). Partitioning (PR 2c):
+nvarchar). mssql_backup_catalog: every base table it lists read whole, its count the rowset's, and
+<set>.modules.txt's sysobjvalues rows among the ones it serves (the table whole since spec 085
+§ Security's revision, 2026-11-21). Partitioning (PR 2c):
 per partitioned table its function, scheme, column, parameter type, side, fanout and NEXT USED, every
 boundary (as the server prints it, a datetimeoffset as its UTC instant), and every table's partitions
 (filegroup, rows, compression). A full set with no
@@ -340,7 +341,7 @@ def compare_set(c, db, name, arg, texts):
                     str(sum(1 for v in views if v["schema_name"] == o["schema_name"])))
 
     # mssql_backup_catalog: every base table it lists reads whole (an xtype a version adds fails here),
-    # its count the rowset's; and sysobjvalues serves exactly the rows the server says it may (DQ-11).
+    # its count the rowset's; and sysobjvalues holds every row the server's catalog views name.
     listed = db.query(f"SELECT base_table, row_count::VARCHAR AS row_count FROM mssql_backup_catalog({arg})")
     c.check(f"{name}: mssql_backup_catalog", "lists sysschobjs", any(r["base_table"] == "sysschobjs" for r in listed),
             True)
@@ -349,15 +350,15 @@ def compare_set(c, db, name, arg, texts):
         f"SELECT {sql_string(r['base_table'])} AS base_table, count(*)::VARCHAR AS n "
         f"FROM mssql_backup_catalog({arg}, {sql_string(r['base_table'])})" for r in listed))} if listed else {}
     for r in listed:
-        if r["row_count"] is not None:
-            c.check(f"{name}: mssql_backup_catalog {r['base_table']}", "rows", served[r["base_table"]], r["row_count"])
+        # Every listed table's count is its rowset's (none NULL since the allow-list went).
+        c.check(f"{name}: mssql_backup_catalog {r['base_table']}", "rows", served[r["base_table"]], r["row_count"])
     # main() requires <set>.modules.txt beside .tables.txt.
     ours = {(r["valclass"], r["objid"], r["subobjid"]) for r in db.query(
         "SELECT DISTINCT valclass::VARCHAR AS valclass, objid::VARCHAR AS objid, subobjid::VARCHAR AS subobjid "
         f"FROM mssql_backup_catalog({arg}, 'sysobjvalues')")}
     theirs = {(r["valclass"], r["objid"], r["subobjid"]) for r in parse_golden(texts[f"{name}.modules.txt"])}
-    c.check(f"{name}: mssql_backup_catalog sysobjvalues", "rows served (valclass, objid, subobjid)",
-            sorted(ours), sorted(theirs))
+    c.check(f"{name}: mssql_backup_catalog sysobjvalues", "rows the catalog views name, missing",
+            sorted(theirs - ours), [])
 
 
 def main():
