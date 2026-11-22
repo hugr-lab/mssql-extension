@@ -8,6 +8,8 @@
 #include "tds_packet.hpp"
 #include "tds_types.hpp"
 
+struct addrinfo;
+
 namespace duckdb {
 namespace tds {
 
@@ -139,6 +141,21 @@ private:
 	const uint8_t *NextPacket(size_t &packet_length, int timeout_ms);
 	//! recv() one read's worth into the tail of the assembly buffer.
 	bool FillReceiveBuffer(int timeout_ms);
+	//! NextPacket's two steps: the whole frame at the cursor, if the buffer holds one (`invalid`: its
+	//! declared length is shorter than a header, the connection is done); the unread tail moved to the
+	//! front before more is read.
+	bool BufferedPacket(const uint8_t *&head, size_t &packet_length, bool &invalid);
+	void CompactReceiveBuffer();
+
+	//! Connect's steps: one resolved address tried (the socket left open on success), the wait for a
+	//! connection under way, and the options every connected socket gets.
+	bool ConnectAddress(const struct addrinfo &address, int addr_index, int timeout_seconds);
+	bool AwaitConnect(int addr_index, int timeout_seconds);
+	void ConfigureConnectedSocket();
+
+	//! Send and Receive through the TLS layer, once it is enabled.
+	bool SendTls(const uint8_t *data, size_t length);
+	ssize_t ReceiveTls(uint8_t *buffer, size_t max_length, int timeout_ms);
 
 	// Helper to set non-blocking mode
 	bool SetNonBlocking(bool enable);

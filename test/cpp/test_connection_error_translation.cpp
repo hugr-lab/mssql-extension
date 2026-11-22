@@ -141,6 +141,13 @@ void TestNonLoginFailuresStillClassified() {
 	const string refused = MSSQLTranslateConnectionError("connect: connection refused", "s", 1433, "u", "db");
 	CHECK(Contains(refused, "Connection refused"));
 
+	// The socket's own words for a refused port (TdsSocket::Connect, test_tds_socket.cpp). It used to word
+	// a refusal "Connection timed out", which this function then turned into advice about firewalls.
+	const string socket_refused =
+		MSSQLTranslateConnectionError("Connection failed: Connection refused", "s", 1433, "u", "db");
+	CHECK(Contains(socket_refused, "check if SQL Server is running"));
+	CHECK(!Contains(socket_refused, "check network connectivity"));
+
 	const string tls = MSSQLTranslateConnectionError("TLS handshake failed: bad record", "s", 1433, "u", "db");
 	// "TLS negotiation failed" is this branch's own wording -- the raw input says
 	// "handshake", so asserting on that would pass from the echo alone even if
