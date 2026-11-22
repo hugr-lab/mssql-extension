@@ -637,7 +637,8 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	// its pages were copied): 'warn' (read it, one WARNING per table in duckdb_logs), 'error' (refuse it
 	// by name: what an importer passes) or 'ignore'. The call's fuzzy := wins, then an ATTACH's.
 	config.AddExtensionOption("mssql_backup_fuzzy",
-							  "What a backup scan does with a table its log tail says is not consistent: 'warn' "
+							  "What a backup function that reads a table's rows (the scan, the change listing, "
+							  "mssql_backup_catalog) does with one its log tail says is not consistent: 'warn' "
 							  "(default: read it, log a WARNING), 'error' (refuse it) or 'ignore'",
 							  LogicalType::VARCHAR, Value("warn"), ValidateBackupFuzzy);
 
