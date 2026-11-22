@@ -39,6 +39,14 @@ private:
 	std::string message_;
 };
 
+//! A read that returned fewer bytes than the file held when it was opened: the file rewritten or truncated
+//! under the reader. A FormatError, so it is reported as one; told apart where a format error is kept for
+//! a file's life (OpenedBackup::Fuzzy): this one may not hold the next time (review of #591's follow-up).
+class FileChangedError : public FormatError {
+public:
+	explicit FileChangedError(const std::string &message) : FormatError(message) {}
+};
+
 //! A read-only view of `size` bytes at `data`, named `what` for errors, at `base` in the file
 //! (so an error names the file offset, not the offset in the view). Every accessor checks its
 //! bounds and throws FormatError past them. Little-endian, as everything SQL Server writes

@@ -168,9 +168,9 @@ FetchedRange ByteSource::Fetch(CachingFileHandle &handle, const std::string &pat
 	if (total != range.length) {
 		// The file is shorter than it was at open (rewritten, truncated): a named error, not the
 		// group's internal one.
-		throw FormatError("backup file \"" + path + "\": a read of " + std::to_string(range.length) +
-						  " bytes at offset " + std::to_string(range.offset) + " returned " + std::to_string(total) +
-						  ": the file changed while it was open");
+		throw FileChangedError("backup file \"" + path + "\": a read of " + std::to_string(range.length) +
+							   " bytes at offset " + std::to_string(range.offset) + " returned " +
+							   std::to_string(total) + ": the file changed while it was open");
 	}
 	if (handles.size() == 1) {
 		fetched.data_ = fetched.group_.Ptr();

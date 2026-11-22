@@ -24,6 +24,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "mssql_function_docs.hpp"
 
 #include <algorithm>
@@ -258,14 +259,23 @@ struct LogBindData : public TableFunctionData {
 	}
 };
 
+//! Per transaction, per allocation unit: the pages it changed and whether a change had D11's effect (the
+//! copy holds an open transaction's change: dirty; it lacks a finished one's: stale).
+struct UnitEffect {
+	uint32_t pages = 0;
+	bool effect = false;
+};
+
 struct LogState : public GlobalTableFunctionState {
 	OpenedForStatement opened;				 // a log backup's (no catalog)
 	std::unique_ptr<OpenedCatalog> catalog;	 // a data backup's
 	const OpenedHeaders *headers = nullptr;	 // either's
 	const FuzzySummary *tail = nullptr;
 	std::unordered_map<uint64_t, UnitOwner> owners;
-	// mssql_backup_transactions: the rows, built at init.
-	std::vector<std::vector<Value>> rows;
+	// mssql_backup_transactions: the transactions in the order they are listed, and their effects by unit,
+	// put at init; each row built as it is returned (review of #591: every row's values were built at init).
+	std::vector<std::pair<uint64_t, const FuzzySummary::Transaction *>> order;
+	std::map<uint64_t, std::map<uint64_t, UnitEffect>> effects;
 	size_t next = 0;
 	// mssql_backup_transaction_records: the tail read one record at a time.
 	std::vector<column_t> column_ids;  // the columns asked for (projection pushdown)
@@ -273,6 +283,7 @@ struct LogState : public GlobalTableFunctionState {
 	Lsn last;						   // the set's LastLSN: records from it on are not the backup's
 	std::unique_ptr<LogTailReader> reader;
 	std::unique_ptr<LogTailCursor> cursor;
+	std::unique_ptr<ReservedBytes> cursor_memory;  // the cursor's chunk, reserved with DuckDB (D17)
 	std::map<const CatalogTable *, std::unique_ptr<RowImageDecoder>> decoders;
 
 	const FileBinding &Binding() const {
@@ -343,13 +354,6 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	return std::move(data);
 }
 
-//! Per transaction, per allocation unit: the pages it changed and whether a change had D11's effect (the
-//! copy holds an open transaction's change: dirty; it lacks a finished one's: stale).
-struct UnitEffect {
-	uint32_t pages = 0;
-	bool effect = false;
-};
-
 std::map<uint64_t, std::map<uint64_t, UnitEffect>> EffectsOf(const FuzzySummary &tail, const PageStore *pages) {
 	std::map<uint64_t, std::map<uint64_t, UnitEffect>> effects;	 // by transaction, then unit
 	Page copy;
@@ -416,6 +420,9 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 				state->tail = &StatementTail(context, state->catalog ? state->catalog->opened : state->opened);
 			}
 			const auto &family = *state->headers->families.front();
+			state->cursor_memory.reset(new ReservedBytes(BufferManager::GetBufferManager(context),
+														 std::string(RECORDS) + ": the log's reader"));
+			state->cursor_memory->Hold(LOG_CURSOR_BYTES);
 			state->reader.reset(new LogTailReader(family.Stream(), family.layout,
 												  LogBlockHeaderBytes(state->headers->Set().software_major)));
 			state->cursor.reset(new LogTailCursor(*state->reader));
@@ -423,7 +430,7 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 		}
 		state->tail = &StatementTail(context, state->catalog ? state->catalog->opened : state->opened);
 		// One row per transaction, in the order they began (those with no BEGIN last, by id).
-		std::vector<std::pair<uint64_t, const FuzzySummary::Transaction *>> order;
+		auto &order = state->order;
 		for (const auto &t : state->tail->transactions) {
 			order.emplace_back(t.first, &t.second);
 		}
@@ -439,55 +446,55 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 					  }
 					  return a.first < b.first;
 				  });
-		const auto effects = EffectsOf(*state->tail, state->Pages());
-		for (const auto &entry : order) {
-			const auto &t = *entry.second;
-			vector<Value> tables;
-			auto found = effects.find(entry.first);
-			if (found != effects.end()) {
-				for (const auto &unit : found->second) {
-					auto owner = state->owners.find(unit.first);
-					const bool known = owner != state->owners.end();
-					const char *effect = nullptr;
-					if (unit.second.effect) {
-						effect = t.state == FuzzySummary::State::Open ? "dirty" : "stale";
-					}
-					child_list_t<Value> f;
-					f.emplace_back("schema_name",
-								   known ? Value(owner->second.table->schema_name) : Value(LogicalType::VARCHAR));
-					f.emplace_back("table_name",
-								   known ? Value(owner->second.table->name) : Value(LogicalType::VARCHAR));
-					f.emplace_back("index_id",
-								   known ? Value::INTEGER(owner->second.index_id) : Value(LogicalType::INTEGER));
-					f.emplace_back("allocation_unit", Value::BIGINT(static_cast<int64_t>(unit.first)));
-					f.emplace_back("pages", Value::INTEGER(static_cast<int32_t>(unit.second.pages)));
-					f.emplace_back("effect", effect ? Value(effect) : Value(LogicalType::VARCHAR));
-					tables.push_back(Value::STRUCT(std::move(f)));
-				}
-			}
-			std::vector<Value> row;
-			row.push_back(Value(TransactionIdText(entry.first)));
-			row.push_back(t.name.empty() ? Value(LogicalType::VARCHAR) : Value(t.name));
-			row.push_back(Value(TransactionStateName(t.state)));
-			row.push_back(OptionalLsn(t.begin));
-			row.push_back(OptionalLsn(t.end));
-			row.push_back(Value::INTEGER(static_cast<int32_t>(t.records)));
-			row.push_back(Value::INTEGER(static_cast<int32_t>(t.row_operations)));
-			row.push_back(Value::BOOLEAN(t.after_checkpoint));
-			row.push_back(Value::LIST(TableStructType(), std::move(tables)));
-			state->rows.push_back(std::move(row));
-		}
+		state->effects = EffectsOf(*state->tail, state->Pages());
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", function, e.what());
 	}
 	return std::move(state);
 }
 
+//! mssql_backup_transactions' row of one transaction: its fields, and the units it changed with their effect.
+std::vector<Value> TransactionRow(const LogState &state, uint64_t id, const FuzzySummary::Transaction &t) {
+	vector<Value> tables;
+	auto found = state.effects.find(id);
+	if (found != state.effects.end()) {
+		for (const auto &unit : found->second) {
+			auto owner = state.owners.find(unit.first);
+			const bool known = owner != state.owners.end();
+			const char *effect = nullptr;
+			if (unit.second.effect) {
+				effect = t.state == FuzzySummary::State::Open ? "dirty" : "stale";
+			}
+			child_list_t<Value> f;
+			f.emplace_back("schema_name",
+						   known ? Value(owner->second.table->schema_name) : Value(LogicalType::VARCHAR));
+			f.emplace_back("table_name", known ? Value(owner->second.table->name) : Value(LogicalType::VARCHAR));
+			f.emplace_back("index_id", known ? Value::INTEGER(owner->second.index_id) : Value(LogicalType::INTEGER));
+			f.emplace_back("allocation_unit", Value::BIGINT(static_cast<int64_t>(unit.first)));
+			f.emplace_back("pages", Value::INTEGER(static_cast<int32_t>(unit.second.pages)));
+			f.emplace_back("effect", effect ? Value(effect) : Value(LogicalType::VARCHAR));
+			tables.push_back(Value::STRUCT(std::move(f)));
+		}
+	}
+	std::vector<Value> row;
+	row.push_back(Value(TransactionIdText(id)));
+	row.push_back(t.name.empty() ? Value(LogicalType::VARCHAR) : Value(t.name));
+	row.push_back(Value(TransactionStateName(t.state)));
+	row.push_back(OptionalLsn(t.begin));
+	row.push_back(OptionalLsn(t.end));
+	row.push_back(Value::INTEGER(static_cast<int32_t>(t.records)));
+	row.push_back(Value::INTEGER(static_cast<int32_t>(t.row_operations)));
+	row.push_back(Value::BOOLEAN(t.after_checkpoint));
+	row.push_back(Value::LIST(TableStructType(), std::move(tables)));
+	return row;
+}
+
 void TransactionsExecute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	auto &state = input.global_state->Cast<LogState>();
 	idx_t count = 0;
-	while (state.next < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
-		const auto &row = state.rows[state.next++];
+	while (state.next < state.order.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &entry = state.order[state.next++];
+		const auto row = TransactionRow(state, entry.first, *entry.second);
 		for (idx_t c = 0; c < row.size(); c++) {
 			output.data[c].SetValue(count, row[c]);
 		}

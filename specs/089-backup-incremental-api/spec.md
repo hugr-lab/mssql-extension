@@ -451,6 +451,7 @@ Beyond the scan's (085 § Resources):
 | the base inputs (D10): the mirror rows, the allocation images, the LOB maps | the database's objects, its size (images: ~0.02 %, E2 R5), the LOB rows on deleted pages | read with `read_parquet` on the side connection into buffer-managed storage, the LOB maps indexed by node RID there; a large `lob.parquet` after a heavy LOB change spills (§ Risks). Rule 10's chain walk and the attribution check work over these images |
 | the export's writers | units, partition values | F open files and min(`max_threads`, F) running units, from `max_memory` / 4, each row group capped in bytes (§ Surface, `mssql_backup_export`) |
 | a sort under `order_by` | a unit's rows | DuckDB's sort, which spills; DuckDB's limits and the connection's `operator_memory_limit` (`max_memory` / 2 on the importer's side connections), not the writers' share |
+| the log's summary (085 D11, `FuzzySummary`: each transaction, and per unit and page each transaction's oldest and newest row change) | the distinct (page, transaction) pairs of the log read -- about 100 bytes each (an estimate, not measured): megabytes for a data backup's tail, up to hundreds for a log backup of many short transactions on many pages | today in memory, reserved with DuckDB in 4 MiB steps as it is read (085 PR 4, review of #591: `ReservedBytes`) and refused by name past `memory_limit`; the cursor beside it a fixed 4 MiB + 64 KiB window, nothing to spill. Spilling the summary is a follow-up (task 14) |
 
 ## Partitioning (E7)
 
@@ -599,6 +600,15 @@ Acceptance:
 **Across PRs**
 
 13. Docs (README, `DATAMODEL.md`: the incremental flow and its diagram, CLAUDE.md, CHANGELOG) — 1 d
+
+**Follow-ups (not in the total)**
+
+14. The log's summary spilled to disk (owner, 2026-11-22): a log backup's summary can pass `memory_limit`,
+    where it is refused by name today. It is needed whole and by key (a transaction's state is known at
+    the log's end; a table's status looks up pages), so spilling means a buffer-managed, partitioned form
+    keyed by unit and page (as `mssql_backup_table_changes` pairs its rows, `LoneRows` / `PlacedChanges`),
+    built together with the parallel log reading and undo / redo (this spec and 090) rather than before
+    them: the log is read by transaction and page there anyway — not costed
 
 **Total ≈ 41.5 days, 8 weeks** (PR 1 ≈ 30.5 days; PR 2 ≈ 10 days; docs 1 day; 37 before E7's
 ownership rule and the DuckLake layout parameters joined tasks 4, 9 and 12, 40 before the IAM chain

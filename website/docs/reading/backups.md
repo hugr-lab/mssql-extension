@@ -318,6 +318,14 @@ lane checks it against `RESTORE` on every version: every table that differs from
 flagged, and no table equal to it is. When the tail cannot be read, the listings give NULL for the
 status with a WARNING, and a scan with `fuzzy := 'error'` is refused.
 
+The tail is read when a statement first needs it, and once per backup while the backup stays open --
+kept by the opened-file cache (`mssql_backup_cache`) or by an `ATTACH`: at the first row of
+`mssql_backup_tables` (whatever its columns), for `mssql_backup_info`'s four columns above when they are
+selected, or as a scan starts -- not for `DESCRIBE`, `EXPLAIN` or a question about the headers alone.
+A scan's WARNING is logged once each time the statement runs. The summary of the tail counts against
+`memory_limit` as it is read. A tail that cannot be read is not read again while the backup stays open:
+the next statement is given the same reason (unless the file changed under the read).
+
 A page the database took into use while the backup ran has no copy in the data the backup carries: its
 content is only in the backup's log tail, which the reader does not replay yet. Its table is never
 `consistent`. Its other pages are read as for any table that is not -- what was committed when the

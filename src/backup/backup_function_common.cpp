@@ -103,11 +103,11 @@ TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, cons
 
 TableFuzziness CheckFuzzyUnits(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
 							   const std::vector<uint64_t> &units, const std::string &name, FuzzyMode mode,
-							   const char *function) {
+							   const char *function, FuzzinessMemo *memo) {
 	if (mode == FuzzyMode::Ignore) {
 		return TableFuzziness();
 	}
-	const TableFuzziness fuzzy = FuzzinessOf(tail, units, pages);
+	const TableFuzziness fuzzy = memo ? memo->Of(tail, units, pages) : FuzzinessOf(tail, units, pages);
 	if (fuzzy.Consistent()) {
 		return fuzzy;
 	}
@@ -147,7 +147,8 @@ void CheckStatementFuzzy(ClientContext &context, const OpenedCatalog &catalog, c
 						   given, e.what());
 	}
 	if (tail) {
-		CheckFuzzyUnits(context, *tail, *catalog.pages->store, units, name, mode, function);
+		CheckFuzzyUnits(context, *tail, *catalog.pages->store, units, name, mode, function,
+						&catalog.opened.backup->Fuzziness());
 	}
 }
 

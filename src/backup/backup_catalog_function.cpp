@@ -158,6 +158,7 @@ struct BaseTableBindData : public TableFunctionData {
 	std::vector<size_t> columns;	 // its served columns: layout indexes (not dropped, not the uniquifier)
 	std::vector<LogicalType> types;	 // of `columns`
 	std::vector<size_t> key;		 // layout indexes of its clustered key, in ordkey order
+	std::vector<uint64_t> units;	 // its rowset's allocation units: D11's status is over them (at init)
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<BaseTableBindData>();
@@ -171,6 +172,7 @@ struct BaseTableBindData : public TableFunctionData {
 		copy->columns = columns;
 		copy->types = types;
 		copy->key = key;
+		copy->units = units;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -286,13 +288,10 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		data->key.push_back(k.second);
 	}
 	// D11 for a base table (review of #591: its rows were read from a dirty or stale copy without a word):
-	// its units against the backup's log tail, as the scan checks a user table's.
-	std::vector<uint64_t> units;
+	// its units against the backup's log tail, as the scan checks a user table's -- at init.
 	for (const SysAllocUnit *unit : tables.UnitsOf(data->layout.rowset_id)) {
-		units.push_back(unit->auid);
+		data->units.push_back(unit->auid);
 	}
-	CheckStatementFuzzy(context, *data->catalog, units, "sys." + data->table, "sys." + data->table,
-						FuzzyModeOf(context, data->fuzzy, FUNCTION), FUNCTION);
 	return std::move(data);
 }
 
@@ -306,7 +305,7 @@ virtual_column_map_t VirtualColumns(ClientContext &, optional_ptr<FunctionData> 
 	return result;
 }
 
-unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionInitInput &input) {
 	const auto &data = input.bind_data->Cast<BaseTableBindData>();
 	auto state = make_uniq<BaseTableState>();
 	state->column_ids = input.column_ids;
@@ -315,6 +314,9 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInpu
 		state->listed = ServedTables(*data.catalog->tables);
 		return std::move(state);
 	}
+	// At init, not bind: a DESCRIBE reads no log tail, and each EXECUTE says it once (review of #591).
+	CheckStatementFuzzy(context, *data.catalog, data.units, "sys." + data.table, "sys." + data.table,
+						FuzzyModeOf(context, data.fuzzy, FUNCTION), FUNCTION);
 	BindFiles bound(data.catalog->Binding());
 	const BootstrapTables &tables = *data.catalog->tables;
 	const PageStore &store = *data.catalog->pages->store;

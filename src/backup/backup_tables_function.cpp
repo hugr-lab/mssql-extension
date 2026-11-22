@@ -324,7 +324,8 @@ std::string CompressionOf(const CatalogTable &t) {
 	return compression;
 }
 
-std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, const PageStore &pages) {
+std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, const PageStore &pages,
+							FuzzinessMemo &memo) {
 	const std::string compression = CompressionOf(t);
 	vector<Value> columns, units;
 	for (const auto &c : t.columns) {
@@ -346,7 +347,7 @@ std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, con
 	row.push_back(Value::BOOLEAN(t.decodable));
 	row.push_back(OptionalText(t.reason));
 	if (tail) {
-		const TableFuzziness fuzzy = FuzzinessOf(*tail, t, pages);	// D11 (task 27)
+		const TableFuzziness fuzzy = memo.Of(*tail, BaseUnitsOf(t), pages);	 // D11 (task 27), kept per unit
 		row.push_back(Text(fuzzy.Status()));
 		row.push_back(Value::INTEGER(static_cast<int32_t>(fuzzy.open_transactions)));
 		row.push_back(Value::INTEGER(static_cast<int32_t>(fuzzy.stale_transactions)));
@@ -760,7 +761,8 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 	while (state.next < total && count < STANDARD_VECTOR_SIZE) {
 		const std::vector<Value> row =
 			data.listing == Listing::Tables
-				? TableRow(model.tables[state.next], Fuzzy(context, data, state), *state.catalog->pages->store)
+				? TableRow(model.tables[state.next], Fuzzy(context, data, state), *state.catalog->pages->store,
+						   state.catalog->opened.backup->Fuzziness())
 			: data.listing == Listing::Views
 				? ViewRow(*state.catalog->pages->store, model, model.views[state.next], state.off_row_bytes)
 				: SchemaRow(model, model.schemas[state.next]);

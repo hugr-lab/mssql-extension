@@ -1568,11 +1568,13 @@ flowchart BT
 - **The log tail and D11's fuzzy status** (spec 085 PR 5, stage 5): `OpenedBackup::Fuzzy` reads family
   1's MQTL streams once (`LogTailReader` / `LogTailCursor`: 512-byte sectors put back, the slot array,
   each record's header; E3§6, checked against `fn_dump_dblog` record by record) into a `FuzzySummary`,
-  kept with the opened backup and in its cache estimate: the transactions (state at LastLSN, begin / end
+  kept with the opened backup and in its cache estimate (reserved with DuckDB in 4 MiB steps as it is
+  read, `ReservedBytes`, until the cache's reservation counts it; a tail that fails its checks kept as
+  its error, not read again; read at a function's init, never at bind): the transactions (state at LastLSN, begin / end
   LSN, the BEGIN's name) and, per allocation unit and page, each transaction's oldest and newest row
   change (`IsRowOperation` in an `IsRowContext`: not PFS, interior index pages, FORMAT_PAGE or
   EXPUNGE_ROWS, which named a table's unit on pages holding none of its rows). A table's status
-  (`FuzzinessOf`, over its base rowsets' units) compares those with the page copies through the
+  (`FuzzinessOf`, over its base rowsets' units, kept per unit by the backup's `FuzzinessMemo`) compares those with the page copies through the
   `PageStore`: stale when a finished transaction's newest change is newer than its page's copy (a page
   not live in the backup: only after CheckpointLSN), dirty when an open one's oldest is not (the copy
   holds what RESTORE undoes). The listings give NULL when the tail cannot be read (`TailOrWarn`); the

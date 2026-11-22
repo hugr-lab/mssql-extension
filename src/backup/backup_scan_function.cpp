@@ -130,10 +130,6 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 	if (!data.entry->decodable) {
 		throw InvalidInputException("%s: %s.%s is not read: %s", FUNCTION, data.schema, data.table, data.entry->reason);
 	}
-	// D11 (task 27): the table's status from the backup's log tail, acted on as fuzzy := says.
-	CheckStatementFuzzy(context, *data.catalog, BaseUnitsOf(*data.entry),
-						data.entry->schema_name + "." + data.entry->name, data.schema + "." + data.table,
-						FuzzyModeOf(context, data.fuzzy, FUNCTION), FUNCTION);
 	ScanColumns columns = ScanColumnsOf(*data.entry);
 	data.column_ids = std::move(columns.column_ids);
 	data.types = std::move(columns.types);
@@ -475,6 +471,12 @@ uint64_t VirtualRowBytes(const ScanGlobalState &global) {
 
 unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionInitInput &input) {
 	const auto &data = input.bind_data->Cast<ScanBindData>();
+	// D11 (task 27): the table's status from the backup's log tail, acted on as fuzzy := says -- at init, not
+	// bind: a DESCRIBE or an EXPLAIN reads no tail, and each EXECUTE says it once (review of #591: a PREPARE
+	// and two EXECUTEs logged three WARNINGs).
+	CheckStatementFuzzy(context, *data.catalog, BaseUnitsOf(*data.entry),
+						data.entry->schema_name + "." + data.entry->name, data.schema + "." + data.table,
+						FuzzyModeOf(context, data.fuzzy, FUNCTION), FUNCTION);
 	auto state = make_uniq<ScanGlobalState>();
 	std::vector<int32_t> &staged = state->staged;
 	for (idx_t c = 0; c < input.column_ids.size(); c++) {
