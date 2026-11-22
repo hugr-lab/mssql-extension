@@ -131,6 +131,73 @@ ATTACH 'test/data/backup/open_tail/open_tail_full.bak' AS ot_bad (TYPE mssql_bac
 ----
 fuzzy 'often' is not 'warn', 'error' or 'ignore'
 
+# --- the change listing and the base tables take the same policy (review of #591) ---
+
+statement ok
+SET enable_logging = true;
+
+# The differential holds the open transaction's changes: the listing reads them, and says the state is dirty.
+query I
+SELECT count(*) FROM mssql_backup_table_changes('test/data/backup/open_tail/open_tail_base.bak', 'dbo', 'changed', diff := 'test/data/backup/open_tail/open_tail_diff.bak');
+----
+26
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'mssql_backup_table_changes: dbo.changed (the newer state) is dirty in this backup: 1 transaction(s) open%';
+----
+1
+
+# 'ignore' reads without a word; a consistent table has none either.
+query I
+SELECT count(*) FROM mssql_backup_table_changes('test/data/backup/open_tail/open_tail_base.bak', 'dbo', 'changed', diff := 'test/data/backup/open_tail/open_tail_diff.bak', fuzzy := 'ignore');
+----
+26
+
+query I
+SELECT count(*) FROM mssql_backup_table_changes('test/data/backup/open_tail/open_tail_base.bak', 'dbo', 'static', diff := 'test/data/backup/open_tail/open_tail_diff.bak', fuzzy := 'error');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'mssql_backup_table_%is dirty in this backup%';
+----
+1
+
+statement ok
+SET enable_logging = false;
+
+statement error
+SELECT count(*) FROM mssql_backup_table_changes('test/data/backup/open_tail/open_tail_base.bak', 'dbo', 'changed', diff := 'test/data/backup/open_tail/open_tail_diff.bak', fuzzy := 'error');
+----
+mssql_backup_table_changes: dbo.changed (the newer state) is dirty in this backup: 1 transaction(s) open at its LastLSN changed it
+
+statement error
+SELECT count(*) FROM mssql_backup_table_insertions('test/data/backup/open_tail/open_tail_base.bak', 'dbo', 'changed', diff := 'test/data/backup/open_tail/open_tail_diff.bak', fuzzy := 'often');
+----
+mssql_backup_table_insertions: fuzzy 'often' is not 'warn', 'error' or 'ignore'
+
+statement ok
+SET mssql_backup_fuzzy = 'error';
+
+statement error
+SELECT count(*) FROM mssql_backup_table_deletions('test/data/backup/open_tail/open_tail_base.bak', 'dbo', 'changed', diff := 'test/data/backup/open_tail/open_tail_diff.bak');
+----
+Refused (fuzzy := 'error')
+
+# A base table the open transaction did not change is read under 'error' too.
+query I
+SELECT count(*) > 0 FROM mssql_backup_catalog('test/data/backup/open_tail/open_tail_full.bak', 'sysschobjs');
+----
+true
+
+statement ok
+RESET mssql_backup_fuzzy;
+
+statement error
+SELECT count(*) FROM mssql_backup_catalog('test/data/backup/open_tail/open_tail_full.bak', 'sysschobjs', fuzzy := 'often');
+----
+mssql_backup_catalog: fuzzy 'often' is not 'warn', 'error' or 'ignore'
+
 # --- mssql_backup_transactions: the open one, with its effect on the table it changed ---
 
 query TTTIT
@@ -211,6 +278,23 @@ SELECT lsn::VARCHAR, operation, context, transaction_id FROM mssql_backup_transa
 WHERE lsn = 44000000209600002;
 ----
 44000000209600002	LOP_MODIFY_COLUMNS	LCX_CLUSTERED	0000:000003f5
+
+# The records' columns are projected: a listing that does not ask for transaction_status does not read the
+# whole log first (review of #591), and gives the same records.
+query III
+SELECT count(*), count(lsn), count(DISTINCT operation) FROM mssql_backup_transaction_records('test/data/backup/log.trn');
+----
+1628	1628	19
+
+query II
+SELECT count(*), count(transaction_status) FROM mssql_backup_transaction_records('test/data/backup/log.trn');
+----
+1628	1506
+
+query TT
+SELECT operation, transaction_status FROM mssql_backup_transaction_records('test/data/backup/log.trn') WHERE lsn = 44000000209600002;
+----
+LOP_MODIFY_COLUMNS	committed
 
 statement ok
 DETACH ot_warn;

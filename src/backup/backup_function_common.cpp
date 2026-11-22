@@ -2,6 +2,7 @@
 
 #include "backup/backup_bytes.hpp"
 #include "backup/backup_collation.hpp"
+#include "backup/backup_files.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "codec/code_page/code_page.hpp"
 #include "duckdb/common/exception.hpp"
@@ -96,18 +97,25 @@ std::string FuzzyParameterOf(const named_argument_map_t &named, const char *func
 
 TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
 						  const CatalogTable &table, FuzzyMode mode, const char *function) {
+	return CheckFuzzyUnits(context, tail, pages, BaseUnitsOf(table), table.schema_name + "." + table.name, mode,
+						   function);
+}
+
+TableFuzziness CheckFuzzyUnits(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
+							   const std::vector<uint64_t> &units, const std::string &name, FuzzyMode mode,
+							   const char *function) {
 	if (mode == FuzzyMode::Ignore) {
 		return TableFuzziness();
 	}
-	const TableFuzziness fuzzy = FuzzinessOf(tail, table, pages);
+	const TableFuzziness fuzzy = FuzzinessOf(tail, units, pages);
 	if (fuzzy.Consistent()) {
 		return fuzzy;
 	}
 	const std::string what = StringUtil::Format(
-		"%s.%s is %s in this backup: %u transaction(s) open at its LastLSN changed it (their changes may show), "
+		"%s is %s in this backup: %u transaction(s) open at its LastLSN changed it (their changes may show), "
 		"%u finished transaction(s) changed pages after their copy (those changes are missing); its rows are "
 		"each page's as the backup copied it",
-		table.schema_name, table.name, fuzzy.Status(), fuzzy.open_transactions, fuzzy.stale_transactions);
+		name, fuzzy.Status(), fuzzy.open_transactions, fuzzy.stale_transactions);
 	if (mode == FuzzyMode::Error) {
 		throw InvalidInputException(
 			"%s: %s. Refused (fuzzy := 'error'); fuzzy := 'warn' reads it anyway, as SQL Server would before "
@@ -116,6 +124,51 @@ TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, cons
 	}
 	DUCKDB_LOG_WARNING(context, "%s: %s (fuzzy := 'error' refuses it)", function, what);
 	return fuzzy;
+}
+
+void CheckStatementFuzzy(ClientContext &context, const OpenedCatalog &catalog, const std::vector<uint64_t> &units,
+						 const std::string &name, const std::string &given, FuzzyMode mode, const char *function) {
+	if (mode == FuzzyMode::Ignore) {
+		return;
+	}
+	BindFiles bound(catalog.Binding());
+	const FuzzySummary *tail = nullptr;
+	try {
+		tail = &StatementTail(context, catalog.opened);
+	} catch (FormatError &e) {
+		// The status unknown: refused when the call asks for a consistent table, else said and read.
+		if (mode == FuzzyMode::Error) {
+			throw InvalidInputException(
+				"%s: %s: the backup's log tail is not read, so whether the table is consistent is unknown "
+				"(fuzzy := 'error'): %s",
+				function, given, e.what());
+		}
+		DUCKDB_LOG_WARNING(context, "%s: %s: the backup's log tail is not read, its fuzzy status unknown: %s", function,
+						   given, e.what());
+	}
+	if (tail) {
+		CheckFuzzyUnits(context, *tail, *catalog.pages->store, units, name, mode, function);
+	}
+}
+
+void ThrowPendingOrFormat(ClientContext &context, const OpenedForStatement &opened, const ZeroCopyError &e) {
+	const FuzzySummary *tail = nullptr;
+	std::string why;
+	try {
+		tail = &StatementTail(context, opened);
+	} catch (FormatError &t) {
+		why = std::string("; the backup's log tail is not read: ") + t.what();
+	}
+	if (!tail || !FormattedInTail(*tail, e.page.file, e.page.page)) {
+		throw FormatError(std::string(e.what()) +
+						  (tail ? "; the backup's log tail formats no such page (" +
+									  std::to_string(tail->formatted.size()) + " pages formatted in it)"
+								: why));
+	}
+	throw PendingPageError("backup: page " + e.page.ToString() +
+						   " became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
+						   "backup), which is not replayed yet (a zero copy in a backup of one data pass, the page "
+						   "formatted in its tail)");
 }
 
 Value RecordDatetimeValue(const std::string &record_form) {

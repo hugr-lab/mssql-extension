@@ -268,6 +268,9 @@ struct LogState : public GlobalTableFunctionState {
 	std::vector<std::vector<Value>> rows;
 	size_t next = 0;
 	// mssql_backup_transaction_records: the tail read one record at a time.
+	std::vector<column_t> column_ids;  // the columns asked for (projection pushdown)
+	bool wants_contents = true;		   // `contents` is among them: a record's elements are decoded
+	Lsn last;						   // the set's LastLSN: records from it on are not the backup's
 	std::unique_ptr<LogTailReader> reader;
 	std::unique_ptr<LogTailCursor> cursor;
 	std::map<const CatalogTable *, std::unique_ptr<RowImageDecoder>> decoders;
@@ -317,6 +320,9 @@ std::vector<Column> RecordColumns() {
 			{"table_name", LogicalType::VARCHAR},	  {"index_id", LogicalType::INTEGER},
 			{"contents", LogicalType::VARIANT()}};
 }
+//! RecordColumns' two that cost more than a record's header: the summary of the whole log, the decode.
+constexpr column_t RECORD_TRANSACTION_STATUS = 5;
+constexpr column_t RECORD_CONTENTS = 12;
 
 template <bool RECORDS_FUNCTION>
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
@@ -395,14 +401,27 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 			state->headers = &state->opened.backup->Headers();
 		}
 		BindFiles bound(state->Binding());
-		state->tail = &StatementTail(context, state->catalog ? state->catalog->opened : state->opened);
+		state->last = state->headers->Set().last_lsn;
 		if (data.records) {
+			// The records stream. Only a transaction's state at the backup's end needs the whole log read
+			// first (the summary, stage 5): it is read when `transaction_status` is asked for, and not for a
+			// listing without it (review of #591: `… LIMIT 5` over a log backup read all of it before its
+			// first row, whatever it selected).
+			state->column_ids = input.column_ids;
+			const auto asked = [&](column_t column) {
+				return std::find(state->column_ids.begin(), state->column_ids.end(), column) != state->column_ids.end();
+			};
+			state->wants_contents = asked(RECORD_CONTENTS);
+			if (asked(RECORD_TRANSACTION_STATUS)) {
+				state->tail = &StatementTail(context, state->catalog ? state->catalog->opened : state->opened);
+			}
 			const auto &family = *state->headers->families.front();
 			state->reader.reset(new LogTailReader(family.Stream(), family.layout,
 												  LogBlockHeaderBytes(state->headers->Set().software_major)));
 			state->cursor.reset(new LogTailCursor(*state->reader));
 			return std::move(state);
 		}
+		state->tail = &StatementTail(context, state->catalog ? state->catalog->opened : state->opened);
 		// One row per transaction, in the order they began (those with no BEGIN last, by id).
 		std::vector<std::pair<uint64_t, const FuzzySummary::Transaction *>> order;
 		for (const auto &t : state->tail->transactions) {
@@ -576,15 +595,19 @@ Value Contents(LogState &state, const UnitOwner *owner, const LogRecord &r, cons
 void RecordsExecute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	auto &state = input.global_state->Cast<LogState>();
 	BindFiles bound(state.Binding());
-	const auto &tail = *state.tail;
+	const FuzzySummary *tail = state.tail;	// null when transaction_status is not asked for
 	idx_t count = 0;
 	LogRecord r;
 	try {
 		while (count < STANDARD_VECTOR_SIZE && state.cursor->Next(r)) {
-			if (!tail.last.IsZero() && tail.last <= r.lsn) {
+			if (!state.last.IsZero() && state.last <= r.lsn) {
 				continue;  // LastLSN is the next record after the backup's (HEADERONLY): not the backup's
 			}
-			auto t = r.transaction ? tail.transactions.find(r.transaction) : tail.transactions.end();
+			const FuzzySummary::Transaction *t = nullptr;
+			if (tail && r.transaction) {
+				auto found = tail->transactions.find(r.transaction);
+				t = found == tail->transactions.end() ? nullptr : &found->second;
+			}
 			auto owner = r.has_allocation_unit ? state.owners.find(r.allocation_unit) : state.owners.end();
 			const UnitOwner *o = owner == state.owners.end() ? nullptr : &owner->second;
 			const std::string where = "the log record " + r.lsn.ToDecimal();
@@ -594,8 +617,7 @@ void RecordsExecute(ClientContext &, TableFunctionInput &input, DataChunk &outpu
 			row.push_back(Value(OperationName(r.op)));
 			row.push_back(Value(ContextName(r.context)));
 			row.push_back(r.transaction ? Value(TransactionIdText(r.transaction)) : Value(LogicalType::VARCHAR));
-			row.push_back(t != tail.transactions.end() ? Value(TransactionStateName(t->second.state))
-													   : Value(LogicalType::VARCHAR));
+			row.push_back(t ? Value(TransactionStateName(t->state)) : Value(LogicalType::VARCHAR));
 			row.push_back(r.has_page ? Value(std::to_string(r.file) + ":" + std::to_string(r.page))
 									 : Value(LogicalType::VARCHAR));
 			row.push_back(r.has_page ? Value::INTEGER(r.slot) : Value(LogicalType::INTEGER));
@@ -604,9 +626,11 @@ void RecordsExecute(ClientContext &, TableFunctionInput &input, DataChunk &outpu
 			row.push_back(o ? Value(o->table->schema_name) : Value(LogicalType::VARCHAR));
 			row.push_back(o ? Value(o->table->name) : Value(LogicalType::VARCHAR));
 			row.push_back(o ? Value::INTEGER(o->index_id) : Value(LogicalType::INTEGER));
-			Value contents;
+			Value contents(LogicalType::VARIANT());
 			try {
-				contents = Contents(state, o, r, RowLogElements(r, where));
+				if (state.wants_contents) {
+					contents = Contents(state, o, r, RowLogElements(r, where));
+				}
 			} catch (FormatError &e) {
 				// Contents of another layout than row-log elements: the bytes after the fixed part, and why.
 				child_list_t<Value> f;
@@ -616,8 +640,11 @@ void RecordsExecute(ClientContext &, TableFunctionInput &input, DataChunk &outpu
 				contents = Value::STRUCT(std::move(f)).DefaultCastAs(LogicalType::VARIANT());
 			}
 			row.push_back(contents);
-			for (idx_t c = 0; c < row.size(); c++) {
-				output.data[c].SetValue(count, row[c]);
+			for (idx_t c = 0; c < state.column_ids.size(); c++) {
+				const column_t id = state.column_ids[c];
+				if (id < row.size()) {
+					output.data[c].SetValue(count, row[id]);
+				}
 			}
 			count++;
 		}
@@ -658,6 +685,7 @@ void RegisterBackupTransactionsFunctions(ExtensionLoader &loader) {
 		TableFunctionSet set(RECORDS);
 		for (const auto &argument : arguments) {
 			TableFunction f(RECORDS, {argument}, RecordsExecute, Bind<true>, Init);
+			f.projection_pushdown = true;  // transaction_status and contents cost what the others do not
 			AddDiffParameter(f);
 			AddVersionParameters(f);
 			set.AddFunction(f);

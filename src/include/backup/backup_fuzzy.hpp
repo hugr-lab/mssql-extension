@@ -31,6 +31,7 @@
 #include "backup/backup_page.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -109,8 +110,12 @@ struct FuzzySummary {
 //! Whether the tail lays `page` out (a FORMAT_PAGE before LastLSN): taken into use while the backup ran.
 bool FormattedInTail(const FuzzySummary &tail, uint16_t file, uint32_t page);
 
-//! The summary of the records `tail` gives, for a backup set with those LSNs.
-FuzzySummary SummarizeLogTail(const LogTailReader &tail, const Lsn &first, const Lsn &last, const Lsn &checkpoint);
+//! The summary of the records `tail` gives, for a backup set with those LSNs. `poll`, when given, is
+//! called every SUMMARY_POLL_RECORDS records: a log backup's whole log is read here, and its caller ends
+//! the read by throwing from it (an interrupt).
+constexpr uint64_t SUMMARY_POLL_RECORDS = 4096;
+FuzzySummary SummarizeLogTail(const LogTailReader &tail, const Lsn &first, const Lsn &last, const Lsn &checkpoint,
+							  const std::function<void()> &poll = std::function<void()>());
 //! The same over records already read (the tests, the fuzz harness).
 FuzzySummary SummarizeLogRecords(const std::vector<LogRecord> &records, const Lsn &first, const Lsn &last,
 								 const Lsn &checkpoint);

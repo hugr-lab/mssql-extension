@@ -11,6 +11,7 @@
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -312,6 +313,31 @@ int main() {
 		const FuzzySummary summary = SummarizeLogRecords(records, first, last, checkpoint);
 		Check(summary.formatted.count(uint64_t(1) << 32 | 44586) == 1 && summary.formatted.size() == 1,
 			  "a FORMAT_PAGE before LastLSN names its page; one past it, none");
+	}
+	{
+		// The summary of a whole log asks its caller as it reads (an interrupt ends it; review of #591).
+		const auto bytes = ReadAll(DIR + "log.trn");
+		MemoryAccess file("log.trn", bytes.data(), bytes.size());
+		const auto layout = WalkMtf(file);
+		LogTailReader tail(file, layout, LogBlockHeaderBytes(16));
+		const Lsn none;
+		uint64_t polls = 0;
+		const FuzzySummary summary = SummarizeLogTail(tail, none, none, none, [&]() { polls++; });
+		const FuzzySummary unasked = SummarizeLogTail(tail, none, none, none);
+		Check(summary.records == 1628 && unasked.records == 1628 &&
+				  polls == (1628 + SUMMARY_POLL_RECORDS - 1) / SUMMARY_POLL_RECORDS,
+			  "the summary polls once every SUMMARY_POLL_RECORDS records, from the first");
+		bool stopped = false;
+		uint64_t seen = 0;
+		try {
+			SummarizeLogTail(tail, none, none, none, [&]() {
+				seen++;
+				throw std::runtime_error("interrupted");
+			});
+		} catch (std::runtime_error &e) {
+			stopped = std::string(e.what()) == "interrupted";
+		}
+		Check(stopped && seen == 1, "what the poll throws ends the read, as thrown");
 	}
 	std::cout << (failures ? "FAILED" : "all passed") << std::endl;
 	return failures ? 1 : 0;

@@ -131,27 +131,9 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 		throw InvalidInputException("%s: %s.%s is not read: %s", FUNCTION, data.schema, data.table, data.entry->reason);
 	}
 	// D11 (task 27): the table's status from the backup's log tail, acted on as fuzzy := says.
-	const FuzzyMode mode = FuzzyModeOf(context, data.fuzzy, FUNCTION);
-	if (mode != FuzzyMode::Ignore) {
-		BindFiles bound(data.catalog->Binding());
-		const FuzzySummary *tail = nullptr;
-		try {
-			tail = &StatementTail(context, data.catalog->opened);
-		} catch (FormatError &e) {
-			// The status unknown: refused when the call asks for a consistent table, else said and read.
-			if (mode == FuzzyMode::Error) {
-				throw InvalidInputException(
-					"%s: %s.%s: the backup's log tail is not read, so whether the table is consistent is unknown "
-					"(fuzzy := 'error'): %s",
-					FUNCTION, data.schema, data.table, e.what());
-			}
-			DUCKDB_LOG_WARNING(context, "%s: %s.%s: the backup's log tail is not read, its fuzzy status unknown: %s",
-							   FUNCTION, data.schema, data.table, e.what());
-		}
-		if (tail) {
-			CheckFuzzy(context, *tail, *data.catalog->pages->store, *data.entry, mode, FUNCTION);
-		}
-	}
+	CheckStatementFuzzy(context, *data.catalog, BaseUnitsOf(*data.entry),
+						data.entry->schema_name + "." + data.entry->name, data.schema + "." + data.table,
+						FuzzyModeOf(context, data.fuzzy, FUNCTION), FUNCTION);
 	ScanColumns columns = ScanColumnsOf(*data.entry);
 	data.column_ids = std::move(columns.column_ids);
 	data.types = std::move(columns.types);
@@ -569,29 +551,6 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 	return std::move(state);
 }
 
-//! A zero copy beside one data pass (2017): a PendingPageError when the backup's tail formats the page
-//! (taken into use while the backup ran), else the FormatError it is, saying why. In-row and off-row
-//! pages alike.
-[[noreturn]] void ThrowPendingOrFormat(ClientContext &context, const ScanBindData &data, const ZeroCopyError &e) {
-	const FuzzySummary *tail = nullptr;
-	std::string why;
-	try {
-		tail = &StatementTail(context, data.catalog->opened);
-	} catch (FormatError &t) {
-		why = std::string("; the backup's log tail is not read: ") + t.what();
-	}
-	if (!tail || !FormattedInTail(*tail, e.page.file, e.page.page)) {
-		throw FormatError(std::string(e.what()) +
-						  (tail ? "; the backup's log tail formats no such page (" +
-									  std::to_string(tail->formatted.size()) + " pages formatted in it)"
-								: why));
-	}
-	throw PendingPageError("backup: page " + e.page.ToString() +
-						   " became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
-						   "backup), which is not replayed yet (a zero copy in a backup of one data pass, the page "
-						   "formatted in its tail)");
-}
-
 unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &execution, TableFunctionInitInput &input,
 											  GlobalTableFunctionState *global_state) {
 	const auto &data = input.bind_data->Cast<ScanBindData>();
@@ -614,7 +573,7 @@ unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &execution, Table
 		try {
 			store.ReadLive(at.file, at.page, out, fragment.c_str());
 		} catch (ZeroCopyError &e) {
-			ThrowPendingOrFormat(*context, *bound, e);
+			ThrowPendingOrFormat(*context, bound->catalog->opened, e);
 		}
 	};
 	local->stager->MapOffRow(global.lob_output != DConstants::INVALID_INDEX);
@@ -811,7 +770,7 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 					continue;
 				}
 			} catch (ZeroCopyError &e) {
-				ThrowPendingOrFormat(context, data, e);
+				ThrowPendingOrFormat(context, data.catalog->opened, e);
 			}
 		} catch (PendingPageError &e) {
 			// A page that became live while the backup ran: its rows are in the log tail only (spec 090

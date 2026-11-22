@@ -14,6 +14,8 @@
 #include "backup/backup_catalog_model.hpp"
 #include "backup/backup_fuzzy.hpp"
 #include "backup/backup_lsn.hpp"
+#include "backup/backup_opened.hpp"
+#include "backup/backup_page.hpp"
 #include "backup/backup_sql_variant.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -47,6 +49,22 @@ std::string FuzzyParameterOf(const named_argument_map_t &named, const char *func
 //! `function` names the caller. Returns the status.
 TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
 						  const CatalogTable &table, FuzzyMode mode, const char *function);
+//! The same over allocation units (a system base table's, which the model does not describe), named `name`
+//! ("dbo.t") in what it says.
+TableFuzziness CheckFuzzyUnits(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
+							   const std::vector<uint64_t> &units, const std::string &name, FuzzyMode mode,
+							   const char *function);
+//! CheckFuzzyUnits with the tail of `catalog`'s backup read for the statement (stage 5), through its files:
+//! what every function that reads a table's pages does before it reads them. A tail that cannot be read
+//! leaves the status unknown: refused under 'error', said under 'warn' (naming `given`, the table as the
+//! call named it).
+void CheckStatementFuzzy(ClientContext &context, const OpenedCatalog &catalog, const std::vector<uint64_t> &units,
+						 const std::string &name, const std::string &given, FuzzyMode mode, const char *function);
+//! A zero copy beside one data pass (2017): a PendingPageError when the backup's tail formats the page
+//! (taken into use while the backup ran), else the FormatError it is, saying why. In-row and off-row
+//! pages alike.
+[[noreturn]] void ThrowPendingOrFormat(ClientContext &context, const OpenedForStatement &opened,
+									   const ZeroCopyError &e);
 
 //! A datetime as a record stores it (u32 ticks of 1/300 s, then i32 days since 1900-01-01) as TYPE
 //! mssql reads one off the wire (days, then ticks: DateTimeEncoding::ConvertDatetime). NULL TIMESTAMP

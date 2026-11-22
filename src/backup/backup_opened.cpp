@@ -475,7 +475,14 @@ const FuzzySummary &OpenedBackup::Fuzzy(ClientContext &context, bool *built) con
 		const auto &set = headers_->Set();
 		try {
 			LogTailReader tail(family.Stream(), family.layout, LogBlockHeaderBytes(set.software_major));
-			summary.reset(new FuzzySummary(SummarizeLogTail(tail, set.first_lsn, set.last_lsn, set.checkpoint_lsn)));
+			// A log backup's whole log is read here: Ctrl-C ends it (review of #591; it used to be asked only
+			// of a statement waiting for another's read).
+			summary.reset(
+				new FuzzySummary(SummarizeLogTail(tail, set.first_lsn, set.last_lsn, set.checkpoint_lsn, [&context]() {
+					if (context.IsInterrupted()) {
+						throw InterruptException();
+					}
+				})));
 		} catch (FormatError &e) {
 			throw FormatError("backup file \"" + headers_->Path(family.file) + "\": its log tail: " + WithoutPrefix(e));
 		}
