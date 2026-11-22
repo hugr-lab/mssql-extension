@@ -694,6 +694,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_vector_encodings.cpp \
     test/cpp/test_collation_metadata.cpp \
     test/cpp/test_tls_verification.cpp \
+    test/cpp/test_tds_socket.cpp \
     test/cpp/test_value_serializer.cpp \
     test/cpp/test_batch_builder.cpp \
     test/cpp/test_insert_executor.cpp \
