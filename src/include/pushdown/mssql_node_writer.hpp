@@ -176,8 +176,8 @@ struct Relation {
 	//! its columns visible only in that join's own condition.
 	bool semi = false;
 	//! A subquery in FROM (PR E1): its node rendered as `(<T-SQL>) AS [rN]`;
-	//! its columns are that node's results, already read (a CAST, STAsBinary
-	//! or a cast back applied inside).
+	//! its columns are that node's results, already read (a CAST or a cast
+	//! back applied inside).
 	bool derived = false;
 	std::string derived_sql;
 	//! A derived table's total_input_rows / total_size_unknown.
@@ -522,8 +522,7 @@ private:
 	int predicate_depth_ = 0;
 	//! Spec 080 PR 3d: the SELECT of an INSERT ... SELECT, whose values never
 	//! leave the server -- a column is written as itself, not through the read
-	//! expression a client needs (a code-page varchar's NVARCHAR cast,
-	//! geometry's STAsBinary).
+	//! expression a client needs (a code-page varchar's NVARCHAR cast).
 	bool raw_columns_ = false;
 	//! GROUP BY, HAVING or an aggregate: the node is an aggregate query.
 	bool aggregated_ = false;

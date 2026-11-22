@@ -1222,11 +1222,11 @@ void TestCodePageKernel() {
 		CHECK_EQ(f.ValueAt(0, 2), std::string("\xD0\xB6"), "decoded and trimmed");
 	}
 
-	// The per-value path, as the composite rowid and INSERT ... RETURNING reach it.
+	// The per-value path, as the composite rowid and INSERT ... RETURNING reach it. A char has no decode notes.
 	{
 		duckdb::Vector out(LogicalType::VARCHAR);
 		const ColumnMetadata col = CodePageMeta(TDS_TYPE_BIGCHAR, 4, 1251);
-		TypeConverter::ConvertValue(Bare({0xE6, 0x20, 0x20, 0x20}), false, col, out, 0);
+		TypeConverter::ConvertValue(Bare({0xE6, 0x20, 0x20, 0x20}), false, col, out, 0, nullptr, nullptr);
 		CHECK_EQ(out.GetValue(0).ToString(), std::string("\xD0\xB6"), "per value: decoded and trimmed");
 	}
 

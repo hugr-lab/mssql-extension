@@ -18,6 +18,12 @@ struct CodePageTable;
 
 namespace tds {
 
+//! What a geometry / geography column is read as (spec 093 T5, D6; the `geometry_as` ATTACH option, fixed
+//! per catalog): a GEOMETRY of the ISO WKB the client decodes, the curves and FullGlobe NULL with a
+//! WARNING (`'geometry'`); a BLOB of that WKB, the curves included (`'wkb'`); a BLOB of the MS-SSCLRT bytes
+//! as stored (`'native'`).
+enum class GeometryAs : uint8_t { Geometry, Wkb, Native };
+
 //===----------------------------------------------------------------------===//
 // ColumnMetadata - Describes a single result column from COLMETADATA token
 //===----------------------------------------------------------------------===//
@@ -47,6 +53,11 @@ struct ColumnMetadata {
 	// (0xFFFF for the spatial types, 892 for hierarchyid). Empty for every other type.
 	std::string udt_schema;
 	std::string udt_type_name;
+	// How a geometry / geography column is read (spec 093 T5): the catalog's geometry_as, set once per
+	// column by whoever reads its COLMETADATA for a catalog (the stream, the describe, the RETURNING
+	// parser), before its type is asked. The parser leaves the default.
+	GeometryAs geometry_as = GeometryAs::Geometry;
+
 	//! COLMETADATA's UserType (4 bytes), kept since spec 093 T3: VECTOR_USER_TYPE marks a vector column
 	//! in every form it streams, the JSON text included (measured V1).
 	uint32_t user_type = 0;
@@ -72,10 +83,14 @@ struct ColumnMetadata {
 	bool IsHierarchyIdUdt() const {
 		return type_id == TDS_TYPE_UDT && udt_schema == "sys" && udt_type_name == "hierarchyid";
 	}
-	//! A UDT column of geometry / geography (spec 093 T5 decodes them; a raw scan refuses them until then).
+	//! A UDT column of geometry / geography (spec 093 T5: decoded on the client).
 	bool IsSpatialUdt() const {
 		return type_id == TDS_TYPE_UDT && udt_schema == "sys" &&
 			   (udt_type_name == "geometry" || udt_type_name == "geography");
+	}
+	//! A UDT column of geography: its points are stored latitude first (G3), its type GEOMETRY('OGC:CRS84').
+	bool IsGeographyUdt() const {
+		return type_id == TDS_TYPE_UDT && udt_schema == "sys" && udt_type_name == "geography";
 	}
 	//! A user CLR type (not one of the three system ones): its bytes are opaque, a BLOB (spec 093 T4).
 	bool IsUserClrUdt() const {

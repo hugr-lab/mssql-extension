@@ -139,7 +139,8 @@ SELECT * FROM mssql_scan('drr', 'SELECT SUM(n) AS n FROM dbo.drr_log');
 3
 
 # a geometry column that is neither key nor SET comes back as the scan reads
-# it (WKB); #out holds the read expression, never the native type
+# it: #out holds the read expression, which since spec 093 T5 is the column
+# itself, read bare and decoded on the client into WKB
 statement ok
 SELECT mssql_exec('drr', 'DROP TABLE IF EXISTS dbo.drr_g; CREATE TABLE dbo.drr_g (id int PRIMARY KEY, v int, g geometry NULL); INSERT INTO dbo.drr_g VALUES (1, 0, geometry::Point(1, 2, 0))');
 

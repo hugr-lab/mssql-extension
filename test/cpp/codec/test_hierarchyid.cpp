@@ -476,11 +476,11 @@ void TestReadPath() {
 			  "four equal values: a CONSTANT vector of /1.5/-2/");
 	}
 
-	// Per value (the RETURNING parser's and the fallback's path).
+	// Per value (the RETURNING parser's and the fallback's path); a hierarchyid has no decode notes.
 	duckdb::Vector out(LogicalType::VARCHAR, 4);
-	duckdb::tds::encoding::TypeConverter::ConvertValue(g2, false, column, out, 0);
-	duckdb::tds::encoding::TypeConverter::ConvertValue(root, false, column, out, 1);
-	duckdb::tds::encoding::TypeConverter::ConvertValue(long_value, false, column, out, 2);
+	duckdb::tds::encoding::TypeConverter::ConvertValue(g2, false, column, out, 0, nullptr, nullptr);
+	duckdb::tds::encoding::TypeConverter::ConvertValue(root, false, column, out, 1, nullptr, nullptr);
+	duckdb::tds::encoding::TypeConverter::ConvertValue(long_value, false, column, out, 2, nullptr, nullptr);
 	Check(out.GetValue(0).ToString() == "/1.5/-2/" && out.GetValue(1).ToString() == "/" &&
 			  out.GetValue(2).ToString() == long_text,
 		  "per value: /1.5/-2/, /, the long text");
@@ -506,7 +506,7 @@ void TestReadPath() {
 		  "staged, malformed: " + staged_error);
 	std::string value_error;
 	try {
-		duckdb::tds::encoding::TypeConverter::ConvertValue(FromHex("40"), false, column, out, 3);
+		duckdb::tds::encoding::TypeConverter::ConvertValue(FromHex("40"), false, column, out, 3, nullptr, nullptr);
 	} catch (std::exception &e) {
 		value_error = e.what();
 	}

@@ -108,7 +108,7 @@ TypeFamily FamilyFromLogicalType(const LogicalType &type) {
 	case LogicalTypeId::GEOMETRY:
 		// GEOMETRY shares string_t physical storage with BLOB and is rendered/encoded
 		// identically by the Binary codec (WKB blob → 0x<hex> literal, VARBINARY(MAX) DDL).
-		// SQL Server-side mapping: see mssql_column_info.cpp + table_scan.cpp STAsBinary rewrite.
+		// The read is codec/clr/spatial_codec (spec 093 T5): the stored MS-SSCLRT bytes decoded into WKB.
 		return TypeFamily::Binary;
 
 	case LogicalTypeId::DATE:

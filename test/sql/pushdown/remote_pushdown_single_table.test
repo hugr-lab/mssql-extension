@@ -34,7 +34,7 @@ SET mssql_remote_pushdown = false;
 
 # The fixture covers what the catalog scan reads through an expression: a
 # varchar under a non-UTF-8 collation holding non-ASCII (read as its NVARCHAR
-# cast), a geometry (STAsBinary), a datetime2(7) with 100 ns ticks (read as
+# cast), a geometry (read bare and decoded on the client since spec 093 T5), a datetime2(7) with 100 ns ticks (read as
 # TIMESTAMP_NS), a UTF-8 varchar (ordered as its bytes), nullable keys.
 statement ok
 SELECT mssql_exec('rp_off', 'DROP TABLE IF EXISTS dbo.rp_t;
@@ -847,7 +847,13 @@ CREATE TEMP TABLE via_off AS SELECT * FROM rp_off.dbo.rp_t ORDER BY id LIMIT 100
 query II
 EXPLAIN SELECT * FROM rp_on.dbo.rp_t ORDER BY id LIMIT 100;
 ----
-physical_plan	<REGEX>:.*\[legacy\], \[amount\].*\[g\]\.STAsBinary\(\) AS \[g\].*
+physical_plan	<REGEX>:.*\[legacy\], \[amount\].*\[g\].*
+
+# spec 093 T5: the geometry is read bare, no .STAsBinary() on the server
+query II
+EXPLAIN SELECT * FROM rp_on.dbo.rp_t ORDER BY id LIMIT 100;
+----
+physical_plan	<!REGEX>:.*STAsBinary.*
 
 query I
 SELECT count(*) FROM (SELECT * FROM via_on EXCEPT ALL SELECT * FROM via_off);

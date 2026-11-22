@@ -178,7 +178,7 @@ bool NodeWriter::SubqueryOperand(const NodeWriter &inner, const WrittenQuery &in
 	out = Operand();
 	if (output.column_index != DConstants::INVALID_INDEX) {
 		if (!output.plain_read) {
-			// Read through a CAST / STAsBinary: not the column it compares as.
+			// Read through a CAST: not the column it compares as.
 			return Veto("a subquery's result read through a conversion");
 		}
 		subquery_columns_.push_back(inner.FlatColumn(output.column_index));

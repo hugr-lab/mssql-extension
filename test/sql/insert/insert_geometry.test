@@ -6,7 +6,8 @@
 #   MSSQL_TESTDB_DSN - Connection string to test database
 #
 # A DuckDB GEOMETRY vector carries OGC WKB, which is what the read path
-# produces (`.STAsBinary()`). Writing it back was broken: the value went as a
+# produces (since spec 093 T5 decoded on the client from the stored bytes, ISO
+# WKB with Z and M; `.STAsBinary()` before). Writing it back was broken: the value went as a
 # bare `0x…` literal, and SQL Server reads a binary value for a geometry column
 # as its OWN Spatial Type Binary Format, so it failed with
 #   [6522] … 24210: Geometry type with an unexpected version of 0 received.
@@ -65,8 +66,9 @@ SELECT * FROM mssql_scan('geoi', 'SELECT id, g.STAsText() AS geom, ISNULL(gg.STA
 2	LINESTRING (0 0, 5 5)	(null)
 3	POLYGON ((0 0, 0 3, 3 3, 3 0, 0 0))	(null)
 
-# --- the SRIDs the wrapper has to assume, because `.STAsBinary()` does not
-# carry one and a value that has made the round trip has already lost it.
+# --- the SRIDs the wrapper has to assume, because WKB does not carry one and a
+# value that has made the round trip has already lost it (spec 093 T6 takes it
+# from the CRS).
 # geometry takes 0, the planar "undefined"; geography REFUSES 0 with error
 # 24204 and is given 4326.
 query II

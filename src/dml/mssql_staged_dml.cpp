@@ -462,7 +462,8 @@ void MSSQLStagedDml::ReadReturned(ClientContext &context) {
 		// The statement's own connection, held by it: "pinned" to the stream so
 		// the stream never releases it.
 		MSSQLResultStream stream(stage_.GetConnectionPtr(), sql, target_.catalog_name, target_.client_transcode,
-								 weak_ptr<tds::ConnectionPool>(), true, target_.query_timeout_seconds);
+								 target_.geometry_as, weak_ptr<tds::ConnectionPool>(), true,
+								 target_.query_timeout_seconds);
 		if (!stream.Initialize()) {
 			throw IOException("reading the RETURNING rows failed");
 		}
