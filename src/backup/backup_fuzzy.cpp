@@ -229,9 +229,16 @@ bool FormattedInTail(const FuzzySummary &tail, uint16_t file, uint32_t page) {
 	return tail.formatted.count(static_cast<uint64_t>(file) << 32 | page) != 0;
 }
 
-FuzzySummary SummarizeLogTail(const LogTailReader &tail, const Lsn &first, const Lsn &last, const Lsn &checkpoint) {
+FuzzySummary SummarizeLogTail(const LogTailReader &tail, const Lsn &first, const Lsn &last, const Lsn &checkpoint,
+							  const std::function<void()> &poll) {
 	Summarizer summarizer(first, last, checkpoint);
-	tail.ForEach([&](const LogRecord &r) { summarizer.Add(r); });
+	uint64_t read = 0;
+	tail.ForEach([&](const LogRecord &r) {
+		if (poll && read++ % SUMMARY_POLL_RECORDS == 0) {
+			poll();
+		}
+		summarizer.Add(r);
+	});
 	// A data backup's tail runs from FirstLSN (at or before the checkpoint) to LastLSN: one that does not
 	// hold the checkpoint's own record was not read whole, and a summary of what it holds would read as
 	// consistent (review of #591: an empty one did).

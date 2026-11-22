@@ -120,6 +120,7 @@ void ReadChangesArguments(TableChangesBindData &data, TableFunctionBindInput &in
 	}
 	data.schema = input.inputs[1].ToString();
 	data.table = input.inputs[2].ToString();
+	data.fuzzy = FuzzyParameterOf(input.named_parameters, data.function);
 	for (const auto &kv : input.named_parameters) {
 		if (kv.first == "start_version") {
 			data.start = kv.second;
@@ -203,6 +204,62 @@ void OpenChangesStates(ClientContext &context, TableChangesBindData &data) {
 	}
 }
 
+//! D11 for the change listing (review of #591: it read a dirty or stale state without a word, and under
+//! mssql_backup_fuzzy = 'error' too): each state's table checked against that state's log tail, as the scan
+//! checks the one it reads -- a WARNING each under 'warn', refused by name under 'error'. One state: nothing
+//! is read, nothing checked.
+void CheckChangesFuzzy(ClientContext &context, TableChangesBindData &data) {
+	if (data.states.same) {
+		return;
+	}
+	if (data.fuzzy.empty() && data.paths.size() == 1) {
+		// Over an attached name, the ATTACH's fuzzy option before the setting, as the scan takes it.
+		data.fuzzy = AttachedFuzzy(context, data.paths.front());
+	}
+	const FuzzyMode mode = FuzzyModeOf(context, data.fuzzy, data.function);
+	const std::string given = data.schema + "." + data.table;
+	const std::string name = data.new_table->schema_name + "." + data.new_table->name;
+	CheckStatementFuzzy(context, *data.states.new_catalog, BaseUnitsOf(*data.new_table), name + " (the newer state)",
+						given, mode, data.function);
+	if (data.old_table && !data.all_inserts) {
+		CheckStatementFuzzy(context, *data.states.old_catalog, BaseUnitsOf(*data.old_table),
+							data.old_table->schema_name + "." + data.old_table->name + " (the older state)", given,
+							mode, data.function);
+	}
+}
+
+//! A page of either state that became live while its backup ran: its rows are in that backup's log tail
+//! only. The scan passes such a page over; a change listing cannot -- a row moved onto it would read as
+//! deleted -- so it is refused whatever fuzzy := says, and said so. A zero copy (2017) is told from a
+//! misplaced one by the tail of the state that holds it.
+[[noreturn]] void ThrowChangesError(ClientContext &context, const TableChangesBindData &data, const FormatError &e) {
+	std::string what = e.what();
+	bool pending = dynamic_cast<const PendingPageError *>(&e) != nullptr;
+	const auto *zero = dynamic_cast<const ZeroCopyError *>(&e);
+	for (const auto &catalog : {data.states.new_catalog, data.states.old_catalog}) {
+		if (!zero || pending || !catalog) {
+			continue;
+		}
+		try {
+			BindFiles bound(catalog->Binding());
+			ThrowPendingOrFormat(context, catalog->opened, *zero);
+		} catch (PendingPageError &p) {
+			pending = true;
+			what = p.what();
+		} catch (FormatError &f) {
+			what = f.what();
+		}
+	}
+	if (pending) {
+		throw InvalidInputException(
+			"%s: %s.%s: %s. A table's changes cannot be told past such a page (a row moved onto it would read as "
+			"deleted), so it is not passed over, whatever fuzzy := says; mssql_backup_scan reads the table's other "
+			"pages",
+			data.function, data.schema, data.table, what);
+	}
+	throw InvalidInputException("%s: %s", data.function, what);
+}
+
 //! The newer state's columns the older state's table reads too: staged from it, cast to the newer's types.
 void PairOldColumns(TableChangesBindData &data) {
 	if (!data.old_table || data.all_inserts) {
@@ -226,6 +283,7 @@ unique_ptr<FunctionData> TableChangesBind(ClientContext &context, TableFunctionB
 	data->function = ChangesFunction(listing);
 	ReadChangesArguments(*data, input);
 	OpenChangesStates(context, *data);
+	CheckChangesFuzzy(context, *data);
 	data->columns = ScanColumnsOf(*data->new_table);
 	PairOldColumns(*data);
 	names.emplace_back("change_type");
@@ -272,7 +330,7 @@ unique_ptr<GlobalTableFunctionState> TableChangesInit(ClientContext &context, Ta
 		state->collector =
 			make_uniq<ChangeCollector>(context, data, *state->new_side, state->old_side.get(), *state->memory, sha256);
 	} catch (FormatError &e) {
-		throw InvalidInputException("%s: %s", data.function, e.what());
+		ThrowChangesError(context, data, e);
 	}
 	auto &buffers = BufferManager::GetBufferManager(context);
 	// DuckDB's `threads`, but no more tasks than a quarter of memory_limit holds the buffers of: each task adds
@@ -683,7 +741,7 @@ void TableChangesExecute(ClientContext &context, TableFunctionInput &input, Data
 		}
 		StageChanges(context, data, global, local, output);
 	} catch (FormatError &e) {
-		throw InvalidInputException("%s: %s", data.function, e.what());
+		ThrowChangesError(context, data, e);
 	} catch (ReservationInterrupted &) {
 		throw InterruptException();
 	} catch (ReservationRefused &e) {
@@ -710,6 +768,7 @@ TableFunction MakeTableChangesFunction(const char *name, const LogicalType &path
 	f.GetSignature().AddKeywordOnly("start_version", LogicalType::ANY, Value());
 	f.GetSignature().AddKeywordOnly("end_version", LogicalType::ANY, Value());
 	AddDiffParameter(f);
+	AddFuzzyParameter(f);
 	return f;
 }
 
