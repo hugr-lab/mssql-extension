@@ -10,6 +10,8 @@
 
 namespace duckdb {
 
+class ClientContext;
+
 //===----------------------------------------------------------------------===//
 // MSSQLReturningParser - Collects the RETURNING rows of an INSERT batch into a
 // DuckDB DataChunk
@@ -31,16 +33,26 @@ namespace duckdb {
 //   mssql::DmlBatchOptions options;
 //   output.Attach(options);
 //   ... mssql::ExecuteDmlBatch(context, connection, sql, options) ...
-//   auto chunk = output.TakeResult();
+//   auto chunk = output.TakeResult(context, warned);
 //===----------------------------------------------------------------------===//
+
+//! Which decode WARNINGs (spec 093 T1 / T5: a sql_variant value read as its bytes, a geometry /
+//! geography value read as NULL) each RETURNING column has logged, by result index. Kept by the
+//! statement (MSSQLInsertExecutor) across its batches, so each is said once a column a statement, as a
+//! scan says it.
+struct MSSQLReturningWarned {
+	std::vector<uint8_t> spatial;  // mssql::SPATIAL_WARNED_* bits
+	std::vector<bool> variant;
+};
 
 class MSSQLReturningParser {
 public:
 	// @param target Insert target with column metadata
 	// @param returning_column_ids Column indices to return (maps to OUTPUT INSERTED columns)
 	// @param client_transcode The catalog's answer (spec 092 D4); no default, as on MSSQLResultStream
+	// @param geometry_as The catalog's answer (spec 093 T5); no default, likewise
 	MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids,
-						 bool client_transcode);
+						 bool client_transcode, tds::GeometryAs geometry_as);
 
 	//! Route the result sets of the statement `options` runs into this parser.
 	//! The parser must outlive that call.
@@ -52,8 +64,10 @@ public:
 	}
 
 	//! The rows of the last result set, decoded, or nullptr when there were
-	//! none. Throws when that set is not the RETURNING list's shape.
-	unique_ptr<DataChunk> TakeResult();
+	//! none. Throws when that set is not the RETURNING list's shape. A value read as NULL or as its
+	//! bytes is said by the result stream's WARNING (mssql::LogSpatialNotes / LogVariantNotes) on
+	//! `context`, unless `warned` says the statement has said it.
+	unique_ptr<DataChunk> TakeResult(ClientContext &context, MSSQLReturningWarned &warned);
 
 	// Get the DuckDB types for the result columns
 	const vector<LogicalType> &GetResultTypes() const {
@@ -68,6 +82,7 @@ private:
 	vector<idx_t> returning_column_ids_;
 
 	bool client_transcode_;
+	tds::GeometryAs geometry_as_;
 
 	// Result types (derived from returning columns)
 	vector<LogicalType> result_types_;

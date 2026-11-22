@@ -754,6 +754,37 @@ spec 093 D3's table -- a string through spec 091's code-page kernels by its own 
 in the vector. The column stays out of pushed comparisons and keys (`comparison_differs`): the server
 compares a `sql_variant` by its base type (#514).
 
+**`geometry` / `geography` are decoded on the client (spec 093 T5, D6).** The column is read bare: a
+UDT (`0xF0`, PLP) carrying the stored MS-SSCLRT bytes (G2), staged on the PLP binary arm. The
+`Spatial` kernel (`codec/clr/spatial_codec`, one call a column-chunk) hands each value to
+`codec/clr/ssclrt_wkb` (DuckDB-free, fuzzed by `fuzz_ssclrt`), which checks the header, the point,
+figure and shape arrays and the segments against the value's length and writes little-endian ISO WKB,
+the form DuckDB's `GEOMETRY` stores: Z / M by their ISO codes, a geography's latitude-first points
+swapped, NaN canonical, POINT EMPTY as a point of NaN (owner's rule, G1), the curves 8 - 10 and
+FullGlobe's 126 when asked for. What the column is follows the catalog's `geometry_as`, fixed at ATTACH
+(`MSSQLCatalogStartup::geometry_as`) and carried to every reader of its COLMETADATA on
+`tds::ColumnMetadata::geometry_as` -- the stream, the describe, sp_prepare's answer, the RETURNING
+parser -- before `TypeConverter::GetDuckDBType` is asked:
+
+| `geometry_as` | column type | kernel |
+|---|---|---|
+| `geometry` | `GEOMETRY` / `GEOMETRY('OGC:CRS84')` (geography) | `Spatial`: a curve or FullGlobe set NULL, counted by the kernel (`SpatialColumnNotes::not_geometry`, the stager's `SpatialNotes` and the per-value path's), one WARNING per column per stream |
+| `wkb` | `BLOB` | `Spatial`, curves written |
+| `native` | `BLOB` | `Binary`: the bytes as they arrived |
+
+In both decoding modes a value whose bytes are not MS-SSCLRT is set NULL and counted
+(`SpatialColumnNotes::malformed`, the first one's status kept), with a WARNING of its own: the kernel
+never throws, so one value does not fail a scan (owner, 2026-11-20). Both WARNINGs are worded by one
+function, `mssql::LogSpatialNotes` (a sql_variant's by `LogVariantNotes`), for the stream and for
+INSERT … RETURNING (`MSSQLReturningParser`, its once-a-column state kept by the statement across its
+batches); neither spatial one gives a count, as a streaming scan logs at the first chunk that meets one.
+`TypeConverter::ConvertValue` takes both notes with no default, so a reader that counts nothing says so.
+
+A `GEOMETRY` target is decoded whatever `geometry_as` says (a raw scan's `column_types`). The column is
+out of pushed comparisons, ORDER BY and keys (`comparison_differs`, `IsSpatial()`); `IS NULL` and
+`COUNT(col)` are pushed, so they answer by the server's values (a curve, NULL here under `'geometry'`, is
+not NULL there: a `DELETE … WHERE g IS NULL` leaves it).
+
 **A `hierarchyid` is decoded on the client (spec 093 T4).** The column is read bare -- a UDT (`0xF0`)
 whose UDT_INFO names `sys.hierarchyid`, always PLP (G2) -- and its MS-SSCLRT 2.2.2 bit string is
 written as its `ToString()` text: the stager keeps the assembled bytes on the PLP binary arm and the

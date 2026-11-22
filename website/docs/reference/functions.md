@@ -96,7 +96,7 @@ FROM mssql_scan_params_unsafe('sqlserver',
 | `datetime2(n)` | any TIMESTAMP variant; the one of its scale keeps full precision (`TIMESTAMP_NS` for `datetime2(7)`) |
 | `datetimeoffset` | `TIMESTAMP WITH TIME ZONE` |
 | `uniqueidentifier` | `UUID` |
-| `geometry` | `GEOMETRY`, sent as WKB: `SELECT shape.STAsBinary() AS shape …` |
+| `geometry` / `geography` | `GEOMETRY` / `GEOMETRY('OGC:CRS84')`, the column bare (decoded on the client); `BLOB` under the catalog's `geometry_as 'wkb'` / `'native'`; or `GEOMETRY` for a varbinary of WKB: `SELECT shape.STAsBinary() AS shape …` |
 | `sql_variant`, `hierarchyid`, other UDTs | not readable as such: cast them in the T-SQL (`CAST(v AS nvarchar(4000))`, `h.ToString()`) |
 
 A type no SQL Server column is read as (`TINYINT`, a LIST, a STRUCT) is refused at bind. Casting each column in the T-SQL to the type you declare keeps the shape from drifting when a table changes. `EXPLAIN` shows `Shape: given (columns :=)`. The remote-pushdown rewriter uses these two for every pushed statement whose column types it knows.

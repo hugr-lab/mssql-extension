@@ -124,6 +124,9 @@ enum class FinalizeKernel : uint8_t {
 	//! Spec 093 T1: a SQL_VARIANT column, each value written as a VARIANT
 	//! (`src/codec/variant/variant_codec.cpp`).
 	Variant,
+	//! Spec 093 T5: a geometry / geography column (UDT, PLP) into GEOMETRY or
+	//! BLOB, each value its ISO WKB (`src/codec/clr/spatial_codec.cpp`).
+	Spatial,
 	//! Spec 093 T4: a hierarchyid column (UDT, PLP) into VARCHAR, each value
 	//! its ToString() text (`src/codec/clr/hierarchyid_codec.cpp`).
 	HierarchyId,
@@ -133,7 +136,7 @@ enum class FinalizeKernel : uint8_t {
 };
 
 //! Number of FinalizeKernel values, for counter arrays.
-static const uint8_t FINALIZE_KERNEL_COUNT = 12;
+static const uint8_t FINALIZE_KERNEL_COUNT = 13;
 static_assert(FINALIZE_KERNEL_COUNT == static_cast<uint8_t>(FinalizeKernel::Vector) + 1,
 			  "a new kernel must not index past the counter arrays");
 

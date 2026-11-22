@@ -57,7 +57,7 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const tds::Request &request,
-									 const string &context_name, bool client_transcode,
+									 const string &context_name, bool client_transcode, tds::GeometryAs geometry_as,
 									 weak_ptr<tds::ConnectionPool> pool_handle, bool transaction_pinned,
 									 int query_timeout_seconds, bool reset_on_release)
 	: connection_(std::move(connection)),
@@ -66,6 +66,7 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
 	  transaction_pinned_(transaction_pinned),
 	  reset_on_release_(reset_on_release),
 	  client_transcode_(client_transcode),
+	  geometry_as_(geometry_as),
 	  sql_(request.sql),
 	  request_(request.IsRpc() ? request : tds::Request()),
 	  state_(MSSQLResultStreamState::Initializing),
@@ -189,6 +190,11 @@ bool MSSQLResultStream::Initialize() {
 				}
 				if (client_transcode_) {
 					mssql::codec::code_page::ResolveWireCodePages(column_metadata_);
+				}
+				// Spec 093 T5: what a geometry / geography column is read as, the catalog's, before its
+				// type is asked below.
+				for (auto &col : column_metadata_) {
+					col.geometry_as = geometry_as_;
 				}
 				column_names_.clear();
 				column_types_.clear();
@@ -489,6 +495,10 @@ exit_loop:
 					warnings_pending_ = true;
 				}
 			}
+			// Spec 093 T5: a spatial value read as NULL, likewise.
+			if (column_metadata_[c].IsSpatialUdt() && SpatialWarningPending(c)) {
+				warnings_pending_ = true;
+			}
 		}
 		if (counters_enabled_) {
 			CountChunkForDebug(chunk, row_count);
@@ -574,8 +584,17 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 			row_variant_notes_.resize(column_metadata_.size());
 			variant_notes = &row_variant_notes_[col_idx];
 		}
+		mssql::codec::spatial::SpatialColumnNotes *spatial_notes = nullptr;
+		if (column_metadata_[col_idx].IsSpatialUdt()) {
+			row_spatial_notes_.resize(column_metadata_.size());
+			spatial_notes = &row_spatial_notes_[col_idx];
+		}
 		tds::encoding::TypeConverter::ConvertValue(row.values[col_idx], row.null_mask[col_idx],
-												   column_metadata_[col_idx], *target_vector, row_idx, variant_notes);
+												   column_metadata_[col_idx], *target_vector, row_idx, variant_notes,
+												   spatial_notes);
+		if (spatial_notes && SpatialWarningPending(col_idx)) {
+			warnings_pending_ = true;
+		}
 		if (column_metadata_[col_idx].IsVectorText() && target_vector->GetType().id() == LogicalTypeId::ARRAY) {
 			NoteVectorText(col_idx);
 		}
@@ -585,7 +604,8 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 			warnings_pending_ = true;
 		}
 		// A datetime2 value read as NULL for not fitting TIMESTAMP_NS (issue #168): spec 093 D8's warning.
-		if (column_metadata_[col_idx].type_id == tds::TDS_TYPE_DATETIME2 && !row.null_mask[col_idx] &&
+		const auto &meta = column_metadata_[col_idx];
+		if (!row.null_mask[col_idx] && meta.type_id == tds::TDS_TYPE_DATETIME2 &&
 			target_vector->GetType().id() == LogicalTypeId::TIMESTAMP_NS &&
 			FlatVector::IsNull(*target_vector, row_idx)) {
 			NoteOutOfRange(col_idx);
@@ -978,6 +998,91 @@ void MSSQLResultStream::DrainRemainingTokens() {
 	}
 }
 
+mssql::codec::spatial::SpatialColumnNotes MSSQLResultStream::SpatialNotesOf(idx_t c) const {
+	mssql::codec::spatial::SpatialColumnNotes notes;
+	if (stager_.IsConfigured()) {
+		notes = stager_.SpatialNotes(c);
+	}
+	if (c < row_spatial_notes_.size()) {
+		const auto &row = row_spatial_notes_[c];
+		notes.not_geometry += row.not_geometry;
+		if (notes.malformed == 0) {
+			notes.first_malformed = row.first_malformed;
+		}
+		notes.malformed += row.malformed;
+	}
+	return notes;
+}
+
+bool MSSQLResultStream::SpatialWarningPending(idx_t c) const {
+	const uint8_t warned = c < spatial_warned_.size() ? spatial_warned_[c] : 0;
+	const auto notes = SpatialNotesOf(c);
+	return (notes.not_geometry > 0 && !(warned & mssql::SPATIAL_WARNED_NOT_GEOMETRY)) ||
+		   (notes.malformed > 0 && !(warned & mssql::SPATIAL_WARNED_MALFORMED));
+}
+
+void MSSQLResultStream::SurfaceSpatialWarnings(ClientContext &context) {
+	spatial_warned_.resize(column_metadata_.size(), 0);
+	for (idx_t c = 0; c < column_metadata_.size(); c++) {
+		if (column_metadata_[c].IsSpatialUdt()) {
+			spatial_warned_[c] =
+				mssql::LogSpatialNotes(context, column_metadata_[c], SpatialNotesOf(c), spatial_warned_[c]);
+		}
+	}
+}
+
+namespace mssql {
+
+uint8_t LogSpatialNotes(ClientContext &context, const tds::ColumnMetadata &column,
+						const codec::spatial::SpatialColumnNotes &notes, uint8_t warned) {
+	// No count in either: on a streaming scan the WARNING is logged as soon as the scan meets the first
+	// such value, so a count would be the count of the chunks read so far, not the column's.
+	// The ATTACH option first: it is read at ATTACH. A column_types override to GEOMETRY decodes whatever
+	// the option says, so it has to go too.
+	if (notes.not_geometry > 0 && !(warned & SPATIAL_WARNED_NOT_GEOMETRY)) {
+		warned |= SPATIAL_WARNED_NOT_GEOMETRY;
+		DUCKDB_LOG_WARNING(context,
+						   "mssql: column \"%s\" (%s) holds values a GEOMETRY cannot hold (a CircularString, "
+						   "CompoundCurve, CurvePolygon or FullGlobe, or collections nested deeper than 15), "
+						   "read as NULL; attach with geometry_as 'wkb' (ISO WKB, the curves included) or 'native' "
+						   "(the stored bytes), and drop any column_types override to GEOMETRY (it still decodes "
+						   "into one), to read them",
+						   column.name.c_str(), column.udt_type_name.c_str());
+	}
+	// A value that is not MS-SSCLRT is NULL, never an error: one value does not fail the scan of its
+	// table (owner, 2026-11-20).
+	if (notes.malformed > 0 && !(warned & SPATIAL_WARNED_MALFORMED)) {
+		warned |= SPATIAL_WARNED_MALFORMED;
+		DUCKDB_LOG_WARNING(context,
+						   "mssql: column \"%s\" (%s) holds values whose stored bytes cannot be read as %s (the "
+						   "first: %s), read as NULL; attach with geometry_as 'native', and drop any column_types "
+						   "override to GEOMETRY (it still decodes into one), to read the stored bytes",
+						   column.name.c_str(), column.udt_type_name.c_str(), column.udt_type_name.c_str(),
+						   codec::ssclrt::DescribeStatus(notes.first_malformed));
+	}
+	return warned;
+}
+
+bool LogVariantNotes(ClientContext &context, const tds::ColumnMetadata &column,
+					 const codec::variant::VariantColumnNotes &notes) {
+	if (notes.unknown_collation + notes.invalid_utf8 == 0) {
+		return false;
+	}
+	// No count: logged at the first chunk (or batch) that meets one, a count would be that chunk's alone.
+	const char *why = notes.unknown_collation && notes.invalid_utf8
+						  ? "under a collation this build has no code page for, and under a UTF-8 collation but "
+							"not UTF-8"
+					  : notes.unknown_collation ? "under a collation this build has no code page for"
+												: "under a UTF-8 collation but not UTF-8";
+	DUCKDB_LOG_WARNING(context,
+					   "mssql: column \"%s\": sql_variant string values read as their bytes (a BLOB inside the "
+					   "VARIANT): %s",
+					   column.name.c_str(), why);
+	return true;
+}
+
+}  // namespace mssql
+
 void MSSQLResultStream::NoteOutOfRange(idx_t c) {
 	if (c < refuse_out_of_range_.size() && refuse_out_of_range_[c]) {
 		// Issue #559: under TIMESTAMP_NS a value outside 1677-2262 reads as NULL, and a table with no usable
@@ -1028,9 +1133,11 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 	}
 
 	// Spec 093 D8: a datetime2 column read as TIMESTAMP_NS whose values outside 1677-2262 were read
-	// as NULL (issue #168), once per column per statement, as soon as the scan meets one.
+	// as NULL (issue #168), once per column per statement, as soon as the scan meets one; T5: a
+	// geometry / geography column's values read as NULL, likewise (SurfaceSpatialWarnings).
 	if (warnings_pending_) {
 		warnings_pending_ = false;
+		SurfaceSpatialWarnings(context);
 		for (idx_t c = 0; c < out_of_range_.size(); c++) {
 			if (out_of_range_[c] != 1) {
 				continue;
@@ -1087,17 +1194,9 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 				notes.unknown_collation += row_variant_notes_[c].unknown_collation;
 				notes.invalid_utf8 += row_variant_notes_[c].invalid_utf8;
 			}
-			if (notes.unknown_collation + notes.invalid_utf8 == 0) {
-				continue;
+			if (mssql::LogVariantNotes(context, column_metadata_[c], notes)) {
+				variant_notes_warned_[c] = true;
 			}
-			variant_notes_warned_[c] = true;
-			DUCKDB_LOG_WARNING(context,
-							   "mssql: column \"%s\": %llu sql_variant string value(s) read as their bytes (a BLOB "
-							   "inside the VARIANT): %llu under a collation this build has no code page for, %llu "
-							   "under a UTF-8 collation but not UTF-8",
-							   column_metadata_[c].name.c_str(),
-							   (unsigned long long)(notes.unknown_collation + notes.invalid_utf8),
-							   (unsigned long long)notes.unknown_collation, (unsigned long long)notes.invalid_utf8);
 		}
 	}
 

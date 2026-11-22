@@ -27,6 +27,25 @@ MSSQLDatetime2Read ParseDatetime2Read(const string &value, const string &source)
 		source, value);
 }
 
+tds::GeometryAs ParseGeometryAs(const string &value, const string &source) {
+	string v = value;
+	StringUtil::Trim(v);
+	v = StringUtil::Lower(v);
+	if (v == "geometry") {
+		return tds::GeometryAs::Geometry;
+	}
+	if (v == "wkb") {
+		return tds::GeometryAs::Wkb;
+	}
+	if (v == "native") {
+		return tds::GeometryAs::Native;
+	}
+	throw InvalidInputException(
+		"%s must be 'geometry' (GEOMETRY, geography's labelled OGC:CRS84; a curve or FullGlobe NULL), 'wkb' "
+		"(a BLOB of ISO WKB, the curves included) or 'native' (a BLOB of the stored MS-SSCLRT bytes), not '%s'",
+		source, value);
+}
+
 bool MSSQLColumnInfo::ReadsDatetime2Truncated() const {
 	return scale >= 7 && duckdb_type.id() == LogicalTypeId::TIMESTAMP &&
 		   StringUtil::CIEquals(sql_type_name, "datetime2");
@@ -49,7 +68,8 @@ MSSQLColumnInfo::MSSQLColumnInfo()
 
 MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const string &sql_type_name, int16_t max_length,
 								 uint8_t precision, uint8_t scale, bool is_nullable, const string &collation_name,
-								 const string &database_collation, MSSQLDatetime2Read datetime2_read)
+								 const string &database_collation, MSSQLDatetime2Read datetime2_read,
+								 tds::GeometryAs geometry_as)
 	: name(name),
 	  column_id(column_id),
 	  sql_type_name(sql_type_name),
@@ -72,6 +92,11 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 
 	// Map to DuckDB type
 	duckdb_type = MapSQLServerTypeToDuckDB(sql_type_name, max_length, precision, scale, datetime2_read);
+	// Spec 093 T5: geometry_as 'wkb' / 'native' read a geometry / geography column as a BLOB, the whole
+	// column (the WKB the client decodes, or the stored bytes).
+	if (IsSpatialType(sql_type_name) && geometry_as != tds::GeometryAs::Geometry) {
+		duckdb_type = LogicalType::BLOB;
+	}
 
 	// Spec 093 D2: how the scan reads it, and whether the server compares it unlike DuckDB -- two
 	// answers that were one flag (is_cast_required) while the two always coincided.
@@ -80,11 +105,9 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 }
 
 MSSQLReadForm MSSQLColumnInfo::ReadFormFor(const string &sql_type_name) {
-	// Geometry / geography: the table scan rewrites them to .STAsBinary(), so the wire delivers OGC WKB
-	// (varbinary(max)) instead of MS-SSCLRT; the catalog reports LogicalType::GEOMETRY().
-	if (IsSpatialType(sql_type_name)) {
-		return MSSQLReadForm::SpatialBinary;
-	}
+	// Geometry / geography (spec 093 T5, D6): read bare (UDT 0xF0), the stored MS-SSCLRT bytes, and decoded
+	// on the client into ISO WKB (or kept as they are, geometry_as 'native'); the server's .STAsBinary(),
+	// which dropped Z and M, is gone. A known type (IsKnownSQLServerType), so Bare below.
 	// sql_variant (spec 093 T1): read bare, each value a VARIANT of its base type. Not a known type for
 	// comparisons or the bulk wire: the server compares a sql_variant unlike DuckDB (#514), and T2 writes it.
 	if (StringUtil::CIEquals(sql_type_name, "sql_variant")) {
@@ -109,24 +132,26 @@ bool MSSQLColumnInfo::ComparisonDiffersFor(const string &sql_type_name) {
 	// not join it by accident (#514). An allow-list, so a type not named -- a user CLR type, one SQL
 	// Server adds later -- differs. Not on it: sql_variant, hierarchyid, vector (#514), and json,
 	// which the server compares by nothing but IS NULL (J1: 402 / 13636 / 421 on SQL Server 2025).
-	// Spatial types are on it and named by IsSpatial() where they matter, as before the split.
+	// Nor, since spec 093 T5, geometry / geography: the server has no comparison of them a pushed filter
+	// could use, and read as a BLOB (geometry_as 'wkb' / 'native') their bytes are not what the server
+	// would compare a varbinary constant with. IsSpatial() names them where it always did.
 	const string t = StringUtil::Lower(sql_type_name);
 	return !(t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" || t == "real" ||
 			 t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "char" ||
 			 t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" || t == "date" ||
 			 t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" || t == "datetimeoffset" ||
 			 t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" || t == "timestamp" ||
-			 t == "rowversion" || t == "xml" || IsSpatialType(t));
+			 t == "rowversion" || t == "xml");
 }
 
 bool MSSQLColumnInfo::BulkWireTakesType(const string &sql_type_name) {
 	// Its own list, not IsKnownSQLServerType's (review of #557): a type joins it in its own write PR,
 	// measured first (spec 093 T2, T6), never because it became decodable (#296). A geometry /
-	// geography column arrives as WKB, which the statement path renders as a 0x literal the server
-	// converts; on the bulk wire FromServerColumn would declare it nvarchar and send the bytes as
-	// text. The same for hierarchyid, read as its text (decoded on the client, T4): the statement
-	// path sends a string literal the server parses, the bulk wire would not. sql_variant's write is
-	// T2's (refused until then).
+	// geography value is WKB in DuckDB, which the statement path renders as a 0x literal the server
+	// converts (STGeomFromWKB); on the bulk wire FromServerColumn would declare it nvarchar and send the
+	// bytes as text (T6 writes it). The same for hierarchyid, read as its text (decoded on the client, T4):
+	// the statement path sends a string literal the server parses, the bulk wire would not. sql_variant's
+	// write is T2's (refused until then).
 	// vector (spec 093 T3): its bytes as varbinary under a declared vector(n), measured V6.
 	const string t = StringUtil::Lower(sql_type_name);
 	return t == "vector" || t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" ||
@@ -408,10 +433,15 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 		return LogicalType::VARIANT();
 	}
 
-	// Spatial types — geometry and geography both arrive via STAsBinary() rewrite
-	// (see ReadFormFor's SpatialBinary + table_scan::BuildColumnExpression).
-	// DuckDB's first-class GEOMETRY type stores WKB bytes — same physical storage as BLOB.
-	if (IsSpatialType(lower_type)) {
+	// Spatial types (spec 093 T5, DQ-45): read bare and decoded on the client into ISO WKB, the bytes
+	// DuckDB's GEOMETRY holds. geography is GEOMETRY('OGC:CRS84') for the whole column, whatever SRID a
+	// value carries (WGS 84, longitude first, built in: spec 093 § Why OGC:CRS84); geometry is a GEOMETRY
+	// with no CRS (a column declares no SRID). The catalog's geometry_as may make either a BLOB
+	// (MSSQLColumnInfo's constructor).
+	if (lower_type == "geography") {
+		return LogicalType::GEOMETRY("OGC:CRS84");
+	}
+	if (lower_type == "geometry") {
 		return LogicalType::GEOMETRY();
 	}
 
@@ -492,7 +522,7 @@ bool MSSQLColumnInfo::IsKnownSQLServerType(const string &sql_type_name) {
 		   lower_type == "json" ||
 		   // XML has dedicated TDS-level support (0xF1) and works without CAST
 		   lower_type == "xml" ||
-		   // Spatial UDTs — handled by table-scan rewrite to STAsBinary() (spec 045 / sub-phase 5).
+		   // Spatial UDTs: read bare and decoded on the client (spec 093 T5).
 		   IsSpatialType(lower_type);
 }
 
@@ -644,10 +674,6 @@ string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string
 											bool utf8_on_wire) {
 	const string escaped_name = mssql::QuoteIdentifier(alias.empty() ? col_name : alias);
 	const string reference = qualifier + mssql::QuoteIdentifier(col_name);
-
-	if (IsSpatialType(sql_type_name)) {
-		return reference + ".STAsBinary() AS " + escaped_name;
-	}
 
 	const LegacyLob lob_kind = LegacyLobKind(sql_type_name);
 	if (lob_kind == LegacyLob::NText) {

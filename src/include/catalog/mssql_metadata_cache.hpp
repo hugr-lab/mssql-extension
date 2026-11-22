@@ -160,8 +160,11 @@ class MSSQLMetadataCache {
 public:
 	//! `datetime2_read`: the catalog's, fixed at ATTACH (spec 093 D8): the type its datetime2(7)
 	//! columns and keys are read as. A cache made without a catalog (tests) reads them as TIMESTAMP_NS.
+	//! `geometry_as`: the catalog's, fixed at ATTACH (spec 093 T5): what its geometry / geography
+	//! columns are read as; GEOMETRY for a cache made without a catalog.
 	explicit MSSQLMetadataCache(int64_t ttl_seconds = 0,
-								MSSQLDatetime2Read datetime2_read = MSSQLDatetime2Read::Nanoseconds);
+								MSSQLDatetime2Read datetime2_read = MSSQLDatetime2Read::Nanoseconds,
+								tds::GeometryAs geometry_as = tds::GeometryAs::Geometry);
 	~MSSQLMetadataCache() = default;
 
 	// Non-copyable
@@ -462,6 +465,7 @@ private:
 	int32_t database_code_page_ = 0;		   // COLLATIONPROPERTY(database collation, 'CodePage'), issue #361
 	string database_collation_;				   // Database default collation
 	const MSSQLDatetime2Read datetime2_read_;  // The catalog's, fixed at ATTACH (spec 093 D8)
+	const tds::GeometryAs geometry_as_;		   // The catalog's, fixed at ATTACH (spec 093 T5)
 
 	// Atomics, NOT guarded by mutex_ (issue #178 D4): written by EnsureCacheLoaded
 	// on every catalog lookup while loaders concurrently read them mid-query

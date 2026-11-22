@@ -44,6 +44,8 @@ using duckdb::LogicalType;
 using duckdb::tds::ColumnMetadata;
 using duckdb::tds::encoding::TypeConverter;
 
+// Every ConvertValue here passes no decode notes: no column is a sql_variant or a geometry / geography.
+
 namespace {
 
 int failures = 0;
@@ -85,7 +87,7 @@ void TestDecimalIntoVarcharVector() {
 	auto col = MakeColumn(duckdb::tds::TDS_TYPE_DECIMAL, /*precision*/ 19, /*scale*/ 4);
 
 	duckdb::Vector vec(LogicalType::VARCHAR, 1);
-	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0);
+	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0, nullptr, nullptr);
 
 	CHECK_EQ(ReadVectorString(vec, 0), std::string("10.0000"));
 }
@@ -97,7 +99,7 @@ void TestNumericIntoVarcharVector() {
 	auto col = MakeColumn(duckdb::tds::TDS_TYPE_NUMERIC, /*precision*/ 19, /*scale*/ 4);
 
 	duckdb::Vector vec(LogicalType::VARCHAR, 1);
-	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0);
+	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0, nullptr, nullptr);
 
 	CHECK_EQ(ReadVectorString(vec, 0), std::string("-10.0000"));
 }
@@ -110,7 +112,7 @@ void TestIntegerIntoVarcharVector() {
 	auto col = MakeColumn(duckdb::tds::TDS_TYPE_INTN);
 
 	duckdb::Vector vec(LogicalType::VARCHAR, 1);
-	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0);
+	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0, nullptr, nullptr);
 
 	CHECK_EQ(ReadVectorString(vec, 0), std::string("12345"));
 }
@@ -125,7 +127,7 @@ void TestBigIntIntoVarcharVector() {
 	auto col = MakeColumn(duckdb::tds::TDS_TYPE_BIGINT);
 
 	duckdb::Vector vec(LogicalType::VARCHAR, 1);
-	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0);
+	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0, nullptr, nullptr);
 
 	CHECK_EQ(ReadVectorString(vec, 0), std::string("9876543210"));
 }
@@ -139,7 +141,7 @@ void TestFloatIntoVarcharVector() {
 	auto col = MakeColumn(duckdb::tds::TDS_TYPE_REAL);
 
 	duckdb::Vector vec(LogicalType::VARCHAR, 1);
-	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0);
+	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0, nullptr, nullptr);
 
 	// setprecision(9) renders 3.14f as "3.1400001" (closest representable).
 	auto rendered = ReadVectorString(vec, 0);
@@ -158,7 +160,7 @@ void TestMoneyIntoVarcharVector() {
 	auto col = MakeColumn(duckdb::tds::TDS_TYPE_MONEY);
 
 	duckdb::Vector vec(LogicalType::VARCHAR, 1);
-	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0);
+	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0, nullptr, nullptr);
 
 	CHECK_EQ(ReadVectorString(vec, 0), std::string("1.5000"));
 }
@@ -171,8 +173,8 @@ void TestBitIntoVarcharVector() {
 	auto col = MakeColumn(duckdb::tds::TDS_TYPE_BIT);
 
 	duckdb::Vector vec(LogicalType::VARCHAR, 2);
-	TypeConverter::ConvertValue(wire_t, /*is_null*/ false, col, vec, 0);
-	TypeConverter::ConvertValue(wire_f, /*is_null*/ false, col, vec, 1);
+	TypeConverter::ConvertValue(wire_t, /*is_null*/ false, col, vec, 0, nullptr, nullptr);
+	TypeConverter::ConvertValue(wire_f, /*is_null*/ false, col, vec, 1, nullptr, nullptr);
 
 	CHECK_EQ(ReadVectorString(vec, 0), std::string("1"));
 	CHECK_EQ(ReadVectorString(vec, 1), std::string("0"));
@@ -184,7 +186,7 @@ void TestNullIntoVarcharVector() {
 	auto col = MakeColumn(duckdb::tds::TDS_TYPE_DECIMAL, 19, 4);
 	std::vector<uint8_t> empty;
 	duckdb::Vector vec(LogicalType::VARCHAR, 1);
-	TypeConverter::ConvertValue(empty, /*is_null*/ true, col, vec, 0);
+	TypeConverter::ConvertValue(empty, /*is_null*/ true, col, vec, 0, nullptr, nullptr);
 
 	if (!duckdb::FlatVector::IsNull(vec, 0)) {
 		++failures;
@@ -201,7 +203,7 @@ void TestUuidIntoVarcharVector() {
 	auto col = MakeColumn(duckdb::tds::TDS_TYPE_UNIQUEIDENTIFIER);
 
 	duckdb::Vector vec(LogicalType::VARCHAR, 1);
-	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0);
+	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0, nullptr, nullptr);
 
 	CHECK_EQ(ReadVectorString(vec, 0), std::string("6ba7b810-9dad-11d1-80b4-00c04fd430c8"));
 }
@@ -214,7 +216,7 @@ void TestStringIntoVarcharVectorTakesNormalPath() {
 	auto col = MakeColumn(duckdb::tds::TDS_TYPE_NVARCHAR);
 
 	duckdb::Vector vec(LogicalType::VARCHAR, 1);
-	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0);
+	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0, nullptr, nullptr);
 
 	CHECK_EQ(ReadVectorString(vec, 0), std::string("hi"));
 }

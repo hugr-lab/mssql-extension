@@ -151,6 +151,76 @@ would remove the difference. A plain `float` column's statement path also stores
 literal `-0.0` is a decimal literal to T-SQL; the float codec's behaviour before T2); a `VARIANT`'s
 literal is a float literal and keeps the sign. A CTAS creates the column as `sql_variant`.
 
+### Spatial Types (GEOMETRY, GEOGRAPHY)
+
+| SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
+|---|---|---|---|---|
+| GEOMETRY | 0xF0 (UDT `sys.geometry`) | PLP, the stored MS-SSCLRT bytes | GEOMETRY | decoded on the client into ISO WKB, Z and M kept (spec 093 T5) |
+| GEOGRAPHY | 0xF0 (UDT `sys.geography`) | PLP, the stored MS-SSCLRT bytes, latitude first | GEOMETRY('OGC:CRS84') | the same, longitude first; the label is the column's whatever SRID a value carries |
+
+Both are read bare, as an attached catalog and a raw `mssql_scan` / `mssql_scan_params` alike: the
+server sends the bytes it stores (`CAST(g AS varbinary(max))`), and a DuckDB-free kernel
+(`src/codec/clr/ssclrt_wkb.cpp`) writes the little-endian ISO WKB DuckDB's `GEOMETRY` holds. Until spec
+093 T5 the catalog read them through `.STAsBinary()`, which cost server CPU and dropped Z and M; a raw
+scan refused them.
+
+- **Z / M**: ISO type codes (the type + 1000 for Z, 2000 for M, 3000 for ZM). A missing Z or M of one
+  point (`LINESTRING(0 0 1, 1 1 NULL)`) is NaN.
+- **geography**: stored latitude first, written longitude first. The column is
+  `GEOMETRY('OGC:CRS84')` -- WGS 84, built into DuckDB, written by Parquet with no conversion. A value in
+  another SRID (4269, 104001, ...) keeps the column's label; the SRID is read, not checked.
+- **geometry**: a `GEOMETRY` with no CRS (a column declares no SRID).
+- **POINT EMPTY** is DuckDB's POINT EMPTY, a point of NaN coordinates, wherever it is stored: the value,
+  a member of a `MULTIPOINT` (`MULTIPOINT (1 2, EMPTY)`) or of a collection. The server's own
+  `STAsBinary()` / `AsBinaryZM()` write MULTIPOINT EMPTY for the value and leave a MULTIPOINT's member
+  out; every other value is `AsBinaryZM()` byte for byte (G1: 64 values, SQL Server 2019, 2022, 2025).
+- **Curves and FullGlobe** (`CIRCULARSTRING`, `COMPOUNDCURVE`, `CURVEPOLYGON`, `FULLGLOBE`) are no
+  `GEOMETRY` DuckDB holds: such a value reads as **NULL**, and the scan logs one `WARNING` per column
+  into `duckdb_logs` as it meets one:
+
+  ```
+  mssql: column "g" (geometry) holds values a GEOMETRY cannot hold (a CircularString, CompoundCurve,
+  CurvePolygon or FullGlobe, or collections nested deeper than 15), read as NULL; attach with
+  geometry_as 'wkb' (ISO WKB, the curves included) or 'native' (the stored bytes), and drop any
+  column_types override to GEOMETRY (it still decodes into one), to read them
+  ```
+
+  Collections nested deeper than 15, which DuckDB's `GEOMETRY` does not read, are NULL the same way.
+
+- **A value whose bytes are not MS-SSCLRT** (truncated, a figure, shape or segment out of place) is
+  NULL too, under `'geometry'` and `'wkb'` alike, never an error: one value does not fail the scan of
+  its table. Its own `WARNING`, once per column, names the first value's fault (not how many: a
+  streaming scan says it as soon as it meets one):
+
+  ```
+  mssql: column "g" (geometry) holds values whose stored bytes cannot be read as geometry (the first:
+  ...), read as NULL; attach with geometry_as 'native', and drop any column_types override to
+  GEOMETRY (it still decodes into one), to read the stored bytes
+  ```
+
+  A compound curve's segments are checked before it is answered a curve, so corrupt segments are this
+  case under `'geometry'` as well.
+
+  The query is not failed. `IS NULL` / `IS NOT NULL` and `count(g)` go to the server, which answers by the
+  real values: `WHERE g IS NULL` matches true NULLs only, so a `DELETE … WHERE g IS NULL` leaves the curves
+  alone, and `count(g)` counts them where DuckDB read NULL (owner, 2026-11-20). Under `'geometry'` DuckDB holds a curve as NULL, so anything DuckDB computes over the column sees NULL: an
+  `UPDATE … SET g = <an expression over g>`, a condition such as `coalesce(g, …)`, or an `INSERT … SELECT`
+  between two catalogs can write NULL over a curve on the server, or pick its row. A copy into a column of the
+  same declaration that goes to the server whole stays exact. Read the column with `'wkb'` to keep the curves.
+- **`geometry_as`** (an ATTACH option of `TYPE mssql`, read once per catalog; raw scans follow it):
+  - `'geometry'` (the default): the types above;
+  - `'wkb'`: `BLOB`, the ISO WKB, the curves in their ISO forms (8 CircularString, 9 CompoundCurve, 10
+    CurvePolygon) and FullGlobe as type 126, as `AsBinaryZM()` writes them;
+  - `'native'`: `BLOB`, the stored MS-SSCLRT bytes (they load back by `CAST(… AS geometry)`). An
+    `INSERT` or `UPDATE` of such a column through the catalog is refused by name: the write path sends
+    WKB, and these bytes are not WKB. An `INSERT … SELECT` pushed to the server whole copies the column
+    there, and is not affected.
+- Filters, ORDER BY and keys on a spatial column are never pushed to the server (it has no comparison of
+  them a filter could use); `IS NULL` / `IS NOT NULL` and `count(g)` are, in every `geometry_as`.
+- Writes are unchanged by T5 (spec 093 T6 takes the SRID from the CRS): the statement path sends
+  `STGeomFromWKB(0x…, 0)` (`geography`: 4326), which takes ISO Z / M (G7). The server refuses a NaN
+  point, so a POINT EMPTY read this way does not write back until T6.
+
 ### HIERARCHYID and user CLR types
 
 | SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
@@ -195,21 +265,6 @@ rounded to nearest even on the client. A NULL element, a NaN / infinity and a fl
 65504 (a magnitude of 65520 or more; below that it rounds to 65504) are refused by name. A CTAS or COPY that creates the table creates `vector(n)` from FLOAT[n]
 (n up to 1998); a server without the type refuses it (error 2715), and a DOUBLE[n] is refused with the
 cast `::FLOAT[n]` named.
-
-### Not read by a raw scan yet
-
-An attached catalog reads `geometry` / `geography` as WKB through `.STAsBinary()`. A raw
-`mssql_scan` / `mssql_scan_params` that selects one bare is refused at bind, naming the column and the
-type; spec 093 T5 decodes them on the client. Their COLMETADATA and rows are parsed, so a batch that
-returns them to `mssql_exec`, or a DML whose trigger does, does not fail.
-
-| SQL Server Type | TDS Type ID | Read by a raw scan |
-|---|---|---|
-| UDT (GEOGRAPHY, GEOMETRY) | 0xF0 | not yet (spec 093 T5) |
-
-```
-MSSQL Error: column 'g' is of the CLR type sys.geometry, which a raw mssql_scan does not read yet. ...
-```
 
 ## NULL Handling
 

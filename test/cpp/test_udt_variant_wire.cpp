@@ -261,7 +261,7 @@ int main() {
 		ColumnMetadata borrowed = columns[0];
 		borrowed.udt_type_name = "hierarchyid";
 		Check(borrowed.IsUserClrUdt() && !borrowed.IsHierarchyIdUdt(), "dbo.hierarchyid is a user type, not sys's");
-		// hierarchyid is decoded into its text (T4); geometry / geography wait for T5 and are refused by name.
+		// hierarchyid is decoded into its text (T4), geometry / geography into GEOMETRY (T5).
 		ColumnMetadata h = columns[0];
 		h.udt_schema = "sys";
 		h.udt_type_name = "hierarchyid";
@@ -270,14 +270,9 @@ int main() {
 		ColumnMetadata g = columns[0];
 		g.udt_schema = "sys";
 		g.udt_type_name = "geometry";
-		std::string message;
-		try {
-			duckdb::tds::encoding::TypeConverter::GetDuckDBType(g);
-		} catch (std::exception &e) {
-			message = e.what();
-		}
-		Check(message.find("column 'u' is of the CLR type sys.geometry") != std::string::npos,
-			  "a raw scan's refusal names the spatial type: " + message);
+		Check(!g.IsUserClrUdt() &&
+				  duckdb::tds::encoding::TypeConverter::GetDuckDBType(g) == duckdb::LogicalType::GEOMETRY(),
+			  "sys.geometry reads as GEOMETRY");
 	}
 
 	std::cout << "An NBCROW variant present by its bitmap but of length 0" << std::endl;
@@ -354,8 +349,8 @@ int main() {
 		const std::vector<uint8_t> envelope = FromHex("A7070904D02400140061FF");
 		duckdb::Vector out(duckdb::LogicalType::VARIANT(), 2);
 		duckdb::mssql::codec::variant::VariantColumnNotes notes;
-		encoding::TypeConverter::ConvertValue(envelope, false, col, out, 0, &notes);
-		encoding::TypeConverter::ConvertValue(envelope, false, col, out, 1);
+		encoding::TypeConverter::ConvertValue(envelope, false, col, out, 0, &notes, nullptr);
+		encoding::TypeConverter::ConvertValue(envelope, false, col, out, 1, nullptr, nullptr);
 		Check(notes.invalid_utf8 == 1 && notes.unknown_collation == 0,
 			  "invalid UTF-8 counted once, only where notes were passed");
 	}
