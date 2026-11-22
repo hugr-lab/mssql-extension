@@ -200,7 +200,7 @@ row's clustered key. With no `base_table` it lists the tables it reads: every sy
 the database with a unique clustered key (`sysschobjs`, `syscolpars`, `sysobjvalues`, `sysowners`,
 ...), each with its rowset's `row_count`. A table is read whole: `sysobjvalues` holds module source
 and `sysowners` contained users' password hashes. Whoever holds the backup can read all of it anyway;
-protecting a backup is encryption's job. A system table without such a key is refused by name. A
+protecting a backup is encryption's job. A system table without such a key, or one stored compressed, is refused by name. A
 value it cannot give (one stored off row past 64 MiB, or past 1 GiB of them in one call; bytes not of
 their type) is NULL, with one WARNING in `duckdb_logs` for the column, and its row is read.
 

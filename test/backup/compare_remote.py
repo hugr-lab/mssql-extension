@@ -68,15 +68,17 @@ class DuckDB:
         if run.returncode != 0:
             first = next((line for line in run.stderr.splitlines() if line.strip()), "(no message)")
             return "ERROR: " + self.mask(first)
-        # The CLI prints a WARNING (a fuzzy table's, spec 085 PR 5; a clamped max_threads) before the rows,
-        # in grey: kept apart, in self.warnings, so that the rows are the JSON after them and the warnings
-        # are compared too.
-        text = re.sub(r"\x1b\[[0-9;]*m", "", run.stdout)
-        lines = text.splitlines()
-        start = next((i for i, line in enumerate(lines) if line.startswith("[")), len(lines))
+        # The CLI prints a WARNING (a fuzzy table's, spec 085 PR 5; a clamped max_threads) in grey, where it
+        # is logged: before the rows for one from the bind, inside the JSON once its '[' is out for one from
+        # the init (the fuzzy check moved there, review of #591). Every grey block is kept apart, in
+        # self.warnings, so that the rows are the JSON left and the warnings are compared too.
+        grey = re.compile(r"\x1b\[90m(.*?)\x1b\[0*m", re.S)
+        blocks = grey.findall(run.stdout)
+        text = re.sub(r"\x1b\[[0-9;]*m", "", grey.sub("", run.stdout))
         # Sorted: a scan's tasks may warn in either order.
-        self.warnings = sorted(w for w in (line.strip() for line in lines[:start]) if w and w != "WARNING:")
-        out = "\n".join(lines[start:]).strip()
+        self.warnings = sorted(w for w in (line.strip() for b in blocks for line in b.splitlines())
+                               if w and w != "WARNING:")
+        out = text.strip()
         return json.loads(out) if out else []
 
 

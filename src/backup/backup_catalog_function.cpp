@@ -109,6 +109,13 @@ LogicalType TypeOf(const RowsetLayout &layout, const PhysicalColumn &c) {
 //! Why the reader does not serve a base table of this layout ("" when it does): _mssql_rid needs a
 //! unique clustered key whose stored bytes it keeps.
 std::string NotServed(const RowsetLayout &layout) {
+	if (layout.compression != 0) {
+		// Its records are CD records (spec 086), which the system-table reader does not take: read as FixedVar
+		// they failed the statement (oracle lane, 2017: syscsrowgroups, a record "a fixed part ending at 37401").
+		const char *form = layout.compression == 1 ? "ROW" : layout.compression == 2 ? "PAGE" : "columnstore";
+		return std::string("its rowset is ") + form + "-compressed (sysrowsets.cmprlevel " +
+			   std::to_string(layout.compression) + "), whose records the system-table reader does not read yet";
+	}
 	if (layout.columns.size() > MAX_SYSTEM_TABLE_COLUMNS) {
 		return "it is described with " + std::to_string(layout.columns.size()) +
 			   " physical columns, more than the reader takes";

@@ -677,6 +677,9 @@ RowsetLayout BootstrapTables::LayoutOf(int32_t object_id, const SysRowset &base)
 	RowsetLayout layout;
 	layout.table = name;
 	layout.rowset_id = base.rowset_id;
+	// Its records' form: a compressed rowset's are CD records, which a reader of FixedVar ones must not take
+	// for its own (a system base table's too: mssql_backup_catalog refuses one by name, NotServed).
+	layout.compression = base.compression;
 	// rscol_order_ is sorted by (rowset, rscolid): the rowset's columns are one range of it.
 	const std::vector<SysRsCol> &rc = rscols;
 	auto first = std::lower_bound(rscol_order_.begin(), rscol_order_.end(), base.rowset_id,
