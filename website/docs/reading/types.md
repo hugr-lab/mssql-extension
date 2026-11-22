@@ -208,6 +208,12 @@ catalog and a raw `mssql_scan()` alike, so they compose with the DuckDB `spatial
 - **Z and M are kept** (`POINT ZM (1 2 3 4)`); until this release the server's `.STAsBinary()` dropped
   them.
 - A `geography` value keeps the column's `OGC:CRS84` label whatever SRID it carries (4269, say).
+- **Writing into a `geography` column** takes a `GEOMETRY` with no CRS or with `OGC:CRS84`. One labelled
+  with another CRS (`GEOMETRY('OGC:CRS83')`, `GEOMETRY('EPSG:4326')`) is refused when the statement is
+  bound -- `Cannot cast GEOMETRY with CRS … to GEOMETRY with different CRS 'OGC:CRS84'` -- because DuckDB
+  casts to the column's type and reprojects nothing. Cast it to a plain `GEOMETRY` first
+  (`g::GEOMETRY`) to write its coordinates as they are, or reproject it with the `spatial` extension.
+  A `geometry` column has no CRS of its own and takes any.
 - **POINT EMPTY** reads as DuckDB's `POINT EMPTY`, also as a member of a `MULTIPOINT` or a collection
   (`MULTIPOINT (1 2, EMPTY)`), where the server's `STAsBinary()` writes `MULTIPOINT EMPTY` or leaves the
   member out.
