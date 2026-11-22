@@ -467,7 +467,17 @@ struct ServerIdentity {
 };
 
 //! How the server misbehaves, for the refusals.
-enum class ServerFault { None, WrongPacketType, ShortLength, CloseAfterHello, CloseInsidePayload, Silent };
+enum class ServerFault {
+	None,
+	WrongPacketType,
+	ShortLength,
+	CloseAfterHello,
+	CloseInsidePayload,
+	Silent,
+	// After a good handshake: TLS closed in order (close_notify), or the socket dropped without it.
+	ShutdownAfterHandshake,
+	DropAfterHandshake
+};
 
 //! What the server saw of the client's handshake packets.
 struct ServerSeen {
@@ -536,6 +546,8 @@ void ServeTls(int fd, const ServerIdentity &identity, ServerFault fault, size_t 
 			ReadUpTo(fd, 1);  // until the client gives up and closes
 			alive = false;
 			break;
+		case ServerFault::ShutdownAfterHandshake:
+		case ServerFault::DropAfterHandshake:
 		case ServerFault::None: {
 			// The flight in `reply_pieces` packets: OpenSSL then asks for records that straddle them.
 			const size_t pieces = flight.empty() ? 0 : std::min(reply_pieces, flight.size());
@@ -553,7 +565,10 @@ void ServeTls(int fd, const ServerIdentity &identity, ServerFault fault, size_t 
 		BIO *direct = BIO_new_socket(fd, BIO_NOCLOSE);
 		SSL_set_bio(ssl, direct, direct);
 		uint8_t buffer[4096];
-		for (;;) {
+		if (fault == ServerFault::ShutdownAfterHandshake) {
+			SSL_shutdown(ssl);
+		}
+		for (; fault == ServerFault::None;) {
 			const int n = SSL_read(ssl, buffer, sizeof(buffer));
 			if (n <= 0) {
 				break;
@@ -707,6 +722,108 @@ void TestEnableTls(const ServerIdentity &identity) {
 }
 
 //------------------------------------------------------------------------------
+// What the cases above leave: moves, SendPacket, the framing's bounds, failures after the dial
+//------------------------------------------------------------------------------
+void TestTheRest(const ServerIdentity &identity) {
+	std::cout << "Moves, SendPacket, failures after the dial" << std::endl;
+	{
+		// A moved socket is the connection; the one moved from is closed and owns nothing.
+		Pair pair;
+		TdsSocket moved(std::move(pair.socket));
+		Check(moved.IsConnected() && moved.GetPort() == pair.listener.port && !pair.socket.IsConnected() &&
+				  pair.socket.GetSocketFd() == -1,
+			  "a move-constructed socket has the connection, the source none");
+		const Bytes out = Pattern(10, 2);
+		Check(moved.Send(out) && ReadUpTo(pair.peer, 10) == out, "and sends on it");
+
+		// Move-assigned over a connected socket: that one's connection is closed first.
+		Pair other;
+		other.socket = std::move(moved);
+		Check(ReadUpTo(other.peer, 1).empty(), "move assignment closes the connection the target had");
+		Check(other.socket.IsConnected() && !moved.IsConnected() && other.socket.Send(out) &&
+				  ReadUpTo(pair.peer, 10) == out,
+			  "and the target is the moved connection");
+		TdsSocket &same = other.socket;
+		other.socket = std::move(same);
+		Check(other.socket.IsConnected(), "a socket moved onto itself keeps its connection");
+	}
+	{
+		Pair pair;
+		Check(pair.socket.GetTlsVersion().empty() && pair.socket.GetTlsCipherSuite().empty() &&
+				  !pair.socket.IsTlsEnabled(),
+			  "a plain connection reports no TLS version or cipher");
+
+		// SendPacket writes the packet's header and payload.
+		TdsPacket packet(duckdb::tds::PacketType::SQL_BATCH);
+		const Bytes payload = Pattern(33, 4);
+		packet.AppendPayload(payload);
+		packet.SetPacketId(9);
+		const bool sent = pair.socket.SendPacket(packet);
+		const Bytes wire = ReadUpTo(pair.peer, 8 + payload.size());
+		Check(sent && wire.size() == 41 && wire[0] == 0x01 && wire[1] == 0x01 && wire[2] == 0 && wire[3] == 41 &&
+				  wire[6] == 9 && Bytes(wire.begin() + 8, wire.end()) == payload,
+			  "SendPacket sends the header (type, end of message, length, id) and the payload");
+
+		// A framing below the smallest packet, or of no frames, falls back to the default packet and one frame.
+		pair.socket.SetReceiveFraming(100, 0);
+		const Bytes big = Pattern(6000, 5);
+		WriteAll(pair.peer, Packet(0x04, 0x01, big));
+		TdsPacket got;
+		Check(pair.socket.ReceivePacket(got, 2000) && got.GetPayload() == big,
+			  "a framing of 100 bytes x 0 frames still reads a packet larger than its read");
+
+		// A message cut off after its first packet, then a payload view on the closed connection.
+		WriteAll(pair.peer, Packet(0x04, 0x00, Pattern(10, 1)));
+		pair.ClosePeer();
+		Bytes message;
+		Check(!pair.socket.ReceiveMessage(message, 2000) && !pair.socket.IsConnected(),
+			  "a message whose last packet never comes is no message, the peer having closed");
+		const uint8_t *view = nullptr;
+		size_t view_length = 0;
+		Check(!pair.socket.ReceivePayloadView(view, view_length, 100), "and no payload view follows");
+	}
+	{
+		// Sending to a peer that is gone: the first bytes may still be taken; then the send fails.
+		Pair pair;
+		pair.ClosePeer();
+		const Bytes out = Pattern(65536, 1);
+		bool failed = false;
+		for (int i = 0; i < 100 && !failed; i++) {
+			failed = !pair.socket.Send(out);
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		}
+		Check(failed && !pair.socket.IsConnected() && pair.socket.GetLastError().find("Send failed: ") == 0,
+			  "a send to a peer that is gone fails and ends the connection (" + pair.socket.GetLastError() + ")");
+	}
+	TlsOptions trust;
+	trust.verify_certificate = false;
+	struct After {
+		ServerFault fault;
+		const char *what;
+	};
+	const After after[] = {{ServerFault::ShutdownAfterHandshake, "the server closing TLS after the handshake"},
+						   {ServerFault::DropAfterHandshake, "the server dropping the socket after the handshake"}};
+	for (const auto &a : after) {
+		Pair pair;
+		ServerSeen seen;
+		std::thread server(ServeTls, pair.peer, std::cref(identity), a.fault, size_t(1), TLS1_2_VERSION,
+						   std::ref(seen));
+		pair.peer = -1;
+		uint8_t packet_id = 1;
+		const bool enabled = pair.socket.EnableTls(packet_id, 3000, "", trust);
+		uint8_t buffer[64];
+		const ssize_t n = enabled ? pair.socket.Receive(buffer, sizeof(buffer), 3000) : 0;
+		const std::string error = pair.socket.GetLastError();
+		Check(enabled && n == -1 && !pair.socket.IsConnected() &&
+				  (error.find("Connection closed by server: ") == 0 || error.find("TLS receive failed: ") == 0),
+			  std::string(a.what) + " is -1 on the next read, the connection done (" + error + ")");
+		Note(a.what, error);
+		pair.socket.Close();
+		server.join();
+	}
+}
+
+//------------------------------------------------------------------------------
 // TlsHandshakeTransport on its own
 //------------------------------------------------------------------------------
 #ifndef TDS_SOCKET_TEST_NO_TRANSPORT
@@ -840,6 +957,7 @@ int main() {
 	TestPlainIo();
 	TestFraming();
 	TestEnableTls(identity);
+	TestTheRest(identity);
 #ifndef TDS_SOCKET_TEST_NO_TRANSPORT
 	TestTransport();
 #endif
