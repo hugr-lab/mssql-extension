@@ -90,6 +90,13 @@ bool PageStore::Read(uint16_t file, uint32_t page, Page &out) const {
 	return state == PageState::Present;
 }
 
+//! A copy that is all zeros, or one that names the page wanted: what a version-0 copy must be to be the
+//! page's own (IsPendingCopy and Fetch draw the line here, both by this; review of #591).
+static bool ZeroOrNamesItself(const PagePointer &want, const Page &copy) {
+	const bool zero = std::all_of(copy.bytes.begin(), copy.bytes.end(), [](uint8_t b) { return b == 0; });
+	return zero || copy.header.page_id == want;
+}
+
 bool PageStore::IsPendingCopy(const PagePointer &want, const Page &copy) const {
 	// Only a backup that ran under changes: a second pass is the server copying what changed during the
 	// first (load fixture, 2022). In a quiet backup -- one pass -- a live page whose copy is a zero
@@ -103,8 +110,7 @@ bool PageStore::IsPendingCopy(const PagePointer &want, const Page &copy) const {
 	}
 	// A unit with bytes in it that names another page (E6's F2 units carry a page id) is a misplaced
 	// copy, not a pending one: the id check below refuses it.
-	const bool zero = std::all_of(copy.bytes.begin(), copy.bytes.end(), [](uint8_t b) { return b == 0; });
-	return zero || copy.header.page_id == want;
+	return ZeroOrNamesItself(want, copy);
 }
 
 PageState PageStore::Fetch(uint16_t file, uint32_t page, Page &out) const {
@@ -135,8 +141,7 @@ PageState PageStore::Fetch(uint16_t file, uint32_t page, Page &out) const {
 		// All zeros, or a page caught being formatted that names itself (2017's 1:44592: version 0, its own
 		// id, an LSN and a flag set). A unit with bytes in it that names another page is a misplaced copy, a
 		// locator's fault: refused, never taken for Pending (as IsPendingCopy draws it; review of #591).
-		const bool zero = std::all_of(out.bytes.begin(), out.bytes.end(), [](uint8_t b) { return b == 0; });
-		if (out.header.version == 0 && (zero || out.header.page_id == want)) {
+		if (out.header.version == 0 && ZeroOrNamesItself(want, out)) {
 			throw ZeroCopyError(message, want);
 		}
 		throw FormatError(message);

@@ -51,74 +51,21 @@ public:
 		if (!summary_.last.IsZero() && summary_.last <= r.lsn) {
 			return;	 // LastLSN is the next record after the backup's (HEADERONLY): not the backup's
 		}
-		summary_.records++;
-		if (reached_.IsZero() || Newer(r.lsn, reached_)) {
-			reached_ = r.lsn;
-			reached_block_size_ = r.block_size;
-		}
-		if (r.lsn <= summary_.checkpoint && summary_.checkpoint <= r.lsn) {
-			saw_checkpoint_ = true;
-		}
-		if (r.op == log_op::FORMAT_PAGE && r.has_page) {
-			summary_.formatted.insert(static_cast<uint64_t>(r.file) << 32 | r.page);
-		}
-		FuzzySummary::Transaction *t = nullptr;
-		if (r.transaction != 0) {
-			t = &summary_.transactions[r.transaction];
-			t->records++;
-		}
-		if (t && r.op == log_op::BEGIN_XACT) {
-			t->state = FuzzySummary::State::Open;
-			t->begin = r.lsn;
-			// Its name, the first element: UTF-16 (fn_dblog's Transaction Name). A record whose contents do not
-			// parse keeps none: the name is for reading, never for a flag.
-			try {
-				const auto elements = RowLogElements(r, "a BEGIN_XACT");
-				if (!elements.empty()) {
-					t->name = Utf16LeToUtf8(elements[0].data, elements[0].length);
-				}
-			} catch (FormatError &) {
-			}
+		NoteRecord(r);
+		if (r.transaction == 0) {
+			// A record of no transaction (id 0) is the system's own work on the page, which no transaction of
+			// the database commits or undoes: not a row change of the flags.
 			return;
 		}
-		if (t && (r.op == log_op::COMMIT_XACT || r.op == log_op::ABORT_XACT)) {
-			t->state = r.op == log_op::COMMIT_XACT ? FuzzySummary::State::Committed : FuzzySummary::State::RolledBack;
-			t->end = r.lsn;
-			return;
-		}
-		// A record of no transaction (id 0) is the system's own work on the page, which no transaction of the
-		// database commits or undoes: not a row change of the flags.
-		if (!t || !IsRowOperation(r.op) || !IsRowContext(r.context) || !r.has_allocation_unit || !r.has_page) {
-			return;
-		}
-		{
-			t->row_operations++;
-			t->after_checkpoint = t->after_checkpoint || Newer(r.lsn, summary_.checkpoint);
-		}
-		const uint64_t page = (static_cast<uint64_t>(r.file) << 32) | r.page;
-		auto &changes = changes_[r.allocation_unit][page];
-		// The page's change by this transaction, found by its index (review of #591: a linear search of the
-		// page's changes was quadratic in the short transactions of a hot page).
-		const ChangeKey key{r.allocation_unit, page, r.transaction};
-		auto at = index_.find(key);
-		if (at != index_.end()) {
-			auto &c = changes[at->second];
-			if (Newer(r.lsn, c.newest)) {
-				c.newest = r.lsn;
-			}
-			if (Newer(c.oldest, r.lsn)) {
-				c.oldest = r.lsn;
-			}
-		} else {
-			FuzzySummary::Change c;
-			c.transaction = r.transaction;
-			c.oldest = r.lsn;
-			c.newest = r.lsn;
-			index_.emplace(key, changes.size());
-			changes.push_back(c);
-		}
-		if (Newer(r.lsn, summary_.checkpoint)) {
-			after_checkpoint_.insert(r.transaction);
+		auto &t = summary_.transactions[r.transaction];
+		t.records++;
+		if (r.op == log_op::BEGIN_XACT) {
+			Begin(t, r);
+		} else if (r.op == log_op::COMMIT_XACT || r.op == log_op::ABORT_XACT) {
+			t.state = r.op == log_op::COMMIT_XACT ? FuzzySummary::State::Committed : FuzzySummary::State::RolledBack;
+			t.end = r.lsn;
+		} else if (IsRowChange(r)) {
+			NoteRowChange(t, r);
 		}
 	}
 
@@ -176,6 +123,73 @@ public:
 	}
 
 private:
+	//! What every record of the backup counts for, whatever it is: the count, the last record read, the
+	//! checkpoint's own record, a formatted page.
+	void NoteRecord(const LogRecord &r) {
+		summary_.records++;
+		if (reached_.IsZero() || Newer(r.lsn, reached_)) {
+			reached_ = r.lsn;
+			reached_block_size_ = r.block_size;
+		}
+		if (r.lsn <= summary_.checkpoint && summary_.checkpoint <= r.lsn) {
+			saw_checkpoint_ = true;
+		}
+		if (r.op == log_op::FORMAT_PAGE && r.has_page) {
+			summary_.formatted.insert(static_cast<uint64_t>(r.file) << 32 | r.page);
+		}
+	}
+
+	static void Begin(FuzzySummary::Transaction &t, const LogRecord &r) {
+		t.state = FuzzySummary::State::Open;
+		t.begin = r.lsn;
+		// Its name, the first element: UTF-16 (fn_dblog's Transaction Name). A record whose contents do not
+		// parse keeps none: the name is for reading, never for a flag.
+		try {
+			const auto elements = RowLogElements(r, "a BEGIN_XACT");
+			if (!elements.empty()) {
+				t.name = Utf16LeToUtf8(elements[0].data, elements[0].length);
+			}
+		} catch (FormatError &) {
+		}
+	}
+
+	static bool IsRowChange(const LogRecord &r) {
+		return IsRowOperation(r.op) && IsRowContext(r.context) && r.has_allocation_unit && r.has_page;
+	}
+
+	void NoteRowChange(FuzzySummary::Transaction &t, const LogRecord &r) {
+		t.row_operations++;
+		t.after_checkpoint = t.after_checkpoint || Newer(r.lsn, summary_.checkpoint);
+		const uint64_t page = (static_cast<uint64_t>(r.file) << 32) | r.page;
+		auto &changes = changes_[r.allocation_unit][page];
+		// The page's change by this transaction, found by its index (review of #591: a linear search of the
+		// page's changes was quadratic in the short transactions of a hot page).
+		const ChangeKey key{r.allocation_unit, page, r.transaction};
+		auto at = index_.find(key);
+		if (at != index_.end()) {
+			Widen(changes[at->second], r.lsn);
+		} else {
+			FuzzySummary::Change c;
+			c.transaction = r.transaction;
+			c.oldest = r.lsn;
+			c.newest = r.lsn;
+			index_.emplace(key, changes.size());
+			changes.push_back(c);
+		}
+		if (Newer(r.lsn, summary_.checkpoint)) {
+			after_checkpoint_.insert(r.transaction);
+		}
+	}
+
+	static void Widen(FuzzySummary::Change &c, const Lsn &lsn) {
+		if (Newer(lsn, c.newest)) {
+			c.newest = lsn;
+		}
+		if (Newer(c.oldest, lsn)) {
+			c.oldest = lsn;
+		}
+	}
+
 	FuzzySummary summary_;
 	std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::vector<FuzzySummary::Change>>> changes_;
 	std::unordered_set<uint64_t> after_checkpoint_;

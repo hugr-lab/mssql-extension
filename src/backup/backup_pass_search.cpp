@@ -431,13 +431,122 @@ bool PassSearch::Find(const ExtentId &extent, uint64_t &position) {
 	return false;
 }
 
+//! A sample was found below `extent`, in its file.
+static bool IsBelowInFile(const PassSample &below, const ExtentId &extent) {
+	return below.position != UINT64_MAX && below.extent.file == extent.file && extent.extent > below.extent.extent;
+}
+
+void PassSearch::CountRead() {
+	std::lock_guard<std::mutex> guard(lock_);
+	reads_++;
+}
+
+bool PassSearch::KnownEmpty(uint64_t position) {
+	// A group a search found empty is not read again (KeepEmpty).
+	std::lock_guard<std::mutex> guard(lock_);
+	auto span = empty_.upper_bound(position);
+	return span != empty_.begin() && std::prev(span)->second > position;
+}
+
+bool PassSearch::Guess(const ExtentId &extent, const PassSample &below, Search &search, uint64_t &position) {
+	if (!medium_->GroupPositions() || !IsBelowInFile(below, extent)) {
+		return false;
+	}
+	const uint64_t apart = extent.extent - below.extent.extent;
+	const uint64_t guess = below.position + apart;
+	const bool known_empty = KnownEmpty(guess);
+	if (guess < search.from || guess >= search.to || known_empty) {
+		return false;
+	}
+	PassSample sample;
+	uint64_t resumed = 0;
+	const bool got = medium_->Probe(guess, guess + 1, sample, resumed);
+	CountRead();
+	if (!got) {
+		KeepEmpty(guess, guess + 1);
+		return false;
+	}
+	Keep(sample);
+	if (sample.extent == extent) {
+		position = sample.position;
+		return true;
+	}
+	if (extent < sample.extent) {
+		search.to = sample.position;
+	} else {
+		search.from = sample.next;
+	}
+	return false;
+}
+
+bool PassSearch::ReadWindow(const ExtentId &extent, const Search &search, uint64_t &position) {
+	std::vector<PassSample> window;
+	medium_->Window(search.from, search.to, window);
+	CountRead();
+	// The window read every group of [from, to): the groups between those that name an extent
+	// are empty, so each sample's `next` (and that of the sample ending at `from`) skips them,
+	// and a later search for an extent in such a gap reads nothing.
+	for (size_t i = 0; i < window.size(); i++) {
+		window[i].next = i + 1 < window.size() ? window[i + 1].position : search.to;
+	}
+	bool found = false;
+	for (const auto &sample : window) {
+		Keep(sample);
+		if (sample.extent == extent) {
+			position = sample.position;
+			found = true;
+		}
+	}
+	KeepEmpty(search.from, window.empty() ? search.to : window.front().position);
+	return found;
+}
+
+bool PassSearch::ProbeOnce(const ExtentId &extent, Search &search, uint64_t &position) {
+	uint64_t mid = search.from + (search.to - search.from) / 2;
+	if (search.galloping) {
+		mid = search.from + std::min(search.step, (search.to - search.from) / 2);
+		search.step = search.step > UINT64_MAX / 2 ? search.step : search.step * 2;
+	}
+	PassSample sample;
+	uint64_t resumed = 0;
+	const bool got = medium_->Probe(mid, search.to, sample, resumed);
+	CountRead();
+	if (!got && resumed >= search.to) {
+		// The probe settled past the interval (fewer than four blocks start in [mid, to)): read
+		// what is left at once.
+		search.window_rest = true;
+		return false;
+	}
+	if (!got) {
+		search.galloping = false;
+		// Nothing from where the probe settled (`mid` in a file; the block a resync found, past
+		// the blocks it passed over, which stay in the interval) to `to` names an extent.
+		KeepEmpty(resumed, search.to);
+		search.to = resumed;
+		return false;
+	}
+	// The groups between where the probe settled and the one it found name no extent.
+	KeepEmpty(resumed, sample.position);
+	Keep(sample);
+	if (sample.extent == extent) {
+		position = sample.position;
+		return true;
+	}
+	if (sample.extent < extent) {
+		search.from = sample.next;
+	} else {
+		search.galloping = false;
+		search.to = resumed;
+	}
+	return false;
+}
+
 bool PassSearch::FindLocked(const ExtentId &extent, uint64_t &position) {
-	uint64_t from = 0;
-	uint64_t to = 0;
+	Search search;
 	PassSample below;
 	{
 		std::lock_guard<std::mutex> guard(lock_);
-		if (Bounds(extent, from, to, position, &below)) {
+		if (Bounds(extent, search.from, search.to, position, &below)) {
 			return true;
 		}
 	}
@@ -448,115 +557,24 @@ bool PassSearch::FindLocked(const ExtentId &extent, uint64_t &position) {
 	// side of it and the search goes on. Without it, tasks scanning units ahead of the samples the
 	// others have found gallop from those samples through groups of the others' units (measured on
 	// 16 tasks: 4.3 decodes a block; PR 2e).
-	if (medium_->GroupPositions() && below.position != UINT64_MAX && below.extent.file == extent.file &&
-		extent.extent > below.extent.extent) {
-		const uint64_t apart = extent.extent - below.extent.extent;
-		const uint64_t guess = below.position + apart;
-		bool known_empty = false;
-		{
-			// A group a search found empty is not read again (KeepEmpty).
-			std::lock_guard<std::mutex> guard(lock_);
-			auto span = empty_.upper_bound(guess);
-			known_empty = span != empty_.begin() && std::prev(span)->second > guess;
-		}
-		if (guess >= from && guess < to && !known_empty) {
-			PassSample sample;
-			uint64_t resumed = 0;
-			const bool got = medium_->Probe(guess, guess + 1, sample, resumed);
-			{
-				std::lock_guard<std::mutex> guard(lock_);
-				reads_++;
-			}
-			if (!got) {
-				KeepEmpty(guess, guess + 1);
-			} else {
-				Keep(sample);
-				if (sample.extent == extent) {
-					position = sample.position;
-					return true;
-				}
-				if (extent < sample.extent) {
-					to = sample.position;
-				} else {
-					from = sample.next;
-				}
-			}
-		}
+	if (Guess(extent, below, search, position)) {
+		return true;
 	}
-	bool window_rest = false;
 	// Galloping until a probe lands past the target; from then on the interval brackets it.
-	bool galloping = strategy_ == Strategy::Gallop;
-	uint64_t step = 1;
+	search.galloping = strategy_ == Strategy::Gallop;
 	for (;;) {
 		{
 			std::lock_guard<std::mutex> guard(lock_);
-			SkipEmptyLocked(from, to);
+			SkipEmptyLocked(search.from, search.to);
 		}
-		if (from >= to) {
+		if (search.from >= search.to) {
 			return false;
 		}
-		if (window_rest || to - from <= medium_->WindowSpan()) {
-			std::vector<PassSample> window;
-			medium_->Window(from, to, window);
-			{
-				std::lock_guard<std::mutex> guard(lock_);
-				reads_++;
-			}
-			// The window read every group of [from, to): the groups between those that name an extent
-			// are empty, so each sample's `next` (and that of the sample ending at `from`) skips them,
-			// and a later search for an extent in such a gap reads nothing.
-			for (size_t i = 0; i < window.size(); i++) {
-				window[i].next = i + 1 < window.size() ? window[i + 1].position : to;
-			}
-			bool found = false;
-			for (const auto &sample : window) {
-				Keep(sample);
-				if (sample.extent == extent) {
-					position = sample.position;
-					found = true;
-				}
-			}
-			KeepEmpty(from, window.empty() ? to : window.front().position);
-			return found;
+		if (search.window_rest || search.to - search.from <= medium_->WindowSpan()) {
+			return ReadWindow(extent, search, position);
 		}
-		uint64_t mid = from + (to - from) / 2;
-		if (galloping) {
-			mid = from + std::min(step, (to - from) / 2);
-			step = step > UINT64_MAX / 2 ? step : step * 2;
-		}
-		PassSample sample;
-		uint64_t resumed = 0;
-		const bool got = medium_->Probe(mid, to, sample, resumed);
-		{
-			std::lock_guard<std::mutex> guard(lock_);
-			reads_++;
-		}
-		if (!got && resumed >= to) {
-			// The probe settled past the interval (fewer than four blocks start in [mid, to)): read
-			// what is left at once.
-			window_rest = true;
-			continue;
-		}
-		if (!got) {
-			galloping = false;
-			// Nothing from where the probe settled (`mid` in a file; the block a resync found, past
-			// the blocks it passed over, which stay in the interval) to `to` names an extent.
-			KeepEmpty(resumed, to);
-			to = resumed;
-			continue;
-		}
-		// The groups between where the probe settled and the one it found name no extent.
-		KeepEmpty(resumed, sample.position);
-		Keep(sample);
-		if (sample.extent == extent) {
-			position = sample.position;
+		if (ProbeOnce(extent, search, position)) {
 			return true;
-		}
-		if (sample.extent < extent) {
-			from = sample.next;
-		} else {
-			galloping = false;
-			to = resumed;
 		}
 	}
 }
