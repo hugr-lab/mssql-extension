@@ -51,7 +51,7 @@ virtual_column_map_t ScanVirtualColumns(const std::vector<UnreadColumn> &unread)
 //! plan deserialized finds it by, whatever a refresh renumbers meanwhile.
 TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &entry,
 								   std::shared_ptr<const AttachedBackup> attached, const std::string &key,
-								   const std::string &schema, const std::string &table,
+								   const std::string &schema, const std::string &table, const std::string &fuzzy,
 								   unique_ptr<FunctionData> &bind_data);
 
 void RegisterBackupScanFunction(ExtensionLoader &loader);

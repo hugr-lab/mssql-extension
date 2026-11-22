@@ -18,6 +18,7 @@
 #include "backup/backup_catalog_model.hpp"
 #include "backup/backup_container.hpp"
 #include "backup/backup_files.hpp"
+#include "backup/backup_fuzzy.hpp"
 #include "backup/backup_history.hpp"
 #include "backup/backup_mtf.hpp"
 #include "backup/backup_open_pass.hpp"
@@ -178,6 +179,13 @@ public:
 	const shared_ptr<OpenedBackup> &Base() const {
 		return base_;
 	}
+	//! Stage 5 (D11, task 27): what the backup's log tail says, read now when it is not -- family 1's
+	//! MQTL streams (the tail is in that family only, E2§6), through the statement's files bound to the
+	//! thread -- and kept. Read outside the entry's locks; a second statement waits for the first's read in
+	//! 100 ms slices that ask `context` for an interrupt. A FormatError naming the backup when the tail is
+	//! not a log's (asked again, it is read again). Meaningful for a data backup (a log backup's records
+	//! are its whole content, not a tail). `built`: whether this call read it.
+	const FuzzySummary &Fuzzy(ClientContext &context, bool *built = nullptr) const;
 
 	static std::string ObjectType() {
 		return "mssql_backup_opened";
@@ -199,6 +207,10 @@ private:
 	std::unique_ptr<OpenedPages> pages_;
 	std::unique_ptr<BootstrapTables> tables_;
 	mutable UnitPageCache unit_pages_;
+	mutable std::mutex fuzzy_lock_;
+	mutable std::condition_variable fuzzy_built_;
+	mutable bool fuzzy_building_ = false;
+	mutable std::unique_ptr<FuzzySummary> fuzzy_;
 	std::atomic<size_t> estimate_{0};
 };
 
@@ -214,6 +226,14 @@ struct OpenedForStatement {
 	//! with no version tag).
 	std::string cache_key;
 };
+
+//! `backup`'s log tail (stage 5, OpenedBackup::Fuzzy), read through the statement's files bound to the
+//! thread; when it cannot be read, none, and one WARNING in duckdb_logs naming `function` and why: a
+//! listing's status columns are NULL then, its other columns read (D13: refused at the narrowest scope).
+const FuzzySummary *TailOrWarn(ClientContext &context, const OpenedForStatement &opened, const char *function);
+//! `opened`'s log tail (OpenedBackup::Fuzzy); a summary just read is weighed into its cache entry (put
+//! again when its measure changed), as the other stages are.
+const FuzzySummary &StatementTail(ClientContext &context, const OpenedForStatement &opened);
 
 //! A backup attached as a catalog (ATTACH … (TYPE mssql_backup), task 23): what its ATTACH opened, held
 //! for its life -- the opened backup (the ObjectCache's entry, which stays alive while attached even if
@@ -278,6 +298,10 @@ void AddVersionParameters(TableFunction &function);
 //! key when pinned), its default version when none. [the catalog layer]
 std::shared_ptr<const AttachedBackup> FindAttachedBackup(ClientContext &context, const std::string &name,
 														 const BackupAt &at = BackupAt());
+//! The `fuzzy` ATTACH option of the backup attached as `name` ("" when none, or `name` is no such
+//! catalog): what a file function named by it does with a table that is not consistent, after its own
+//! fuzzy := and before the setting (review of #591). [the catalog layer]
+std::string AttachedFuzzy(ClientContext &context, const std::string &name);
 //! The key a version of an attached backup's history is pinned by (BackupAt::key): its backups and their
 //! files. A caller that resolved numbers in one `history` (the catalog's versions it read) opens them by
 //! these keys, so a refresh between two opens cannot renumber one of them (review of #580's merge).

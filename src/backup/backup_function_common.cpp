@@ -2,10 +2,13 @@
 
 #include "backup/backup_bytes.hpp"
 #include "backup/backup_collation.hpp"
+#include "backup/backup_files.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "codec/code_page/code_page.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "tds/encoding/datetime_encoding.hpp"
 #include "utf8proc_wrapper.hpp"
 
@@ -58,6 +61,114 @@ vector<std::string> DiffPathsOf(const named_argument_map_t &named, const char *f
 void AddDiffParameter(TableFunction &function) {
 	// VARCHAR or LIST(VARCHAR), as the path: one file, a glob, or a differential's stripes.
 	function.GetSignature().AddKeywordOnly("diff", LogicalType::ANY, Value());
+}
+
+FuzzyMode FuzzyModeOf(ClientContext &context, const std::string &given, const char *function) {
+	std::string text = given;
+	if (text.empty()) {
+		Value value;
+		if (context.TryGetCurrentSetting("mssql_backup_fuzzy", value) && !value.IsNull()) {
+			text = value.ToString();
+		}
+	}
+	FuzzyMode mode = FuzzyMode::Warn;
+	if (!text.empty() && !ParseFuzzyMode(text, mode)) {
+		throw InvalidInputException("%s: fuzzy '%s' is not 'warn', 'error' or 'ignore'", function, text);
+	}
+	return mode;
+}
+
+void AddFuzzyParameter(TableFunction &function) {
+	function.GetSignature().AddKeywordOnly("fuzzy", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
+}
+
+std::string FuzzyParameterOf(const named_argument_map_t &named, const char *function) {
+	auto it = named.find("fuzzy");
+	if (it == named.end() || it->second.IsNull()) {
+		return std::string();
+	}
+	FuzzyMode mode;
+	const std::string text = it->second.ToString();
+	if (!ParseFuzzyMode(text, mode)) {
+		throw InvalidInputException("%s: fuzzy '%s' is not 'warn', 'error' or 'ignore'", function, text);
+	}
+	return text;
+}
+
+TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
+						  const CatalogTable &table, FuzzyMode mode, const char *function) {
+	return CheckFuzzyUnits(context, tail, pages, BaseUnitsOf(table), table.schema_name + "." + table.name, mode,
+						   function);
+}
+
+TableFuzziness CheckFuzzyUnits(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
+							   const std::vector<uint64_t> &units, const std::string &name, FuzzyMode mode,
+							   const char *function) {
+	if (mode == FuzzyMode::Ignore) {
+		return TableFuzziness();
+	}
+	const TableFuzziness fuzzy = FuzzinessOf(tail, units, pages);
+	if (fuzzy.Consistent()) {
+		return fuzzy;
+	}
+	const std::string what = StringUtil::Format(
+		"%s is %s in this backup: %u transaction(s) open at its LastLSN changed it (their changes may show), "
+		"%u finished transaction(s) changed pages after their copy (those changes are missing); its rows are "
+		"each page's as the backup copied it",
+		name, fuzzy.Status(), fuzzy.open_transactions, fuzzy.stale_transactions);
+	if (mode == FuzzyMode::Error) {
+		throw InvalidInputException(
+			"%s: %s. Refused (fuzzy := 'error'); fuzzy := 'warn' reads it anyway, as SQL Server would before "
+			"recovery (spec 090 replays the tail)",
+			function, what);
+	}
+	DUCKDB_LOG_WARNING(context, "%s: %s (fuzzy := 'error' refuses it)", function, what);
+	return fuzzy;
+}
+
+void CheckStatementFuzzy(ClientContext &context, const OpenedCatalog &catalog, const std::vector<uint64_t> &units,
+						 const std::string &name, const std::string &given, FuzzyMode mode, const char *function) {
+	if (mode == FuzzyMode::Ignore) {
+		return;
+	}
+	BindFiles bound(catalog.Binding());
+	const FuzzySummary *tail = nullptr;
+	try {
+		tail = &StatementTail(context, catalog.opened);
+	} catch (FormatError &e) {
+		// The status unknown: refused when the call asks for a consistent table, else said and read.
+		if (mode == FuzzyMode::Error) {
+			throw InvalidInputException(
+				"%s: %s: the backup's log tail is not read, so whether the table is consistent is unknown "
+				"(fuzzy := 'error'): %s",
+				function, given, e.what());
+		}
+		DUCKDB_LOG_WARNING(context, "%s: %s: the backup's log tail is not read, its fuzzy status unknown: %s", function,
+						   given, e.what());
+	}
+	if (tail) {
+		CheckFuzzyUnits(context, *tail, *catalog.pages->store, units, name, mode, function);
+	}
+}
+
+void ThrowPendingOrFormat(ClientContext &context, const OpenedForStatement &opened, const ZeroCopyError &e) {
+	const FuzzySummary *tail = nullptr;
+	std::string why;
+	try {
+		tail = &StatementTail(context, opened);
+	} catch (FormatError &t) {
+		why = std::string("; the backup's log tail is not read: ") + t.what();
+	}
+	if (!tail || !FormattedInTail(*tail, e.page.file, e.page.page)) {
+		throw FormatError(std::string(e.what()) +
+						  (tail ? "; the backup's log tail formats no such page (" +
+									  std::to_string(tail->formatted.size()) + " pages formatted in it)"
+								: why));
+	}
+	throw PendingPageError("backup: page " + e.page.ToString() +
+						   " became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
+						   "backup), which is not replayed yet (a zero copy in a backup of one data pass, the page "
+						   "formatted in its tail)");
 }
 
 Value RecordDatetimeValue(const std::string &record_form) {
@@ -148,11 +259,17 @@ void Require(const SqlVariant &v, size_t size, const std::string &what) {
 	}
 }
 
-}  // namespace
+const uint8_t *VariantBytes(const SqlVariant &v) {
+	return reinterpret_cast<const uint8_t *>(v.value.data());
+}
 
-Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
-	const uint8_t *b = reinterpret_cast<const uint8_t *>(v.value.data());
-	const ByteReader r(b, v.value.size(), what.c_str());
+//! A sql_variant's value by type family (D6), one reader per family: `SqlVariantValue` was a single
+//! switch of 178 lines over 24 xtypes. Every refusal below is the one that switch raised, word for
+//! word -- the messages name the column and the tests quote them -- and each reader takes the same
+//! arguments so the table beneath can hold them all. A reader is reached only through that table, so
+//! one that reads two types tells them apart with a single test and has no refusal of its own.
+Value VariantInteger(const SqlVariant &v, const std::string &what) {
+	const ByteReader r(VariantBytes(v), v.value.size(), what.c_str());
 	switch (v.xtype) {
 	case 48:  // tinyint
 		Require(v, 1, what);
@@ -166,170 +283,305 @@ Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
 	case 127:  // bigint
 		Require(v, 8, what);
 		return Value::BIGINT(r.I64(0));
-	case 104:  // bit
+	default:  // bit (104)
 		Require(v, 1, what);
 		return Value::BOOLEAN(r.U8(0) != 0);
-	case 59: {	// real
+	}
+}
+
+Value VariantApproximate(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
+	if (v.xtype == 59) {  // real
 		Require(v, 4, what);
 		float f;
 		std::memcpy(&f, b, 4);
 		return Value::FLOAT(f);
 	}
-	case 62: {	// float
-		Require(v, 8, what);
-		double d;
-		std::memcpy(&d, b, 8);
-		return Value::DOUBLE(d);
-	}
-	case 60:  // money: i64 of 1/10,000
+	Require(v, 8, what);  // float (62)
+	double d;
+	std::memcpy(&d, b, 8);
+	return Value::DOUBLE(d);
+}
+
+Value VariantMoney(const SqlVariant &v, const std::string &what) {
+	const ByteReader r(VariantBytes(v), v.value.size(), what.c_str());
+	if (v.xtype == 60) {  // money: i64 of 1/10,000
 		Require(v, 8, what);
 		return Value::DECIMAL(r.I64(0), 19, 4);
-	case 122:  // smallmoney: i32 of 1/10,000
-		Require(v, 4, what);
-		return Value::DECIMAL(static_cast<int64_t>(r.I32(0)), 10, 4);
-	case 106:	 // decimal
-	case 108: {	 // numeric: a sign byte (1 positive), then the magnitude, little-endian
-		if (v.value.size() < 2 || v.value.size() > 17 || v.precision < 1 || v.precision > 38 || v.scale > v.precision) {
-			throw FormatError("backup: " + what + " is a decimal of " + std::to_string(v.value.size()) +
-							  " bytes, precision " + std::to_string(v.precision) + ", scale " +
-							  std::to_string(v.scale));
-		}
-		const size_t n = v.value.size() - 1;
-		hugeint_t magnitude(0);
-		magnitude.lower = LittleEndian(b + 1, std::min<size_t>(n, 8));
-		magnitude.upper = n > 8 ? static_cast<int64_t>(LittleEndian(b + 9, n - 8)) : 0;
-		if (magnitude.upper < 0) {
-			throw FormatError("backup: " + what + " is a decimal past 38 digits");
-		}
-		// The magnitude must fit the precision: a larger one is a crafted value, refused (D13), never cut.
-		if (magnitude >= Hugeint::POWERS_OF_TEN[v.precision]) {
-			throw FormatError("backup: " + what + " is a decimal(" + std::to_string(v.precision) + ", " +
-							  std::to_string(v.scale) + ") whose value has more than " + std::to_string(v.precision) +
-							  " digits");
-		}
-		const hugeint_t value = b[0] == 1 ? magnitude : -magnitude;
-		if (v.precision <= 18) {
-			return Value::DECIMAL(Hugeint::Cast<int64_t>(value), v.precision, v.scale);
-		}
-		return Value::DECIMAL(value, v.precision, v.scale);
 	}
-	case 40:  // date: 3 bytes of days since 0001-01-01
-		Require(v, 3, what);
-		return Value::DATE(date_t(static_cast<int32_t>(Days(b, what))));
-	case 41: {	// time: units of 10^-scale s since midnight
-		if (v.scale > 7) {
-			throw FormatError("backup: " + what + " is a time of scale " + std::to_string(v.scale));
+	Require(v, 4, what);  // smallmoney (122): i32 of 1/10,000
+	return Value::DECIMAL(static_cast<int64_t>(r.I32(0)), 10, 4);
+}
+
+//! decimal / numeric: a sign byte (1 positive), then the magnitude, little-endian.
+Value VariantDecimal(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
+	if (v.value.size() < 2 || v.value.size() > 17 || v.precision < 1 || v.precision > 38 || v.scale > v.precision) {
+		throw FormatError("backup: " + what + " is a decimal of " + std::to_string(v.value.size()) +
+						  " bytes, precision " + std::to_string(v.precision) + ", scale " + std::to_string(v.scale));
+	}
+	const size_t n = v.value.size() - 1;
+	hugeint_t magnitude(0);
+	magnitude.lower = LittleEndian(b + 1, std::min<size_t>(n, 8));
+	magnitude.upper = n > 8 ? static_cast<int64_t>(LittleEndian(b + 9, n - 8)) : 0;
+	if (magnitude.upper < 0) {
+		throw FormatError("backup: " + what + " is a decimal past 38 digits");
+	}
+	// The magnitude must fit the precision: a larger one is a crafted value, refused (D13), never cut.
+	if (magnitude >= Hugeint::POWERS_OF_TEN[v.precision]) {
+		throw FormatError("backup: " + what + " is a decimal(" + std::to_string(v.precision) + ", " +
+						  std::to_string(v.scale) + ") whose value has more than " + std::to_string(v.precision) +
+						  " digits");
+	}
+	const hugeint_t value = b[0] == 1 ? magnitude : -magnitude;
+	if (v.precision <= 18) {
+		return Value::DECIMAL(Hugeint::Cast<int64_t>(value), v.precision, v.scale);
+	}
+	return Value::DECIMAL(value, v.precision, v.scale);
+}
+
+//! date: 3 bytes of days since 0001-01-01.
+Value VariantDate(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
+	Require(v, 3, what);
+	return Value::DATE(date_t(static_cast<int32_t>(Days(b, what))));
+}
+
+//! time: units of 10^-scale s since midnight.
+Value VariantTime(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
+	if (v.scale > 7) {
+		throw FormatError("backup: " + what + " is a time of scale " + std::to_string(v.scale));
+	}
+	Require(v, TimeBytes(v.scale), what);
+	const int64_t units = TimeUnits(b, v.value.size(), v.scale, what);
+	if (v.scale == 7 && units % 10) {
+		throw FormatError("backup: " + what + " is a time(7) with a 100 ns digit, which a TIME cannot hold");
+	}
+	const int64_t micros = v.scale <= 6 ? units * Pow10(6 - v.scale) : units / 10;
+	return Value::TIME(dtime_t(micros));
+}
+
+//! datetime2: the time, then 3 bytes of days since 0001-01-01. datetimeoffset: the UTC time and
+//! date, then i16 minutes of offset.
+Value VariantDatetime2(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
+	if (v.scale > 7) {
+		throw FormatError("backup: " + what + " is of scale " + std::to_string(v.scale));
+	}
+	const size_t time_bytes = TimeBytes(v.scale);
+	Require(v, time_bytes + 3 + (v.xtype == 43 ? 2 : 0), what);
+	const int64_t units = TimeUnits(b, time_bytes, v.scale, what);
+	const int64_t days = Days(b + time_bytes, what);
+	if (v.xtype == 43) {
+		const int16_t offset = static_cast<int16_t>(LittleEndian(b + time_bytes + 3, 2));
+		if (offset < -840 || offset > 840) {
+			throw FormatError("backup: " + what + " is a datetimeoffset of offset " + std::to_string(offset) +
+							  " minutes, outside -14:00..+14:00");
 		}
-		Require(v, TimeBytes(v.scale), what);
-		const int64_t units = TimeUnits(b, v.value.size(), v.scale, what);
 		if (v.scale == 7 && units % 10) {
-			throw FormatError("backup: " + what + " is a time(7) with a 100 ns digit, which a TIME cannot hold");
-		}
-		const int64_t micros = v.scale <= 6 ? units * Pow10(6 - v.scale) : units / 10;
-		return Value::TIME(dtime_t(micros));
-	}
-	case 42:	// datetime2: the time, then 3 bytes of days since 0001-01-01
-	case 43: {	// datetimeoffset: the UTC time and date, then i16 minutes of offset
-		if (v.scale > 7) {
-			throw FormatError("backup: " + what + " is of scale " + std::to_string(v.scale));
-		}
-		const size_t time_bytes = TimeBytes(v.scale);
-		Require(v, time_bytes + 3 + (v.xtype == 43 ? 2 : 0), what);
-		const int64_t units = TimeUnits(b, time_bytes, v.scale, what);
-		const int64_t days = Days(b + time_bytes, what);
-		if (v.xtype == 43) {
-			const int16_t offset = static_cast<int16_t>(LittleEndian(b + time_bytes + 3, 2));
-			if (offset < -840 || offset > 840) {
-				throw FormatError("backup: " + what + " is a datetimeoffset of offset " + std::to_string(offset) +
-								  " minutes, outside -14:00..+14:00");
-			}
-			if (v.scale == 7 && units % 10) {
-				throw FormatError("backup: " + what +
-								  " is a datetimeoffset(7) with a 100 ns digit, which a TIMESTAMP_TZ cannot hold");
-			}
-		}
-		// TIMESTAMP_NS holds about 1677-2262 (int64 nanoseconds): a datetime2(7) value past it -- a
-		// 9999-12-31 sentinel, 0001-01-01 -- is refused by name (D13), where TYPE mssql's read gives NULL.
-		if (v.xtype == 42 && v.scale == 7 && (days > 106750 || days < -106751)) {
 			throw FormatError("backup: " + what +
-							  " is a datetime2(7) outside 1677-2262, which a TIMESTAMP_NS "
-							  "cannot hold");
+							  " is a datetimeoffset(7) with a 100 ns digit, which a TIMESTAMP_TZ cannot hold");
 		}
-		const int64_t micros_of_day = v.scale <= 6 ? units * Pow10(6 - v.scale) : units / 10;
-		if (v.xtype == 43) {  // TIMESTAMP_TZ, µs at the UTC instant (D6)
-			return Value::TIMESTAMPTZ(timestamp_tz_t(days * SECONDS_PER_DAY * 1000000 + micros_of_day));
-		}
-		if (v.scale == 0) {
-			return Value::TIMESTAMPSEC(timestamp_sec_t(days * SECONDS_PER_DAY + units));
-		}
-		if (v.scale <= 3) {
-			return Value::TIMESTAMPMS(timestamp_ms_t(days * SECONDS_PER_DAY * 1000 + units * Pow10(3 - v.scale)));
-		}
-		if (v.scale <= 6) {
-			return Value::TIMESTAMP(timestamp_t(days * SECONDS_PER_DAY * 1000000 + micros_of_day));
-		}
-		return Value::TIMESTAMPNS(timestamp_ns_t(days * SECONDS_PER_DAY * 1000000000 + units * 100));
 	}
-	case 61:  // datetime, in record form
+	// TIMESTAMP_NS holds about 1677-2262 (int64 nanoseconds): a datetime2(7) value past it -- a
+	// 9999-12-31 sentinel, 0001-01-01 -- is refused by name (D13), where TYPE mssql's read gives NULL.
+	if (v.xtype == 42 && v.scale == 7 && (days > 106750 || days < -106751)) {
+		throw FormatError("backup: " + what +
+						  " is a datetime2(7) outside 1677-2262, which a TIMESTAMP_NS "
+						  "cannot hold");
+	}
+	const int64_t micros_of_day = v.scale <= 6 ? units * Pow10(6 - v.scale) : units / 10;
+	if (v.xtype == 43) {  // TIMESTAMP_TZ, µs at the UTC instant (D6)
+		return Value::TIMESTAMPTZ(timestamp_tz_t(days * SECONDS_PER_DAY * 1000000 + micros_of_day));
+	}
+	if (v.scale == 0) {
+		return Value::TIMESTAMPSEC(timestamp_sec_t(days * SECONDS_PER_DAY + units));
+	}
+	if (v.scale <= 3) {
+		return Value::TIMESTAMPMS(timestamp_ms_t(days * SECONDS_PER_DAY * 1000 + units * Pow10(3 - v.scale)));
+	}
+	if (v.scale <= 6) {
+		return Value::TIMESTAMP(timestamp_t(days * SECONDS_PER_DAY * 1000000 + micros_of_day));
+	}
+	return Value::TIMESTAMPNS(timestamp_ns_t(days * SECONDS_PER_DAY * 1000000000 + units * 100));
+}
+
+//! datetime and smalldatetime, both in record form.
+Value VariantRecordDatetime(const SqlVariant &v, const std::string &what) {
+	if (v.xtype == 61) {  // datetime
 		Require(v, 8, what);
 		return RecordDatetimeValue(v.value);
-	case 58:  // smalldatetime, in record form
-		Require(v, 4, what);
-		return RecordSmallDatetimeValue(v.value);
-	case 36:  // uniqueidentifier
-		return GuidValue(v.value, what);
-	case 165:  // varbinary
-	case 173:  // binary
-		return Value::BLOB(reinterpret_cast<const_data_ptr_t>(v.value.data()), v.value.size());
-	case 231:  // nvarchar
-	case 239:  // nchar
-		if (v.value.size() % 2) {
-			throw FormatError("backup: " + what + " holds an odd number of bytes of UTF-16");
-		}
-		// A surrogate without its pair is refused: Utf16LeToUtf8 would write U+FFFD for it, a guess.
-		for (size_t i = 0; i + 1 < v.value.size(); i += 2) {
-			const uint16_t unit = static_cast<uint16_t>(b[i] | (b[i + 1] << 8));
-			const bool high = unit >= 0xD800 && unit <= 0xDBFF;
-			const bool low = unit >= 0xDC00 && unit <= 0xDFFF;
-			const uint16_t next = i + 3 < v.value.size() ? static_cast<uint16_t>(b[i + 2] | (b[i + 3] << 8)) : 0;
-			if (low || (high && !(next >= 0xDC00 && next <= 0xDFFF))) {
-				throw FormatError("backup: " + what + " is UTF-16 with an unpaired surrogate at byte " +
-								  std::to_string(i));
-			}
-			i += high ? 2 : 0;
-		}
-		return Value(Utf16LeToUtf8(b, v.value.size(), false));
-	case 167:	 // varchar
-	case 175: {	 // char: the bytes of its collation's code page
-		const CollationRow *collation = CollationById(static_cast<int32_t>(v.collation));
-		if (!collation) {
-			throw FormatError("backup: " + what + " is a varchar of collation " + std::to_string(v.collation) +
-							  ", which the reader does not know");
-		}
-		if (collation->code_page == 65001) {
-			if (!Utf8Proc::IsValid(v.value.data(), v.value.size())) {
-				throw FormatError("backup: " + what + " is a UTF-8 varchar that is not UTF-8");
-			}
-			return Value(v.value);
-		}
-		// Every page the server stores a varchar in has a table, double-byte ones included: a backup has
-		// no server to convert it, so the client does (spec 092's direction for the backup reader).
-		const auto *page = codec::code_page::FindCodePage(static_cast<int32_t>(collation->code_page));
-		if (!page) {
-			throw FormatError("backup: " + what + " is a varchar of code page " + std::to_string(collation->code_page) +
-							  ", which has no table");
-		}
-		std::string out(codec::code_page::Utf8Bound(v.value.size()), '\0');
-		out.resize(codec::code_page::DecodeToUtf8(*page, b, v.value.size(), &out[0]));
-		return Value(out);
 	}
-	default:
+	Require(v, 4, what);  // smalldatetime (58)
+	return RecordSmallDatetimeValue(v.value);
+}
+
+Value VariantGuid(const SqlVariant &v, const std::string &what) {
+	return GuidValue(v.value, what);
+}
+
+Value VariantBinary(const SqlVariant &v, const std::string &) {
+	return Value::BLOB(reinterpret_cast<const_data_ptr_t>(v.value.data()), v.value.size());
+}
+
+//! nvarchar / nchar: UTF-16LE, every surrogate paired.
+Value VariantUtf16(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
+	if (v.value.size() % 2) {
+		throw FormatError("backup: " + what + " holds an odd number of bytes of UTF-16");
+	}
+	// A surrogate without its pair is refused: Utf16LeToUtf8 would write U+FFFD for it, a guess.
+	for (size_t i = 0; i + 1 < v.value.size(); i += 2) {
+		const uint16_t unit = static_cast<uint16_t>(b[i] | (b[i + 1] << 8));
+		const bool high = unit >= 0xD800 && unit <= 0xDBFF;
+		const bool low = unit >= 0xDC00 && unit <= 0xDFFF;
+		const uint16_t next = i + 3 < v.value.size() ? static_cast<uint16_t>(b[i + 2] | (b[i + 3] << 8)) : 0;
+		if (low || (high && !(next >= 0xDC00 && next <= 0xDFFF))) {
+			throw FormatError("backup: " + what + " is UTF-16 with an unpaired surrogate at byte " + std::to_string(i));
+		}
+		i += high ? 2 : 0;
+	}
+	return Value(Utf16LeToUtf8(b, v.value.size(), false));
+}
+
+//! varchar / char: the bytes of its collation's code page.
+Value VariantCodePage(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
+	const CollationRow *collation = CollationById(static_cast<int32_t>(v.collation));
+	if (!collation) {
+		throw FormatError("backup: " + what + " is a varchar of collation " + std::to_string(v.collation) +
+						  ", which the reader does not know");
+	}
+	if (collation->code_page == 65001) {
+		if (!Utf8Proc::IsValid(v.value.data(), v.value.size())) {
+			throw FormatError("backup: " + what + " is a UTF-8 varchar that is not UTF-8");
+		}
+		return Value(v.value);
+	}
+	// Every page the server stores a varchar in has a table, double-byte ones included: a backup has
+	// no server to convert it, so the client does (spec 092's direction for the backup reader).
+	const auto *page = codec::code_page::FindCodePage(static_cast<int32_t>(collation->code_page));
+	if (!page) {
+		throw FormatError("backup: " + what + " is a varchar of code page " + std::to_string(collation->code_page) +
+						  ", which has no table");
+	}
+	std::string out(codec::code_page::Utf8Bound(v.value.size()), '\0');
+	out.resize(codec::code_page::DecodeToUtf8(*page, b, v.value.size(), &out[0]));
+	return Value(out);
+}
+
+using VariantReader = Value (*)(const SqlVariant &, const std::string &);
+
+//! xtype -> reader, in the order the one switch had them, so a diff against it reads straight down.
+struct VariantCase {
+	uint8_t xtype;
+	VariantReader read;
+};
+
+const VariantCase VARIANT_CASES[] = {
+	{48, VariantInteger},		 {52, VariantInteger},	   {56, VariantInteger},	 {127, VariantInteger},
+	{104, VariantInteger},		 {59, VariantApproximate}, {62, VariantApproximate}, {60, VariantMoney},
+	{122, VariantMoney},		 {106, VariantDecimal},	   {108, VariantDecimal},	 {40, VariantDate},
+	{41, VariantTime},			 {42, VariantDatetime2},   {43, VariantDatetime2},	 {61, VariantRecordDatetime},
+	{58, VariantRecordDatetime}, {36, VariantGuid},		   {165, VariantBinary},	 {173, VariantBinary},
+	{231, VariantUtf16},		 {239, VariantUtf16},	   {167, VariantCodePage},	 {175, VariantCodePage},
+};
+
+//! The cases by xtype, so a value's reader is one lookup; null for a type the reader does not read.
+struct VariantReaders {
+	VariantReader of[256];
+	VariantReaders() : of() {
+		for (const VariantCase &c : VARIANT_CASES) {
+			of[c.xtype] = c.read;
+		}
+	}
+};
+
+const VariantReaders VARIANT_READERS;
+
+}  // namespace
+
+Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
+	const VariantReader read = VARIANT_READERS.of[v.xtype];
+	if (!read) {
 		throw FormatError("backup: " + what + " is a sql_variant of xtype " + std::to_string(v.xtype) +
 						  ", which the reader does not read");
 	}
+	return read(v, what);
 }
 
 namespace {
+
+// Why column `c` (called `type` in a reason) is read as its stored bytes for what its type is, or "":
+// a type converted later with the TDS path's, one the reader does not know, or an xtype that is no
+// storage type.
+std::string RawByType(const CatalogColumn &c, const std::string &type) {
+	switch (c.system_type_id) {
+	case XTYPE_SQL_VARIANT:
+		return "sql_variant (its base type, properties and value) is converted later, with the TDS path's";
+	case XTYPE_XML:
+		return "xml (stored as binary XML) is converted to text later, with the TDS path's";
+	case XTYPE_CLR:
+		return type + " (its CLR serialization) is converted later, with the TDS path's";
+	default:
+		break;
+	}
+	if (c.system_type_name.empty()) {
+		return type + " is a type the reader does not know";
+	}
+	if (c.system_type_name == "json" || c.system_type_name == "vector") {
+		return type + " is converted later, with the TDS path's";
+	}
+	// Only a storage type the record decoder knows is converted: the kernels are keyed by the TDS id the
+	// xtype is passed as, and an xtype that is no storage type (a TDS-only id -- INTN, BITN, the legacy
+	// forms -- in a crafted catalog) would be decoded as a form its bytes are not. Any other is its bytes
+	// (review of #552).
+	if (!KnownFixedXtype(c.system_type_id) && !KnownVariableXtype(c.system_type_id)) {
+		return "xtype " + std::to_string(c.system_type_id) + " is not a storage type the reader decodes";
+	}
+	return std::string();
+}
+
+// A code-page text is converted through its collation's page: one the reader has no table for, or no
+// collation at all, is its bytes -- never bytes of another page in a VARCHAR, which is UTF-8 (#224;
+// review of #552). Why, or "".
+std::string RawByCodePage(const CatalogColumn &c) {
+	const bool code_page_text =
+		c.system_type_id == XTYPE_VARCHAR || c.system_type_id == XTYPE_CHAR || c.system_type_id == XTYPE_TEXT;
+	if (!code_page_text) {
+		return std::string();
+	}
+	const CollationRow *collation = c.collation_id ? CollationById(static_cast<int32_t>(c.collation_id)) : nullptr;
+	if (!collation) {
+		return c.collation_id ? "its collation (CollationId " + std::to_string(c.collation_id) +
+									") is newer than the code-page tables"
+							  : std::string("it has no collation");
+	}
+	if (collation->code_page != 65001 && !codec::code_page::FindCodePage(static_cast<int32_t>(collation->code_page))) {
+		return "its code page " + std::to_string(collation->code_page) + " has no table";
+	}
+	return std::string();
+}
+
+// The precision and scale are the file's: LogicalType::DECIMAL asserts what they must be (an
+// assertion, not an exception), so a declaration no server writes is caught here. By the name too,
+// which the type map dispatches on and the file's own sysscalartypes supplies (review of #549). Why
+// the column is its bytes, or "".
+std::string RawByDeclaration(const CatalogColumn &c, const std::string &type) {
+	std::string name = c.system_type_name;
+	std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
+	const bool decimal = c.system_type_id == XTYPE_DECIMAL || c.system_type_id == XTYPE_NUMERIC || name == "decimal" ||
+						 name == "numeric";
+	const bool scaled = c.system_type_id == XTYPE_TIME || c.system_type_id == XTYPE_DATETIME2 ||
+						c.system_type_id == XTYPE_DATETIMEOFFSET || name == "time" || name == "datetime2" ||
+						name == "datetimeoffset";
+	if ((decimal && (c.precision < 1 || c.precision > 38 || c.scale > c.precision)) || (scaled && c.scale > 7)) {
+		return type + " is declared with precision " + std::to_string(c.precision) + " and scale " +
+			   std::to_string(c.scale) + ", which no SQL Server type has";
+	}
+	return std::string();
+}
 
 // The type column `c` is read as, its readability aside: converted, or its stored bytes (`raw`).
 ColumnReading TypeReading(const CatalogColumn &c) {
@@ -343,59 +595,15 @@ ColumnReading TypeReading(const CatalogColumn &c) {
 		r.note = "its stored bytes, not converted: " + why;
 		return r;
 	};
-	switch (c.system_type_id) {
-	case XTYPE_SQL_VARIANT:
-		return raw("sql_variant (its base type, properties and value) is converted later, with the TDS path's");
-	case XTYPE_XML:
-		return raw("xml (stored as binary XML) is converted to text later, with the TDS path's");
-	case XTYPE_CLR:
-		return raw(type + " (its CLR serialization) is converted later, with the TDS path's");
-	default:
-		break;
+	std::string why = RawByType(c, type);
+	if (why.empty()) {
+		why = RawByCodePage(c);
 	}
-	if (c.system_type_name.empty()) {
-		return raw(type + " is a type the reader does not know");
+	if (why.empty()) {
+		why = RawByDeclaration(c, type);
 	}
-	if (c.system_type_name == "json" || c.system_type_name == "vector") {
-		return raw(type + " is converted later, with the TDS path's");
-	}
-	// Only a storage type the record decoder knows is converted: the kernels are keyed by the TDS id the
-	// xtype is passed as, and an xtype that is no storage type (a TDS-only id -- INTN, BITN, the legacy
-	// forms -- in a crafted catalog) would be decoded as a form its bytes are not. Any other is its bytes
-	// (review of #552).
-	if (!KnownFixedXtype(c.system_type_id) && !KnownVariableXtype(c.system_type_id)) {
-		return raw("xtype " + std::to_string(c.system_type_id) + " is not a storage type the reader decodes");
-	}
-	// A code-page text is converted through its collation's page: one the reader has no table for, or no
-	// collation at all, is its bytes -- never bytes of another page in a VARCHAR, which is UTF-8 (#224;
-	// review of #552).
-	const bool code_page_text =
-		c.system_type_id == XTYPE_VARCHAR || c.system_type_id == XTYPE_CHAR || c.system_type_id == XTYPE_TEXT;
-	if (code_page_text) {
-		const CollationRow *collation = c.collation_id ? CollationById(static_cast<int32_t>(c.collation_id)) : nullptr;
-		if (!collation) {
-			return raw(c.collation_id ? "its collation (CollationId " + std::to_string(c.collation_id) +
-											") is newer than the code-page tables"
-									  : std::string("it has no collation"));
-		}
-		if (collation->code_page != 65001 &&
-			!codec::code_page::FindCodePage(static_cast<int32_t>(collation->code_page))) {
-			return raw("its code page " + std::to_string(collation->code_page) + " has no table");
-		}
-	}
-	// The precision and scale are the file's: LogicalType::DECIMAL asserts what they must be (an
-	// assertion, not an exception), so a declaration no server writes is caught here. By the name too,
-	// which the type map dispatches on and the file's own sysscalartypes supplies (review of #549).
-	std::string name = c.system_type_name;
-	std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
-	const bool decimal = c.system_type_id == XTYPE_DECIMAL || c.system_type_id == XTYPE_NUMERIC || name == "decimal" ||
-						 name == "numeric";
-	const bool scaled = c.system_type_id == XTYPE_TIME || c.system_type_id == XTYPE_DATETIME2 ||
-						c.system_type_id == XTYPE_DATETIMEOFFSET || name == "time" || name == "datetime2" ||
-						name == "datetimeoffset";
-	if ((decimal && (c.precision < 1 || c.precision > 38 || c.scale > c.precision)) || (scaled && c.scale > 7)) {
-		return raw(type + " is declared with precision " + std::to_string(c.precision) + " and scale " +
-				   std::to_string(c.scale) + ", which no SQL Server type has");
+	if (!why.empty()) {
+		return raw(why);
 	}
 	try {
 		// datetime2(7) as TIMESTAMP_NS until spec 093 T8 hooks mssql_datetime2_7_as into the backup scan.

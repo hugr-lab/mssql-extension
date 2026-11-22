@@ -6,6 +6,7 @@
 #include "backup/backup_scan_function.hpp"
 #include "backup/backup_snapshots_function.hpp"
 #include "backup/backup_tables_function.hpp"
+#include "backup/backup_transactions_function.hpp"
 #include "catalog/backup/mssql_backup_catalog.hpp"
 #include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_refresh_function.hpp"
@@ -214,6 +215,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Spec 085: the backup reader's functions (mssql_backup_info).
 	mssql::backup::RegisterBackupInfoFunction(loader);
 	mssql::backup::RegisterBackupSnapshotsFunction(loader);
+	mssql::backup::RegisterBackupTransactionsFunctions(loader);
 	mssql::backup::RegisterBackupChangesFunctions(loader);
 	mssql::backup::RegisterBackupTablesFunctions(loader);
 	mssql::backup::RegisterBackupCatalogFunction(loader);

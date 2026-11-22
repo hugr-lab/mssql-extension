@@ -220,88 +220,82 @@ bool StageableFixedStride(uint32_t stride) {
 
 }  // namespace
 
-RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t> &column_ids)
-	: table_(table.schema_name + "." + table.name) {
-	for (int32_t id : column_ids) {
-		const CatalogColumn *found = nullptr;
-		for (const auto &c : table.columns) {
-			if (c.column_id == id) {
-				found = &c;
-			}
-		}
-		if (!found) {
-			throw InvalidInputException("backup: %s has no column %d", table_, id);
-		}
-		const CatalogColumn &c = *found;
-		Column col;
-		col.column_id = id;
-		col.name = table_ + "." + c.name;
-		// text / ntext / image declare 16 bytes (their pointer), but text in row keeps up to 7,000 in the row.
-		const bool legacy_lob =
-			c.system_type_id == XTYPE_TEXT || c.system_type_id == XTYPE_NTEXT || c.system_type_id == XTYPE_IMAGE;
-		col.declared_bytes = c.max_length < 0 || legacy_lob ? IN_ROW_BYTES : static_cast<uint32_t>(c.max_length);
-		const ColumnReading reading = ReadingOf(c);
-		if (!reading.readable) {
-			throw InvalidInputException("backup: %s: %s", col.name, reading.note);
-		}
-		const LogicalType type = reading.type;
-		col.meta = reading.raw ? RawMetadataOf(c) : MetadataOf(c);
-		col.ops = codec::staging::ResolveColumnOps(col.meta, type);
-		col.binary_kernel = col.ops.kernel == FinalizeKernel::Binary && col.meta.type_id != tds::TDS_TYPE_BIGCHAR;
-		col.utf16_kernel = col.ops.kernel == FinalizeKernel::String && col.meta.type_id != tds::TDS_TYPE_NCHAR;
-		col.code_page_kernel = col.ops.kernel == FinalizeKernel::CodePage && col.meta.code_page != nullptr &&
-							   col.meta.type_id != tds::TDS_TYPE_BIGCHAR;
-		if (col.ops.arm == AppendArm::Unsupported || col.ops.kernel == FinalizeKernel::Text) {
-			// The TDS map and D6's would disagree about the column (the text fallback), or the codec
-			// has no way in: both are this reader's gap, named, never a value rendered another way.
-			throw InvalidInputException("backup: %s (%s) has no staged decode to %s", col.name, c.system_type_name,
-										type.ToString());
-		}
-		switch (c.system_type_id) {
-		case XTYPE_BIT:
-			col.arm = StageArm::Bit;
-			break;
-		case XTYPE_DATETIME:
-		case XTYPE_SMALLDATETIME:
-		case XTYPE_MONEY:
-			col.arm = StageArm::SwapHalves;
-			break;
-		default:
-			if (codec::staging::IsDirectKind(col.ops.kind)) {
-				col.arm = StageArm::Direct;
-			} else if (col.ops.kind == StagingKind::Fixed) {
-				col.arm = StageArm::Fixed;
-			} else if (col.ops.arm == AppendArm::P2StageString || col.ops.arm == AppendArm::PlpStageString ||
-					   col.ops.arm == AppendArm::LobStageString) {
-				col.arm = StageArm::Utf16;
-			} else {
-				col.arm = StageArm::Bytes;
-			}
-		}
-		// What each arm stages must be what the codec resolved: a direct value into a vector slot of
-		// its width, a fixed one at a stride AppendFixed has (and for a swap, the 8 or 4 bytes it swaps).
-		const bool direct = col.arm == StageArm::Direct || col.arm == StageArm::Bit;
-		const bool fixed = col.arm == StageArm::Fixed || col.arm == StageArm::SwapHalves;
-		if ((direct && !codec::staging::IsDirectKind(col.ops.kind)) ||
-			(col.arm == StageArm::Bit && col.ops.stride != 1) ||
-			(fixed && (col.ops.kind != StagingKind::Fixed || !StageableFixedStride(col.ops.stride))) ||
-			(col.arm == StageArm::SwapHalves && col.ops.stride != 8 && col.ops.stride != 4)) {
-			throw InvalidInputException("backup: %s (%s) is staged by the codec in a form this reader does not fill",
-										col.name, c.system_type_name);
-		}
-		// The live path's budget (RowStager::Configure): its MAX columns, a code-page one twice.
-		if (col.ops.arm >= AppendArm::PlpStageString && col.ops.arm <= AppendArm::LobStageBinary) {
-			col.budget_weight = col.ops.kernel == FinalizeKernel::CodePage ? 2 : 1;
-		}
-		columns_.push_back(std::move(col));
-		types_.push_back(type);
+//! How column `c`, staged by the codec as `ops`, is taken from a record.
+StageArm RecordStager::ArmOf(const CatalogColumn &c, const codec::staging::ColumnOps &ops) {
+	switch (c.system_type_id) {
+	case XTYPE_BIT:
+		return StageArm::Bit;
+	case XTYPE_DATETIME:
+	case XTYPE_SMALLDATETIME:
+	case XTYPE_MONEY:
+		return StageArm::SwapHalves;
+	default:
+		break;
 	}
-	prepared_.assign(columns_.size(), PreparedValue());
-	for (size_t i = 0; i < columns_.size(); i++) {
-		if (columns_[i].arm == StageArm::Utf16 || columns_[i].arm == StageArm::Bytes) {
-			var_columns_.push_back(i);
-		}
+	if (codec::staging::IsDirectKind(ops.kind)) {
+		return StageArm::Direct;
 	}
+	if (ops.kind == StagingKind::Fixed) {
+		return StageArm::Fixed;
+	}
+	if (ops.arm == AppendArm::P2StageString || ops.arm == AppendArm::PlpStageString ||
+		ops.arm == AppendArm::LobStageString) {
+		return StageArm::Utf16;
+	}
+	return StageArm::Bytes;
+}
+
+//! What each arm stages must be what the codec resolved: a direct value into a vector slot of
+//! its width, a fixed one at a stride AppendFixed has (and for a swap, the 8 or 4 bytes it swaps).
+void RecordStager::CheckArm(const Column &col, const CatalogColumn &c) {
+	const bool direct = col.arm == StageArm::Direct || col.arm == StageArm::Bit;
+	const bool fixed = col.arm == StageArm::Fixed || col.arm == StageArm::SwapHalves;
+	if ((direct && !codec::staging::IsDirectKind(col.ops.kind)) || (col.arm == StageArm::Bit && col.ops.stride != 1) ||
+		(fixed && (col.ops.kind != StagingKind::Fixed || !StageableFixedStride(col.ops.stride))) ||
+		(col.arm == StageArm::SwapHalves && col.ops.stride != 8 && col.ops.stride != 4)) {
+		throw InvalidInputException("backup: %s (%s) is staged by the codec in a form this reader does not fill",
+									col.name, c.system_type_name);
+	}
+}
+
+//! Column `c` of `table` resolved to its staging, the type it is read as into `type`: an
+//! InvalidInputException naming it when the reader has no way to read it.
+RecordStager::Column RecordStager::ResolveColumn(const std::string &table, const CatalogColumn &c, LogicalType &type) {
+	Column col;
+	col.column_id = c.column_id;
+	col.name = table + "." + c.name;
+	// text / ntext / image declare 16 bytes (their pointer), but text in row keeps up to 7,000 in the row.
+	const bool legacy_lob =
+		c.system_type_id == XTYPE_TEXT || c.system_type_id == XTYPE_NTEXT || c.system_type_id == XTYPE_IMAGE;
+	col.declared_bytes = c.max_length < 0 || legacy_lob ? IN_ROW_BYTES : static_cast<uint32_t>(c.max_length);
+	const ColumnReading reading = ReadingOf(c);
+	if (!reading.readable) {
+		throw InvalidInputException("backup: %s: %s", col.name, reading.note);
+	}
+	type = reading.type;
+	col.meta = reading.raw ? RawMetadataOf(c) : MetadataOf(c);
+	col.ops = codec::staging::ResolveColumnOps(col.meta, type);
+	col.binary_kernel = col.ops.kernel == FinalizeKernel::Binary && col.meta.type_id != tds::TDS_TYPE_BIGCHAR;
+	col.utf16_kernel = col.ops.kernel == FinalizeKernel::String && col.meta.type_id != tds::TDS_TYPE_NCHAR;
+	col.code_page_kernel = col.ops.kernel == FinalizeKernel::CodePage && col.meta.code_page != nullptr &&
+						   col.meta.type_id != tds::TDS_TYPE_BIGCHAR;
+	if (col.ops.arm == AppendArm::Unsupported || col.ops.kernel == FinalizeKernel::Text) {
+		// The TDS map and D6's would disagree about the column (the text fallback), or the codec
+		// has no way in: both are this reader's gap, named, never a value rendered another way.
+		throw InvalidInputException("backup: %s (%s) has no staged decode to %s", col.name, c.system_type_name,
+									type.ToString());
+	}
+	col.arm = ArmOf(c, col.ops);
+	CheckArm(col, c);
+	// The live path's budget (RowStager::Configure): its MAX columns, a code-page one twice.
+	if (col.ops.arm >= AppendArm::PlpStageString && col.ops.arm <= AppendArm::LobStageBinary) {
+		col.budget_weight = col.ops.kernel == FinalizeKernel::CodePage ? 2 : 1;
+	}
+	return col;
+}
+
+//! The arena's columns as the codec staged them.
+void RecordStager::ConfigureArena() {
 	arena_.Configure(columns_.size());
 	for (size_t i = 0; i < columns_.size(); i++) {
 		arena_.Column(i).Configure(columns_[i].ops.kind, columns_[i].ops.stride, columns_[i].ops.max_value_bytes);
@@ -309,9 +303,12 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 		// only), within the offsets' 32 bits.
 		arena_.Column(i).payload_cap = 0xFFFFFFFFull;
 	}
-	// The staging's bound (FixedStagingBytes, VarRowBytes): a direct value or a bit goes into its vector
-	// and stages nothing; a fixed one a vector of strides; a variable one its offset and length per row
-	// and a first buffer, and its stored bytes (+2 for UTF-16's delimiter), a row's in-row part at most.
+}
+
+//! The staging's bound (FixedStagingBytes, VarRowBytes): a direct value or a bit goes into its vector
+//! and stages nothing; a fixed one a vector of strides; a variable one its offset and length per row
+//! and a first buffer, and its stored bytes (+2 for UTF-16's delimiter), a row's in-row part at most.
+void RecordStager::MeasureStaging() {
 	uint64_t declared = 0;
 	uint64_t delimiters = 0;
 	for (const auto &col : columns_) {
@@ -325,6 +322,32 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 		}
 	}
 	var_row_ = std::min<uint64_t>(declared, IN_ROW_BYTES) + delimiters;
+}
+
+RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t> &column_ids)
+	: table_(table.schema_name + "." + table.name) {
+	for (int32_t id : column_ids) {
+		const CatalogColumn *found = nullptr;
+		for (const auto &c : table.columns) {
+			if (c.column_id == id) {
+				found = &c;
+			}
+		}
+		if (!found) {
+			throw InvalidInputException("backup: %s has no column %d", table_, id);
+		}
+		LogicalType type;
+		columns_.push_back(ResolveColumn(table_, *found, type));
+		types_.push_back(type);
+	}
+	prepared_.assign(columns_.size(), PreparedValue());
+	for (size_t i = 0; i < columns_.size(); i++) {
+		if (columns_[i].arm == StageArm::Utf16 || columns_[i].arm == StageArm::Bytes) {
+			var_columns_.push_back(i);
+		}
+	}
+	ConfigureArena();
+	MeasureStaging();
 }
 
 void RecordStager::UseLayout(const RowsetLayout &layout) {
@@ -400,6 +423,22 @@ OffRowNeed RecordStager::PrepareRow(const RecordView &record) {
 	return PrepareRow(RowRecord::Fixed(record, RowVarCount(record, layout_->table)));
 }
 
+template <class WALK>
+bool RecordStager::UnlessPending(WALK &&walk) {
+	try {
+		walk();
+		return true;
+	} catch (PendingPageError &e) {
+		if (!pending_as_null_) {
+			throw PendingValueError(e.what());
+		}
+		if (pending_values_++ == 0) {
+			first_pending_ = e.what();
+		}
+		return false;
+	}
+}
+
 OffRowNeed RecordStager::PrepareRow(const RowRecord &row) {
 	if (!layout_) {
 		throw InternalException("backup: RecordStager::PrepareRow with no layout");
@@ -427,8 +466,13 @@ OffRowNeed RecordStager::PrepareRow(const RowRecord &row) {
 			// Its length (and whether it is NULL) is its root record's: read now, so it is reserved
 			// before it is assembled.
 			NoSink none;
-			const LobValue root =
-				WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::MapOnly, MAX_OFF_ROW_BYTES, c.name, none);
+			LobValue root;
+			if (!UnlessPending([&]() {
+					root = WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::MapOnly, MAX_OFF_ROW_BYTES, c.name, none);
+				})) {
+				p.is_null = true;  // a node on a Pending page: the value NULL (PendingValuesAsNull)
+				continue;
+			}
 			p.length = root.length;
 			p.is_null = root.is_null;
 		} else {
@@ -490,7 +534,11 @@ void RecordStager::AppendDirect(size_t column, Column &c, ColumnStaging &st, con
 								   c.name, StringUtil::BytesToHumanReadableString(p.length), e.what());
 	}
 	DirectSink sink(value.GetDataWriteable(), p.length, c.name);
-	WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+	if (!UnlessPending(
+			[&]() { WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink); })) {
+		st.AppendNull();  // its room in the vector's heap stays unused
+		return;
+	}
 	if (sink.at != p.length) {
 		throw FormatError("backup: " + c.name + " holds " + std::to_string(sink.at) + " bytes off row, not its " +
 						  std::to_string(p.length));
@@ -519,7 +567,11 @@ void RecordStager::AppendStream(size_t column, Column &c, ColumnStaging &st, con
 	}
 	StreamSink sink(stream_block_, value.GetDataWriteable(), c.code_page_kernel ? c.meta.code_page : nullptr,
 					st.replaced_units);
-	WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+	if (!UnlessPending(
+			[&]() { WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink); })) {
+		st.AppendNull();
+		return;
+	}
 	if (sink.Flush(true) != 0) {
 		throw FormatError("backup: " + c.name + " holds " + std::to_string(p.length) +
 						  " bytes off row, not a whole number of UTF-16 units");
@@ -549,8 +601,15 @@ void RecordStager::AppendOffRow(Column &c, ColumnStaging &st, const PreparedValu
 		large_staged_ = true;
 	}
 	StagingSink sink(st);
-	const LobValue value =
-		WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+	const idx_t staged_before = st.payload_used;
+	LobValue value;
+	if (!UnlessPending([&]() {
+			value = WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+		})) {
+		st.payload_used = staged_before;  // the fragments staged before the Pending page, given back
+		st.AppendNull();
+		return;
+	}
 	if (value.is_null) {
 		st.AppendNull();
 		return;
@@ -588,7 +647,12 @@ void RecordStager::MapRow(const RowRecord &row) {
 		e.form = pointer.form;
 		e.pointer.assign(reinterpret_cast<const char *>(v.data), v.size);
 		LobNodeList nodes;
-		const LobValue value = WalkLob(Fetch(what), pointer, units_, LobWalk::MapOnly, MAX_OFF_ROW_BYTES, what, nodes);
+		LobValue value;
+		if (!UnlessPending([&]() {
+				value = WalkLob(Fetch(what), pointer, units_, LobWalk::MapOnly, MAX_OFF_ROW_BYTES, what, nodes);
+			})) {
+			continue;  // its tree on a Pending page: not in the map, as the value is NULL
+		}
 		e.is_null = value.is_null;
 		e.length = static_cast<uint32_t>(value.length);
 		e.nodes = std::move(nodes.nodes);

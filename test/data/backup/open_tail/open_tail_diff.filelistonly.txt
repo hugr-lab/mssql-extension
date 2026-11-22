@@ -1,0 +1,4 @@
+LogicalName|PhysicalName|Type|FileGroupName|Size|MaxSize|FileId|CreateLSN|DropLSN|UniqueId|ReadOnlyLSN|ReadWriteLSN|BackupSizeInBytes|SourceBlockSize|FileGroupId|LogGroupGUID|DifferentialBaseLSN|DifferentialBaseGUID|IsReadOnly|IsPresent|TDEThumbprint|SnapshotUrl
+-----------|------------|----|-------------|----|-------|------|---------|-------|--------|-----------|------------|-----------------|---------------|-----------|------------|-------------------|--------------------|----------|---------|-------------|-----------
+bak_open_tail|/var/opt/mssql/data/bak_open_tail.mdf|D|PRIMARY|8388608|35184372080640|1|0|0|E6541307-3CA0-4FDB-8F83-50EA4552C297|0|0|851968|4096|1|NULL|44000000055200001|E5392436-E468-413C-841C-167DC7B2CDDA|0|1|NULL|NULL
+bak_open_tail_log|/var/opt/mssql/data/bak_open_tail_log.ldf|L|NULL|8388608|2199023255552|2|0|0|41E869A8-0E71-4643-A8D4-BE8083E89ED1|0|0|0|4096|0|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL

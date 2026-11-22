@@ -127,3 +127,18 @@ SELECT (SELECT count(*) FROM (SELECT * FROM t_new EXCEPT ALL SELECT * FROM c_new
 0	0
 
 endloop
+
+# A row's values stored off row are reserved before the row is staged (spec 085 D17): a row whose values
+# cannot fit the scan's half of max_memory beside a chunk's decoding is refused by name -- the row by
+# its _mssql_rid and its place, and what it holds off row. (A chunk that cannot fit at all is
+# mssql_backup_scan.test's.)
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/lob_changes/lob_changes_full.bak', 'dbo', 'inroot', max_memory := '300KB');
+----
+dbo.inroot: the row of _mssql_rid 0x01040001000000 (page 1:1000 slot 0), whose values stored off row (dbo.inroot.v (19.5 KiB)), need up to
+
+# Given the room, the same rows are read.
+query I
+SELECT count(*) > 0 FROM (SELECT * FROM mssql_backup_scan('test/data/backup/lob_changes/lob_changes_full.bak', 'dbo', 'inroot', max_memory := '64MB'));
+----
+true

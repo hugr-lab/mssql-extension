@@ -134,5 +134,21 @@ SELECT * FROM mssql_backup_table_changes('test/data/backup/full.bak', 'dbo', 'it
 ----
 do not go beside it
 
+# The bind's own refusals: a NULL schema or table, and the whole of the refusal of versions beside diff :=.
+statement error
+SELECT * FROM mssql_backup_table_changes('tc', NULL, 'items');
+----
+mssql_backup_table_changes: the schema and the table must not be NULL
+
+statement error
+SELECT * FROM mssql_backup_table_deletions('tc', 'dbo', NULL);
+----
+mssql_backup_table_deletions: the schema and the table must not be NULL
+
+statement error
+SELECT * FROM mssql_backup_table_insertions('test/data/backup/full.bak', 'dbo', 'events', diff := 'test/data/backup/diff.bak', end_version := 2);
+----
+mssql_backup_table_insertions: diff := names its two states (the full, and the full with the differential): start_version / end_version do not go beside it
+
 statement ok
 DETACH tc;

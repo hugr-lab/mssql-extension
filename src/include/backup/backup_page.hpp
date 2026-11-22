@@ -113,6 +113,26 @@ public:
 	explicit PendingPageError(const std::string &message) : FormatError(message) {}
 };
 
+//! A value stored off row met on a Pending page by a stager that does not read it as NULL (fuzzy :=
+//! 'error'): told apart from a Pending page met elsewhere (an IAM page), whose refusal is worded otherwise.
+class PendingValueError : public PendingPageError {
+public:
+	explicit PendingValueError(const std::string &message) : PendingPageError(message) {}
+};
+
+//! A live page whose copy is no formatted page (header version 0) in a backup of one data pass: SQL Server
+//! 2017 under writes copies the data once, no later pass copies what changed (measured in the oracle
+//! lane), and a page taken into use while it ran is copied as a zero unit, or caught being formatted (7
+//! bytes set, its own id among them, the rest zeros, measured; one naming another page is a misplaced
+//! copy, refused). Pending when the backup's log tail formats the page
+//! (FormattedInTail), which only a reader holding the tail can tell -- the scan asks it; else a
+//! locator's or a short backup's fault, refused.
+class ZeroCopyError : public FormatError {
+public:
+	ZeroCopyError(const std::string &message, const PagePointer &page_) : FormatError(message), page(page_) {}
+	PagePointer page;
+};
+
 class PageStore {
 public:
 	//! Pages located by `index`, alive as `allocation` says; both are kept by reference.

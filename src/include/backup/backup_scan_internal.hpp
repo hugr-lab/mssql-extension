@@ -42,6 +42,8 @@ struct ScanBindData : public TableFunctionData {
 	//! `max_memory` in bytes as the call gave it; 0 = not given (DuckDB's `memory_limit`). Clamped at
 	//! init; half of it is the budget of the scan's reservations (D17).
 	idx_t max_memory = 0;
+	//! D11's `fuzzy` as the call (or the attached catalog) gave it; "" = the setting mssql_backup_fuzzy.
+	std::string fuzzy;
 	//! An attached backup's table entry the scan reads (task 23), for the binder, and that backup, read
 	//! through its catalog, never found again by name; none for a file's (and for a plan deserialized,
 	//! which resolves `paths` and checks the columns).
@@ -57,6 +59,7 @@ struct ScanBindData : public TableFunctionData {
 		copy->table = table;
 		copy->max_threads = max_threads;
 		copy->max_memory = max_memory;
+		copy->fuzzy = fuzzy;
 		copy->catalog = catalog;
 		copy->entry = entry;
 		copy->column_ids = column_ids;
@@ -70,7 +73,8 @@ struct ScanBindData : public TableFunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<ScanBindData>();
 		return paths == other.paths && diff == other.diff && at.Same(other.at) && schema == other.schema &&
-			   table == other.table && max_threads == other.max_threads && max_memory == other.max_memory;
+			   table == other.table && max_threads == other.max_threads && max_memory == other.max_memory &&
+			   fuzzy == other.fuzzy;
 	}
 	//! Every EXECUTE binds again: the file is read at bind.
 	bool SupportStatementCache() const override {
