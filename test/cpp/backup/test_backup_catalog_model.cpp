@@ -629,6 +629,100 @@ int main() {
 			  "a table not read says so in each column's reason");
 	}
 
+	{
+		// A partition's layout checked against the table's declaration (PartitionLayout): what sysrscols says
+		// of a column that syscolpars does not, refused by name before any row is read. dbo.items of the
+		// sample, one field of one system-table row changed at a time.
+		auto headers = OpenBackupHeaders(context, {DIR + "full.bak"});
+		auto pages = OpenBackupPages(context, *headers);
+		Page boot;
+		pages->store->ReadLive(1, 9, boot, "the test");
+		const BootstrapTables clean = ReadBootstrapTables(*pages->store, ReadBootPage(boot));
+		const CatalogModel model = BuildCatalogModel(*pages->store, clean);
+		const CatalogTable *items = model.FindTable("dbo", "items");
+		Check(items && items->decodable && items->reason.empty(), "dbo.items as it is: decodable");
+		const int32_t object_id = items ? items->object_id : 0;
+		uint64_t rowset_id = 0;
+		for (const auto &r : clean.rowsets) {
+			if (r.object_id == object_id) {
+				rowset_id = r.rowset_id;
+			}
+		}
+		// The column's row in syscolpars, and its physical column's in sysrscols (rscolid names the colid).
+		auto declared = [&](BootstrapTables &t, const std::string &name) -> SysColumn & {
+			for (auto &c : t.columns) {
+				if (c.object_id == object_id && c.number == 0 && c.name == name) {
+					return c;
+				}
+			}
+			throw FormatError("the test: no column " + name);
+		};
+		auto stored = [&](BootstrapTables &t, const std::string &name) -> SysRsCol & {
+			const int32_t id = declared(t, name).column_id;
+			for (auto &c : t.rscols) {
+				if (c.rowset_id == rowset_id && c.rscolid == id) {
+					return c;
+				}
+			}
+			throw FormatError("the test: no physical column " + name);
+		};
+		// The reason dbo.items is refused with after `change`; "decodable" when it is not refused.
+		auto reason_after = [&](const std::function<void(BootstrapTables &)> &change) {
+			BootstrapTables t = clean;
+			std::string reason;
+			const std::string error = ErrorOf([&]() {
+				change(t);
+				const CatalogModel m = BuildCatalogModel(*pages->store, t);
+				const CatalogTable *table = m.FindTable("dbo", "items");
+				reason = !table ? "no table" : (table->decodable ? "decodable" : table->reason);
+			});
+			return error.empty() ? reason : "error: " + error;
+		};
+		auto has = [](const std::string &text, const std::string &part) {
+			return text.find(part) != std::string::npos;
+		};
+
+		std::string why = reason_after([&](BootstrapTables &t) {
+			SysRsCol &c = stored(t, "id");
+			c.ti = (c.ti & ~0xFFu) | XTYPE_BIGINT;
+		});
+		Check(has(why, "column id is stored as xtype 127") && has(why, "which its declaration does not say"),
+			  "a column stored as another type than declared: " + why);
+		why = reason_after([&](BootstrapTables &t) { declared(t, "price").precision = 13; });
+		Check(has(why, "column price is stored as xtype 106 (precision 12, scale 2)"),
+			  "a decimal stored with another precision than declared: " + why);
+		why = reason_after([&](BootstrapTables &t) { declared(t, "created").scale = 4; });
+		Check(has(why, "column created is stored as xtype 42") && has(why, "scale 3"),
+			  "a datetime2 stored with another scale than declared: " + why);
+		why = reason_after([&](BootstrapTables &t) {
+			SysRsCol &c = stored(t, "id");
+			c.offset = static_cast<int16_t>(-c.offset);
+		});
+		Check(has(why, "column id (xtype 56) is stored as a variable column, which its type is not"),
+			  "a fixed type stored as a variable column: " + why);
+		why = reason_after([&](BootstrapTables &t) { stored(t, "name").offset = 4; });
+		Check(has(why, "column name (xtype 231) is stored as a fixed column, which its type is not"),
+			  "a variable type stored at a fixed offset: " + why);
+		why = reason_after([&](BootstrapTables &t) {
+			for (auto &r : t.rowsets) {
+				if (r.rowset_id == rowset_id) {
+					r.compression = 1;
+				}
+			}
+		});
+		Check(has(why, "is at fixed offset") && has(why, "in a compressed rowset, whose columns are CD indexes"),
+			  "a ROW-compressed rowset whose columns are at fixed offsets: " + why);
+		why = reason_after([&](BootstrapTables &t) {
+			stored(t, "flag").rscolid += 50;
+			t.BuildIndexes();
+		});
+		Check(has(why, "its physical layout: ") && has(why, "has no column in syscolpars"),
+			  "a physical column syscolpars does not name: " + why);
+		why = reason_after([&](BootstrapTables &t) { stored(t, "code").status |= 0x200; });
+		Check(has(why, "column code was added with a default the catalog does not hold"),
+			  "a column added with a default the catalog does not hold: " + why);
+	}
+
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;
 	return failures ? 1 : 0;
 }

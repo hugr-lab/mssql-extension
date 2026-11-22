@@ -3,6 +3,7 @@
 #include "backup/backup_iam.hpp"
 
 #include <algorithm>
+#include <initializer_list>
 #include <set>
 
 namespace duckdb {
@@ -181,75 +182,93 @@ void RequireSize(const RowsetLayout &layout, size_t column, const SystemValue &v
 	}
 }
 
+//! How a type's fixed width is found: its own bytes, a time part's by its scale (and `bytes` beside it),
+//! a decimal's by its precision, the declared length, none (a variable type), or a type not known here.
+enum class WidthRule : uint8_t { Unknown, Bytes, Time, Decimal, Declared, Variable };
+
+struct FixedWidth {
+	WidthRule rule = WidthRule::Unknown;
+	uint8_t bytes = 0;
+};
+
+//! Each xtype's rule, so a width is one lookup.
+struct FixedWidths {
+	FixedWidth of[256];
+	void Set(std::initializer_list<uint8_t> xtypes, WidthRule rule, uint8_t bytes = 0) {
+		for (const uint8_t xtype : xtypes) {
+			of[xtype].rule = rule;
+			of[xtype].bytes = bytes;
+		}
+	}
+	FixedWidths() {
+		Set({XTYPE_TINYINT, XTYPE_BIT}, WidthRule::Bytes, 1);
+		Set({XTYPE_SMALLINT}, WidthRule::Bytes, 2);
+		Set({XTYPE_DATE}, WidthRule::Bytes, 3);
+		Set({XTYPE_INT, XTYPE_SMALLDATETIME, XTYPE_REAL, XTYPE_SMALLMONEY}, WidthRule::Bytes, 4);
+		Set({XTYPE_BIGINT, XTYPE_DATETIME, XTYPE_FLOAT, XTYPE_MONEY, XTYPE_TIMESTAMP}, WidthRule::Bytes, 8);
+		Set({XTYPE_UNIQUEIDENTIFIER}, WidthRule::Bytes, 16);
+		Set({XTYPE_TIME}, WidthRule::Time, 0);
+		Set({XTYPE_DATETIME2}, WidthRule::Time, 3);
+		Set({XTYPE_DATETIMEOFFSET}, WidthRule::Time, 5);
+		Set({XTYPE_DECIMAL, XTYPE_NUMERIC}, WidthRule::Decimal);
+		Set({XTYPE_BINARY, XTYPE_CHAR, XTYPE_NCHAR}, WidthRule::Declared);
+		Set({XTYPE_VARBINARY, XTYPE_VARCHAR, XTYPE_NVARCHAR, XTYPE_IMAGE, XTYPE_TEXT, XTYPE_NTEXT, XTYPE_SQL_VARIANT,
+			 XTYPE_XML},
+			WidthRule::Variable);
+	}
+};
+
+//! Built at its first use, not at load: a layout can be asked for its widths from another file's
+//! initializer.
+const FixedWidth &FixedWidthOf(uint8_t xtype) {
+	static const FixedWidths widths;
+	return widths.of[xtype];
+}
+
+//! A time part's bytes by its scale (fractional digits 0-7), the server's storage sizes.
+uint16_t TimePartBytes(const PhysicalColumn &c, const std::string &table) {
+	if (c.scale > 7) {
+		throw FormatError("backup: " + table + "." + c.name + " is a " + XtypeName(c.xtype) + " of scale " +
+						  std::to_string(c.scale) + ", past 7");
+	}
+	return c.scale <= 2 ? 3 : c.scale <= 4 ? 4 : 5;
+}
+
+//! A decimal's bytes: a sign byte, then the mantissa in 4, 8, 12 or 16 bytes by precision.
+uint16_t DecimalBytes(const PhysicalColumn &c, const std::string &table) {
+	if (c.precision < 1 || c.precision > 38 || c.scale > c.precision) {
+		throw FormatError("backup: " + table + "." + c.name + " is a " + XtypeName(c.xtype) + " of precision " +
+						  std::to_string(c.precision) + " and scale " + std::to_string(c.scale));
+	}
+	return c.precision <= 9 ? 5 : c.precision <= 19 ? 9 : c.precision <= 28 ? 13 : 17;
+}
+
 }  // namespace
 
 uint16_t PhysicalColumn::FixedLength(const std::string &table) const {
-	// A time part's bytes by its scale (fractional digits 0-7), the server's storage sizes.
-	auto time_bytes = [&]() -> uint16_t {
-		if (scale > 7) {
-			throw FormatError("backup: " + table + "." + name + " is a " + XtypeName(xtype) + " of scale " +
-							  std::to_string(scale) + ", past 7");
-		}
-		return scale <= 2 ? 3 : scale <= 4 ? 4 : 5;
-	};
-	switch (xtype) {
-	case XTYPE_TINYINT:
-	case XTYPE_BIT:
-		return 1;
-	case XTYPE_SMALLINT:
-		return 2;
-	case XTYPE_DATE:
-		return 3;
-	case XTYPE_INT:
-	case XTYPE_SMALLDATETIME:
-	case XTYPE_REAL:
-	case XTYPE_SMALLMONEY:
-		return 4;
-	case XTYPE_BIGINT:
-	case XTYPE_DATETIME:
-	case XTYPE_FLOAT:
-	case XTYPE_MONEY:
-	case XTYPE_TIMESTAMP:
-		return 8;
-	case XTYPE_UNIQUEIDENTIFIER:
-		return 16;
-	case XTYPE_TIME:
-		return time_bytes();
-	case XTYPE_DATETIME2:
-		return static_cast<uint16_t>(time_bytes() + 3);
-	case XTYPE_DATETIMEOFFSET:
-		return static_cast<uint16_t>(time_bytes() + 5);
-	case XTYPE_DECIMAL:
-	case XTYPE_NUMERIC:
-		// A sign byte, then the mantissa in 4, 8, 12 or 16 bytes by precision.
-		if (precision < 1 || precision > 38 || scale > precision) {
-			throw FormatError("backup: " + table + "." + name + " is a " + XtypeName(xtype) + " of precision " +
-							  std::to_string(precision) + " and scale " + std::to_string(scale));
-		}
-		return precision <= 9 ? 5 : precision <= 19 ? 9 : precision <= 28 ? 13 : 17;
-	case XTYPE_BINARY:
-	case XTYPE_CHAR:
-	case XTYPE_NCHAR:
+	const FixedWidth width = FixedWidthOf(xtype);
+	switch (width.rule) {
+	case WidthRule::Bytes:
+		return width.bytes;
+	case WidthRule::Time:
+		return static_cast<uint16_t>(TimePartBytes(*this, table) + width.bytes);
+	case WidthRule::Decimal:
+		return DecimalBytes(*this, table);
+	case WidthRule::Declared:
 		return length;
-	case XTYPE_VARBINARY:
-	case XTYPE_VARCHAR:
-	case XTYPE_NVARCHAR:
-	case XTYPE_IMAGE:
-	case XTYPE_TEXT:
-	case XTYPE_NTEXT:
-	case XTYPE_SQL_VARIANT:
-	case XTYPE_XML:
+	case WidthRule::Variable:
 		// A variable type is never at a fixed offset: named, not read as `length` bytes of the fixed part
 		// (the system tables' decoder takes the width from here too; review of #552).
 		throw FormatError("backup: " + table + "." + name + " is a " + XtypeName(xtype) +
 						  ", a variable type, at a fixed offset");
-	default:
-		if (length > 0) {
-			return length;	// a type the reader does not know: its bytes, as wide as sysrscols says
-		}
-		throw FormatError("backup: " + table + "." + name + " is a fixed column of " + XtypeName(xtype) +
-						  ", a type the record decoder does not know, with no length given");
+	case WidthRule::Unknown:
+		break;
 	}
+	if (length > 0) {
+		return length;	// a type the reader does not know: its bytes, as wide as sysrscols says
+	}
+	throw FormatError("backup: " + table + "." + name + " is a fixed column of " + XtypeName(xtype) +
+					  ", a type the record decoder does not know, with no length given");
 }
 
 bool KnownVariableXtype(uint8_t xtype) {
@@ -270,33 +289,9 @@ bool KnownVariableXtype(uint8_t xtype) {
 }
 
 bool KnownFixedXtype(uint8_t xtype) {
-	switch (xtype) {
-	case XTYPE_TINYINT:
-	case XTYPE_BIT:
-	case XTYPE_SMALLINT:
-	case XTYPE_DATE:
-	case XTYPE_INT:
-	case XTYPE_SMALLDATETIME:
-	case XTYPE_REAL:
-	case XTYPE_SMALLMONEY:
-	case XTYPE_BIGINT:
-	case XTYPE_DATETIME:
-	case XTYPE_FLOAT:
-	case XTYPE_MONEY:
-	case XTYPE_TIMESTAMP:
-	case XTYPE_UNIQUEIDENTIFIER:
-	case XTYPE_TIME:
-	case XTYPE_DATETIME2:
-	case XTYPE_DATETIMEOFFSET:
-	case XTYPE_DECIMAL:
-	case XTYPE_NUMERIC:
-	case XTYPE_BINARY:
-	case XTYPE_CHAR:
-	case XTYPE_NCHAR:
-		return true;
-	default:
-		return false;
-	}
+	// The types FixedLength has a width for: every rule but a variable type's and a type not known.
+	const WidthRule rule = FixedWidthOf(xtype).rule;
+	return rule != WidthRule::Unknown && rule != WidthRule::Variable;
 }
 
 void SetTypeInfo(PhysicalColumn &column, uint32_t ti) {
@@ -748,11 +743,11 @@ bool ReadUnitDataPage(const PageStore &store, const SysAllocUnit &unit, const Pa
 		if (!store.Read(at.file, at.page, out)) {
 			return false;  // in one of the unit's extents, and not in use
 		}
-	} catch (PendingPageError &e) {
-		// Kept a PendingPageError: the catalog model names it on the objects that need the table (D13).
-		throw PendingPageError(std::string(e.what()) + " (reading " + table + ")");
 	} catch (FormatError &e) {
-		throw FormatError(std::string(e.what()) + " (reading " + table + ")");
+		// Rethrown as it was thrown, the table named: a PendingPageError (the catalog model names it on the
+		// objects that need the table, D13) or a ZeroCopyError (the scan asks the log tail about it) stays one.
+		e.AddContext(" (reading " + table + ")");
+		throw;
 	}
 	if (out.header.type != static_cast<uint8_t>(PageType::Data) || out.header.level != 0) {
 		return false;  // its IAM pages, a clustered index's upper levels

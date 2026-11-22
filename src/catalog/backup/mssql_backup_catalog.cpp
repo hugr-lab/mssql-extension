@@ -77,6 +77,8 @@ MSSQLBackupCatalog::MSSQLBackupCatalog(AttachedDatabase &db, std::string name,
 		{"tables", "mssql_backup_tables", versioned},
 		{"views", "mssql_backup_views", versioned},
 		{"columns", "mssql_backup_columns", versioned},
+		{"transactions", "mssql_backup_transactions", versioned},
+		{"transaction_records", "mssql_backup_transaction_records", versioned},
 		{"schema_changes", "mssql_backup_schema_changes", {"start_version", "end_version"}},
 		{"table_changes",
 		 "mssql_backup_table_changes",
@@ -606,7 +608,8 @@ TableFunction MSSQLBackupTableEntry::GetScanFunction(ClientContext &context, uni
 	const auto &backup = schema.Cast<MSSQLBackupSchemaEntry>().Backup();
 	// The version by its key: a plan run or deserialized after a refresh reads this one.
 	return mssql::backup::AttachedScanFunction(context, *this, backup, MSSQLBackupCatalog::StateKey(*backup),
-											   schema_name_, table_name_, bind_data);
+											   schema_name_, table_name_,
+											   ParentCatalog().Cast<MSSQLBackupCatalog>().Fuzzy(), bind_data);
 }
 
 TableStorageInfo MSSQLBackupTableEntry::GetStorageInfo(ClientContext &) {
@@ -666,6 +669,14 @@ std::shared_ptr<const AttachedBackup> mssql::backup::FindAttachedBackup(ClientCo
 	return catalog.Cast<MSSQLBackupCatalog>().BackupAt(context, at);
 }
 
+std::string mssql::backup::AttachedFuzzy(ClientContext &context, const std::string &name) {
+	auto db = DatabaseManager::Get(context).GetDatabase(Identifier(name));
+	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
+		return std::string();
+	}
+	return db->GetCatalog().Cast<MSSQLBackupCatalog>().Fuzzy();
+}
+
 void mssql::backup::PinAttachedVersion(ClientContext &context, const std::string &name, BackupAt &at) {
 	auto db = DatabaseManager::Get(context).GetDatabase(Identifier(name));
 	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
@@ -678,69 +689,109 @@ std::string mssql::backup::AttachedStateKey(const BackupHistory &history, uint64
 	return MSSQLBackupCatalog::StateKey(history, history.versions[number - 1]);
 }
 
-static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
-											 AttachedDatabase &db, const string &name, AttachInfo &info,
-											 AttachOptions &options) {
+namespace {
+
+//! What an ATTACH … (TYPE mssql_backup) was given.
+struct BackupAttachOptions {
 	// schema_filter / table_filter keep what they match; schema_exclude / table_exclude drop what they
 	// match. All regexes as TYPE mssql's: case-insensitive, a partial match.
-	auto filter = std::make_shared<MSSQLCatalogFilter>();
-	auto exclude = std::make_shared<MSSQLCatalogFilter>();
+	std::shared_ptr<MSSQLCatalogFilter> filter = std::make_shared<MSSQLCatalogFilter>();
+	std::shared_ptr<MSSQLCatalogFilter> exclude = std::make_shared<MSSQLCatalogFilter>();
 	std::vector<std::string> diff;
+	std::string fuzzy;	// D11 (task 27): "" = the setting
 	bool history_mode = false;
 	mssql::backup::BackupAt default_at;
+};
+
+typedef std::function<bool(const std::string &)> WantsSchema;
+typedef std::function<bool(const std::string &, const std::string &)> WantsObject;
+
+//! DuckLake's: the version read without AT.
+void TakeDefaultVersion(const string &name, const std::string &key, const Value &value, BackupAttachOptions &o) {
+	if (o.default_at.IsSet()) {
+		throw InvalidInputException(
+			"ATTACH %s (TYPE mssql_backup): snapshot_version and snapshot_time name "
+			"the default version twice: give one",
+			name);
+	}
+	if (!value.IsNull()) {
+		o.default_at.unit = key == "snapshot_version" ? "version" : "timestamp";
+		o.default_at.value = value;
+	}
+}
+
+//! D11 (task 27): what the tables' scans do with one that is not consistent.
+void TakeFuzzy(const string &name, const Value &value, BackupAttachOptions &o) {
+	if (value.IsNull()) {
+		return;
+	}
+	o.fuzzy = value.ToString();
+	mssql::backup::FuzzyMode mode;
+	if (!mssql::backup::ParseFuzzyMode(o.fuzzy, mode)) {
+		throw InvalidInputException("ATTACH %s (TYPE mssql_backup): fuzzy '%s' is not 'warn', 'error' or 'ignore'",
+									name, o.fuzzy);
+	}
+}
+
+//! Task 24 (D12): a differential laid over the attached full.
+void TakeDiff(const Value &value, BackupAttachOptions &o) {
+	if (value.IsNull()) {
+		return;
+	}
+	for (auto &path : mssql::backup::PathsOf(value, "ATTACH (TYPE mssql_backup) diff")) {
+		o.diff.push_back(path);
+	}
+}
+
+bool IsFilterOption(const std::string &key) {
+	return key == "schema_filter" || key == "table_filter" || key == "schema_exclude" || key == "table_exclude";
+}
+
+void TakeFilter(const string &name, const std::string &key, const Value &value, BackupAttachOptions &o) {
+	const std::string pattern = value.IsNull() ? std::string() : value.ToString();
+	const std::string invalid = MSSQLCatalogFilter::ValidatePattern(pattern);
+	if (!invalid.empty()) {
+		throw InvalidInputException("ATTACH %s (TYPE mssql_backup): %s: %s", name, key, invalid);
+	}
+	if (key == "schema_filter") {
+		o.filter->SetSchemaFilter(pattern);
+	} else if (key == "table_filter") {
+		o.filter->SetTableFilter(pattern);
+	} else if (key == "schema_exclude") {
+		o.exclude->SetSchemaFilter(pattern);
+	} else {
+		o.exclude->SetTableFilter(pattern);
+	}
+}
+
+//! One option taken: false for one that is not an attached backup's.
+bool TakeOption(const string &name, const std::string &key, const Value &value, BackupAttachOptions &o) {
+	if (key == "history") {
+		// Task 24b (DQ-48): every backup the path names, as one catalog's versions. A string too, as the
+		// other boolean ATTACH options take one (DuckLake's METADATA_PARAMETERS, issue #325).
+		o.history_mode = !value.IsNull() && value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+	} else if (key == "snapshot_version" || key == "snapshot_time") {
+		TakeDefaultVersion(name, key, value, o);
+	} else if (key == "fuzzy") {
+		TakeFuzzy(name, value, o);
+	} else if (key == "diff") {
+		TakeDiff(value, o);
+	} else if (IsFilterOption(key)) {
+		TakeFilter(name, key, value, o);
+	} else {
+		return false;
+	}
+	return true;
+}
+
+BackupAttachOptions ReadAttachOptions(const string &name, AttachOptions &options) {
+	BackupAttachOptions o;
 	for (auto it = options.options.begin(); it != options.options.end();) {
-		const std::string key = StringUtil::Lower(it->first);
-		if (key == "history") {
-			// Task 24b (DQ-48): every backup the path names, as one catalog's versions. A string too, as the
-			// other boolean ATTACH options take one (DuckLake's METADATA_PARAMETERS, issue #325).
-			history_mode = !it->second.IsNull() && it->second.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+		if (TakeOption(name, StringUtil::Lower(it->first), it->second, o)) {
 			it = options.options.erase(it);
-			continue;
-		}
-		if (key == "snapshot_version" || key == "snapshot_time") {
-			// DuckLake's: the version read without AT.
-			if (default_at.IsSet()) {
-				throw InvalidInputException(
-					"ATTACH %s (TYPE mssql_backup): snapshot_version and snapshot_time name "
-					"the default version twice: give one",
-					name);
-			}
-			if (!it->second.IsNull()) {
-				default_at.unit = key == "snapshot_version" ? "version" : "timestamp";
-				default_at.value = it->second;
-			}
-			it = options.options.erase(it);
-			continue;
-		}
-		if (key == "diff") {
-			// Task 24 (D12): a differential laid over the attached full.
-			if (!it->second.IsNull()) {
-				for (auto &path : mssql::backup::PathsOf(it->second, "ATTACH (TYPE mssql_backup) diff")) {
-					diff.push_back(path);
-				}
-			}
-			it = options.options.erase(it);
-			continue;
-		}
-		if (key != "schema_filter" && key != "table_filter" && key != "schema_exclude" && key != "table_exclude") {
-			++it;
-			continue;
-		}
-		const std::string pattern = it->second.IsNull() ? std::string() : it->second.ToString();
-		const std::string invalid = MSSQLCatalogFilter::ValidatePattern(pattern);
-		if (!invalid.empty()) {
-			throw InvalidInputException("ATTACH %s (TYPE mssql_backup): %s: %s", name, key, invalid);
-		}
-		if (key == "schema_filter") {
-			filter->SetSchemaFilter(pattern);
-		} else if (key == "table_filter") {
-			filter->SetTableFilter(pattern);
-		} else if (key == "schema_exclude") {
-			exclude->SetSchemaFilter(pattern);
 		} else {
-			exclude->SetTableFilter(pattern);
+			++it;
 		}
-		it = options.options.erase(it);
 	}
 	// DuckDB hands a storage extension the options it does not know itself: a misspelt one is refused,
 	// not ignored.
@@ -748,27 +799,109 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 		throw InvalidInputException(
 			"ATTACH %s (TYPE mssql_backup): '%s' is not an option of an attached backup "
 			"(schema_filter, table_filter, schema_exclude, table_exclude, diff, history, snapshot_version, "
-			"snapshot_time)",
+			"snapshot_time, fuzzy)",
 			name, option.first);
 	}
+	return o;
+}
+
+//! What the filters keep: nothing set when there is none.
+void FiltersOf(const BackupAttachOptions &o, WantsSchema &wants_schema, WantsObject &wants_object) {
+	const auto filter = o.filter;
+	const auto exclude = o.exclude;
+	if (!filter->HasFilters() && !exclude->HasFilters()) {
+		return;
+	}
+	// A name is kept when it matches the filter (or there is none) and not the exclusion; the table
+	// filter and exclusion judge views too.
+	auto keeps_schema = [filter, exclude](const std::string &schema) {
+		return filter->MatchesSchema(schema) && !(exclude->HasSchemaFilter() && exclude->MatchesSchema(schema));
+	};
+	wants_schema = keeps_schema;
+	wants_object = [filter, exclude, keeps_schema](const std::string &schema, const std::string &object) {
+		return keeps_schema(schema) && filter->MatchesTable(object) &&
+			   !(exclude->HasTableFilter() && exclude->MatchesTable(object));
+	};
+}
+
+//! The backup attached (a full, or a full and its differential) is a history of its own: the full, and
+//! the full with the differential.
+std::shared_ptr<BackupHistory> HistoryOfAttached(const AttachedBackup &attached) {
+	std::vector<mssql::backup::HistoryFamily> families;
+	for (auto backup = attached.backup.get(); backup; backup = backup->Base().get()) {
+		const auto &headers = backup->Headers();
+		for (const auto &family : headers.families) {
+			const auto &key = headers.files[family->file];
+			mssql::backup::HistoryFamily f;
+			f.path = key.path;
+			f.size = key.size;
+			f.version_tag = key.version;
+			f.set = family->set;
+			families.push_back(std::move(f));
+		}
+	}
+	return std::make_shared<BackupHistory>(mssql::backup::BuildHistory(std::move(families)));
+}
+
+std::shared_ptr<BackupHistory> ReadAttachHistory(ClientContext &context, const string &name, const string &path) {
+	auto history = std::make_shared<BackupHistory>(mssql::backup::ReadBackupHistory(context, {path}));
+	for (const auto &skipped : history->skipped) {
+		DUCKDB_LOG_WARNING(context, "ATTACH %s (TYPE mssql_backup): \"%s\" is left out of the history: %s", name,
+						   skipped.path, skipped.reason);
+	}
+	return history;
+}
+
+MSSQLBackupCatalog::Opener OpenerOf(const std::string &catalog_name, const WantsSchema &wants_schema,
+									const WantsObject &wants_object) {
+	return [catalog_name, wants_schema, wants_object](ClientContext &c, const BackupHistory &versions,
+													  const mssql::backup::HistoryVersion &version) {
+		const auto &full = versions.backups[version.full].paths;
+		const std::vector<std::string> over =
+			version.IsDifferential() ? versions.backups[version.diff].paths : std::vector<std::string>();
+		try {
+			auto opened = mssql::backup::OpenAttachedBackup(c, catalog_name, full, wants_schema, wants_object, over);
+			// The files as the history read them (PR 4b's promise, from the ATTACH or the refresh, not
+			// from the version's open).
+			mssql::backup::CheckVersionFiles(*opened->backup, versions, version, catalog_name, true);
+			return std::shared_ptr<const AttachedBackup>(std::move(opened));
+		} catch (mssql::backup::FormatError &e) {
+			throw InvalidInputException("%s (TYPE mssql_backup), version %llu: %s", catalog_name,
+										(unsigned long long)version.number, e.what());
+		}
+	};
+}
+
+//! mssql_backup_refresh's reader of a history's glob.
+MSSQLBackupCatalog::Reader ReaderOf(const std::string &catalog_name, const std::string &path) {
+	const std::vector<std::string> paths{path};
+	return [paths, catalog_name](ClientContext &c, const BackupHistory &previous) {
+		try {
+			auto read = std::make_shared<BackupHistory>(mssql::backup::ReadBackupHistory(c, paths, &previous));
+			for (const auto &skipped : read->skipped) {
+				DUCKDB_LOG_WARNING(c, "%s (TYPE mssql_backup): \"%s\" is left out of the history: %s", catalog_name,
+								   skipped.path, skipped.reason);
+			}
+			return std::shared_ptr<const BackupHistory>(std::move(read));
+		} catch (mssql::backup::FormatError &e) {
+			throw InvalidInputException("mssql_backup_refresh: %s: %s", catalog_name, e.what());
+		}
+	};
+}
+
+}  // namespace
+
+static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
+											 AttachedDatabase &db, const string &name, AttachInfo &info,
+											 AttachOptions &options) {
+	const BackupAttachOptions o = ReadAttachOptions(name, options);
 	// Always read-only (D1): DuckDB's own check refuses every write before the catalog sees it.
 	db.SetReadOnlyDatabase();
 
-	std::function<bool(const std::string &)> wants_schema;
-	std::function<bool(const std::string &, const std::string &)> wants_object;
-	if (filter->HasFilters() || exclude->HasFilters()) {
-		// A name is kept when it matches the filter (or there is none) and not the exclusion; the table
-		// filter and exclusion judge views too.
-		auto keeps_schema = [filter, exclude](const std::string &schema) {
-			return filter->MatchesSchema(schema) && !(exclude->HasSchemaFilter() && exclude->MatchesSchema(schema));
-		};
-		wants_schema = keeps_schema;
-		wants_object = [filter, exclude, keeps_schema](const std::string &schema, const std::string &object) {
-			return keeps_schema(schema) && filter->MatchesTable(object) &&
-				   !(exclude->HasTableFilter() && exclude->MatchesTable(object));
-		};
-	}
-	if (history_mode && !diff.empty()) {
+	WantsSchema wants_schema;
+	WantsObject wants_object;
+	FiltersOf(o, wants_schema, wants_object);
+	if (o.history_mode && !o.diff.empty()) {
 		throw InvalidInputException(
 			"ATTACH %s (TYPE mssql_backup): diff does not go beside history: the history "
 			"lays each differential among its files over its own full",
@@ -778,53 +911,16 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 	try {
 		std::shared_ptr<BackupHistory> history;
 		std::shared_ptr<const AttachedBackup> attached;
-		if (history_mode) {
-			history = std::make_shared<BackupHistory>(mssql::backup::ReadBackupHistory(context, {info.path}));
-			for (const auto &skipped : history->skipped) {
-				DUCKDB_LOG_WARNING(context, "ATTACH %s (TYPE mssql_backup): \"%s\" is left out of the history: %s",
-								   name, skipped.path, skipped.reason);
-			}
+		if (o.history_mode) {
+			history = ReadAttachHistory(context, name, info.path);
 		} else {
-			// The backup attached (a full, or a full and its differential) is a history of its own: the full,
-			// and the full with the differential.
-			auto opened =
-				mssql::backup::OpenAttachedBackup(context, name, {info.path}, wants_schema, wants_object, diff);
-			attached = opened;
-			std::vector<mssql::backup::HistoryFamily> families;
-			for (auto backup = attached->backup.get(); backup; backup = backup->Base().get()) {
-				const auto &headers = backup->Headers();
-				for (const auto &family : headers.families) {
-					const auto &key = headers.files[family->file];
-					mssql::backup::HistoryFamily f;
-					f.path = key.path;
-					f.size = key.size;
-					f.version_tag = key.version;
-					f.set = family->set;
-					families.push_back(std::move(f));
-				}
-			}
-			history = std::make_shared<BackupHistory>(mssql::backup::BuildHistory(std::move(families)));
+			attached =
+				mssql::backup::OpenAttachedBackup(context, name, {info.path}, wants_schema, wants_object, o.diff);
+			history = HistoryOfAttached(*attached);
 		}
-		MSSQLBackupCatalog::Opener opener = [catalog_name, wants_schema, wants_object](
-												ClientContext &c, const BackupHistory &versions,
-												const mssql::backup::HistoryVersion &version) {
-			const auto &full = versions.backups[version.full].paths;
-			const std::vector<std::string> over =
-				version.IsDifferential() ? versions.backups[version.diff].paths : std::vector<std::string>();
-			try {
-				auto opened =
-					mssql::backup::OpenAttachedBackup(c, catalog_name, full, wants_schema, wants_object, over);
-				// The files as the history read them (PR 4b's promise, from the ATTACH or the refresh, not
-				// from the version's open).
-				mssql::backup::CheckVersionFiles(*opened->backup, versions, version, catalog_name, true);
-				return std::shared_ptr<const AttachedBackup>(std::move(opened));
-			} catch (mssql::backup::FormatError &e) {
-				throw InvalidInputException("%s (TYPE mssql_backup), version %llu: %s", catalog_name,
-											(unsigned long long)version.number, e.what());
-			}
-		};
+		MSSQLBackupCatalog::Opener opener = OpenerOf(catalog_name, wants_schema, wants_object);
 		const uint64_t default_version =
-			mssql::backup::ResolveVersion(*history, context, default_at, "ATTACH " + name + " (TYPE mssql_backup)");
+			mssql::backup::ResolveVersion(*history, context, o.default_at, "ATTACH " + name + " (TYPE mssql_backup)");
 		// The backup opened is the default version's only when their files say so (review of #579: under a
 		// clock set back, the latest by finish need not be the backup attached).
 		if (!attached || MSSQLBackupCatalog::StateKey(*attached) !=
@@ -832,23 +928,14 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 			attached = opener(context, *history, history->versions[default_version - 1]);
 		}
 		MSSQLBackupCatalog::Reader reader;
-		if (history_mode) {
-			const std::vector<std::string> paths{info.path};
-			reader = [paths, catalog_name](ClientContext &c, const BackupHistory &previous) {
-				try {
-					auto read = std::make_shared<BackupHistory>(mssql::backup::ReadBackupHistory(c, paths, &previous));
-					for (const auto &skipped : read->skipped) {
-						DUCKDB_LOG_WARNING(c, "%s (TYPE mssql_backup): \"%s\" is left out of the history: %s",
-										   catalog_name, skipped.path, skipped.reason);
-					}
-					return std::shared_ptr<const BackupHistory>(std::move(read));
-				} catch (mssql::backup::FormatError &e) {
-					throw InvalidInputException("mssql_backup_refresh: %s: %s", catalog_name, e.what());
-				}
-			};
+		if (o.history_mode) {
+			reader = ReaderOf(catalog_name, info.path);
 		}
-		return make_uniq<MSSQLBackupCatalog>(db, catalog_name, std::move(history), default_at, default_version,
-											 std::move(attached), std::move(opener), std::move(reader));
+		auto catalog =
+			make_uniq<MSSQLBackupCatalog>(db, catalog_name, std::move(history), o.default_at, default_version,
+										  std::move(attached), std::move(opener), std::move(reader));
+		catalog->SetFuzzy(o.fuzzy);
+		return std::move(catalog);
 	} catch (mssql::backup::FormatError &e) {
 		throw InvalidInputException("ATTACH %s (TYPE mssql_backup): %s", name, e.what());
 	}

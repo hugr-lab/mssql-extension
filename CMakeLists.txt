@@ -191,7 +191,9 @@ set(EXTENSION_SOURCES
     src/backup/backup_info_function.cpp
     src/backup/backup_mtf.cpp
     src/backup/backup_files.cpp
+    src/backup/backup_fuzzy.cpp
     src/backup/backup_hash.cpp
+    src/backup/backup_log_tail.cpp
     src/backup/backup_open_pass.cpp
     src/backup/backup_opened.cpp
     src/backup/backup_page.cpp
@@ -210,6 +212,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_sql_variant.cpp
     src/backup/backup_system_tables.cpp
     src/backup/backup_tables_function.cpp
+    src/backup/backup_transactions_function.cpp
     src/backup/backup_xpress.cpp
     src/backup/backup_zstd.cpp
     src/catalog/backup/mssql_backup_catalog.cpp

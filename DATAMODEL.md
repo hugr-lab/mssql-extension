@@ -1557,7 +1557,28 @@ flowchart BT
   model --> att["ATTACH … (TYPE mssql_backup)<br/>MSSQLBackupCatalog: schema / table entries,<br/>read-only; AttachedBackup holds the opened backup<br/>and its model"]
   att --> scan
   idx -. "a differential: PageIndex::SetBase<br/>(its passes, then the full's)" .-> idx
+  opened --> tail["stage 5: log tail (PR 5)<br/>backup_log_tail: MQTL blocks, sector parity,<br/>records; backup_fuzzy: FuzzySummary<br/>(transactions, changes by unit and page)"]
+  tail --> info
+  tail --> tables
+  tail --> scan
+  tail --> log["mssql_backup_transactions<br/>mssql_backup_transaction_records"]
+  store --> tail
 ```
+
+- **The log tail and D11's fuzzy status** (spec 085 PR 5, stage 5): `OpenedBackup::Fuzzy` reads family
+  1's MQTL streams once (`LogTailReader` / `LogTailCursor`: 512-byte sectors put back, the slot array,
+  each record's header; E3§6, checked against `fn_dump_dblog` record by record) into a `FuzzySummary`,
+  kept with the opened backup and in its cache estimate: the transactions (state at LastLSN, begin / end
+  LSN, the BEGIN's name) and, per allocation unit and page, each transaction's oldest and newest row
+  change (`IsRowOperation` in an `IsRowContext`: not PFS, interior index pages, FORMAT_PAGE or
+  EXPUNGE_ROWS, which named a table's unit on pages holding none of its rows). A table's status
+  (`FuzzinessOf`, over its base rowsets' units) compares those with the page copies through the
+  `PageStore`: stale when a finished transaction's newest change is newer than its page's copy (a page
+  not live in the backup: only after CheckpointLSN), dirty when an open one's oldest is not (the copy
+  holds what RESTORE undoes). The listings give NULL when the tail cannot be read (`TailOrWarn`); the
+  scan acts by `fuzzy :=` (`CheckFuzzy`). `mssql_backup_transaction_records` walks the tail again
+  through a cursor, a row image laid on a page of its own and staged by `RecordStager` into the
+  table's columns, built into a VARIANT.
 
 - **A differential over its full** (spec 085 PR 4c, `diff :=`): its own `OpenedBackup`, whose base is
   the full's (`OpenedBackup::Base`; a cache entry of its own, keyed by both backups' files). Its

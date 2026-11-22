@@ -155,6 +155,38 @@ public:
 	}
 
 private:
+	//! One value being staged: its column, its CD value, and where its bytes lie. Passed by reference
+	//! so the staging functions below share one description instead of eight parameters each.
+	struct Staging {
+		const RowsetLayout &layout;
+		const PhysicalColumn &c;
+		const CdValue &cd;
+		size_t k;
+		size_t start;
+		const uint8_t *p;
+		size_t size;
+		bool rebuilt;
+		//! The column's name, for an error only: built where one is thrown, never per value.
+		std::string What() const {
+			return layout.table + "." + c.name;
+		}
+	};
+
+	void StageValue(const Staging &s, const std::vector<bool> *needed);
+	void StageNumeric(const Staging &s);
+	void StageTemporal(const Staging &s);
+	void StageBytes(const Staging &s);
+
+	void Store(const Staging &s, size_t bytes);
+	void StoreAsIs(const Staging &s);
+	void StoreInteger(const Staging &s, size_t width);
+	void StorePadded(const Staging &s, uint8_t pad, size_t width);
+
+	//! A value's bytes under PAGE compression: a symbol resolved to its dictionary entry, an anchored
+	//! column's value rebuilt from the anchor's prefix and its own suffix (E23).
+	void RebuildFromPage(const PageCompression &page, const CdValue &cd, size_t index, const RowsetLayout &layout,
+						 const PhysicalColumn &c, const uint8_t *&p, size_t &size, bool &rebuilt);
+
 	std::vector<ValueRef> values_;
 	std::vector<size_t> at_;  // where each column's normalized bytes start in buffer_, or SIZE_MAX
 	std::vector<uint8_t> buffer_;

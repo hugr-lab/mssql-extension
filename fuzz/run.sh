@@ -9,6 +9,7 @@
 #                 | backup_mtf | backup_container | backup_xpress | backup_page | backup_catalog
 #                 | backup_record | backup_lob   (spec 085; built here through TARGETS)
 #                 | backup_cd                    (spec 086 PR 1)
+#                 | backup_log                   (spec 085 PR 5)
 #                 | backup_page_ci               (spec 086 PR 2)
 #                 | variant_envelope              (spec 093 T1; likewise)
 #                 | vector                        (spec 093 T3; likewise)
@@ -28,7 +29,7 @@ CORES="${3:-$(( $(nproc) < 8 ? $(nproc) : 8 ))}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 case "${TARGET}" in
 	browser_response|tds_tokens|utf16|envchange_txn|login_response|code_page) ;;
-	backup_mtf|backup_container|backup_xpress|backup_page|backup_catalog|backup_record|backup_lob|backup_cd|backup_page_ci|variant_envelope|vector|hierarchyid|ssclrt)
+	backup_mtf|backup_container|backup_xpress|backup_page|backup_catalog|backup_record|backup_lob|backup_cd|backup_log|backup_page_ci|variant_envelope|vector|hierarchyid|ssclrt)
 		# Not in build.sh's default TARGETS (the per-PR budget is the TDS layer's): build this one.
 		export TARGETS="${TARGET}" ;;
 	*) echo "unknown target '${TARGET}' (browser_response|tds_tokens|utf16|envchange_txn|login_response|code_page|backup_*|variant_envelope|vector|hierarchyid|ssclrt)"; exit 2 ;;

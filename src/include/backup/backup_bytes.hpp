@@ -24,7 +24,19 @@ namespace backup {
 //! match, a value the format does not allow. The message names the structure and the offset.
 class FormatError : public std::runtime_error {
 public:
-	explicit FormatError(const std::string &message) : std::runtime_error(message) {}
+	explicit FormatError(const std::string &message) : std::runtime_error(message), message_(message) {}
+	const char *what() const noexcept override {
+		return message_.c_str();
+	}
+	//! `context` appended to the message, the error kept as it was thrown: a reader that names what it was
+	//! reading rethrows with `throw;`, so a subclass a caller tells apart (PendingPageError, ZeroCopyError)
+	//! stays one (review of #591: a FormatError built anew lost a ZeroCopyError).
+	void AddContext(const std::string &context) {
+		message_ += context;
+	}
+
+private:
+	std::string message_;
 };
 
 //! A read-only view of `size` bytes at `data`, named `what` for errors, at `base` in the file

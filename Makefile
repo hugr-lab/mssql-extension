@@ -666,6 +666,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_schema_changes.cpp \
     test/cpp/backup/test_backup_lob.cpp \
     test/cpp/backup/test_backup_lob_map.cpp \
+    test/cpp/backup/test_backup_log_tail.cpp \
     test/cpp/backup/test_backup_info.cpp \
     test/cpp/backup/test_backup_mtf.cpp \
     test/cpp/backup/test_backup_open_pass.cpp \
@@ -681,6 +682,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_system_tables.cpp \
     test/cpp/backup/test_backup_xpress.cpp \
     test/cpp/backup/test_backup_xpress_diff.cpp \
+    test/cpp/backup/test_backup_zero_copy.cpp \
     test/cpp/backup/test_backup_zstd.cpp \
     test/cpp/test_catalog_filter.cpp \
     test/cpp/test_filter_encoder.cpp \
@@ -1432,9 +1434,9 @@ fuzz-encode-replay: release
 # Linux leak-check lane replays the same corpora under ASan + LSan. The corpora are synthetic
 # (fuzz/gen_backup_seeds.cc): no backup of a server whose data is not ours (spec 085 T4).
 fuzz-backup-replay:
-	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci variant_envelope vector hierarchyid ssclrt" \
+	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci variant_envelope vector hierarchyid ssclrt" \
 	    $(PROJ_DIR)fuzz/build.sh
-	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci variant_envelope vector hierarchyid ssclrt; do \
+	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci variant_envelope vector hierarchyid ssclrt; do \
 	    $(PROJ_DIR)fuzz/out/fuzz_$$t $(PROJ_DIR)fuzz/corpus/$$t || exit 1; \
 	done
 # Spec 085 acceptance 2 over the committed samples: mssql_backup_info against the golden RESTORE
@@ -1446,6 +1448,7 @@ test-backup-golden:
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --expect-major 17 $(PROJ_DIR)test/data/backup
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 $(PROJ_DIR)test/data/backup/switch_in
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 $(PROJ_DIR)test/data/backup/lob_changes
+	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 $(PROJ_DIR)test/data/backup/open_tail
 # Spec 085 PR 2a: the release build the backup oracle lane tests with -- httpfs linked in
 # statically (test/backup/httpfs_extension_config.cmake, at the duckdb pin's own httpfs commit), so
 # the lane reads its backups from R2 through s3://. Like bench-build, a later plain `make`

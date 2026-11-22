@@ -101,6 +101,15 @@ public:
 		return true;
 	}
 
+	//! D11's `fuzzy` ATTACH option (task 27): what its tables' scans do with a table that is not consistent;
+	//! "" = the setting mssql_backup_fuzzy, read at each scan's bind.
+	void SetFuzzy(std::string fuzzy) {
+		fuzzy_ = std::move(fuzzy);
+	}
+	const std::string &Fuzzy() const {
+		return fuzzy_;
+	}
+
 	//! The versions now. A version named by number or time is resolved against them when a query is bound and
 	//! pinned by its key (BackupAt::key) in the bind data, serialized with the plan (owner, 2026-11-19: no
 	//! transaction keeps versions, and no connection state either): a refresh reaches the next bind.
@@ -164,6 +173,7 @@ private:
 	std::shared_ptr<State> DefaultState() const;
 
 	std::string name_;
+	std::string fuzzy_;
 	//! The version snapshot_version / snapshot_time chose at ATTACH, by its backups; empty: the latest.
 	std::string pinned_;
 	Opener opener_;

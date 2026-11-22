@@ -146,6 +146,84 @@ struct Reader {
 		sink.Node(LobNode{at, slot, offset, length, static_cast<uint8_t>(depth), FRAGMENT_DATA});
 	}
 
+	//! A node's fragment type against what its parent says it is; a SMALL_ROOT root record's size against
+	//! `bound`.
+	void CheckType(const PagePointer &at, uint16_t slot, const ByteReader &body, uint16_t type, uint64_t bound,
+				   Expect expect) const {
+		if (expect.kind == Expect::Leaf && type != FRAGMENT_DATA) {
+			Fail(at, slot, "is of fragment type " + std::to_string(type) + " where its parent's level 0 names data");
+		}
+		if (expect.kind == Expect::Inner && type != FRAGMENT_INTERNAL) {
+			Fail(at, slot,
+				 "is of fragment type " + std::to_string(type) + " where its parent's level names an internal node");
+		}
+		if (expect.kind != Expect::Root) {
+			return;
+		}
+		// A root record is a SMALL_ROOT, a LARGE_ROOT or a NULL one (E21); a SMALL_ROOT's size is the
+		// value's, within the bound.
+		if (type != FRAGMENT_SMALL_ROOT && type != FRAGMENT_LARGE_ROOT && type != FRAGMENT_NULL) {
+			Fail(at, slot, "is a root record of fragment type " + std::to_string(type));
+		}
+		if (type == FRAGMENT_SMALL_ROOT && body.U16(14) > bound) {
+			throw FormatError("backup: " + what + " is a value of " + std::to_string(body.U16(14)) +
+							  " bytes, more than the " + std::to_string(bound) + " the reader takes");
+		}
+	}
+
+	//! A node of links (an INTERNAL node, or a LARGE_ROOT root record) and the children they name, in
+	//! order: each link's cumulative size ascends, within what the node covers, and the last is all of it.
+	uint64_t Links(const PagePointer &at, uint16_t slot, const ByteReader &body, uint16_t type, uint64_t offset,
+				   uint64_t expected, uint64_t bound, size_t depth, Expect expect) {
+		const uint16_t count = body.U16(16);
+		const uint16_t level = body.U16(18);
+		if (expect.kind == Expect::Inner && level != expect.level) {
+			Fail(at, slot,
+				 "is at level " + std::to_string(level) + " where its parent names level " +
+					 std::to_string(expect.level));
+		}
+		const bool wide = type == FRAGMENT_INTERNAL;
+		const size_t first = wide ? 20 : 24, step = wide ? 16 : 12;
+		body.Require(first, step * count);
+		if (expect.kind == Expect::Root) {
+			// A root record: what its links add up to is the value's length, checked against the bound
+			// before any child is read.
+			expected =
+				count ? (wide ? body.U64(first + step * (count - 1u)) : body.U32(first + step * (count - 1u))) : 0;
+			if (expected > bound) {
+				throw FormatError("backup: " + what + " is a value of " + std::to_string(expected) +
+								  " bytes, more than the " + std::to_string(bound) + " the reader takes");
+			}
+		}
+		sink.Node(LobNode{at, slot, offset, expected, static_cast<uint8_t>(depth), static_cast<uint8_t>(type)});
+		const Expect child =
+			level == 0 ? Expect{Expect::Leaf, 0, false} : Expect{Expect::Inner, uint16_t(level - 1u), false};
+		uint64_t previous = 0;
+		for (uint16_t i = 0; i < count; i++) {
+			const size_t link = first + step * i;
+			const uint64_t cumulative = wide ? body.U64(link) : body.U32(link);
+			const size_t pointer = link + (wide ? 8 : 4);
+			if (cumulative <= previous) {
+				Fail(at, slot, "has links whose sizes do not ascend");
+			}
+			if (cumulative > expected) {
+				Fail(at, slot,
+					 "has a link to " + std::to_string(cumulative) + " bytes where its parent claims " +
+						 std::to_string(expected));
+			}
+			Expect named = child;
+			named.last = i + 1u == count;
+			Child(ReadPagePointer(body, pointer), body.U16(pointer + 6), offset + previous, cumulative - previous,
+				  depth + 1, named);
+			previous = cumulative;
+		}
+		if (previous != expected) {
+			Fail(at, slot,
+				 "holds " + std::to_string(previous) + " bytes where its parent claims " + std::to_string(expected));
+		}
+		return expected;
+	}
+
 	//! The node at (at, slot), covering `expected` bytes from `offset` (a root record: whatever it
 	//! holds, within `bound`). Returns the bytes it covers.
 	uint64_t Node(const PagePointer &at, uint16_t slot, uint64_t offset, uint64_t expected, uint64_t bound,
@@ -154,24 +232,7 @@ struct Reader {
 		Page &page = PageAt(depth);
 		const ByteReader body = Fragment(at, slot, page);
 		const uint16_t type = body.U16(12);
-		if (expect.kind == Expect::Leaf && type != FRAGMENT_DATA) {
-			Fail(at, slot, "is of fragment type " + std::to_string(type) + " where its parent's level 0 names data");
-		}
-		if (expect.kind == Expect::Inner && type != FRAGMENT_INTERNAL) {
-			Fail(at, slot,
-				 "is of fragment type " + std::to_string(type) + " where its parent's level names an internal node");
-		}
-		if (expect.kind == Expect::Root) {
-			// A root record is a SMALL_ROOT, a LARGE_ROOT or a NULL one (E21); a SMALL_ROOT's size is the
-			// value's, within the bound.
-			if (type != FRAGMENT_SMALL_ROOT && type != FRAGMENT_LARGE_ROOT && type != FRAGMENT_NULL) {
-				Fail(at, slot, "is a root record of fragment type " + std::to_string(type));
-			}
-			if (type == FRAGMENT_SMALL_ROOT && body.U16(14) > bound) {
-				throw FormatError("backup: " + what + " is a value of " + std::to_string(body.U16(14)) +
-								  " bytes, more than the " + std::to_string(bound) + " the reader takes");
-			}
-		}
+		CheckType(at, slot, body, type, bound, expect);
 		switch (type) {
 		case FRAGMENT_DATA:
 			return Leaf(at, slot, body, 14, body.Size() - 14u, offset, expected, depth, type, expect);
@@ -182,56 +243,8 @@ struct Reader {
 			is_null = true;
 			return 0;
 		case FRAGMENT_INTERNAL:
-		case FRAGMENT_LARGE_ROOT: {
-			const uint16_t count = body.U16(16);
-			const uint16_t level = body.U16(18);
-			if (expect.kind == Expect::Inner && level != expect.level) {
-				Fail(at, slot,
-					 "is at level " + std::to_string(level) + " where its parent names level " +
-						 std::to_string(expect.level));
-			}
-			const bool wide = type == FRAGMENT_INTERNAL;
-			const size_t first = wide ? 20 : 24, step = wide ? 16 : 12;
-			body.Require(first, step * count);
-			if (expect.kind == Expect::Root) {
-				// A root record: what its links add up to is the value's length, checked against the bound
-				// before any child is read.
-				expected =
-					count ? (wide ? body.U64(first + step * (count - 1u)) : body.U32(first + step * (count - 1u))) : 0;
-				if (expected > bound) {
-					throw FormatError("backup: " + what + " is a value of " + std::to_string(expected) +
-									  " bytes, more than the " + std::to_string(bound) + " the reader takes");
-				}
-			}
-			sink.Node(LobNode{at, slot, offset, expected, static_cast<uint8_t>(depth), static_cast<uint8_t>(type)});
-			const Expect child =
-				level == 0 ? Expect{Expect::Leaf, 0, false} : Expect{Expect::Inner, uint16_t(level - 1u), false};
-			uint64_t previous = 0;
-			for (uint16_t i = 0; i < count; i++) {
-				const size_t link = first + step * i;
-				const uint64_t cumulative = wide ? body.U64(link) : body.U32(link);
-				const size_t pointer = link + (wide ? 8 : 4);
-				if (cumulative <= previous) {
-					Fail(at, slot, "has links whose sizes do not ascend");
-				}
-				if (cumulative > expected) {
-					Fail(at, slot,
-						 "has a link to " + std::to_string(cumulative) + " bytes where its parent claims " +
-							 std::to_string(expected));
-				}
-				Expect named = child;
-				named.last = i + 1u == count;
-				Child(ReadPagePointer(body, pointer), body.U16(pointer + 6), offset + previous, cumulative - previous,
-					  depth + 1, named);
-				previous = cumulative;
-			}
-			if (previous != expected) {
-				Fail(
-					at, slot,
-					"holds " + std::to_string(previous) + " bytes where its parent claims " + std::to_string(expected));
-			}
-			return expected;
-		}
+		case FRAGMENT_LARGE_ROOT:
+			return Links(at, slot, body, type, offset, expected, bound, depth, expect);
 		default:
 			Fail(at, slot, "is of fragment type " + std::to_string(type) + ", which the reader does not know");
 		}
