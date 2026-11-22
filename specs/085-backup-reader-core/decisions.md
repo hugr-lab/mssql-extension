@@ -44,7 +44,7 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | DQ-08 | users' writes to imported tables | refuse the import by default | 023 |
 | DQ-09 | where pending page images (uncommitted rows) live | in the lake, `__mssql_sys.pending_pages` | 022 D11, 023 I4 |
 | DQ-10 | partition values, file layout and SWITCH in the lake | **decided** (owner, 2026-11-05): follow DuckLake's rules | — |
-| DQ-11 | which base tables and rows leave the backup | allow-list of tables and of `sysobjvalues` value classes; no module source | 085 PR 2 |
+| DQ-11 | which base tables and rows leave the backup | every one, whole (owner, 2026-11-21; was an allow-list of tables and of `sysobjvalues` value classes, no module source) | 085 PR 2 |
 | DQ-12 | how lake state reaches the reader | Parquet side files under `base`, side connection | 089 PR 1 |
 | DQ-13 | browsing defaults | `recovery := true`, `fuzzy := 'warn'` | 085 PR 5, 090 |
 | DQ-14 | `mode := 'rebase'` in v1 | yes | 023 |
@@ -336,6 +336,12 @@ that `__mssql_backup.columns` records; the classes are pinned by 085 task 11. Mo
 procedures, functions and triggers never leaves. The mirror takes `syssingleobjrefs` classes 7, 8, 30
 and 31 only. Reason: the least exposure that still gives the importer everything it needs (E1 §4.8,
 E7 §2).
+
+**Revised by the owner, 2026-11-21 (review of #591): every base table leaves, whole.** Whoever holds
+the backup -- and, for an encrypted one (spec 087), its key -- may read all of it; protecting a backup
+is encryption's job, not the reader's. `mssql_backup_catalog` serves every system base table with a
+unique clustered key, `sysobjvalues` with module source and `sysowners` included, and the log's records
+are given whole. What the lake mirrors is the importer's choice (022 D3), as it always was.
 
 ### DQ-12 — How does lake state reach the reader?
 
@@ -958,8 +964,8 @@ shows what changed in them as well as in the data.** A lake keeps the text thoug
 - A listing, `mssql_backup_modules(path)` (and `bk.modules()`): schema, name, type (`P`, `FN`, `IF`,
   `TF`, `TR`, …), the parent table of a DML trigger, created / modified dates, `definition` (the module's
   `sysobjvalues` valclass 1 text, read on demand when off row, as a view's; NULL `WITH ENCRYPTION`), and
-  a CLR module's assembly method instead of a definition. The allow-list of § Security grows by those
-  rows of `sysobjvalues` only.
+  a CLR module's assembly method instead of a definition. `mssql_backup_catalog` already serves those
+  rows of `sysobjvalues` (DQ-11's revision).
 - In DQ-47's `schema_changes`: `module_created`, `module_dropped`, `module_renamed`,
   `module_definition_changed` (old and new text), as the views' events.
 - With issue #210 (the same objects in a `TYPE mssql` catalog, from the server's `sys.sql_modules`):
@@ -1031,7 +1037,7 @@ RESEARCH or an experiment already answers these, and the drafts were aligned to 
   - `reflected_lsn` (was `prev_last_lsn`);
   - `base :=` with 089's fixed file names (was `catalog_base`, `lob_side`, `alloc_base`, `pending`);
   - `xids`;
-  - `mssql_backup_catalog(path)` with no table lists the allow-listed base tables;
+  - `mssql_backup_catalog(path)` with no table lists the base tables it reads;
   - pending pages come from `mssql_backup_pending_pages`, not from the export.
 - **The stale set** is lake state, not a reader input. The importer checks healing (089 D10, 023 D7);
   a failed check is a named error at that file, the way out a rebase (DQ-06, accepted).

@@ -472,9 +472,9 @@ SELECT * FROM mssql_backup_info('s3://bak/sales_full.bak');
 SELECT * FROM mssql_backup_tables('s3://bak/sales_full.bak');
 SELECT * FROM mssql_backup_views('s3://bak/sales_full.bak');            -- T-SQL text
 
--- a base table as stored (the importer's mirror; allow-listed, see Security)
+-- a base table as stored (the importer's mirror; any of them, see Security)
 SELECT * FROM mssql_backup_catalog('s3://bak/sales_full.bak', 'syscolpars');
-SELECT * FROM mssql_backup_catalog('s3://bak/sales_full.bak');   -- the allow-listed base tables
+SELECT * FROM mssql_backup_catalog('s3://bak/sales_full.bak');   -- the base tables it reads
 
 -- one table's rows
 SELECT id, amount, _mssql_rid, _mssql_page
@@ -581,11 +581,12 @@ its clustering key by `ordkey`: `0x01`, then per key column u16 length and its s
 `sysclsobjs(class, id)` -- and `sysrscols(rsid, hbcolid)`, not E1's `(rsid, rscolid)`: its own
 `ordkey` says so on 2017–2025, and the two agree only without a uniquifier; `syssingleobjrefs` is
 `(depid, class, depsubid)`). The columns are typed through D6's map; a `sql_variant` (`value`) is its
-raw bytes, `BLOB` (a VARIANT is 086's). Without `base_table` it lists the allow-listed base tables
-(`base_table`, `object_id`, `row_count` -- the rowset's, NULL for the two served by value class --,
-`columns`: `name`, `duckdb_type`, `key_ordinal`), which is
-the set an importer mirrors (022 D3); the list is the reader's, per version (a table the version
-lacks is left out). The catalog is opened at bind, since a table's columns depend on the version
+raw bytes, `BLOB` (a VARIANT is 086's). Without `base_table` it lists the base tables it reads
+(`base_table`, `object_id`, `row_count` -- the rowset's --, `columns`: `name`, `duckdb_type`,
+`key_ordinal`): every system base table of the database with a unique clustered key (sysschobjs type
+'S'), a superset of the one an importer mirrors (022 D3, the importer's choice); the list is the
+version's own (a table the version lacks is not there). A heap, or a table whose clustered key is not
+unique or holds a `bit`, is refused by name. The catalog is opened at bind, since a table's columns depend on the version
 (2022 added `sysrscols.ordlock`), and every EXECUTE binds again. Rows are produced a page at a time
 (the unit's IAM-listed pages and a cursor, never the table), an off-row value as its row is, within one
 value's bound and 1 GiB for the call.
@@ -1196,27 +1197,28 @@ A backup file is untrusted input (R§9). Every parser:
   time, and their bodies are never read further. The same holds for non-live pages and ghost records,
   which hold deleted rows (X§4: a deleted heap row's bytes stay on the page). The reader is not a
   forensic tool: it returns what RESTORE returns.
-- **Limits the base tables it exposes**: `mssql_backup_catalog` serves an allow-list (the mirror set of
+- **Serves every base table it can read** (DQ-11 as revised by the owner, 2026-11-21, review of #591):
+  whoever holds the backup -- and, for an encrypted one (spec 087), its key -- may read all of it;
+  protecting a backup is encryption's job, not the reader's. `mssql_backup_catalog` reads every system
+  base table with a unique clustered key whole, `sysobjvalues` (module source) and `sysowners`
+  (contained users' password hashes) included, and `mssql_backup_transaction_records` gives every
+  record's bytes, a system table's row included (a log backup has no catalog to tell them apart). The
+  oracle lane reads every listed table whole, its count the rowset's, and finds every `sysobjvalues`
+  row the server's catalog views name among the ones served (`catalog_golden.sql`'s `.modules.txt`).
+  *Until that revision* it served an allow-list (the mirror set of
   E1§4.8 — `sysallocunits`, `sysrowsets`, `sysschobjs`, `syscolpars`, `sysrscols`, `sysseobjvalues`,
   `sysclsobjs` — plus `sysobjvalues`, `sysidxstats`, `sysiscols`, the columnstore tables of 088, the
   partitioning tables of E7: `systypedsubobjs`, `syssingleobjrefs`, and `sysscalartypes`, the type
   names an alias column needs). Others, such as `sysowners`
-  (contained users' password hashes) or the certificate and key tables, are refused by name.
-  `sysobjvalues` is served by value class only, each row checked against the object it belongs to:
+  (contained users' password hashes) or the certificate and key tables, were refused by name.
+  `sysobjvalues` was served by value class only, each row checked against the object it belongs to:
   valclass 1 of a view (not one `WITH ENCRYPTION`) or a default, with subobjid and valnum 0; valclass
   2 of a computed column of a user table -- not by its class alone: a multi-statement function's
   return table can have a computed column, and its definition is a valclass 2 row of the function
   (measured, catalog fixture 2022: `([a]+(1))` of an encrypted TVF); valclass 30 of a partition
-  function. `sysseobjvalues` by its valclass 1 (an added column's default, the one class measured).
-  Module source -- a procedure's, a function's, a trigger's, a check's -- never leaves (DQ-11,
-  accepted); the oracle lane compares the served set with the one the server's catalog views give
-  (`catalog_golden.sql`'s `.modules.txt`, the fixture holding a procedure, functions, an encrypted TVF,
-  a trigger and a partition function).
-  **Revised by the owner, 2026-11-21 (review of #591):** whoever holds the backup -- and, for an
-  encrypted one (spec 087), its key -- may read all of it; protecting a backup is encryption's job, not
-  the reader's. So `mssql_backup_transaction_records` gives every record's bytes, a system table's row
-  included (a log backup has no catalog to tell them apart), and the allow-list above is to be removed
-  from `mssql_backup_catalog` in a PR of its own: every base table served, `sysobjvalues` whole.
+  function; `sysseobjvalues` by its valclass 1 (an added column's default, the one class measured).
+  Module source -- a procedure's, a function's, a trigger's, a check's -- did not leave (DQ-11 as
+  first accepted).
 - **Fuzzing** (ClusterFuzzLite, `fuzz/`, D15): one harness per parser, each with a seed corpus cut from
   the committed samples: `fuzz_backup_mtf` (walker), `fuzz_backup_container` (MSSQLBAK chain),
   `fuzz_backup_xpress` (raw codec, with a differential oracle against a reference decode of the seed),
@@ -1849,8 +1851,8 @@ cost.
   SPLIT, PAGE compression per partition, boundary types beyond those listed above, a computed
   partitioning column. Each gets a fixture before it is trusted.
 - Decided ([decisions.md](decisions.md)): browsing with `fuzzy := 'warn'` and `recovery := true`
-  (D11; DQ-13); 2017 as the minimum version (D14; DQ-04); the allow-list of base tables and
-  `sysobjvalues` value classes (§ Security; DQ-11); the service-column types (D8; DQ-02); the
+  (D11; DQ-13); 2017 as the minimum version (D14; DQ-04); which base tables leave the backup
+  (§ Security; DQ-11: an allow-list, revised by the owner on 2026-11-21 to every one); the service-column types (D8; DQ-02); the
   `backup_<component>.cpp` file names (D16; DQ-37); committed samples, ≤ 2 MB each and ≤ 16 MB in
   all (DQ-36).
 
