@@ -158,18 +158,22 @@ static const char *AddressFamilyName(int family) {
 
 bool TdsSocket::AwaitConnect(int addr_index, int timeout_seconds) {
 	MSSQL_SOCKET_DEBUG_LOG(2, "Connect: waiting for connection (timeout=%ds)...", timeout_seconds);
-	// Wait for connection with timeout
-	if (!WaitForReady(true, timeout_seconds * 1000)) {
+	// Wait for connection with timeout. The wait ends on a socket error too -- a refused port is one -- so
+	// whether it timed out is asked of the socket, not of the wait: SO_ERROR is 0 when nothing came back in
+	// time. (Every failed wait used to be worded "Connection timed out", and a refusal reached the user as
+	// advice about firewalls.)
+	const bool ready = WaitForReady(true, timeout_seconds * 1000);
+	int error = 0;
+	socklen_t len = sizeof(error);
+	const bool known = getsockopt(fd_, SOL_SOCKET, SO_ERROR, SOCK_OPT_CAST(&error), &len) == 0;
+	if (ready && known && error == 0) {
+		MSSQL_SOCKET_DEBUG_LOG(1, "Connect: connected to address %d after wait", addr_index);
+		return true;
+	}
+	if (!ready && (!known || error == 0)) {
 		last_error_ = "Connection timed out";
 		MSSQL_SOCKET_DEBUG_LOG(1, "Connect: timed out on address %d", addr_index);
 		return false;
-	}
-	// Check if connection succeeded
-	int error = 0;
-	socklen_t len = sizeof(error);
-	if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, SOCK_OPT_CAST(&error), &len) == 0 && error == 0) {
-		MSSQL_SOCKET_DEBUG_LOG(1, "Connect: connected to address %d after wait", addr_index);
-		return true;
 	}
 	last_error_ = "Connection failed: " + std::string(strerror(error));
 	MSSQL_SOCKET_DEBUG_LOG(1, "Connect: getsockopt SO_ERROR=%d for address %d: %s", error, addr_index,
@@ -200,8 +204,9 @@ bool TdsSocket::ConnectAddress(const struct addrinfo &address, int addr_index, i
 		if (ConnectInProgress(connect_error)) {
 			connected = AwaitConnect(addr_index, timeout_seconds);
 		} else {
-			MSSQL_SOCKET_DEBUG_LOG(1, "Connect: connect failed on address %d with unexpected error %d", addr_index,
-								   connect_error);
+			// Refused at once (no wait): the same wording as a refusal that arrives after it.
+			last_error_ = "Connection failed: " + std::string(strerror(connect_error));
+			MSSQL_SOCKET_DEBUG_LOG(1, "Connect: connect failed on address %d with error %d", addr_index, connect_error);
 		}
 	}
 	if (!connected) {
@@ -602,6 +607,17 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 	if (!tls_context_->Handshake(timeout_ms)) {
 		last_error_ = HandshakeError(*tls_context_);
 		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: FAILED - handshake: %s", last_error_.c_str());
+		tls_context_->ClearBioCallbacks();
+		tls_context_.reset();
+		return false;
+	}
+
+	// What the handshake wrote last and nothing was read after: in TLS 1.3 the client's Finished. Kept bytes
+	// go out when the next read asks, and after the handshake no read comes through here -- it stayed in
+	// the buffer, TLS "enabled" and the server still waiting. (TLS 1.2 ends on a read: nothing is kept.)
+	if (!transport->Flush()) {
+		last_error_ = "TLS handshake failed: its last message could not be sent";
+		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: FAILED - %s", last_error_.c_str());
 		tls_context_->ClearBioCallbacks();
 		tls_context_.reset();
 		return false;

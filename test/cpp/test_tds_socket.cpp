@@ -5,8 +5,9 @@
 // (EnableTls, against an in-process OpenSSL server that speaks the same framing) and the bytes after it,
 // and TlsHandshakeTransport on its own over a socket pair.
 //
-// Every observation is also printed as a `note:` line, ports replaced: built with -DTDS_SOCKET_TEST_NO_TRANSPORT
-// against the code as it was before TdsSocket was split, the notes are the same (how the split was checked).
+// Every observation is also printed as a `note:` line, ports replaced. Built with -DTDS_SOCKET_TEST_NO_TRANSPORT
+// against the code as it was before TdsSocket was split, the notes were the same but for the two regressions
+// marked below, which that code fails (how the split was checked).
 //
 // Part of STANDALONE_TEST_SOURCES (`make test-cpp`), which CI runs.
 
@@ -28,6 +29,7 @@ int main() {
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <cerrno>
 #include <csignal>
 
 #include <chrono>
@@ -228,13 +230,11 @@ void TestConnect() {
 		const std::string error = socket.GetLastError();
 		Check(!connected && !socket.IsConnected() && socket.GetSocketFd() == -1, "a refused port is not connected to");
 		Check(took < 3000, "and is refused at once, not after the timeout");
-		// How the refusal is worded depends on where the platform reports it: connect() itself (no error of
-		// its own: the last line), the socket's SO_ERROR after the wait ("Connection failed: Connection
-		// refused"), or the wait seeing POLLERR -- which Connect words as "Connection timed out" though
-		// nothing timed out (macOS and Linux both take this path on loopback; kept as it is, see the PR).
-		Check(error.find("Connection failed: ") == 0 || error == "Connection timed out" ||
-				  error == "Failed to connect to 127.0.0.1:" + std::to_string(port),
-			  "and the error is one of Connect's three wordings (" + error + ")");
+		// Regression: the wait for the connection sees the refusal as a socket error, and Connect used to
+		// word every failed wait as "Connection timed out" -- which the ATTACH error then turned into advice
+		// about firewalls. The socket's own error is the reason.
+		Check(error == std::string("Connection failed: ") + std::strerror(ECONNREFUSED),
+			  "and the error is the refusal, not a timeout (" + error + ")");
 		Note("refused", error);
 	}
 	{
@@ -479,12 +479,15 @@ struct ServerSeen {
 //! The server's side of one connection: TLS through memory BIOs, each flight wrapped in a TDS packet as SQL
 //! Server wraps it; after the handshake TLS runs on the socket itself, and the server answers what it reads
 //! with every byte incremented.
-void ServeTls(int fd, const ServerIdentity &identity, ServerFault fault, size_t reply_pieces, ServerSeen &seen) {
+void ServeTls(int fd, const ServerIdentity &identity, ServerFault fault, size_t reply_pieces, int max_version,
+			  ServerSeen &seen) {
 	SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
 	SSL_CTX_use_certificate(ctx, identity.cert);
 	SSL_CTX_use_PrivateKey(ctx, identity.key);
-	// TDS 7.x wraps a TLS 1.2 handshake: SQL Server takes TLS 1.3 only under TDS 8, whose handshake is not wrapped.
-	SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+	// SQL Server wraps a TLS 1.2 handshake (it takes TLS 1.3 under TDS 8, whose handshake is not wrapped). A
+	// TLS 1.3 handshake differs in who speaks last: the client, whose Finished nothing is read after.
+	SSL_CTX_set_max_proto_version(ctx, max_version);
+	SSL_CTX_set_num_tickets(ctx, 0);  // no post-handshake messages: after the handshake TLS is on the socket
 	SSL *ssl = SSL_new(ctx);
 	BIO *in = BIO_new(BIO_s_mem());
 	BIO *out = BIO_new(BIO_s_mem());
@@ -573,19 +576,34 @@ void TestEnableTls(const ServerIdentity &identity) {
 	std::cout << "EnableTls" << std::endl;
 	TlsOptions trust;
 	trust.verify_certificate = false;
-	for (size_t pieces : {1, 2, 7}) {
+	struct Shape {
+		int version;
+		const char *name;
+		size_t pieces;
+	};
+	// TLS 1.3 is the regression: its last handshake message is the client's, and it used to stay in the
+	// transport's buffer when the handshake ended -- "enabled", and nothing after it understood.
+	const Shape shapes[] = {{TLS1_2_VERSION, "TLSv1.2", 1},
+							{TLS1_2_VERSION, "TLSv1.2", 2},
+							{TLS1_2_VERSION, "TLSv1.2", 7},
+							{TLS1_3_VERSION, "TLSv1.3", 1},
+							{TLS1_3_VERSION, "TLSv1.3", 3}};
+	for (const auto &shape : shapes) {
+		const size_t pieces = shape.pieces;
 		Pair pair;
 		ServerSeen seen;
-		std::thread server(ServeTls, pair.peer, std::cref(identity), ServerFault::None, pieces, std::ref(seen));
+		std::thread server(ServeTls, pair.peer, std::cref(identity), ServerFault::None, pieces, shape.version,
+						   std::ref(seen));
 		pair.peer = -1;	 // the server's now
 		uint8_t packet_id = 5;
 		const bool enabled = pair.socket.EnableTls(packet_id, 5000, "", trust);
-		const std::string label = "server flights in " + std::to_string(pieces) + " packet(s)";
+		const std::string label =
+			std::string(shape.name) + ", server flights in " + std::to_string(pieces) + " packet(s)";
 		Check(enabled && pair.socket.IsTlsEnabled(),
 			  "the handshake completes, " + label + " (" + pair.socket.GetLastError() + ")");
 		Note("tls version, " + label, pair.socket.GetTlsVersion());
-		Check(pair.socket.GetTlsVersion() == "TLSv1.2" && !pair.socket.GetTlsCipherSuite().empty(),
-			  "as TLS 1.2 with a cipher suite");
+		Check(pair.socket.GetTlsVersion() == shape.name && !pair.socket.GetTlsCipherSuite().empty(),
+			  std::string("as ") + shape.name + " with a cipher suite");
 		uint8_t unused = 0;
 		Check(!pair.socket.EnableTls(unused, 100, "", trust) && pair.socket.GetLastError() == "TLS is already enabled",
 			  "TLS cannot be enabled twice");
@@ -633,7 +651,8 @@ void TestEnableTls(const ServerIdentity &identity) {
 	for (const auto &refusal : refusals) {
 		Pair pair;
 		ServerSeen seen;
-		std::thread server(ServeTls, pair.peer, std::cref(identity), refusal.fault, size_t(1), std::ref(seen));
+		std::thread server(ServeTls, pair.peer, std::cref(identity), refusal.fault, size_t(1), TLS1_2_VERSION,
+						   std::ref(seen));
 		pair.peer = -1;
 		uint8_t packet_id = 1;
 		const bool enabled = pair.socket.EnableTls(packet_id, 3000, "", trust);
@@ -647,7 +666,8 @@ void TestEnableTls(const ServerIdentity &identity) {
 	{
 		Pair pair;
 		ServerSeen seen;
-		std::thread server(ServeTls, pair.peer, std::cref(identity), ServerFault::Silent, size_t(1), std::ref(seen));
+		std::thread server(ServeTls, pair.peer, std::cref(identity), ServerFault::Silent, size_t(1), TLS1_2_VERSION,
+						   std::ref(seen));
 		pair.peer = -1;
 		uint8_t packet_id = 1;
 		const auto start = std::chrono::steady_clock::now();
@@ -664,7 +684,8 @@ void TestEnableTls(const ServerIdentity &identity) {
 		// The default verifies: a self-signed certificate is refused, with the two ways out named.
 		Pair pair;
 		ServerSeen seen;
-		std::thread server(ServeTls, pair.peer, std::cref(identity), ServerFault::None, size_t(1), std::ref(seen));
+		std::thread server(ServeTls, pair.peer, std::cref(identity), ServerFault::None, size_t(1), TLS1_2_VERSION,
+						   std::ref(seen));
 		pair.peer = -1;
 		uint8_t packet_id = 1;
 		const bool enabled = pair.socket.EnableTls(packet_id, 3000);
