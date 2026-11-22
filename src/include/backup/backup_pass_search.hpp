@@ -193,6 +193,23 @@ public:
 private:
 	//! Find, past the thread's last answer: the samples, then the medium.
 	bool FindLocked(const ExtentId &extent, uint64_t &position);
+	//! A search under way (FindLocked): the interval that brackets the extent, and how it is narrowed.
+	struct Search {
+		uint64_t from = 0;
+		uint64_t to = 0;
+		bool window_rest = false;  // a probe settled past the interval: what is left is read at once
+		bool galloping = false;
+		uint64_t step = 1;
+	};
+	//! The group `extent` would be in were the groups past `below` its extents' (one read): true when it
+	//! is; else the interval narrowed where the read allows.
+	bool Guess(const ExtentId &extent, const PassSample &below, Search &search, uint64_t &position);
+	//! Every group of the interval read at once: whether `extent` is among them.
+	bool ReadWindow(const ExtentId &extent, const Search &search, uint64_t &position);
+	//! One probe of the interval: true when it found `extent`; else the interval narrowed.
+	bool ProbeOnce(const ExtentId &extent, Search &search, uint64_t &position);
+	bool KnownEmpty(uint64_t position);
+	void CountRead();
 	//! The narrowest [from, to) the samples leave for `extent`, or true with its position when a
 	//! sample is it. `below`, when given, is the nearest sample below `extent` (position UINT64_MAX
 	//! when none).

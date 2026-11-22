@@ -113,82 +113,98 @@ static MtfStream ReadStreamHeader(const RandomAccess &file, uint64_t offset, con
 	return stream;
 }
 
+//! The descriptor block at `offset`: its common header checked (and the block's own, for the blocks
+//! that keep it), and that it may stand where it does in `layout` so far.
+static MtfBlock ReadBlockHeader(const RandomAccess &file, uint64_t offset, bool data_set, const MtfLayout &layout) {
+	auto common = ReadExact(file, offset, DBLK_HEADER, "a descriptor block header");
+	ByteReader r(common.data(), common.size(), "an MTF descriptor block", offset);
+	if (!IsTypeChar(common[0]) || !IsTypeChar(common[1]) || !IsTypeChar(common[2]) || !IsTypeChar(common[3]) ||
+		Xor16(common.data(), 50) != r.U16(50)) {
+		throw FormatError(Where(file, offset) + ": no valid descriptor block where the previous one ended" +
+						  (layout.blocks.empty() ? std::string(" (not an MTF backup file?)")
+												 : " (after " + layout.blocks.back().type + ")"));
+	}
+	MtfBlock block;
+	block.type = TypeOf(common.data());
+	block.offset = offset;
+	block.attributes = r.U32(4);
+	block.first_event = r.U16(8);
+	block.string_type = r.U8(48);
+	const char *first = data_set ? "SSET" : "TAPE";
+	if (layout.blocks.empty() && block.type != first) {
+		throw FormatError(Where(file, offset) + ": the first descriptor block is " + block.type + ", not " + first);
+	}
+	if (data_set && (block.type == "TAPE" || block.type == "SFMB")) {
+		throw FormatError(Where(file, offset) + ": a " + block.type + " block inside a compressed backup's data set");
+	}
+	if (block.first_event != 0 && block.first_event < DBLK_HEADER) {
+		throw FormatError(Where(file, offset) + ": the " + block.type + " block's first stream (" +
+						  std::to_string(block.first_event) + ") lies inside its own header");
+	}
+	const size_t header_size = (block.first_event == 0 || !KeepsHeader(block.type)) ? DBLK_HEADER : block.first_event;
+	block.header =
+		header_size == DBLK_HEADER ? std::move(common) : ReadExact(file, offset, header_size, "a descriptor block");
+	return block;
+}
+
+//! The soft-filemark size a TAPE block gives, into `layout`.
+static void ReadSoftFilemarkSize(const RandomAccess &file, const MtfBlock &block, MtfLayout &layout) {
+	ByteReader tape(block.header.data(), block.header.size(), "the TAPE block", block.offset);
+	layout.soft_filemark_bytes = static_cast<uint32_t>(tape.U16(64)) * 512;
+	if (layout.soft_filemark_bytes == 0) {
+		throw FormatError(Where(file, block.offset) + ": the TAPE block gives a soft-filemark size of 0");
+	}
+}
+
+//! Where an SFMB block ends: the soft-filemark size past its start.
+static uint64_t SoftFilemarkEnd(const RandomAccess &file, const MtfBlock &block, const MtfLayout &layout) {
+	if (layout.soft_filemark_bytes == 0) {
+		throw FormatError(Where(file, block.offset) + ": an SFMB before any TAPE block");
+	}
+	if (block.first_event > layout.soft_filemark_bytes) {
+		throw FormatError(Where(file, block.offset) + ": an SFMB whose first stream (" +
+						  std::to_string(block.first_event) + ") lies past its own " +
+						  std::to_string(layout.soft_filemark_bytes) + " bytes");
+	}
+	return block.offset + layout.soft_filemark_bytes;
+}
+
+//! A block's streams, up to its SPAD, into `block`. Returns where the block ends.
+static uint64_t ReadBlockStreams(const RandomAccess &file, MtfBlock &block) {
+	const uint64_t size = file.Size();
+	if (block.first_event == 0) {
+		throw FormatError(Where(file, block.offset) + ": the " + block.type + " block has no streams");
+	}
+	uint64_t at = block.offset + block.first_event;
+	while (true) {
+		auto stream = ReadStreamHeader(file, at, block.type);
+		// Stream data is padded to 4 bytes; the next stream, or block, follows.
+		uint64_t next = stream.data_offset + stream.length;
+		next = (next + 3) & ~static_cast<uint64_t>(3);
+		const bool spad = stream.id == "SPAD";
+		block.streams.push_back(std::move(stream));
+		at = next;
+		if (spad) {
+			return at;
+		}
+		if (at >= size) {
+			throw FormatError(Where(file, block.offset) + ": the " + block.type +
+							  " block's streams run to the end of the file with no SPAD");
+		}
+	}
+}
+
 static MtfLayout Walk(const RandomAccess &file, bool data_set, bool tape_only = false) {
 	MtfLayout layout;
 	layout.has_tape = !data_set;
 	const uint64_t size = file.Size();
 	uint64_t offset = 0;
 	while (offset < size) {
-		auto common = ReadExact(file, offset, DBLK_HEADER, "a descriptor block header");
-		ByteReader r(common.data(), common.size(), "an MTF descriptor block", offset);
-		if (!IsTypeChar(common[0]) || !IsTypeChar(common[1]) || !IsTypeChar(common[2]) || !IsTypeChar(common[3]) ||
-			Xor16(common.data(), 50) != r.U16(50)) {
-			throw FormatError(Where(file, offset) + ": no valid descriptor block where the previous one ended" +
-							  (layout.blocks.empty() ? std::string(" (not an MTF backup file?)")
-													 : " (after " + layout.blocks.back().type + ")"));
-		}
-		MtfBlock block;
-		block.type = TypeOf(common.data());
-		block.offset = offset;
-		block.attributes = r.U32(4);
-		block.first_event = r.U16(8);
-		block.string_type = r.U8(48);
-		const char *first = data_set ? "SSET" : "TAPE";
-		if (layout.blocks.empty() && block.type != first) {
-			throw FormatError(Where(file, offset) + ": the first descriptor block is " + block.type + ", not " + first);
-		}
-		if (data_set && (block.type == "TAPE" || block.type == "SFMB")) {
-			throw FormatError(Where(file, offset) + ": a " + block.type +
-							  " block inside a compressed backup's data set");
-		}
-		if (block.first_event != 0 && block.first_event < DBLK_HEADER) {
-			throw FormatError(Where(file, offset) + ": the " + block.type + " block's first stream (" +
-							  std::to_string(block.first_event) + ") lies inside its own header");
-		}
-		const size_t header_size =
-			(block.first_event == 0 || !KeepsHeader(block.type)) ? DBLK_HEADER : block.first_event;
-		block.header =
-			header_size == DBLK_HEADER ? std::move(common) : ReadExact(file, offset, header_size, "a descriptor block");
+		MtfBlock block = ReadBlockHeader(file, offset, data_set, layout);
 		if (block.type == "TAPE") {
-			ByteReader tape(block.header.data(), block.header.size(), "the TAPE block", offset);
-			layout.soft_filemark_bytes = static_cast<uint32_t>(tape.U16(64)) * 512;
-			if (layout.soft_filemark_bytes == 0) {
-				throw FormatError(Where(file, offset) + ": the TAPE block gives a soft-filemark size of 0");
-			}
+			ReadSoftFilemarkSize(file, block, layout);
 		}
-		if (block.type == "SFMB") {
-			if (layout.soft_filemark_bytes == 0) {
-				throw FormatError(Where(file, offset) + ": an SFMB before any TAPE block");
-			}
-			if (block.first_event > layout.soft_filemark_bytes) {
-				throw FormatError(Where(file, offset) + ": an SFMB whose first stream (" +
-								  std::to_string(block.first_event) + ") lies past its own " +
-								  std::to_string(layout.soft_filemark_bytes) + " bytes");
-			}
-			block.end = offset + layout.soft_filemark_bytes;
-		} else {
-			if (block.first_event == 0) {
-				throw FormatError(Where(file, offset) + ": the " + block.type + " block has no streams");
-			}
-			uint64_t at = offset + block.first_event;
-			while (true) {
-				auto stream = ReadStreamHeader(file, at, block.type);
-				// Stream data is padded to 4 bytes; the next stream, or block, follows.
-				uint64_t next = stream.data_offset + stream.length;
-				next = (next + 3) & ~static_cast<uint64_t>(3);
-				const bool spad = stream.id == "SPAD";
-				block.streams.push_back(std::move(stream));
-				at = next;
-				if (spad) {
-					break;
-				}
-				if (at >= size) {
-					throw FormatError(Where(file, offset) + ": the " + block.type +
-									  " block's streams run to the end of the file with no SPAD");
-				}
-			}
-			block.end = at;
-		}
+		block.end = block.type == "SFMB" ? SoftFilemarkEnd(file, block, layout) : ReadBlockStreams(file, block);
 		if (block.end <= offset) {
 			throw FormatError(Where(file, offset) + ": the " + block.type + " block does not advance");
 		}

@@ -45,6 +45,14 @@ static void ValidateBackupChangeHash(ClientContext &context, SetScope scope, Val
 	}
 }
 
+static void ValidateBackupFuzzy(ClientContext &context, SetScope scope, Value &parameter) {
+	const auto v = StringUtil::Lower(parameter.ToString());
+	if (!parameter.IsNull() && v != "warn" && v != "error" && v != "ignore") {
+		throw InvalidInputException("mssql_backup_fuzzy: '%s' is not 'warn', 'error' or 'ignore'",
+									parameter.ToString());
+	}
+}
+
 static void ValidateDmlPlatform(ClientContext &context, SetScope scope, Value &parameter) {
 	const auto v = StringUtil::Lower(parameter.ToString());
 	if (!v.empty() && v != "sqlserver" && v != "fabric" && v != "synapse") {
@@ -623,6 +631,15 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "next call on the same unchanged files, in the DuckDB instance's object cache "
 							  "(default: true)",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
+	// mssql_backup_fuzzy - Spec 085 D11 (task 27): what a backup function does with a table the backup's
+	// log tail says is not consistent (a transaction open at its end changed it, or one finished after
+	// its pages were copied): 'warn' (read it, one WARNING per table in duckdb_logs), 'error' (refuse it
+	// by name: what an importer passes) or 'ignore'. The call's fuzzy := wins, then an ATTACH's.
+	config.AddExtensionOption("mssql_backup_fuzzy",
+							  "What a backup scan does with a table its log tail says is not consistent: 'warn' "
+							  "(default: read it, log a WARNING), 'error' (refuse it) or 'ignore'",
+							  LogicalType::VARCHAR, Value("warn"), ValidateBackupFuzzy);
 
 	// mssql_backup_change_hash - Spec 085 PR 4c-3: how mssql_backup_table_changes tells two versions of
 	// a row apart where it keeps their digests, not their bytes (a row moved between pages, a value

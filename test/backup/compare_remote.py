@@ -24,6 +24,7 @@ comparisons were made.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -50,6 +51,7 @@ class DuckDB:
                       f"USE_SSL {'true' if ca else 'false'},", "REGION 'us-east-1', URL_STYLE 'path');"]
         lines.append(".output")
         self.preamble = "\n".join(lines) + "\n"
+        self.warnings = []
 
     def mask(self, text):
         for s in sorted(self.secrets, key=len, reverse=True):
@@ -61,11 +63,20 @@ class DuckDB:
         its output dropped."""
         script = self.preamble + (f".output /dev/null\n{setup}\n.output\n" if setup else "") + ".mode json\n" + \
             statement.rstrip().rstrip(";") + ";\n"
+        self.warnings = []
         run = subprocess.run([self.binary, "-no-agent", "-bail"], input=script, capture_output=True, text=True)
         if run.returncode != 0:
             first = next((line for line in run.stderr.splitlines() if line.strip()), "(no message)")
             return "ERROR: " + self.mask(first)
-        out = run.stdout.strip()
+        # The CLI prints a WARNING (a fuzzy table's, spec 085 PR 5; a clamped max_threads) before the rows,
+        # in grey: kept apart, in self.warnings, so that the rows are the JSON after them and the warnings
+        # are compared too.
+        text = re.sub(r"\x1b\[[0-9;]*m", "", run.stdout)
+        lines = text.splitlines()
+        start = next((i for i, line in enumerate(lines) if line.startswith("[")), len(lines))
+        # Sorted: a scan's tasks may warn in either order.
+        self.warnings = sorted(w for w in (line.strip() for line in lines[:start]) if w and w != "WARNING:")
+        out = "\n".join(lines[start:]).strip()
         return json.loads(out) if out else []
 
 
@@ -192,6 +203,7 @@ def main():
             differences.append(f"{label}: local: {expected}")
             continue
         expected_text = json.dumps(expected, sort_keys=True)
+        expected_warnings = db.warnings
         for remote in ARGS.remote:
             if glob and not remote.startswith("s3://"):
                 continue
@@ -203,6 +215,9 @@ def main():
             elif json.dumps(relocated(got, remote, local), sort_keys=True) != expected_text:
                 differences.append(f"{label}: {remote}: {json.dumps(got)[:300]} where local gives "
                                    f"{expected_text[:300]}")
+            elif relocated(db.warnings, remote, local) != expected_warnings:
+                differences.append(f"{label}: {remote}: warnings {db.warnings} where local gives "
+                                   f"{expected_warnings}")
     for d in differences:
         print("DIFFERENCE " + d)
     print("compare_remote: statements by kind: " + ", ".join(f"{k} {n}" for k, n in sorted(kinds.items())))

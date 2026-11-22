@@ -130,7 +130,7 @@ TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_respon
 # whole space-separated words, so a stray separator or a typo would otherwise build fewer harnesses
 # than asked, green.
 TARGETS="$(printf '%s %s' "${TARGETS}" "${TARGETS_EXTRA:-}" | tr ',\n\r\t' '    ')"
-KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci variant_envelope vector hierarchyid "
+KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci variant_envelope vector hierarchyid "
 for t in ${TARGETS}; do
 	if [[ "${KNOWN_TARGETS}" != *" ${t} "* ]]; then
 		echo "ERROR: unknown fuzz target '${t}' in TARGETS / TARGETS_EXTRA (known:${KNOWN_TARGETS})" >&2
@@ -259,16 +259,18 @@ BACKUP_CATALOG_SRCS=(
 BACKUP_LOB_SRCS=("${BACKUP}/backup_lob_map.cpp")
 # ROW-compressed records (spec 086 PR 1): the CD walk and the values' uncompressed forms.
 BACKUP_CD_SRCS=("${BACKUP}/backup_cd_record.cpp")
+# The log tail (spec 085 PR 5): its blocks and records, and D11's summary of them.
+BACKUP_LOG_SRCS=("${BACKUP}/backup_log_tail.cpp" "${BACKUP}/backup_fuzzy.cpp")
 BACKUP_OBJS=""
 if want backup_mtf || want backup_container || want backup_xpress || want backup_page || want backup_catalog ||
-	want backup_record || want backup_lob || want backup_cd || want backup_page_ci; then
+	want backup_record || want backup_lob || want backup_cd || want backup_log || want backup_page_ci; then
 	BACKUP_OBJS="$(compile_objs backup "${BACKUP_SRCS[@]}")"
 fi
 want backup_mtf && build_harness fuzz_backup_mtf fuzz_backup_mtf.cc ${BACKUP_OBJS}
 want backup_container && build_harness fuzz_backup_container fuzz_backup_container.cc ${BACKUP_OBJS}
 want backup_xpress && build_harness fuzz_backup_xpress fuzz_backup_xpress.cc ${BACKUP_OBJS}
 want backup_page && build_harness fuzz_backup_page fuzz_backup_page.cc ${BACKUP_OBJS}
-if want backup_catalog || want backup_record || want backup_lob || want backup_cd || want backup_page_ci; then
+if want backup_catalog || want backup_record || want backup_lob || want backup_cd || want backup_log || want backup_page_ci; then
 	BACKUP_CATALOG_OBJS="$(compile_objs backup_catalog "${BACKUP_CATALOG_SRCS[@]}")"
 fi
 want backup_catalog && build_harness fuzz_backup_catalog fuzz_backup_catalog.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS}
@@ -284,6 +286,13 @@ if want backup_cd; then
 	BACKUP_CD_OBJS="$(compile_objs backup_cd "${BACKUP_CD_SRCS[@]}")"
 	build_harness fuzz_backup_cd fuzz_backup_cd.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS} ${BACKUP_CD_OBJS}
 fi
+# The log tail (spec 085 PR 5): ParseLogBlock, RestoreSectorParity, RowLogElements, LogTailCursor,
+# SummarizeLogTail.
+if want backup_log; then
+	BACKUP_LOG_OBJS="$(compile_objs backup_log "${BACKUP_LOG_SRCS[@]}")"
+	build_harness fuzz_backup_log fuzz_backup_log.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS} ${BACKUP_LOG_OBJS}
+fi
+
 # PAGE compression (spec 086 PR 2): ReadPageCompression, and CdRow::Read with a page's compression information.
 if want backup_page_ci; then
 	BACKUP_PAGE_CI_OBJS="$(compile_objs backup_page_ci "${BACKUP_CD_SRCS[@]}")"
@@ -404,7 +413,7 @@ fi
 
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
 for t in browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode \
-	backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci \
+	backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci \
 	variant_envelope vector hierarchyid; do
 	# Only the corpora of the targets this build makes: OSS-Fuzz pairs a zip with its binary.
 	want "${t}" || continue

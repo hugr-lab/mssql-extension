@@ -111,89 +111,181 @@ struct TableChangesLocal : public LocalTableFunctionState {
 	DataChunk old_values;  // the older state's columns, before their cast to the newer state's types
 };
 
+//! The call's arguments: the files, the table, the two versions.
+void ReadChangesArguments(TableChangesBindData &data, TableFunctionBindInput &input) {
+	data.paths = PathsOf(input.inputs[0], data.function);
+	data.diff = DiffPathsOf(input.named_parameters, data.function);
+	if (input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
+		throw InvalidInputException("%s: the schema and the table must not be NULL", data.function);
+	}
+	data.schema = input.inputs[1].ToString();
+	data.table = input.inputs[2].ToString();
+	data.fuzzy = FuzzyParameterOf(input.named_parameters, data.function);
+	for (const auto &kv : input.named_parameters) {
+		if (kv.first == "start_version") {
+			data.start = kv.second;
+		} else if (kv.first == "end_version") {
+			data.end = kv.second;
+		}
+	}
+	if (!data.diff.empty() && (!data.start.IsNull() || !data.end.IsNull())) {
+		throw InvalidInputException(
+			"%s: diff := names its two states (the full, and the full with the "
+			"differential): start_version / end_version do not go beside it",
+			data.function);
+	}
+}
+
+//! The newer state's table names the columns, whatever the states (one state: no rows; OpenTwoStates
+//! opened it).
+void FindNewTable(TableChangesBindData &data) {
+	const CatalogModel &new_model = data.states.new_catalog->Model();
+	data.new_table = new_model.FindTable(data.schema, data.table);
+	if (!data.new_table) {
+		throw InvalidInputException("%s: the newer state has no table %s.%s (mssql_backup_tables lists them)",
+									data.function, data.schema, data.table);
+	}
+	if (!data.new_table->decodable) {
+		throw InvalidInputException("%s: %s.%s is not read: %s", data.function, data.schema, data.table,
+									data.new_table->reason);
+	}
+}
+
+//! The older state's table: by object id (a rename is a rename), by name across a break.
+bool IsOlderTable(const TableChangesBindData &data, const CatalogTable &t) {
+	if (data.states.history_break) {
+		return t.schema_name == data.new_table->schema_name && t.name == data.new_table->name;
+	}
+	return t.object_id == data.new_table->object_id;
+}
+
+//! A reload (DQ-47): the table recreated, a partition switched in, a break -- its whole content.
+bool IsReload(const TableChangesBindData &data, const CatalogModel &old_model, const CatalogModel &new_model) {
+	bool reload = !data.old_table || data.states.history_break;
+	if (!reload) {
+		// Against the whole models: a partition switched in is a rowset another table owned, one an
+		// ATTACH's filters leave out too.
+		const ViewDefinition none = [](bool, const CatalogView &) { return std::string(); };
+		for (const auto &c : CompareCatalogs(old_model, new_model, false, none, data.states.old_whole.get(),
+											 data.states.new_whole.get())) {
+			reload = reload || (c.change_type == "table_reload" && c.object_id == data.new_table->object_id);
+		}
+	}
+	return reload;
+}
+
+void FindOldTable(TableChangesBindData &data) {
+	const CatalogModel &old_model = data.states.old_catalog->Model();
+	for (const auto &t : old_model.tables) {
+		if (IsOlderTable(data, t)) {
+			data.old_table = &t;
+		}
+	}
+	const bool reload = IsReload(data, old_model, data.states.new_catalog->Model());
+	data.all_inserts = reload;
+	if (!reload && !data.old_table->decodable) {
+		throw InvalidInputException("%s: %s.%s is not read in the older state: %s", data.function, data.schema,
+									data.table, data.old_table->reason);
+	}
+}
+
+//! The two states opened, and the table found in each.
+void OpenChangesStates(ClientContext &context, TableChangesBindData &data) {
+	try {
+		data.states = OpenTwoStates(context, std::vector<std::string>(data.paths.begin(), data.paths.end()),
+									std::vector<std::string>(data.diff.begin(), data.diff.end()), data.start, data.end,
+									data.function, true);
+		FindNewTable(data);
+		if (!data.states.same) {
+			FindOldTable(data);
+		}
+	} catch (FormatError &e) {
+		throw InvalidInputException("%s: %s", data.function, e.what());
+	}
+}
+
+//! D11 for the change listing (review of #591: it read a dirty or stale state without a word, and under
+//! mssql_backup_fuzzy = 'error' too): each state's table checked against that state's log tail, as the scan
+//! checks the one it reads -- a WARNING each under 'warn', refused by name under 'error'. One state: nothing
+//! is read, nothing checked.
+void CheckChangesFuzzy(ClientContext &context, TableChangesBindData &data) {
+	if (data.states.same) {
+		return;
+	}
+	if (data.fuzzy.empty() && data.paths.size() == 1) {
+		// Over an attached name, the ATTACH's fuzzy option before the setting, as the scan takes it.
+		data.fuzzy = AttachedFuzzy(context, data.paths.front());
+	}
+	const FuzzyMode mode = FuzzyModeOf(context, data.fuzzy, data.function);
+	const std::string given = data.schema + "." + data.table;
+	const std::string name = data.new_table->schema_name + "." + data.new_table->name;
+	CheckStatementFuzzy(context, *data.states.new_catalog, BaseUnitsOf(*data.new_table), name + " (the newer state)",
+						given, mode, data.function);
+	if (data.old_table && !data.all_inserts) {
+		CheckStatementFuzzy(context, *data.states.old_catalog, BaseUnitsOf(*data.old_table),
+							data.old_table->schema_name + "." + data.old_table->name + " (the older state)", given,
+							mode, data.function);
+	}
+}
+
+//! A page of either state that became live while its backup ran: its rows are in that backup's log tail
+//! only. The scan passes such a page over; a change listing cannot -- a row moved onto it would read as
+//! deleted -- so it is refused whatever fuzzy := says, and said so. A zero copy (2017) is told from a
+//! misplaced one by the tail of the state that holds it.
+[[noreturn]] void ThrowChangesError(ClientContext &context, const TableChangesBindData &data, const FormatError &e) {
+	std::string what = e.what();
+	bool pending = dynamic_cast<const PendingPageError *>(&e) != nullptr;
+	const auto *zero = dynamic_cast<const ZeroCopyError *>(&e);
+	for (const auto &catalog : {data.states.new_catalog, data.states.old_catalog}) {
+		if (!zero || pending || !catalog) {
+			continue;
+		}
+		try {
+			BindFiles bound(catalog->Binding());
+			ThrowPendingOrFormat(context, catalog->opened, *zero);
+		} catch (PendingPageError &p) {
+			pending = true;
+			what = p.what();
+		} catch (FormatError &f) {
+			what = f.what();
+		}
+	}
+	if (pending) {
+		throw InvalidInputException(
+			"%s: %s.%s: %s. A table's changes cannot be told past such a page (a row moved onto it would read as "
+			"deleted), so it is not passed over, whatever fuzzy := says; mssql_backup_scan reads the table's other "
+			"pages",
+			data.function, data.schema, data.table, what);
+	}
+	throw InvalidInputException("%s: %s", data.function, what);
+}
+
+//! The newer state's columns the older state's table reads too: staged from it, cast to the newer's types.
+void PairOldColumns(TableChangesBindData &data) {
+	if (!data.old_table || data.all_inserts) {
+		return;
+	}
+	const ScanColumns old_columns = ScanColumnsOf(*data.old_table);
+	std::set<int32_t> readable(old_columns.column_ids.begin(), old_columns.column_ids.end());
+	for (idx_t i = 0; i < data.columns.column_ids.size(); i++) {
+		if (readable.count(data.columns.column_ids[i])) {
+			data.old_staged.push_back(data.columns.column_ids[i]);
+			data.old_outputs.push_back(i);
+		}
+	}
+}
+
 unique_ptr<FunctionData> TableChangesBind(ClientContext &context, TableFunctionBindInput &input,
 										  vector<LogicalType> &return_types, vector<Identifier> &names,
 										  ChangeListing listing) {
 	auto data = make_uniq<TableChangesBindData>();
 	data->listing = listing;
 	data->function = ChangesFunction(listing);
-	data->paths = PathsOf(input.inputs[0], data->function);
-	data->diff = DiffPathsOf(input.named_parameters, data->function);
-	if (input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
-		throw InvalidInputException("%s: the schema and the table must not be NULL", data->function);
-	}
-	data->schema = input.inputs[1].ToString();
-	data->table = input.inputs[2].ToString();
-	for (const auto &kv : input.named_parameters) {
-		if (kv.first == "start_version") {
-			data->start = kv.second;
-		} else if (kv.first == "end_version") {
-			data->end = kv.second;
-		}
-	}
-	if (!data->diff.empty() && (!data->start.IsNull() || !data->end.IsNull())) {
-		throw InvalidInputException(
-			"%s: diff := names its two states (the full, and the full with the "
-			"differential): start_version / end_version do not go beside it",
-			data->function);
-	}
-	try {
-		data->states = OpenTwoStates(context, std::vector<std::string>(data->paths.begin(), data->paths.end()),
-									 std::vector<std::string>(data->diff.begin(), data->diff.end()), data->start,
-									 data->end, data->function, true);
-		// The newer state's table names the columns, whatever the states (one state: no rows; OpenTwoStates
-		// opened it).
-		const CatalogModel &new_model = data->states.new_catalog->Model();
-		data->new_table = new_model.FindTable(data->schema, data->table);
-		if (!data->new_table) {
-			throw InvalidInputException("%s: the newer state has no table %s.%s (mssql_backup_tables lists them)",
-										data->function, data->schema, data->table);
-		}
-		if (!data->new_table->decodable) {
-			throw InvalidInputException("%s: %s.%s is not read: %s", data->function, data->schema, data->table,
-										data->new_table->reason);
-		}
-		if (!data->states.same) {
-			// The older state's table: by object id (a rename is a rename), by name across a break.
-			const CatalogModel &old_model = data->states.old_catalog->Model();
-			for (const auto &t : old_model.tables) {
-				if (data->states.history_break
-						? (t.schema_name == data->new_table->schema_name && t.name == data->new_table->name)
-						: t.object_id == data->new_table->object_id) {
-					data->old_table = &t;
-				}
-			}
-			// A reload (DQ-47): the table recreated, a partition switched in, a break -- its whole content.
-			bool reload = !data->old_table || data->states.history_break;
-			if (!reload) {
-				// Against the whole models: a partition switched in is a rowset another table owned, one an
-				// ATTACH's filters leave out too.
-				const ViewDefinition none = [](bool, const CatalogView &) { return std::string(); };
-				for (const auto &c : CompareCatalogs(old_model, new_model, false, none, data->states.old_whole.get(),
-													 data->states.new_whole.get())) {
-					reload = reload || (c.change_type == "table_reload" && c.object_id == data->new_table->object_id);
-				}
-			}
-			data->all_inserts = reload;
-			if (!reload && !data->old_table->decodable) {
-				throw InvalidInputException("%s: %s.%s is not read in the older state: %s", data->function,
-											data->schema, data->table, data->old_table->reason);
-			}
-		}
-	} catch (FormatError &e) {
-		throw InvalidInputException("%s: %s", data->function, e.what());
-	}
+	ReadChangesArguments(*data, input);
+	OpenChangesStates(context, *data);
+	CheckChangesFuzzy(context, *data);
 	data->columns = ScanColumnsOf(*data->new_table);
-	if (data->old_table && !data->all_inserts) {
-		const ScanColumns old_columns = ScanColumnsOf(*data->old_table);
-		std::set<int32_t> readable(old_columns.column_ids.begin(), old_columns.column_ids.end());
-		for (idx_t i = 0; i < data->columns.column_ids.size(); i++) {
-			if (readable.count(data->columns.column_ids[i])) {
-				data->old_staged.push_back(data->columns.column_ids[i]);
-				data->old_outputs.push_back(i);
-			}
-		}
-	}
+	PairOldColumns(*data);
 	names.emplace_back("change_type");
 	return_types.push_back(LogicalType::VARCHAR);
 	for (idx_t i = 0; i < data->columns.names.size(); i++) {
@@ -238,7 +330,7 @@ unique_ptr<GlobalTableFunctionState> TableChangesInit(ClientContext &context, Ta
 		state->collector =
 			make_uniq<ChangeCollector>(context, data, *state->new_side, state->old_side.get(), *state->memory, sha256);
 	} catch (FormatError &e) {
-		throw InvalidInputException("%s: %s", data.function, e.what());
+		ThrowChangesError(context, data, e);
 	}
 	auto &buffers = BufferManager::GetBufferManager(context);
 	// DuckDB's `threads`, but no more tasks than a quarter of memory_limit holds the buffers of: each task adds
@@ -393,6 +485,245 @@ unique_ptr<LocalTableFunctionState> TableChangesInitLocal(ExecutionContext &exec
 	return std::move(local);
 }
 
+//! The rows of a chunk's items read from one state's pages: the page an item names (kept while the items
+//! stay on it, its compression information with it) and the item's record in either form. `row` points
+//! into this reader (its CD row or its record view), so the reader outlives every use of it.
+struct ChangeRowReader {
+	ChangeRowReader(const ChangeSide &side, const PartitionCursor &cursor, const RowsetLayout &layout,
+					std::vector<bool> needed_p)
+		: side(side),
+		  cursor(cursor),
+		  layout(layout),
+		  store(*side.data.catalog->pages->store),
+		  name(side.data.schema + "." + side.data.table),
+		  needed(std::move(needed_p)) {}
+
+	//! `item`'s row into `row`, and where it is (or was before it was forwarded) into `at`.
+	void Read(const ChangeItem &item, RowRecord &row, RowLocation &at) {
+		if (!have || !(page.header.page_id == item.page)) {
+			ReadPage(item);
+		}
+		at.page = page.header.page_id;
+		at.slot = item.slot;
+		if (layout.compression == 1 || layout.compression == 2) {
+			ReadCompressed(item, row, at);
+			return;
+		}
+		fixed = ReadSlot(page.bytes.data(), PAGE_SIZE, page.header.slot_count, item.slot, side.data.table.c_str());
+		if (fixed.Type() == RECORD_FORWARDED) {
+			at = ForwardedFrom(fixed, layout.table);
+		}
+		row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
+	}
+
+	const ChangeSide &side;
+	const PartitionCursor &cursor;
+	const RowsetLayout &layout;
+	const PageStore &store;
+	const std::string name;
+
+private:
+	void ReadPage(const ChangeItem &item) {
+		if (!ReadUnitDataPage(store, *cursor.unit, item.page, name, page)) {
+			throw FormatError("backup: page " + item.page.ToString() + " of " + name +
+							  " is no longer a data page of the table on its second read");
+		}
+		have = true;
+		page_ci.present = false;
+		if (layout.compression == 2 && (page.header.type_flags & 0x80)) {
+			ReadPageCompression(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * page.header.slot_count,
+								side.data.table.c_str(), page_ci);
+		}
+	}
+
+	void ReadCompressed(const ChangeItem &item, RowRecord &row, RowLocation &at) {
+		const size_t pos = PAGE_SIZE - 2 - 2 * static_cast<size_t>(item.slot);
+		const uint16_t offset = static_cast<uint16_t>(page.bytes[pos] | (page.bytes[pos + 1] << 8));
+		if (page_ci.present && offset < page_ci.end) {
+			throw FormatError("backup: page " + item.page.ToString() + " has a record at offset " +
+							  std::to_string(offset) + " inside its compression information (to " +
+							  std::to_string(page_ci.end) + ")");
+		}
+		ReadCdRecord(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * page.header.slot_count, offset,
+					 side.data.table.c_str(), cd);
+		if (cd.kind == CdRecord::Kind::Forwarded) {
+			cd.BackPointer(at.page.page, at.page.file, at.slot);
+		}
+		cd_row.Read(cd, layout, &needed, layout.compression == 2 ? &page_ci : nullptr);
+		row = RowRecord::Compressed(cd, cd_row);
+	}
+
+	Page page;
+	bool have = false;
+	std::vector<bool> needed;
+	CdRecord cd;
+	CdRow cd_row;
+	PageCompression page_ci;  // the current page's, a PAGE rowset's (spec 086 PR 2)
+	RecordView fixed;
+};
+
+//! The columns a compressed row's values are read for: the stager's, and the row's key.
+std::vector<bool> NeededForChanges(const RecordStager &stager, const PartitionCursor &cursor) {
+	std::vector<bool> needed;
+	stager.MarkNeeded(needed);
+	for (size_t k : cursor.key) {
+		needed[k] = true;
+	}
+	if (cursor.has_uniquifier) {
+		needed[cursor.uniquifier] = true;
+	}
+	return needed;
+}
+
+//! Where the chunk starting at the queue's position ends: items of one state and one partition (one
+//! layout), STANDARD_VECTOR_SIZE at most.
+size_t ChunkEnd(const TableChangesLocal &local) {
+	const size_t begin = local.pos;
+	size_t end = begin;
+	while (end < local.queue.size() && end - begin < STANDARD_VECTOR_SIZE &&
+		   local.queue[end].old_side == local.queue[begin].old_side &&
+		   local.queue[end].partition == local.queue[begin].partition) {
+		end++;
+	}
+	return end;
+}
+
+//! The vectors the chunk's values are staged into: the output's for the newer state, the local chunk
+//! of the older state's own types for the older.
+std::vector<Vector *> ChangeTargets(const TableChangesBindData &data, TableChangesLocal &local, DataChunk &output,
+									bool old_side) {
+	std::vector<Vector *> targets;
+	if (old_side) {
+		local.old_values.Reset();
+		for (idx_t c = 0; c < local.old_values.ColumnCount(); c++) {
+			targets.push_back(&local.old_values.data[c]);
+		}
+	} else {
+		for (idx_t c = 0; c < data.columns.types.size(); c++) {
+			targets.push_back(&output.data[1 + c]);
+		}
+	}
+	return targets;
+}
+
+//! A row's values stored off row (`need`) reserved before it is staged (D17): a refusal with rows staged
+//! closes the chunk before this row (false); with none, the chunk's reservation is taken again with it.
+//! Refused, the row is named by its place, what it holds off row, and what was asked.
+bool ReserveChangeRow(const TableChangesBindData &data, CallReservations &held, RecordStager &stager,
+					  const OffRowNeed &need, const ChangeItem &item, uint64_t chunk_bytes) {
+	auto refused = [&](uint64_t bytes, const ReservationRefused &e) {
+		return OutOfMemoryException(
+			"%s: staging the row of %s.%s on page %s slot %u, whose values stored "
+			"off row (%s) take %s of the %s reserved: %s",
+			data.function, data.schema, data.table, item.page.ToString(), static_cast<unsigned>(item.slot),
+			stager.DescribePrepared(), StringUtil::BytesToHumanReadableString(need.Total()),
+			StringUtil::BytesToHumanReadableString(bytes), e.what());
+	};
+	bool fits = need.Total() == 0;
+	if (!fits) {
+		try {
+			fits = held.TryAcquire(need.Total(), need.Ours());
+		} catch (ReservationRefused &e) {
+			throw refused(need.Total(), e);
+		}
+	}
+	if (fits) {
+		return true;
+	}
+	if (stager.Count() > 0) {
+		return false;
+	}
+	held.ReleaseAll();
+	try {
+		held.Acquire(chunk_bytes + need.Total(), chunk_bytes + need.Ours());
+	} catch (ReservationRefused &e) {
+		throw refused(chunk_bytes + need.Total(), e);
+	}
+	return true;
+}
+
+//! The older state's values on the newer state's columns: by column id, cast to the newer types; a
+//! column the older state has not is NULL.
+void CastOldValues(ClientContext &context, const TableChangesBindData &data, TableChangesLocal &local,
+				   DataChunk &output, idx_t count) {
+	std::vector<bool> filled(data.columns.types.size(), false);
+	for (idx_t c = 0; c < data.old_outputs.size(); c++) {
+		Vector &target = output.data[1 + data.old_outputs[c]];
+		// An older value the newer type cannot take (the column's type changed) is NULL, said once a
+		// chunk; DuckDB's cast, not the server's ALTER COLUMN.
+		std::string error;
+		if (!VectorOperations::TryCast(context, local.old_values.data[c], target, count, &error)) {
+			DUCKDB_LOG_WARNING(context, "%s: %s.%s: an older value of %s is NULL in the newer type: %s", data.function,
+							   data.schema, data.table, data.columns.names[data.old_outputs[c]], error);
+		}
+		filled[data.old_outputs[c]] = true;
+	}
+	for (idx_t c = 0; c < filled.size(); c++) {
+		if (!filled[c]) {
+			output.data[1 + c].SetVectorType(VectorType::CONSTANT_VECTOR);
+			ConstantVector::SetNull(output.data[1 + c], true);
+		}
+	}
+}
+
+//! The chunk's change kinds (column 0) and _mssql_rid values (the last column).
+void WriteKindsAndRids(const TableChangesBindData &data, DataChunk &output, const std::vector<ChangeKind> &kinds,
+					   const std::vector<std::string> &rids, idx_t count) {
+	Vector &kind_vector = output.data[0];
+	Vector &rid_vector = output.data[1 + data.columns.types.size()];
+	auto *kind_out = FlatVector::GetDataMutable<string_t>(kind_vector);
+	auto *rid_out = FlatVector::GetDataMutable<string_t>(rid_vector);
+	for (idx_t i = 0; i < count; i++) {
+		kind_out[i] = StringVector::AddString(kind_vector, ChangeName(kinds[i]));
+		rid_out[i] = StringVector::AddStringOrBlob(rid_vector, rids[i]);
+	}
+}
+
+//! One chunk of the queue's items staged into `output`.
+void StageChanges(ClientContext &context, const TableChangesBindData &data, TableChangesState &global,
+				  TableChangesLocal &local, DataChunk &output) {
+	const size_t begin = local.pos;
+	const size_t end = ChunkEnd(local);
+	const ChangeItem &first = local.queue[begin];
+	const bool old_side = first.old_side;
+	// The chunk's staging reserved for this call only (D17, as the scan's Execute).
+	const uint64_t chunk_bytes = global.chunk_bytes[old_side ? 1 : 0];
+	CallReservations held(*global.gate, [&context]() { return context.IsInterrupted(); });
+	held.Acquire(chunk_bytes, chunk_bytes);
+	const ChangeSide &side = old_side ? *global.old_side : *global.new_side;
+	const PartitionCursor &cursor = side.cursors[first.partition];
+	RecordStager &stager = old_side ? *local.old_stager : *local.new_stager;
+	const RowsetLayout &layout = side.data.entry->Layout(*cursor.partition);
+	stager.UseLayout(layout);
+	stager.UseOffRow(old_side ? &local.old_fetch : &local.new_fetch, cursor.off_row);
+	stager.BeginChunk(ChangeTargets(data, local, output, old_side));
+	ChangeRowReader reader(side, cursor, layout, NeededForChanges(stager, cursor));
+	std::vector<std::string> rids;
+	std::vector<ChangeKind> kinds;
+	size_t i = begin;
+	for (; i < end && !stager.Full(); i++) {
+		const ChangeItem &item = local.queue[i];
+		RowLocation at;
+		RowRecord row;
+		reader.Read(item, row, at);
+		const OffRowNeed need = stager.PrepareRow(row);
+		if (!ReserveChangeRow(data, held, stager, need, item, chunk_bytes)) {
+			break;
+		}
+		stager.Append(row);
+		rids.push_back(RowId(side.data, cursor, row, at));
+		kinds.push_back(item.kind);
+	}
+	local.pos = i;
+	const idx_t count = stager.Count();
+	stager.FinalizeChunk();
+	if (old_side) {
+		CastOldValues(context, data, local, output, count);
+	}
+	WriteKindsAndRids(data, output, kinds, rids, count);
+	output.SetChildCardinality(count);
+}
+
 void TableChangesExecute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<TableChangesBindData>();
 	auto &global = input.global_state->Cast<TableChangesState>();
@@ -404,174 +735,13 @@ void TableChangesExecute(ClientContext &context, TableFunctionInput &input, Data
 	try {
 		BindFiles bound_new(data.states.new_catalog->Binding());
 		BindFiles bound_old(data.states.old_catalog->Binding());
-		// A chunk's items: of one state and one partition (one layout), STANDARD_VECTOR_SIZE at most.
 		if (!NextChanges(context, data, global, local)) {
 			output.SetChildCardinality(0);
 			return;
 		}
-		const size_t begin = local.pos;
-		size_t end = begin;
-		while (end < local.queue.size() && end - begin < STANDARD_VECTOR_SIZE &&
-			   local.queue[end].old_side == local.queue[begin].old_side &&
-			   local.queue[end].partition == local.queue[begin].partition) {
-			end++;
-		}
-		const ChangeItem &first = local.queue[begin];
-		const bool old_side = first.old_side;
-		// The chunk's staging reserved for this call only (D17, as the scan's Execute).
-		const uint64_t chunk_bytes = global.chunk_bytes[old_side ? 1 : 0];
-		CallReservations held(*global.gate, [&context]() { return context.IsInterrupted(); });
-		held.Acquire(chunk_bytes, chunk_bytes);
-		const ChangeSide &side = old_side ? *global.old_side : *global.new_side;
-		const PartitionCursor &cursor = side.cursors[first.partition];
-		RecordStager &stager = old_side ? *local.old_stager : *local.new_stager;
-		const RowsetLayout &layout = side.data.entry->Layout(*cursor.partition);
-		stager.UseLayout(layout);
-		stager.UseOffRow(old_side ? &local.old_fetch : &local.new_fetch, cursor.off_row);
-		std::vector<Vector *> targets;
-		if (old_side) {
-			local.old_values.Reset();
-			for (idx_t c = 0; c < local.old_values.ColumnCount(); c++) {
-				targets.push_back(&local.old_values.data[c]);
-			}
-		} else {
-			for (idx_t c = 0; c < data.columns.types.size(); c++) {
-				targets.push_back(&output.data[1 + c]);
-			}
-		}
-		stager.BeginChunk(targets);
-		const PageStore &store = *side.data.catalog->pages->store;
-		const std::string name = side.data.schema + "." + side.data.table;
-		Page page;
-		bool have = false;
-		std::vector<bool> needed;
-		stager.MarkNeeded(needed);
-		for (size_t k : cursor.key) {
-			needed[k] = true;
-		}
-		if (cursor.has_uniquifier) {
-			needed[cursor.uniquifier] = true;
-		}
-		CdRecord cd;
-		CdRow cd_row;
-		PageCompression page_ci;  // the current page's, a PAGE rowset's (spec 086 PR 2)
-		std::vector<std::string> rids;
-		std::vector<ChangeKind> kinds;
-		size_t i = begin;
-		for (; i < end && !stager.Full(); i++) {
-			const ChangeItem &item = local.queue[i];
-			if (!have || !(page.header.page_id == item.page)) {
-				if (!ReadUnitDataPage(store, *cursor.unit, item.page, name, page)) {
-					throw FormatError("backup: page " + item.page.ToString() + " of " + name +
-									  " is no longer a data page of the table on its second read");
-				}
-				have = true;
-				page_ci.present = false;
-				if (layout.compression == 2 && (page.header.type_flags & 0x80)) {
-					ReadPageCompression(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * page.header.slot_count,
-										side.data.table.c_str(), page_ci);
-				}
-			}
-			RowLocation at;
-			at.page = page.header.page_id;
-			at.slot = item.slot;
-			RowRecord row;
-			RecordView fixed;
-			if (layout.compression == 1 || layout.compression == 2) {
-				const size_t pos = PAGE_SIZE - 2 - 2 * static_cast<size_t>(item.slot);
-				const uint16_t offset = static_cast<uint16_t>(page.bytes[pos] | (page.bytes[pos + 1] << 8));
-				if (page_ci.present && offset < page_ci.end) {
-					throw FormatError("backup: page " + item.page.ToString() + " has a record at offset " +
-									  std::to_string(offset) + " inside its compression information (to " +
-									  std::to_string(page_ci.end) + ")");
-				}
-				ReadCdRecord(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * page.header.slot_count, offset,
-							 side.data.table.c_str(), cd);
-				if (cd.kind == CdRecord::Kind::Forwarded) {
-					cd.BackPointer(at.page.page, at.page.file, at.slot);
-				}
-				cd_row.Read(cd, layout, &needed, layout.compression == 2 ? &page_ci : nullptr);
-				row = RowRecord::Compressed(cd, cd_row);
-			} else {
-				fixed =
-					ReadSlot(page.bytes.data(), PAGE_SIZE, page.header.slot_count, item.slot, side.data.table.c_str());
-				if (fixed.Type() == RECORD_FORWARDED) {
-					at = ForwardedFrom(fixed, layout.table);
-				}
-				row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
-			}
-			// A row's values stored off row reserved before it is staged (D17): a refusal with rows staged
-			// closes the chunk before this row; with none, the chunk's reservation is taken again with it.
-			const OffRowNeed need = stager.PrepareRow(row);
-			// Named when refused: the row by its place, what it holds off row, what was asked.
-			auto refused = [&](uint64_t bytes, const ReservationRefused &e) {
-				return OutOfMemoryException(
-					"%s: staging the row of %s.%s on page %s slot %u, whose values stored "
-					"off row (%s) take %s of the %s reserved: %s",
-					data.function, data.schema, data.table, item.page.ToString(), static_cast<unsigned>(item.slot),
-					stager.DescribePrepared(), StringUtil::BytesToHumanReadableString(need.Total()),
-					StringUtil::BytesToHumanReadableString(bytes), e.what());
-			};
-			bool fits = need.Total() == 0;
-			if (!fits) {
-				try {
-					fits = held.TryAcquire(need.Total(), need.Ours());
-				} catch (ReservationRefused &e) {
-					throw refused(need.Total(), e);
-				}
-			}
-			if (!fits) {
-				if (stager.Count() > 0) {
-					break;
-				}
-				held.ReleaseAll();
-				try {
-					held.Acquire(chunk_bytes + need.Total(), chunk_bytes + need.Ours());
-				} catch (ReservationRefused &e) {
-					throw refused(chunk_bytes + need.Total(), e);
-				}
-			}
-			stager.Append(row);
-			rids.push_back(RowId(side.data, cursor, row, at));
-			kinds.push_back(item.kind);
-		}
-		local.pos = i;
-		const idx_t count = stager.Count();
-		stager.FinalizeChunk();
-		if (old_side) {
-			// The older state's values on the newer state's columns: by column id, cast to the newer types;
-			// a column the older state has not is NULL.
-			std::vector<bool> filled(data.columns.types.size(), false);
-			for (idx_t c = 0; c < data.old_outputs.size(); c++) {
-				Vector &target = output.data[1 + data.old_outputs[c]];
-				// An older value the newer type cannot take (the column's type changed) is NULL, said once a
-				// chunk; DuckDB's cast, not the server's ALTER COLUMN.
-				std::string error;
-				if (!VectorOperations::TryCast(context, local.old_values.data[c], target, count, &error)) {
-					DUCKDB_LOG_WARNING(context, "%s: %s.%s: an older value of %s is NULL in the newer type: %s",
-									   data.function, data.schema, data.table, data.columns.names[data.old_outputs[c]],
-									   error);
-				}
-				filled[data.old_outputs[c]] = true;
-			}
-			for (idx_t c = 0; c < filled.size(); c++) {
-				if (!filled[c]) {
-					output.data[1 + c].SetVectorType(VectorType::CONSTANT_VECTOR);
-					ConstantVector::SetNull(output.data[1 + c], true);
-				}
-			}
-		}
-		Vector &kind_vector = output.data[0];
-		Vector &rid_vector = output.data[1 + data.columns.types.size()];
-		auto *kind_out = FlatVector::GetDataMutable<string_t>(kind_vector);
-		auto *rid_out = FlatVector::GetDataMutable<string_t>(rid_vector);
-		for (idx_t i = 0; i < count; i++) {
-			kind_out[i] = StringVector::AddString(kind_vector, ChangeName(kinds[i]));
-			rid_out[i] = StringVector::AddStringOrBlob(rid_vector, rids[i]);
-		}
-		output.SetChildCardinality(count);
+		StageChanges(context, data, global, local, output);
 	} catch (FormatError &e) {
-		throw InvalidInputException("%s: %s", data.function, e.what());
+		ThrowChangesError(context, data, e);
 	} catch (ReservationInterrupted &) {
 		throw InterruptException();
 	} catch (ReservationRefused &e) {
@@ -598,6 +768,7 @@ TableFunction MakeTableChangesFunction(const char *name, const LogicalType &path
 	f.GetSignature().AddKeywordOnly("start_version", LogicalType::ANY, Value());
 	f.GetSignature().AddKeywordOnly("end_version", LogicalType::ANY, Value());
 	AddDiffParameter(f);
+	AddFuzzyParameter(f);
 	return f;
 }
 

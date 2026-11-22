@@ -101,7 +101,7 @@ Each of these is refused by name, before any value is returned:
 | `backup_size`, `compressed_size` | `BIGINT` | `BackupSize` / `CompressedBackupSize`; equal for an uncompressed backup; `compressed_size` NULL when the backup does not record it |
 | `page_count` | `BIGINT` | NULL for now |
 | `log_tail_bytes` | `BIGINT` | the bytes of log the backup carries |
-| `consistent`, `open_transactions`, `committed_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER` | NULL for now |
+| `consistent`, `open_transactions`, `committed_after_checkpoint`, `rolled_back_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER`, `INTEGER` | from the backup's log tail (see [A backup taken under writes](#a-backup-taken-under-writes)): no transaction open at the backup's end and none committed or rolled back after its checkpoint; the transactions open, and those committed / rolled back with a row change after the checkpoint (a rolled-back one makes `consistent` false: whether a page copy holds what it undid is the tables' `fuzzy_status`). NULL for a log backup, and with a WARNING when the tail cannot be read whole |
 | `recovery_model` | `VARCHAR` | `FULL`, `BULK_LOGGED` or `SIMPLE` |
 | `files` | `LIST(STRUCT(…))` | the database's files: `logical_name`, `physical_name`, `type` (`data` / `log`), `file_id`, `filegroup_id`, `filegroup_name`, `size_bytes`, `max_size_bytes`, `create_lsn`, `unique_id`, `backup_size_bytes` (NULL for now), `is_present` (FILELISTONLY's IsPresent: the file is in this backup) |
 
@@ -134,7 +134,7 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 | `partition_count`, `row_count` | `INTEGER`, `BIGINT` | the row count the catalog keeps (`sys.partitions.rows`); NULL when a partition's count is negative (an upgraded database can hold one until `DBCC UPDATEUSAGE`). For a clustered columnstore it includes the delta stores the tuple mover has not dropped yet, as SQL Server 2022 counts them (2025 does not); exact once columnstores are read |
 | `created`, `modified` | `TIMESTAMP` | `sys.tables.create_date` / `modify_date` |
 | `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether `mssql_backup_scan` reads the table, and why not (a clustered columnstore, for now; ROW and PAGE compression are read) |
-| `fuzzy_status`, `open_transactions`, `stale_transactions` | `VARCHAR`, `INTEGER`, `INTEGER` | NULL for now |
+| `fuzzy_status`, `open_transactions`, `stale_transactions` | `VARCHAR`, `INTEGER`, `INTEGER` | `consistent`, `stale`, `dirty` or `stale+dirty` (see [A backup taken under writes](#a-backup-taken-under-writes)); the transactions whose open changes the table's page copies hold, and those whose finished changes they lack |
 | `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `type_schema` (the schema of the column's type: `sys` for a system type, the one an alias or CLR type was created in), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type the scan returns: the one `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off -- a plain `VARCHAR` for a string --, or for now `BLOB`, its stored bytes, for `sql_variant`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector` and `json`, which a later release converts), `decodable` (false only for a column the scan cannot read: a computed one not persisted, a sparse one), `reason` (why a column is not converted or not readable) |
 | `allocation_units` | `LIST(STRUCT(…))` | the table's allocation units: `au_id`, `type` (`IN_ROW_DATA`, `LOB_DATA`, `ROW_OVERFLOW_DATA`), `rowset_id`, `index_id`, `partition_number`, `compression`, `filegroup_id`, `first_page`, `root_page`, `first_iam_page`, `live_pages` (NULL for now) |
 | `partitioning` | `STRUCT(…)` | for a partitioned table (NULL on a filegroup): `function_name`, `scheme_name`, `column_name`, `column_id`, `parameter_type`, `range_right`, `boundaries` (a list of `VARIANT`s in the parameter's type, in boundary order; a NULL boundary is a NULL element), `destinations` (the filegroup of each partition), `next_used`, and `reason` when the reader cannot give it exactly (the boundaries are then NULL, never a partial list; the destinations and `next_used` are still given when only a boundary's value could not be read). The table's rows are read either way |
@@ -256,7 +256,7 @@ Four virtual columns, which `SELECT *` leaves out:
 | `_mssql_page` | `VARCHAR` | the row's page: `'01'`, then its file and page number in hex (14 characters) |
 | `_mssql_rid` | `BLOB` | the row's identity: a heap row's original place (its `%%physloc%%`, after a byte `0x00`), a clustered row's key (after `0x01`), stable across index rebuilds |
 | `_mssql_page_lsn` | `DECIMAL(25,0)` | the LSN of the page's last change, in `RESTORE HEADERONLY`'s numeric form |
-| `_mssql_lob` | `BLOB` | the row's values stored off row and the pages that hold them -- every one of the row's, whichever columns are selected -- in a format of the reader's own (versioned by its first byte), for a later differential backup's import; NULL for a row with none (a `text` / `ntext` / `image` value updated to NULL keeps its place off row, so its row has a map) |
+| `_mssql_lob` | `BLOB` | the row's values stored off row and the pages that hold them -- every one of the row's, whichever columns are selected -- in a format of the reader's own (versioned by its first byte), for a later differential backup's import; NULL for a row with none (a `text` / `ntext` / `image` value updated to NULL keeps its place off row, so its row has a map). It maps a value's tree as the row points to it: a value read as NULL because a page of it became live while the backup ran (see [A backup taken under writes](#a-backup-taken-under-writes)) keeps its entry when only its data, not its tree, is on that page |
 
 A ROW- or PAGE-compressed table, or partition, is read like an uncompressed one: the same values, the
 same `_mssql_rid`; a PAGE page's values are rebuilt from its anchor record and dictionary, so a row reads
@@ -266,12 +266,109 @@ table with a clustered columnstore index
 (see `mssql_backup_tables.reason`); a column the scan cannot read, when it is named (above); a
 value stored off row that cannot fit in half of `max_memory` even with nothing else of the scan
 held, or in DuckDB's memory (named by its row's `_mssql_rid`, its page and slot, and its columns and
-sizes), or whose stored pieces do not form its tree; and a page that became live while the backup ran (a backup taken under writes), whose content is only in the
-backup's log tail. A backup taken under writes is read as its data pages hold it, which may differ
-from what `RESTORE` makes of it by replaying the log tail.
+sizes), or whose stored pieces do not form its tree. A backup taken under writes is read as its data pages hold it, which may differ
+from what `RESTORE` makes of it by replaying the log tail: each table says whether it does (next section).
 
 The oracle lane restores every fixture backup of SQL Server 2017 to 2025 and compares each table's
 rows with `mssql_backup_scan`'s, both ways, through `TYPE mssql`.
+
+## A backup taken under writes
+
+A backup of a database that was being written holds each page as it was when the backup copied it,
+written by transactions finished or not, and the log from its checkpoint to its end (its *tail*). `RESTORE … WITH RECOVERY`
+replays that log: it redoes what was committed after the pages were copied and undoes what was still
+open. This reader does not replay it (yet). It reads the tail and says, table by table, where its rows
+can differ from the restored database's:
+
+- `dirty`: a transaction still open at the backup's end changed the table, and the copies of its
+  pages hold that change (`RESTORE` undoes it);
+- `stale`: a committed transaction changed the table after its pages were copied, or on a page the
+  backup does not hold (`RESTORE` redoes it); or a rolled-back one changed a page before its copy and
+  undid it after (`RESTORE` redoes the undo). A rolled-back transaction whose changes and undo are all
+  before a page's copy, or all after it, leaves the copy as `RESTORE` has it;
+- `stale+dirty`: both; `consistent`: neither.
+
+```sql
+SELECT table_name, fuzzy_status, open_transactions, stale_transactions
+FROM mssql_backup_tables('/backups/busy.bak') WHERE fuzzy_status IS DISTINCT FROM 'consistent';
+```
+
+`mssql_backup_info` says it for the whole database: `consistent` when no transaction was open at the
+end and none committed or rolled back after the checkpoint. A table the status does not name is read as the
+restored database holds it in its rows' changes; one it names may differ in the rows those transactions
+changed. (The query above keeps a NULL status: the tail could not be read, so nothing is known.)
+
+The status counts the log's row changes -- inserts, deletes and updates of rows, a rollback's undo
+included. What the log records otherwise is not counted yet: a bulk load logged as pages rather than
+rows, a `TRUNCATE TABLE`, a partition switch and other DDL run while the backup ran leave the tables
+they touched `consistent` (for now), though `RESTORE` would give them as those left them.
+
+What a scan does with a table that is not consistent is `fuzzy :=` on `mssql_backup_scan`, the `fuzzy`
+option of `ATTACH … (TYPE mssql_backup)` for its tables, or the `mssql_backup_fuzzy` setting:
+
+| `fuzzy` | |
+|---|---|
+| `'warn'` (default) | read it; one WARNING in `duckdb_logs` naming the table and its status |
+| `'error'` | refuse it by name -- what an importer that wants only exact rows asks for |
+| `'ignore'` | read it, saying nothing |
+
+The status is the one that held on every table of the measurements it was designed from (E3: a flag
+from the log tail, not the pages' LSNs, which miss a page copied before it changed), and the oracle
+lane checks it against `RESTORE` on every version: every table that differs from the restored one is
+flagged, and no table equal to it is. When the tail cannot be read, the listings give NULL for the
+status with a WARNING, and a scan with `fuzzy := 'error'` is refused.
+
+A page the database took into use while the backup ran has no copy in the data the backup carries: its
+content is only in the backup's log tail, which the reader does not replay yet. Its table is never
+`consistent`. Its other pages are read as for any table that is not -- what was committed when the
+backup began is in them -- and the page is passed over: with a WARNING naming it under `'warn'`,
+silently under `'ignore'`; `'error'` refuses the table by name. A value stored off row (a `varchar(max)`
+past the row, say) on such a page is read as NULL and its row read, with a WARNING of its own under
+`'warn'`. `RESTORE` holds its rows and values, and so will the reader once it replays the tail.
+
+### The log a backup carries
+
+The tail's transactions and records can be read too, with no server, as `fn_dump_dblog` lists them --
+a data backup's tail, or a log backup's whole log:
+
+```sql
+-- each transaction: its name, its state at the backup's end, the tables it changed and its effect on them
+SELECT transaction_id, name, status, after_checkpoint, tables
+FROM mssql_backup_transactions('/backups/busy.bak');
+
+-- each record, its contents a VARIANT: an inserted or deleted row's columns, a modified row's bytes
+SELECT lsn, operation, table_name, contents
+FROM mssql_backup_transaction_records('/backups/busy.bak') WHERE transaction_status = 'open';
+```
+
+`mssql_backup_transactions` has one row per transaction: `transaction_id` (as `fn_dblog` prints it),
+`name` (`user_transaction`, `UPDATE`, a name given to `BEGIN TRANSACTION`), `status` (`open`,
+`committed`, `rolled back`, or `no begin`: in a data backup's tail the system's work, in a log backup also
+a transaction begun in an earlier log), `begin_lsn`, `end_lsn`, `records`,
+`row_operations`, `after_checkpoint` (a row changed after the backup's checkpoint), and `tables`, each
+with its `schema_name`, `table_name`, `index_id`, `allocation_unit`, the `pages` it changed and its
+`effect` (`dirty`, `stale`, or NULL when the page copies are what `RESTORE` gives).
+
+`mssql_backup_transaction_records` has one row per record: `lsn`, `previous_lsn` (the transaction's
+record before it), `operation` and `context` (`fn_dblog`'s names, `LOP_INSERT_ROWS`, `LCX_CLUSTERED`),
+`transaction_id`, `transaction_status`, `page`, `slot`, `allocation_unit`, `schema_name`, `table_name`,
+`index_id`, and `contents`:
+
+| operation | `contents` |
+|---|---|
+| `LOP_INSERT_ROWS` | `{rows: [...]}`: the rows inserted (a page split moves many in one record), each a struct of the table's columns as `mssql_backup_scan` reads them |
+| `LOP_DELETE_ROWS` | `{row: {...}}`: the row deleted, as it was (NULL when the record logs none) |
+| `LOP_MODIFY_ROW` | `{offset, size, before, after}`: the bytes changed in the row |
+| `LOP_MODIFY_COLUMNS` | `{ranges: [{offset, before, after}, ...]}` |
+| `LOP_BEGIN_XACT` | `{name}` |
+| others | `{elements: [...]}`: the record's contents as bytes |
+
+A row is given as bytes, with `undecoded` saying why, when it is not a base table's row (an index's, a
+LOB fragment), its values are stored off row (their pages are the backup's, not the record's moment),
+or it is ROW- or PAGE-compressed (for now). The names of tables need the backup's catalog: a log backup's
+records, and a differential's given without its full, name allocation units only. Both are on an
+attached backup as `b.transactions()` and `b.transaction_records()`, with `version :=` / `as_of :=`.
+The oracle lane compares every record with `fn_dump_dblog` over the same files on SQL Server 2017-2025.
 
 ## A differential over its full
 
@@ -330,6 +427,7 @@ It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, 
 | `table_exclude` | A regex: the tables and views it matches are left out |
 | `diff` | A differential backup to read over the attached full ([above](#a-differential-over-its-full)) |
 | `history`, `snapshot_version`, `snapshot_time` | A history of backups ([below](#a-history-of-backups)) |
+| `fuzzy` | What a scan of its tables does with one that is not consistent: `'warn'`, `'error'` or `'ignore'` ([above](#a-backup-taken-under-writes)); unset, the `mssql_backup_fuzzy` setting |
 
 The filters work as `TYPE mssql`'s. An object is kept when it passes the filter -- it matches it, or
 no filter is given -- and does not match the exclusion, so an exclusion alone keeps everything else:

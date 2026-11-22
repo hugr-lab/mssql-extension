@@ -9,6 +9,7 @@
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #include <algorithm>
@@ -451,6 +452,75 @@ bool OpenedBackup::EnsureTables(ClientContext &context) {
 	return true;
 }
 
+const FuzzySummary &OpenedBackup::Fuzzy(ClientContext &context, bool *built) const {
+	if (built) {
+		*built = false;
+	}
+	std::unique_lock<std::mutex> guard(fuzzy_lock_);
+	while (fuzzy_building_) {
+		// Another statement reads it: wait for it in slices, so an interrupt still ends this one.
+		fuzzy_built_.wait_for(guard, std::chrono::milliseconds(100));
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	}
+	if (fuzzy_) {
+		return *fuzzy_;
+	}
+	fuzzy_building_ = true;
+	guard.unlock();
+	std::unique_ptr<FuzzySummary> summary;
+	try {
+		const auto &family = *headers_->families.front();
+		const auto &set = headers_->Set();
+		try {
+			LogTailReader tail(family.Stream(), family.layout, LogBlockHeaderBytes(set.software_major));
+			// A log backup's whole log is read here: Ctrl-C ends it (review of #591; it used to be asked only
+			// of a statement waiting for another's read).
+			summary.reset(
+				new FuzzySummary(SummarizeLogTail(tail, set.first_lsn, set.last_lsn, set.checkpoint_lsn, [&context]() {
+					if (context.IsInterrupted()) {
+						throw InterruptException();
+					}
+				})));
+		} catch (FormatError &e) {
+			throw FormatError("backup file \"" + headers_->Path(family.file) + "\": its log tail: " + WithoutPrefix(e));
+		}
+	} catch (...) {
+		guard.lock();
+		fuzzy_building_ = false;
+		fuzzy_built_.notify_all();
+		throw;
+	}
+	guard.lock();
+	fuzzy_ = std::move(summary);
+	fuzzy_building_ = false;
+	fuzzy_built_.notify_all();
+	if (built) {
+		*built = true;
+	}
+	return *fuzzy_;
+}
+
+const FuzzySummary &StatementTail(ClientContext &context, const OpenedForStatement &opened) {
+	bool built = false;
+	const FuzzySummary &tail = opened.backup->Fuzzy(context, &built);
+	if (built && !opened.cache_key.empty() && opened.backup->Reweigh()) {
+		ObjectCache::GetObjectCache(context).Put(opened.cache_key, opened.backup);
+	}
+	return tail;
+}
+
+const FuzzySummary *TailOrWarn(ClientContext &context, const OpenedForStatement &opened, const char *function) {
+	try {
+		return &StatementTail(context, opened);
+	} catch (FormatError &e) {
+		DUCKDB_LOG_WARNING(context, "%s: the backup's log tail is not read, its fuzzy status unknown: %s", function,
+						   e.what());
+		return nullptr;
+	}
+}
+
 //! What an entry holds, roughly, for the buffer pool's eviction (D9): the page index and the
 //! allocation map as they measure themselves, a container family's recent blocks (up to 4 MiB) and
 //! its chain, and the bootstrap tables at a few hundred bytes a row.
@@ -477,6 +547,13 @@ bool OpenedBackup::Reweigh() {
 		bytes += rows * 256;
 	}
 	bytes += unit_pages_.MemoryBytes();
+	{
+		// Never held for a tail's read (Fuzzy reads outside it): a weigh does not wait for one.
+		std::lock_guard<std::mutex> guard(fuzzy_lock_);
+		if (fuzzy_) {
+			bytes += fuzzy_->MemoryBytes();
+		}
+	}
 	return estimate_.exchange(bytes, std::memory_order_relaxed) != bytes;
 }
 

@@ -152,6 +152,7 @@ struct BaseTableBindData : public TableFunctionData {
 	vector<std::string> diff;  // task 24
 	BackupAt at;			   // task 24b
 	std::string table;		   // "" lists the tables served
+	std::string fuzzy;		   // D11: fuzzy := as given, else the ATTACH's option; "" = the setting
 	std::shared_ptr<OpenedCatalog> catalog;
 	RowsetLayout layout;			 // the table's
 	std::vector<size_t> columns;	 // its served columns: layout indexes (not dropped, not the uniquifier)
@@ -164,6 +165,7 @@ struct BaseTableBindData : public TableFunctionData {
 		copy->diff = diff;
 		copy->at = at;
 		copy->table = table;
+		copy->fuzzy = fuzzy;
 		copy->catalog = catalog;
 		copy->layout = layout;
 		copy->columns = columns;
@@ -173,7 +175,8 @@ struct BaseTableBindData : public TableFunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<BaseTableBindData>();
-		return paths == other.paths && diff == other.diff && at.Same(other.at) && table == other.table;
+		return paths == other.paths && diff == other.diff && at.Same(other.at) && table == other.table &&
+			   fuzzy == other.fuzzy;
 	}
 	//! Every EXECUTE binds again: the file is read at bind.
 	bool SupportStatementCache() const override {
@@ -191,7 +194,8 @@ struct BaseTableState : public GlobalTableFunctionState {
 	std::vector<SystemRow> pending;	 // the kept rows of the page being produced
 	size_t next_row = 0;
 	uint64_t off_row_bytes = 0;
-	size_t next_listed = 0;	 // the listing's cursor
+	size_t next_listed = 0;		  // the listing's cursor
+	bool pending_warned = false;  // a page that became live while the backup ran, said once
 	//! A value the reader cannot give is NULL, never a refusal of the table (owner, 2026-11-20): per
 	//! output column (and _mssql_rid last) how many, the first's reason, and whether its WARNING is said.
 	struct Unread {
@@ -221,9 +225,13 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	data->paths = PathsOf(input.inputs[0], FUNCTION);
 	data->diff = DiffPathsOf(input.named_parameters, FUNCTION);
 	data->at = BackupAtOf(input.named_parameters, FUNCTION);
+	data->fuzzy = FuzzyParameterOf(input.named_parameters, FUNCTION);
 	if (data->paths.size() == 1) {
 		// Over an attached backup, the version pinned now by its files (task 24b, owner 2026-11-19).
 		PinAttachedVersion(context, data->paths.front(), data->at);
+		if (data->fuzzy.empty()) {
+			data->fuzzy = AttachedFuzzy(context, data->paths.front());
+		}
 	}
 	if (input.inputs.size() > 1) {
 		if (input.inputs[1].IsNull()) {
@@ -277,6 +285,14 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	for (const auto &k : key) {
 		data->key.push_back(k.second);
 	}
+	// D11 for a base table (review of #591: its rows were read from a dirty or stale copy without a word):
+	// its units against the backup's log tail, as the scan checks a user table's.
+	std::vector<uint64_t> units;
+	for (const SysAllocUnit *unit : tables.UnitsOf(data->layout.rowset_id)) {
+		units.push_back(unit->auid);
+	}
+	CheckStatementFuzzy(context, *data->catalog, units, "sys." + data->table, "sys." + data->table,
+						FuzzyModeOf(context, data->fuzzy, FUNCTION), FUNCTION);
 	return std::move(data);
 }
 
@@ -313,12 +329,37 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInpu
 }
 
 // The kept rows of the next data page of the unit into state.pending; false when no page is left.
-bool LoadNextPage(const BaseTableBindData &data, BaseTableState &state) {
+bool LoadNextPage(ClientContext &context, const BaseTableBindData &data, BaseTableState &state) {
 	const PageStore &store = *data.catalog->pages->store;
 	Page page;
 	while (state.next_page < state.pages.size()) {
 		const PagePointer at = state.pages[state.next_page++];
-		if (!ReadUnitDataPage(store, *state.unit, at, data.table, page)) {
+		try {
+			try {
+				if (!ReadUnitDataPage(store, *state.unit, at, data.table, page)) {
+					continue;
+				}
+			} catch (ZeroCopyError &e) {
+				ThrowPendingOrFormat(context, data.catalog->opened, e);
+			}
+		} catch (PendingPageError &e) {
+			// A page that became live while the backup ran, as the scan takes it: refused under fuzzy :=
+			// 'error', said once under 'warn', passed over under 'ignore' (review of #591: it failed the
+			// statement whatever the policy).
+			const FuzzyMode mode = FuzzyModeOf(context, data.fuzzy, FUNCTION);
+			if (mode == FuzzyMode::Error) {
+				throw InvalidInputException(
+					"%s: sys.%s: %s (fuzzy := 'error'; under 'warn' the table's other pages are read)", FUNCTION,
+					data.table, e.what());
+			}
+			if (mode == FuzzyMode::Warn && !state.pending_warned) {
+				state.pending_warned = true;
+				DUCKDB_LOG_WARNING(context,
+								   "%s: sys.%s: %s; its rows are not read, the table's other pages are (a fuzzy "
+								   "backup: spec 090 replays the tail; any further such page of the table is "
+								   "passed over without another WARNING)",
+								   FUNCTION, data.table, e.what());
+			}
 			continue;
 		}
 		state.pending.clear();
@@ -497,7 +538,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		}
 		idx_t count = 0;
 		while (count < STANDARD_VECTOR_SIZE) {
-			if (state.next_row >= state.pending.size() && !LoadNextPage(data, state)) {
+			if (state.next_row >= state.pending.size() && !LoadNextPage(context, data, state)) {
 				break;
 			}
 			const SystemRow &row = state.pending[state.next_row++];
@@ -547,6 +588,7 @@ void RegisterBackupCatalogFunction(ExtensionLoader &loader) {
 			TableFunction f(FUNCTION, arguments, Execute, Bind, Init);
 			AddDiffParameter(f);
 			AddVersionParameters(f);
+			AddFuzzyParameter(f);
 			f.projection_pushdown = true;
 			f.get_virtual_columns = VirtualColumns;
 			set.AddFunction(f);

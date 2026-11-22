@@ -523,7 +523,7 @@ Common named parameters of every function, and ATTACH options of the same names:
 | `has_backup_checksums` | `BOOLEAN` | MQDA / MQTL media-format attribute 0x100 and the `CSUM` streams (E2§7) |
 | `backup_size`, `compressed_size` | `BIGINT` | `BackupSize` as the trailer records it, SCIN +96, the set's value in every family; checked against the sum over the families of (the MSLS block's offset − the soft-filemark size, TAPE's `soft_filemark_block_size` × 512), which task 3 found on every truth (a 64 KB `BLOCKSIZE` and a striped set included **(2025)**): a file whose two disagree is refused by name; `compressed_size` is HEADERONLY's CompressedBackupSize as the trailer records it: a u64 at SCIN +344 (task 9: on every truth, compressed and plain, striped and E3's included), the whole set's value in every family (they must agree), equal to `BackupSize` for a plain backup; NULL on a SCIN too short to hold it. Before it was found, a measured formula reproduced it on 29 compressed truths (E14's 24 included): the physical offset of the chain block holding MSLS + half of MSLS's offset in that block − 4096, i.e. the compressed stream's position when the trailer was written, each 1 KB MTF block before MSLS in that block counted as a 512-byte sector |
 | `page_count`, `log_tail_bytes` | `BIGINT` | live pages (NULL until PR 2 reads the allocation pages for it); the MQTL streams' log bytes (each stream's length less its 2-byte lead-in) |
-| `consistent`, `open_transactions`, `committed_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER` | D11, database level (data backups only); NULL until PR 5 |
+| `consistent`, `open_transactions`, `committed_after_checkpoint`, `rolled_back_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER`, `INTEGER` | D11, database level (data backups only; PR 5) |
 | `recovery_model` | `VARCHAR` | located (task 3): trailer SCIN +244, `0x08` SIMPLE, else `0x04` BULK_LOGGED, else FULL (sysdatabases' "trunc. log on chkpt" and "select into/bulkcopy" bits) |
 | `files` | `LIST(STRUCT(logical_name, physical_name, type, file_id, filegroup_id, filegroup_name, size_bytes, max_size_bytes, create_lsn, unique_id, backup_size_bytes))` | the trailer MQCI's SFIN / SFGI records (§ Rules, header fields); `backup_size_bytes` from the page index (task 7), NULL before it |
 
@@ -1212,6 +1212,11 @@ A backup file is untrusted input (R§9). Every parser:
   accepted); the oracle lane compares the served set with the one the server's catalog views give
   (`catalog_golden.sql`'s `.modules.txt`, the fixture holding a procedure, functions, an encrypted TVF,
   a trigger and a partition function).
+  **Revised by the owner, 2026-11-21 (review of #591):** whoever holds the backup -- and, for an
+  encrypted one (spec 087), its key -- may read all of it; protecting a backup is encryption's job, not
+  the reader's. So `mssql_backup_transaction_records` gives every record's bytes, a system table's row
+  included (a log backup has no catalog to tell them apart), and the allow-list above is to be removed
+  from `mssql_backup_catalog` in a PR of its own: every base table served, `sysobjvalues` whole.
 - **Fuzzing** (ClusterFuzzLite, `fuzz/`, D15): one harness per parser, each with a seed corpus cut from
   the committed samples: `fuzz_backup_mtf` (walker), `fuzz_backup_container` (MSSQLBAK chain),
   `fuzz_backup_xpress` (raw codec, with a differential oracle against a reference decode of the seed),
@@ -1739,8 +1744,62 @@ before the next opens.
 **PR 5 — fuzzy status**
 
 26. Log tail reader: blocks, parity, record headers, transaction table, AU per record — 3 d
+    As built: `backup_log_tail` (DuckDB-free). `LogTailReader` takes family 1's MQTL streams (each less its
+    2-byte lead-in) as one sequence of log blocks; `LogTailCursor` walks them a chunk of 4 MiB at a time, a
+    block header of zeros ending its stream (the stream's unused end: a 64 KiB stream held 12 KiB of log on
+    the samples). `ParseLogBlock` puts the sectors back (`RestoreSectorParity`), reads the slot array
+    backwards and each record's header (E3§6: previous LSN @4, transaction @16, operation @22, context @23,
+    page @24, slot @30, the unit from @32 / @46), a record running to the next one in the block;
+    `RowLogElements` its contents (u16 n, n lengths, the elements from 4-byte boundaries). Checked against
+    `fn_dump_dblog` over the same files: log.trn's 1628 records equal on the LSN, operation, context,
+    transaction, page and unit (RowLog Contents 0-3 equal too; fn_dump_dblog joins the elements from the
+    fifth on into its columns 4 / 5), and in the lane every set's tail on every version
+    (`compare_rows.py --log`; locally on 2025, 231 thousand records of 9 sets, the load fixture's log
+    backup 159 thousand of them).
 27. Flag (v), the status columns, the warning, `fuzzy :=`; E3-style fuzzy fixtures in the lane — 2 d
+    As built: `backup_fuzzy` (DuckDB-free): `FuzzySummary`, stage 5 of `OpenedBackup` (`Fuzzy`, kept with
+    it and in its cache estimate): the transactions by id (`open` -- a BEGIN in the tail and no end by
+    LastLSN --, `committed`, `rolled back`, `no begin`: the system's work), and per unit and page each
+    transaction's oldest and newest row change. Three refinements of E3's flag, each measured against a
+    RESTORE on the load and fuzzy fixtures (2025):
+    - only operations that change a row a reader sees count (INSERT_ROWS, DELETE_ROWS, MODIFY_ROW,
+      MODIFY_COLUMNS, DELETE_SPLIT), in contexts of a data or LOB page (LCX_HEAP, LCX_CLUSTERED,
+      LCX_INDEX_LEAF, LCX_TEXT_MIX, LCX_TEXT_TREE, LCX_MARK_AS_GHOST): a PFS update (logged as a
+      MODIFY_ROW under the unit allocated), interior index rows and 37 pages formatted after the
+      checkpoint named a table's unit on pages that held none of its rows -- a table equal to the RESTORE
+      read stale;
+    - (iii) by the page copy: dirty when an open transaction's oldest change on a page is no newer than the
+      copy (the copy holds what RESTORE undoes); one written after the copies read dirty while equal;
+    - (iv): a committed transaction (or one with no BEGIN in the tail) stale when its newest change on a
+      page is newer than the copy; a page the backup holds as not live only when the change is after
+      CheckpointLSN (freed before the image, its rows went with it; taken into use after it, they are
+      missing); a Pending or unreadable page always. A rolled-back one only when the copy is between its
+      oldest change on the page and its newest (the copy holds what its undo, after it, took back); never
+      on a page the backup does not hold (review of #591: counted as committed, a table equal to the
+      RESTORE read stale). One rule, `ChangeShows`, for the tables' status and the transactions' effects.
+      The tail must hold the record at CheckpointLSN, or it is not read (D13): an empty one read as
+      consistent (review of #591).
+    `mssql_backup_info`: `consistent` / `open_transactions` / `committed_after_checkpoint` /
+    `rolled_back_after_checkpoint` (transactions with a row change after CheckpointLSN; a rolled-back one
+    makes `consistent` false too, the tables saying where it shows), NULL for a log backup; `mssql_backup_tables`:
+    `fuzzy_status` / `open_transactions` / `stale_transactions` over the table's base rowsets (index 0 or 1);
+    both NULL with a WARNING when the tail cannot be read (D13). `fuzzy :=` on `mssql_backup_scan`, the
+    `fuzzy` ATTACH option and the `mssql_backup_fuzzy` setting (`CheckFuzzy`). Fixtures: `fuzzy.sql` (E3's
+    controls: three sessions committing, one in twenty rolled back -- and `rolled_only`, changed by those
+    alone --, one transaction left open, a committed change after it began; a full, a compressed full, a differential), and the load fixture, both in
+    `compare_rows.sh`'s FUZZY sets (RESTORE WITH RECOVERY: a table that differs must not be `consistent`,
+    one that does not must be); locally on 2025: 27 of 27 table checks over 5 sets. `open_tail.sql`,
+    committed under test/data/backup/open_tail, for the SQL tests. Not seen yet on a fixture: a `stale`
+    table (the throttled backups' window held too few commits; the lane's other versions may).
+    The log functions (owner, 2026-11-20): `mssql_backup_transactions` (a transaction's state, LSNs, name,
+    the tables it changed and its effect on each) and `mssql_backup_transaction_records` (fn_dump_dblog's
+    fields and each record's contents as a VARIANT: a row image decoded into its table's columns through
+    `RecordStager`, a modified row's bytes, a transaction's name), the catalog's `transactions()` /
+    `transaction_records()`. A row image with values stored off row stays bytes: their pages are the
+    backup's, not the record's moment; typed images of compressed tables come with spec 090.
 28. Fuzz harness log — 0.5 d
+    As built: `fuzz_backup_log`: the input as one block and as one MQTL stream (cursor, elements,
+    summary); seeds are blocks of the committed samples' tails.
 
 **Across PRs**
 

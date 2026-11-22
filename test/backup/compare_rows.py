@@ -13,6 +13,18 @@ the types TYPE mssql reads), and the row counts too; values stored off row (row-
 text pointers) are compared like any others since PR 3, and each table's _mssql_lob is built for every
 row (its map of them, NULL where a row has none).
 Exits 1 on any difference or failure, or when fewer than --min-tables tables were compared.
+
+With --log FILES (spec 085 task 27) the backup's log is compared instead: mssql_backup_transaction_records
+against fn_dump_dblog on the server over the same files (FILES: their paths on the server, comma-separated),
+record by record on the LSN, the operation, the context, the transaction id, the page and the allocation
+unit, and a BEGIN_XACT's transaction name; up to the backup's LastLSN (a data backup's tail ends there).
+
+With --fuzzy (spec 085 D11, task 27: a backup taken under load, which RESTORE recovers and the reader
+does not) a table may differ, and its fuzzy_status (mssql_backup_tables) is checked against it instead:
+a table that differs from the restored one must not be 'consistent', and one that does not differ must be
+(acceptance 6: every differing table flagged, no consistent table flagged). Only the rows are compared
+there: a fuzzy backup may hold a row twice (a split torn by the backup, E3§3), so _mssql_rid and
+_mssql_lob are not.
 """
 import argparse
 import json
@@ -61,12 +73,94 @@ class Session:
             return False, self.mask(f"not JSON ({e}): {out[:300]!r}")
 
 
+def lsn_text(value):
+    """fn_dblog's spelling of an LSN given as HEADERONLY's number."""
+    n = int(value)
+    return f"{n // 10**15:08X}:{(n // 10**5) % 10**10:08X}:{n % 10**5:04X}"
+
+
+def compare_log(session, args, paths):
+    """mssql_backup_transaction_records against fn_dump_dblog: 0 when every record agrees."""
+    server_files = [f for f in args.log.split(",") if f]
+    devices = ", ".join("'" + f.replace("'", "''") + "'" for f in server_files) + ", DEFAULT" * (64 - len(server_files))
+    dblog = ("SELECT [Current LSN] AS lsn, Operation AS operation, Context AS context, [Transaction ID] AS xid, "
+             "[Page ID] AS page, AllocUnitId AS au, [Transaction Name] AS name "
+             f"FROM fn_dump_dblog(NULL, NULL, 'DISK', 1, {devices})")
+    ok, info = session.query(f"SELECT backup_type, last_lsn FROM mssql_backup_info({paths})")
+    if not ok:
+        print(f"compare_rows --log: mssql_backup_info failed on {args.backup}:\n{info}")
+        return 1
+    last = lsn_text(info[0]["last_lsn"])
+    ok, server = session.query(f"SELECT * FROM mssql_scan('srv', {sql_string(dblog)})")
+    if not ok:
+        print(f"compare_rows --log: fn_dump_dblog failed on {args.backup}:\n{server}")
+        return 1
+    ok, ours = session.query(
+        f"SELECT lsn::VARCHAR AS lsn, operation, context, transaction_id AS xid, page, allocation_unit AS au, "
+        f"CASE WHEN operation = 'LOP_BEGIN_XACT' THEN contents.name::VARCHAR END AS name "
+        f"FROM mssql_backup_transaction_records({paths})")
+    if not ok:
+        print(f"compare_rows --log: mssql_backup_transaction_records failed on {args.backup}:\n{ours}")
+        return 1
+
+    def server_page(p):
+        if not p:
+            return None
+        f, n = p.split(":")
+        return f"{int(f, 16)}:{int(n, 16)}"
+
+    want = {}
+    for r in server:
+        # Up to 2019 the server spells an LSN's hex in lower case (00000028:000007d0:000a), from 2022 on in
+        # upper case, as lsn_text does: compared, and ordered against LastLSN, in upper case. A transaction id
+        # is compared in lower case, as the reader spells it.
+        lsn = r["lsn"].upper()
+        xid = r["xid"].lower() if r["xid"] else r["xid"]
+        if lsn >= last:
+            continue  # LastLSN is the next record after the backup's (HEADERONLY): not the backup's
+        want[lsn] = (r["operation"], r["context"], xid if xid != "0000:00000000" else None,
+                          server_page(r["page"]), int(r["au"]) if r["au"] not in (None, "") else None, r["name"])
+    got = {}
+    duplicates = []
+    for r in ours:
+        key = lsn_text(r["lsn"])
+        if key in got:
+            duplicates.append(key)  # the reader under test giving one record twice (review of #591)
+        got[key] = (r["operation"], r["context"], r["xid"].lower() if r["xid"] else r["xid"], r["page"], int(r["au"]) if r["au"] is not None else None,
+                    r["name"])
+    failures = [f"{lsn}: given twice by the reader" for lsn in duplicates]
+    for lsn in sorted(set(want) | set(got)):
+        w, g = want.get(lsn), got.get(lsn)
+        if w is None or g is None:
+            failures.append(f"{lsn}: {'only ours' if w is None else 'only the server'}: {g or w}")
+            continue
+        fields = ["operation", "context", "transaction", "page", "allocation unit", "name"]
+        for name, a, b in zip(fields, w, g):
+            # The server prints no page or unit where the record names none (and some records name a unit
+            # on page 0:0); only what it does print is compared.
+            if name in ("page", "allocation unit") and a in (None, "0:0", 0):
+                continue
+            if name == "name" and not a:
+                continue
+            if a != b:
+                failures.append(f"{lsn} {w[0]}: {name} {a!r} on the server, {b!r} here")
+    print(f"compare_rows --log: {args.backup}: {len(want)} records of the server, {len(got)} here, "
+          f"{len(failures)} differences")
+    for f in failures[:40]:
+        print(f"  FAIL {f}")
+    return 1 if failures or not want else 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("backup", help="the backup: a file, or its stripes comma-separated")
     parser.add_argument("--duckdb", required=True)
     parser.add_argument("--min-tables", type=int, default=1)
     parser.add_argument("--diff", default="", help="a differential to lay over the backup: its stripes comma-separated")
+    parser.add_argument("--log", default="",
+                        help="compare the backup's log with fn_dump_dblog over these server paths (comma-separated)")
+    parser.add_argument("--fuzzy", action="store_true",
+                        help="a backup taken under load: check each table's fuzzy_status against whether it differs")
     args = parser.parse_args()
     try:
         session = Session(args.duckdb, os.environ["MSSQL_ROWS_PORT"], os.environ["MSSQL_ROWS_PASSWORD"],
@@ -78,15 +172,21 @@ def main():
     diff = [f for f in args.diff.split(",") if f]
     # Spec 085 PR 4c: every call reads the differential over the full (a named parameter, last).
     opts = (", diff := [" + ", ".join(sql_string(f) for f in diff) + "]") if diff else ""
+    # A table's status is checked from the listing; its scan reads it whatever the status (no WARNING in the output).
+    scan_opts = opts + (", fuzzy := 'ignore'" if args.fuzzy else "")
+
+    if args.log:
+        sys.exit(compare_log(session, args, paths))
 
     ok, tables = session.query(
-        f"SELECT schema_name, table_name, shape, decodable, reason, "
+        f"SELECT schema_name, table_name, shape, decodable, reason, fuzzy_status, open_transactions, stale_transactions, "
         f"to_json([{{'name': c.name, 'decodable': c.decodable, 'reason': c.reason}} FOR c IN columns]) AS columns "
         f"FROM mssql_backup_tables({paths}{opts}) ORDER BY schema_name, table_name")
     if not ok:
         sys.exit(f"compare_rows: mssql_backup_tables failed on {args.backup}:\n{tables}")
 
     compared, failures, rows_total = 0, [], 0
+    statuses = {}
     for t in tables:
         schema, table = t["schema_name"], t["table_name"]
         where = f"{schema}.{table}"
@@ -99,7 +199,7 @@ def main():
         # name (owner, review of #552): checked on the first such column of each table.
         unread = [c["name"] for c in columns if not c["decodable"]]
         if unread:
-            scan_of = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)}{opts})"
+            scan_of = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)}{scan_opts})"
             ok, result = session.query(f"SELECT {ident(unread[0])} FROM {scan_of} LIMIT 1")
             if ok or "is not read" not in str(result):
                 failures.append(f"{where}: naming {unread[0]}, which is not read, was not refused by name")
@@ -109,7 +209,7 @@ def main():
                 failures.append(f"{where}: no column left to compare ({left_out})")
                 break
             select = ", ".join(ident(c) for c in cols)
-            scan = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)}{opts})"
+            scan = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)}{scan_opts})"
             server = f"srv.{ident(schema)}.{ident(table)}"
             ok, result = session.query(
                 f"SELECT (SELECT count(*) FROM (SELECT {select} FROM {scan} EXCEPT ALL SELECT {select} FROM {server})) "
@@ -122,7 +222,26 @@ def main():
             r = result[0]
             only_backup, only_server = int(r["only_backup"]), int(r["only_server"])
             backup_rows, server_rows = int(r["backup_rows"]), int(r["server_rows"])
-            status = "ok" if (only_backup, only_server) == (0, 0) and backup_rows == server_rows else "DIFF"
+            differs = (only_backup, only_server) != (0, 0) or backup_rows != server_rows
+            if args.fuzzy:
+                fuzzy = t["fuzzy_status"]
+                statuses[fuzzy] = statuses.get(fuzzy, 0) + 1
+                verdict = "ok"
+                if differs and fuzzy == "consistent":
+                    verdict = "MISSED"
+                    failures.append(f"{where}: differs from the restored table ({only_backup} rows only in the backup, "
+                                    f"{only_server} only on the server) but its fuzzy_status is 'consistent'")
+                elif not differs and fuzzy != "consistent":
+                    verdict = "FLAGGED"
+                    failures.append(f"{where}: equal to the restored table but its fuzzy_status is '{fuzzy}' "
+                                    f"({t['open_transactions']} open, {t['stale_transactions']} stale transactions)")
+                print(f"  {verdict:7} {where}: {fuzzy} ({t['open_transactions']} open, {t['stale_transactions']} stale), "
+                      f"{'differs' if differs else 'equal'}: {only_backup} rows only in the backup, {only_server} only "
+                      f"on the server, {backup_rows} against {server_rows} rows")
+                compared += 1
+                rows_total += backup_rows
+                break
+            status = "DIFF" if differs else "ok"
             if status != "ok":
                 failures.append(f"{where}: {only_backup} rows only in the backup, {only_server} only on the server, "
                                 f"{backup_rows} against {server_rows} rows")
@@ -179,13 +298,15 @@ def main():
                               "WHERE is_indexed ORDER BY schema_name, view_name")
     if not ok:
         sys.exit(f"compare_rows: mssql_backup_views failed on {args.backup}:\n{views}")
-    for v in views:
+    # Not on a backup taken under load (--fuzzy): a view's rows may differ there, and no fuzzy status is
+    # given for a view, so its exact comparison would fail where nothing is wrong (review of #591).
+    for v in ([] if args.fuzzy else views):
         schema, view = v["schema_name"], v["view_name"]
         where = f"{schema}.{view} (indexed view)"
         if v["decodable"] in (False, "false"):
             print(f"  skip {where}: {v['scan_reason']}")
             continue
-        scan = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(view)}{opts})"
+        scan = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(view)}{scan_opts})"
         server = f"srv.{ident(schema)}.{ident(view)}"
         ok, described = session.query(f"DESCRIBE SELECT * FROM {scan}")
         ok_server, server_described = session.query(f"DESCRIBE SELECT * FROM {server}")
@@ -217,14 +338,15 @@ def main():
 
     # Spec 086 acceptance 2: a compressed table <x>_row beside its uncompressed twin <x>_plain (the same rows,
     # cd.sql) reads alike, _mssql_rid included -- the key bytes are the uncompressed form's.
-    names = {(t["schema_name"], t["table_name"]): t for t in tables}
+    # Not on a backup taken under load (--fuzzy): its tables may differ, which the status checks above judge.
+    names = {} if args.fuzzy else {(t["schema_name"], t["table_name"]): t for t in tables}
     for (schema, table), t in sorted(names.items()):
         twin = names.get((schema, table[:-4] + "_plain")) if table.endswith("_row") else None
         if not twin or t["decodable"] in (False, "false") or twin["decodable"] in (False, "false"):
             continue
         where = f"{schema}.{table} against {twin['table_name']}"
-        a = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)}{opts})"
-        b = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(twin['table_name'])}{opts})"
+        a = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)}{scan_opts})"
+        b = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(twin['table_name'])}{scan_opts})"
         ok, result = session.query(
             f"SELECT (SELECT count(*) FROM (SELECT *, _mssql_rid FROM {a} EXCEPT ALL SELECT *, _mssql_rid FROM {b})) "
             f"AS only_row, (SELECT count(*) FROM (SELECT *, _mssql_rid FROM {b} EXCEPT ALL "
@@ -255,6 +377,9 @@ def main():
         else:
             print(f"  ok   {where}: equal, _mssql_rid included; each of {len(described)} columns alone too")
 
+    if args.fuzzy:
+        print(f"compare_rows: fuzzy_status of the tables compared: "
+              f"{', '.join(f'{n} {k}' for k, n in sorted(statuses.items())) or 'none'}")
     print(f"compare_rows: {args.backup}: {compared} tables and indexed views, {rows_total} rows compared, "
           f"{len(failures)} failures")
     for f in failures:
