@@ -106,18 +106,24 @@ enum class PageState : uint8_t {
 	Pending,
 };
 
+class PageStore;
+
 //! A Pending page met by a reader that needs it: a FormatError a caller can tell apart, to name the objects whose
 //! rows the page may hold rather than fail the whole call (spec 085 D13).
 class PendingPageError : public FormatError {
 public:
-	explicit PendingPageError(const std::string &message) : FormatError(message) {}
+	PendingPageError(const std::string &message, const PageStore *store_) : FormatError(message), store(store_) {}
+	//! The page store that met the page (PageStore::Read; a rethrow passes it on): a reader of two backups' pages --
+	//! the change listing's two states, whose page numbers are alike -- tells by it which backup the page is of (review
+	//! of #607).
+	const PageStore *store;
 };
 
 //! A value stored off row met on a Pending page by a stager that does not read it as NULL (fuzzy :=
 //! 'error'): told apart from a Pending page met elsewhere (an IAM page), whose refusal is worded otherwise.
 class PendingValueError : public PendingPageError {
 public:
-	explicit PendingValueError(const std::string &message) : PendingPageError(message) {}
+	PendingValueError(const std::string &message, const PageStore *store_) : PendingPageError(message, store_) {}
 };
 
 //! A live page whose copy is no formatted page (header version 0) in a backup of one data pass: SQL Server
@@ -129,8 +135,11 @@ public:
 //! locator's or a short backup's fault, refused.
 class ZeroCopyError : public FormatError {
 public:
-	ZeroCopyError(const std::string &message, const PagePointer &page_) : FormatError(message), page(page_) {}
+	ZeroCopyError(const std::string &message, const PagePointer &page_, const PageStore *store_)
+		: FormatError(message), page(page_), store(store_) {}
 	PagePointer page;
+	//! The page store whose copy it is: the backup whose log tail is to be asked (review of #607).
+	const PageStore *store;
 };
 
 class PageStore {

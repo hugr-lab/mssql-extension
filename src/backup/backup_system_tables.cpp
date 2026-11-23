@@ -261,6 +261,10 @@ struct FixedWidths {
 		Set({XTYPE_VARBINARY, XTYPE_VARCHAR, XTYPE_NVARCHAR, XTYPE_IMAGE, XTYPE_TEXT, XTYPE_NTEXT, XTYPE_SQL_VARIANT,
 			 XTYPE_XML},
 			WidthRule::Variable);
+		// XTYPE_CLR is in neither set. A user type of Format.Native is stored at a fixed offset, but sysrscols
+		// describes it as binary of its size, so its width is binary's (measured on 2022 and 2025;
+		// CheckDeclaredType); the other CLR types are variable columns. Were a CLR xtype ever at a fixed offset,
+		// it would take the length sysrscols gives it (WidthRule::Unknown), as a type the reader does not know.
 	}
 };
 

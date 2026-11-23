@@ -24,5 +24,7 @@ OUT="${HERE}/switch_in" VERSION="${VERSION}" FIXTURES=switch_in "${HERE}/../../b
 OUT="${HERE}/open_tail" VERSION="${VERSION}" FIXTURES=open_tail "${HERE}/../../backup/gen/generate.sh"
 # A full restored over its database between two fulls: a history break (review of #612).
 OUT="${HERE}/history_break" VERSION="${VERSION}" FIXTURES=history_break "${HERE}/../../backup/gen/generate.sh"
+# CLR columns of every storage form: a Format.Native user type stored at a fixed offset as binary (spec 093).
+OUT="${HERE}/clr" VERSION="${VERSION}" FIXTURES=clr "${HERE}/../../backup/gen/generate.sh"
 # Values stored off row changed every way, then a shrink (spec 085 PR 4c-3, the LOB tail).
 OUT="${HERE}/lob_changes" VERSION="${VERSION}" FIXTURES=lob_changes exec "${HERE}/../../backup/gen/generate.sh"

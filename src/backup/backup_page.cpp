@@ -84,8 +84,9 @@ bool PageStore::Read(uint16_t file, uint32_t page, Page &out) const {
 		p.page = page;
 		throw PendingPageError(
 			"backup: page " + p.ToString() +
-			" became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
-			"backup), which is not replayed yet");
+				" became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
+				"backup), which is not replayed yet",
+			this);
 	}
 	return state == PageState::Present;
 }
@@ -142,7 +143,7 @@ PageState PageStore::Fetch(uint16_t file, uint32_t page, Page &out) const {
 		// id, an LSN and a flag set). A unit with bytes in it that names another page is a misplaced copy, a
 		// locator's fault: refused, never taken for Pending (as IsPendingCopy draws it; review of #591).
 		if (out.header.version == 0 && ZeroOrNamesItself(want, out)) {
-			throw ZeroCopyError(message, want);
+			throw ZeroCopyError(message, want, this);
 		}
 		throw FormatError(message);
 	}

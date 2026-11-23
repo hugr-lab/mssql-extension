@@ -92,7 +92,7 @@ test/
   backup/               # Spec 085 PR 2a/2b/2c: gen/ (generate.sh; fixtures samples / catalog / partition
                         # (partitioned tables of every boundary type) / files (two files, a file
                         # removed) / load (backups under a workload) / fuzzy (E3's controls under load, PR 5) / open_tail (one transaction left open, committed under test/data/backup/open_tail) / large (data past a GAM interval) / rows (record
-                        # forms, E20) / dbcs (double-byte code pages) / lob (every off-row form, PR 3) / cd (ROW) / page (PAGE, spec 086 PR 2) / schema_changes (truncates, a shrink, a sliding window, PR 4c-3; not run by default) / history_break (a full restored over its database between two fulls, committed under test/data/backup/history_break); catalog_golden.sql, run by generate.sh with ONE -v path
+                        # forms, E20) / dbcs (double-byte code pages) / lob (every off-row form, PR 3) / cd (ROW) / page (PAGE, spec 086 PR 2) / schema_changes (truncates, a shrink, a sliding window, PR 4c-3; not run by default) / history_break (a full restored over its database between two fulls, committed under test/data/backup/history_break) / clr (CLR columns of every storage form, a Format.Native user type stored as binary at a fixed offset, committed under test/data/backup/clr); catalog_golden.sql, run by generate.sh with ONE -v path
                         # variable (sqlcmd substitutes no :setvar and only the first -v in :OUT); images.txt pinning each
                         # SQL Server image by digest), compare_catalog.py (mssql_backup_tables / _views vs the
                         # server's catalog), compare_info.py (mssql_backup_info vs RESTORE,
@@ -102,7 +102,7 @@ test/
   data/backup/          # Synthetic backup samples + golden RESTORE HEADERONLY/LABELONLY/FILELISTONLY,
                         # made by generate.sh on a throwaway container. Never commit a backup of
                         # any other instance (spec 085 T4); .gitignore admits only this directory's .bak and its switch_in/, lob_changes/,
-                        # open_tail/ and history_break/ (databases of their own)
+                        # open_tail/, history_break/ and clr/ (databases of their own)
 docs/                   # Architecture documentation (see docs/architecture.md)
 docker/                 # SQL Server container and Linux CI build
 tools/

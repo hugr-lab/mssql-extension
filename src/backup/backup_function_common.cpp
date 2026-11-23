@@ -166,10 +166,12 @@ void ThrowPendingOrFormat(ClientContext &context, const OpenedForStatement &open
 									  std::to_string(tail->formatted.size()) + " pages formatted in it)"
 								: why));
 	}
-	throw PendingPageError("backup: page " + e.page.ToString() +
-						   " became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
-						   "backup), which is not replayed yet (a zero copy in a backup of one data pass, the page "
-						   "formatted in its tail)");
+	throw PendingPageError(
+		"backup: page " + e.page.ToString() +
+			" became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
+			"backup), which is not replayed yet (a zero copy in a backup of one data pass, the page "
+			"formatted in its tail)",
+		e.store);
 }
 
 Value RecordDatetimeValue(const std::string &record_form) {
