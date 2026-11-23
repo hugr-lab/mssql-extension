@@ -230,6 +230,14 @@ void TestConnect() {
 		const std::string error = socket.GetLastError();
 		Check(!connected && !socket.IsConnected() && socket.GetSocketFd() == -1, "a refused port is not connected to");
 		Check(took < 3000, "and is refused at once, not after the timeout");
+		{
+			// The same port by name: localhost may resolve to ::1 and 127.0.0.1, every address tried; what is
+			// reported is a refusal, not what a later address failed with locally (review of #610).
+			TdsSocket by_name;
+			const bool named = by_name.Connect("localhost", port, 5);
+			Check(!named && by_name.GetLastError() == std::string("Connection failed: ") + std::strerror(ECONNREFUSED),
+				  "by name too, the refusal is the reason (" + by_name.GetLastError() + ")");
+		}
 		// Regression: the wait for the connection sees the refusal as a socket error, and Connect used to
 		// word every failed wait as "Connection timed out" -- which the ATTACH error then turned into advice
 		// about firewalls. The socket's own error is the reason.
@@ -267,6 +275,9 @@ void TestPlainIo() {
 		Bytes got;
 		std::thread reader([&]() { got = ReadUpTo(pair.peer, out.size()); });
 		const bool sent = pair.socket.Send(out);
+		if (!sent) {
+			pair.socket.Close();  // the reader waits for every byte: end it with the connection (review of #610)
+		}
 		reader.join();
 		Check(sent && got == out, "Send delivers every byte, in order");
 		Check(pair.socket.Send(nullptr, 0), "an empty Send succeeds");
@@ -428,6 +439,11 @@ void TestFraming() {
 				break;
 			}
 			matched++;
+		}
+		if (matched != payloads.size()) {
+			// The writer blocks on a full socket nobody reads: closing it fails the writer's sends, so the
+			// failure is a FAIL line and not a hung run (review of #610).
+			pair.socket.Close();
 		}
 		writer.join();
 		Check(matched == payloads.size(), "400 packets in arbitrary pieces, framing " + std::to_string(framing[0]) +
@@ -855,16 +871,16 @@ void TestTransport() {
 	std::cout << "TlsHandshakeTransport" << std::endl;
 	{
 		SocketPair pair;
-		uint8_t packet_id = 250;
+		uint8_t packet_id = 254;
 		TlsHandshakeTransport transport(pair.a, packet_id);
-		Check(transport.Flush() && packet_id == 250, "nothing kept: Flush sends nothing");
+		Check(transport.Flush() && packet_id == 254, "nothing kept: Flush sends nothing");
 		const Bytes one = Pattern(5, 1), two = Pattern(300, 2);
 		Check(transport.Buffer(one.data(), one.size()) == 5 && transport.Buffer(two.data(), two.size()) == 300 &&
 				  transport.PendingSendBytes() == 305,
 			  "Buffer keeps what it is given and answers its length");
-		Check(transport.Flush() && transport.PendingSendBytes() == 0 && packet_id == 251,
+		Check(transport.Flush() && transport.PendingSendBytes() == 0 && packet_id == 255,
 			  "Flush sends it and advances the packet id");
-		Bytes expected = {0x12, 0x01, 0x01, 0x39, 0x00, 0x00, 250, 0x00};  // 8 + 305 = 0x139
+		Bytes expected = {0x12, 0x01, 0x01, 0x39, 0x00, 0x00, 254, 0x00};  // 8 + 305 = 0x139
 		expected.insert(expected.end(), one.begin(), one.end());
 		expected.insert(expected.end(), two.begin(), two.end());
 		Check(ReadUpTo(pair.b, expected.size()) == expected,
@@ -873,8 +889,9 @@ void TestTransport() {
 		transport.Flush();
 		transport.Buffer(one.data(), one.size());
 		transport.Flush();
-		Check(packet_id == 253 && ReadUpTo(pair.b, 26).size() == 26,
-			  "the id wraps from 255 to 0 like the connection's");
+		const Bytes next = ReadUpTo(pair.b, 26);  // two packets of 8 + 5
+		Check(packet_id == 1 && next.size() == 26 && next[6] == 255 && next[13 + 6] == 0,
+			  "the id wraps from 255 to 0 like the connection's: the packets carry 255, then 0");
 	}
 	{
 		SocketPair pair;

@@ -149,6 +149,51 @@ static bool ConnectInProgress(int error) {
 #endif
 }
 
+//! A socket error's text. On Windows strerror() knows no Winsock code ("Unknown error" for every one), so
+//! the codes a dial ends on are named as POSIX names them -- the words MSSQLTranslateConnectionError
+//! classifies (review of #610).
+static std::string SocketErrorText(int error) {
+#ifdef _WIN32
+	static const struct {
+		int code;
+		const char *text;
+	} NAMES[] = {{WSAECONNREFUSED, "Connection refused"},
+				 {WSAETIMEDOUT, "Connection timed out"},
+				 {WSAEHOSTUNREACH, "No route to host"},
+				 {WSAENETUNREACH, "Network is unreachable"},
+				 {WSAEHOSTDOWN, "Host is down"},
+				 {WSAEADDRNOTAVAIL, "Cannot assign requested address"},
+				 {WSAEAFNOSUPPORT, "Address family not supported by protocol"},
+				 {WSAECONNRESET, "Connection reset by peer"}};
+	for (const auto &name : NAMES) {
+		if (name.code == error) {
+			return name.text;
+		}
+	}
+	return "socket error " + std::to_string(error);
+#else
+	return strerror(error);
+#endif
+}
+
+//! A dial that failed before reaching the network: this host has no route or address of that family
+//! (an AAAA address on a host without IPv6, say). On a name of several addresses it says nothing about
+//! the server, so it must not replace what an address actually tried reported (review of #610).
+static bool IsLocalDialFailure(int error) {
+#ifdef _WIN32
+	return error == WSAENETUNREACH || error == WSAEADDRNOTAVAIL || error == WSAEAFNOSUPPORT;
+#else
+	return error == ENETUNREACH || error == EADDRNOTAVAIL || error == EAFNOSUPPORT;
+#endif
+}
+
+void TdsSocket::NoteDialError(int error) {
+	if (IsLocalDialFailure(error) && !last_error_.empty()) {
+		return;
+	}
+	last_error_ = "Connection failed: " + SocketErrorText(error);
+}
+
 static const char *AddressFamilyName(int family) {
 	if (family == AF_INET) {
 		return "IPv4";
@@ -175,7 +220,7 @@ bool TdsSocket::AwaitConnect(int addr_index, int timeout_seconds) {
 		MSSQL_SOCKET_DEBUG_LOG(1, "Connect: timed out on address %d", addr_index);
 		return false;
 	}
-	last_error_ = "Connection failed: " + std::string(strerror(error));
+	NoteDialError(error);
 	MSSQL_SOCKET_DEBUG_LOG(1, "Connect: getsockopt SO_ERROR=%d for address %d: %s", error, addr_index,
 						   last_error_.c_str());
 	return false;
@@ -205,7 +250,7 @@ bool TdsSocket::ConnectAddress(const struct addrinfo &address, int addr_index, i
 			connected = AwaitConnect(addr_index, timeout_seconds);
 		} else {
 			// Refused at once (no wait): the same wording as a refusal that arrives after it.
-			last_error_ = "Connection failed: " + std::string(strerror(connect_error));
+			NoteDialError(connect_error);
 			MSSQL_SOCKET_DEBUG_LOG(1, "Connect: connect failed on address %d with error %d", addr_index, connect_error);
 		}
 	}

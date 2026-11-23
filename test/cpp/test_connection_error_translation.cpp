@@ -148,6 +148,19 @@ void TestNonLoginFailuresStillClassified() {
 	CHECK(Contains(socket_refused, "check if SQL Server is running"));
 	CHECK(!Contains(socket_refused, "check network connectivity"));
 
+	// An unreachable server is a network problem, not a name that does not resolve (review of #610: the DNS
+	// arm's bare "host" caught "No route to host"). A name that does not resolve keeps the DNS advice.
+	for (const char *unreachable : {"Connection failed: No route to host", "Connection failed: Host is down",
+									"Connection failed: Network is unreachable"}) {
+		const string out = MSSQLTranslateConnectionError(unreachable, "s", 1433, "u", "db");
+		CHECK(Contains(out, "Cannot reach s:1433"));
+		CHECK(Contains(out, "check network connectivity"));
+		CHECK(!Contains(out, "Cannot resolve hostname"));
+	}
+	const string unresolved = MSSQLTranslateConnectionError(
+		"Failed to resolve hostname: nodename nor servname provided, or not known", "s", 1433, "u", "db");
+	CHECK(Contains(unresolved, "Cannot resolve hostname 's'"));
+
 	const string tls = MSSQLTranslateConnectionError("TLS handshake failed: bad record", "s", 1433, "u", "db");
 	// "TLS negotiation failed" is this branch's own wording -- the raw input says
 	// "handshake", so asserting on that would pass from the echo alone even if
