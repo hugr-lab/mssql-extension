@@ -349,6 +349,10 @@ user, system base (S), internal (IT), MS-shipped -- is described by the catalog 
 (heap, non-unique key, ROW / PAGE compression included), `mssql_backup_catalog(path, t)` being
 `mssql_backup_scan(path, 'sys', t)`, and an attached backup has every one as an entry (`bk.sys.sysschobjs`):
 functions never stand in for the catalog.
+The schema changes (DQ-47) compare every table too, and each event carries its object's `type` (`U` / `S` /
+`IT`, a view's `V`) and `is_ms_shipped` (owner, 2026-11-23, oluies' review of #612: a history break reloads
+every table, ~115 of schema `sys`; the importer keeps `NOT is_ms_shipped`, a choice of its own as above).
+Fixture `test/data/backup/history_break`.
 
 ### DQ-12 — How does lake state reach the reader?
 

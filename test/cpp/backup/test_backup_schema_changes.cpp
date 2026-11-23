@@ -141,6 +141,23 @@ int main() {
 			  "recreated under a new object id: a reload naming both ids");
 	}
 	{
+		// Every table is compared (review of #612): each event carries its object's type and is_ms_shipped --
+		// a dropped table its old state's --, so a consumer mirroring the user's objects filters the rest out.
+		CatalogModel old_model, new_model;
+		auto queue = Table(40, "sys", "queue_messages_1", 400, {Column(1, "id", "int", 56, false)});
+		queue.type = "IT";
+		queue.is_ms_shipped = true;
+		old_model.tables.push_back(queue);
+		new_model.tables.push_back(Table(41, "dbo", "fresh", 410, {Column(1, "id", "int", 56, false)}));
+		new_model.views.push_back(View(42, "v", "2026-11-23", "SELECT 1 AS x"));
+		const auto changes = CompareCatalogs(old_model, new_model, false, DEFINITION);
+		Check(Types(changes) == std::vector<std::string>(
+									{"table_dropped:queue_messages_1", "table_created:fresh", "view_created:v"}) &&
+				  changes[0].type == "IT" && changes[0].is_ms_shipped && changes[1].type == "U" &&
+				  !changes[1].is_ms_shipped && changes[2].type == "V" && !changes[2].is_ms_shipped,
+			  "an event's type and is_ms_shipped: an internal table's, a user table's, a view's");
+	}
+	{
 		// Partitions (DQ-47 / DQ-49), judged by rowset: a rebuild is nothing (its pages are written anew), a
 		// TRUNCATE keeps the rowset and starts its IAM chain anew -- or leaves none when nothing was inserted
 		// since --, a partition switched in from another table is a reload and its source switched out.

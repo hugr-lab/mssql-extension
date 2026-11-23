@@ -30,6 +30,11 @@ struct SchemaChange {
 							  // column_nullability_changed, view_created, view_dropped, view_renamed,
 							  // view_definition_changed, view_indexed, view_unindexed
 	std::string object_type;
+	//! sys.objects' type of the object -- a table's `U`, `S` or `IT`, a view's `V` -- and is_ms_shipped, so a
+	//! consumer that mirrors only the user's objects filters the system and internal tables out (review of #612:
+	//! every table is compared, and a history break reloads ~115 tables of schema sys).
+	std::string type;
+	bool is_ms_shipped = false;
 	int32_t object_id = 0;	// the new state's; the old state's for a drop
 	int32_t old_object_id = 0;
 	std::string schema_name, name;

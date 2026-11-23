@@ -149,8 +149,8 @@ and the roles' included): `schema_id`, `schema_name`, and the `table_count` and 
 tables (every one `mssql_backup_tables` lists: `sys` counts its system and internal tables) and user views
 in each.
 
-`mssql_backup_columns(path [, schema [, table]])` lists every column of the user tables, one row
-each, with its state at a glance: `schema_name`, `table_name`, `column_id`, `column_name`,
+`mssql_backup_columns(path [, schema [, table]])` lists every column of every table (those of schema
+`sys` included), one row each, with its state at a glance: `schema_name`, `table_name`, `column_id`, `column_name`,
 `sql_type` (as declared: an alias type by its own name, e.g. AdventureWorks' `Name`), `type_schema` (its schema, `dbo` for that `Name`; `sys` for a system type), `system_type`
 (the type underneath, declared: `nvarchar(50)`; NULL for a user-defined CLR type), `duckdb_type` (the
 type the scan returns a column it reads as; the declared type's otherwise), `state` and `reason`.
@@ -200,7 +200,7 @@ SHA-256), on backups made by SQL Server 2017 to 2025.
 Every table of the database is read, not only the user tables: the system base tables (the catalog's own:
 `sysschobjs`, `syscolpars`, `sysobjvalues`, `sysowners`, ...), the internal tables SQL Server keeps for a
 feature (Query Store's `plan_persist_*`, a Service Broker queue's `queue_messages_*`, change tracking's
-`syscommittab`, ...) and the MS-shipped ones. They are in schema `sys`, and read as any table: by the scan,
+`syscommittab`, ...). They are in schema `sys`, and read as any table: by the scan,
 with its types and virtual columns, whatever their shape or storage (a heap, a non-unique key, a ROW- or
 PAGE-compressed one). Attached, they are catalog entries:
 
@@ -224,7 +224,8 @@ resource database's tables (`sys.trace_xe_event_map`, ...) are listed by the dat
 
 ## Rows
 
-`mssql_backup_scan(path, schema, table)` reads a user table's rows from a full backup, typed as
+`mssql_backup_scan(path, schema, table)` reads a table's rows from a full backup -- any table, those of
+schema `sys` included --, typed as
 `TYPE mssql` reads them over a connection (`mssql_catalog_native_types` off: a plain `VARCHAR` for a
 string). Every collation is converted, the double-byte code pages (Japanese, Chinese, Korean)
 included. A type whose conversion comes in a later release -- `sql_variant`, `xml`, `geometry` /
@@ -567,7 +568,10 @@ SELECT count(*) FROM mssql_backup_scan('/backups/sales/*.bak', 'dbo', 'orders',
 
 `mssql_backup_schema_changes` gives what changed in the schema from one state of a history to another,
 as an importer applies it before the rows -- compared by object id and column id, so a rename is a
-rename:
+rename. Every table is compared, the system and internal ones of schema `sys` too: each row carries the
+object's `type` (`U` a user table, `S` a system base table, `IT` an internal one, `V` a view) and
+`is_ms_shipped`, and an importer that mirrors only the user's objects keeps `WHERE NOT is_ms_shipped`.
+Across a history break every table is a reload, the hundred-odd of schema `sys` with them:
 
 ```sql
 FROM b.schema_changes(start_version := 41, end_version := 42);

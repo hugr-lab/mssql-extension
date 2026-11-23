@@ -259,6 +259,8 @@ struct CatalogView {
 	std::string created;
 	std::string modified;
 	bool is_encrypted = false;
+	//! sys.objects' is_ms_shipped. False for every view listed today: IsUserView leaves the MS-shipped ones out.
+	bool is_ms_shipped = false;
 	//! The T-SQL text; Absent for an encrypted view (its bytes are obfuscated, never read).
 	ModuleDefinition definition;
 	//! Why the view's own row cannot be trusted (its schema is not one); empty otherwise.

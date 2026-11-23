@@ -1,0 +1,56 @@
+# name: test/sql/backup/mssql_backup_history_break.test
+# description: a history break -- a full restored over its database between two fulls (review of #612)
+# group: [mssql]
+#
+# test/data/backup/history_break (test/backup/gen/history_break.sql, SQL Server 2025): dbo.t holds id 1 in
+# break_before; that full is restored over the database WITH REPLACE (a new recovery fork), id 2 inserted,
+# and break_after taken. Across the break object ids compare as nothing, so every table is a reload:
+# the user's and those of schema sys (every table is in the catalog model), told apart by type and
+# is_ms_shipped. No SQL Server is needed.
+
+require mssql
+
+statement ok
+ATTACH 'test/data/backup/history_break/*.bak' AS hb (TYPE mssql_backup, history true);
+
+query IT
+SELECT snapshot_id, history_break FROM hb.snapshots() ORDER BY 1;
+----
+1	false
+2	true
+
+# Every table reloads: one user table, 72 system base tables and 43 internal ones.
+query TTTI
+SELECT type, is_ms_shipped, change_type, count(*) FROM hb.schema_changes(start_version := 1, end_version := 2)
+GROUP BY ALL ORDER BY ALL;
+----
+IT	true	table_reload	43
+S	true	table_reload	72
+U	false	table_reload	1
+
+# What an importer that mirrors the user's tables takes.
+query TTTT
+SELECT change_type, schema_name, name, reason FROM hb.schema_changes(start_version := 1, end_version := 2)
+WHERE NOT is_ms_shipped;
+----
+table_reload	dbo	t	the database was restored or recreated between the two states
+
+# The files themselves, no ATTACH: the same rows.
+query I
+SELECT count(*) FROM (SELECT * FROM hb.schema_changes(start_version := 1, end_version := 2)
+                      EXCEPT ALL SELECT * FROM mssql_backup_schema_changes('test/data/backup/history_break/*.bak', start_version := 1, end_version := 2));
+----
+0
+
+# A table to reload gives every row of the newer state as an insert.
+query TII
+SELECT change_type, id, v FROM hb.table_changes('dbo', 't', start_version := 1, end_version := 2) ORDER BY ALL;
+----
+insert	1	1
+insert	2	2
+
+# One state: no change.
+query I
+SELECT count(*) FROM hb.schema_changes(start_version := 2, end_version := 2);
+----
+0

@@ -1289,6 +1289,7 @@ CatalogView ModelBuilder::DescribeView(const SysObject &o, std::string schema_na
 	v.created = o.created;
 	v.modified = o.modified;
 	v.is_encrypted = (o.status & VIEW_ENCRYPTED) != 0;
+	v.is_ms_shipped = (o.status & OBJECT_MS_SHIPPED) != 0;
 	auto text = texts_.find(ModuleKey{1, o.id, 0});
 	if (!v.is_encrypted && !texts_pending_.empty()) {
 		v.definition = Unreadable(texts_pending_);

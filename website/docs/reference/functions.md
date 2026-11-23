@@ -276,7 +276,7 @@ SELECT schema_name, table_count FROM mssql_backup_schemas('/backups/sales_full.b
 
 ### mssql_backup_columns()
 
-Every column of the user tables in a SQL Server full backup, one row each, with its state at a
+Every column of every table in a SQL Server full backup (those of schema `sys` included), one row each, with its state at a
 glance (`converted`, `stored_bytes`, `not_stored`, `storage_format`) and why;
 optionally one schema's or one table's. See [Backup Files](../reading/backups.md#tables-and-views).
 
@@ -288,9 +288,10 @@ SELECT column_name, sql_type, system_type, state FROM mssql_backup_columns('/bac
 
 ### mssql_backup_catalog()
 
-A table of schema `sys` of the database in a SQL Server full backup -- a system base table, an internal
-one or an MS-shipped one -- read as `mssql_backup_scan(path, 'sys', base_table)` reads it, with the same
-parameters and virtual columns. Attached, the same table is `bk.sys.<table>`. See
+A table of schema `sys` of the database in a SQL Server full backup -- a system base table or an internal
+one -- read as `mssql_backup_scan(path, 'sys', base_table)` reads it, with the same parameters and virtual
+columns. A table of another schema, MS-shipped or not (`cdc.*`), is read with `mssql_backup_scan(path,
+schema, table)`. Attached, the same table is `bk.sys.<table>`. See
 [Backup Files](../reading/backups.md#system-and-internal-tables).
 
 **Signature:** `mssql_backup_catalog(path VARCHAR | VARCHAR[], base_table VARCHAR) -> TABLE(...)`

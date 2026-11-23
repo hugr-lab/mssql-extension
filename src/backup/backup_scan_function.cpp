@@ -228,7 +228,8 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 }
 
 //! mssql_backup_catalog(path, base_table): the table of schema sys, read by the scan as any table (owner,
-//! 2026-11-22: one reader for every table; a system base table, an internal one, an MS-shipped one).
+//! 2026-11-22: one reader for every table; a system base table, an internal one). An MS-shipped table of another
+//! schema (cdc.*) is mssql_backup_scan's, with its schema.
 unique_ptr<FunctionData> CatalogBind(ClientContext &context, TableFunctionBindInput &input,
 									 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return BindScan(context, CATALOG_FUNCTION, input.inputs[0], Value("sys"), input.inputs[1], input, return_types,
@@ -1281,9 +1282,10 @@ void RegisterBackupScanFunction(ExtensionLoader &loader) {
 		loader, std::move(catalog),
 		{{},
 		 "Reads a table of schema sys of a SQL Server full backup -- a system base table (the catalog's own, as "
-		 "sysschobjs), an internal one (Query Store's, a queue's messages, ...) or an MS-shipped one -- as "
+		 "sysschobjs) or an internal one (Query Store's, a queue's messages, ...) -- as "
 		 "mssql_backup_scan(path, 'sys', table) reads it: its rows typed as TYPE mssql reads them and the same "
-		 "virtual columns. mssql_backup_tables lists every table, of every kind (its type column).",
+		 "virtual columns. A table of another schema, MS-shipped or not (cdc.*), is mssql_backup_scan's. "
+		 "mssql_backup_tables lists every table, of every kind (its type column).",
 		 {"SELECT id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs')",
 		  "SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak', 'plan_persist_query_text')"},
 		 {"backup"}});
