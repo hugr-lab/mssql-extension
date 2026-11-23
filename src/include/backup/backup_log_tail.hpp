@@ -101,8 +101,12 @@ std::vector<LogElement> RowLogElements(const LogRecord &record, const std::strin
 
 class LogTailReader;
 
+//! What a cursor holds while it reads: the chunk it reads the stream by (4 MiB, a block never cut across
+//! two) and one block beside it, for the memory its caller reserves (D17).
+constexpr uint64_t LOG_CURSOR_BYTES = (4ull << 20) + (64ull << 10);
+
 //! The tail's records one at a time, in ForEach's order: what a table function returns a chunk of per
-//! call. Reads through the reader's stream as it goes (a chunk of CHUNK bytes at a time).
+//! call. Reads through the reader's stream as it goes (a chunk of 4 MiB at a time).
 class LogTailCursor {
 public:
 	explicit LogTailCursor(const LogTailReader &tail);

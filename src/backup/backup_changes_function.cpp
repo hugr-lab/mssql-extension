@@ -27,16 +27,28 @@ namespace {
 constexpr const char *FUNCTION = "mssql_backup_schema_changes";
 
 std::vector<std::pair<const char *, LogicalType>> Columns() {
-	return {{"start_version", LogicalType::BIGINT},	   {"end_version", LogicalType::BIGINT},
-			{"change_type", LogicalType::VARCHAR},	   {"object_type", LogicalType::VARCHAR},
-			{"object_id", LogicalType::INTEGER},	   {"old_object_id", LogicalType::INTEGER},
-			{"schema_name", LogicalType::VARCHAR},	   {"name", LogicalType::VARCHAR},
-			{"old_schema_name", LogicalType::VARCHAR}, {"old_name", LogicalType::VARCHAR},
-			{"column_id", LogicalType::INTEGER},	   {"column_name", LogicalType::VARCHAR},
-			{"old_column_name", LogicalType::VARCHAR}, {"sql_type", LogicalType::VARCHAR},
-			{"old_sql_type", LogicalType::VARCHAR},	   {"is_nullable", LogicalType::BOOLEAN},
-			{"old_is_nullable", LogicalType::BOOLEAN}, {"definition", LogicalType::VARCHAR},
-			{"old_definition", LogicalType::VARCHAR},  {"partitions", LogicalType::LIST(LogicalType::INTEGER)},
+	return {{"start_version", LogicalType::BIGINT},
+			{"end_version", LogicalType::BIGINT},
+			{"change_type", LogicalType::VARCHAR},
+			{"object_type", LogicalType::VARCHAR},
+			{"type", LogicalType::VARCHAR},
+			{"is_ms_shipped", LogicalType::BOOLEAN},
+			{"object_id", LogicalType::INTEGER},
+			{"old_object_id", LogicalType::INTEGER},
+			{"schema_name", LogicalType::VARCHAR},
+			{"name", LogicalType::VARCHAR},
+			{"old_schema_name", LogicalType::VARCHAR},
+			{"old_name", LogicalType::VARCHAR},
+			{"column_id", LogicalType::INTEGER},
+			{"column_name", LogicalType::VARCHAR},
+			{"old_column_name", LogicalType::VARCHAR},
+			{"sql_type", LogicalType::VARCHAR},
+			{"old_sql_type", LogicalType::VARCHAR},
+			{"is_nullable", LogicalType::BOOLEAN},
+			{"old_is_nullable", LogicalType::BOOLEAN},
+			{"definition", LogicalType::VARCHAR},
+			{"old_definition", LogicalType::VARCHAR},
+			{"partitions", LogicalType::LIST(LogicalType::INTEGER)},
 			{"reason", LogicalType::VARCHAR}};
 }
 
@@ -173,6 +185,8 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 			row.push_back(end_number);
 			row.emplace_back(c.change_type);
 			row.emplace_back(c.object_type);
+			row.emplace_back(c.type);
+			row.push_back(Value::BOOLEAN(c.is_ms_shipped));
 			row.push_back(Id(c.object_id));
 			row.push_back(Id(c.old_object_id));
 			row.push_back(Text(c.schema_name));
@@ -327,7 +341,9 @@ void RegisterBackupChangesFunctions(ExtensionLoader &loader) {
 		 "reload (recreated under a new object id, a partition switched in, the database restored between the "
 		 "two), columns added, dropped, renamed, retyped or "
 		 "of another nullability, views created, dropped, renamed, redefined (their T-SQL old and new), indexed "
-		 "or unindexed -- compared by object id and column id, so a rename is a rename. The states are versions "
+		 "or unindexed -- compared by object id and column id, so a rename is a rename. Every table is compared, "
+		 "the system (type S) and internal (IT) ones too: type and is_ms_shipped tell them from the user's. "
+		 "The states are versions "
 		 "of an attached history or of the files (start_version / end_version: a number, or a time; by default "
 		 "the default version, and its full alone; NULL for diff :=), or a full and the differential diff := names. "
 		 "One state: no rows.",

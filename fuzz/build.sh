@@ -250,8 +250,10 @@ BACKUP_SRCS=(
 	"${BACKUP}/backup_record.cpp"
 )
 # The catalog reader (PR 2b): pages, records, IAM chains, the boot page (its collation lookup takes
-# spec 091's generated tables), the system base tables, sql_variant, LOB trees, the model.
+# spec 091's generated tables), the system base tables, sql_variant, LOB trees, the model; and the CD
+# records (spec 086), which the system-table reader takes as the scan does (a compressed system table).
 BACKUP_CATALOG_SRCS=(
+	"${BACKUP}/backup_cd_record.cpp"
 	"${BACKUP}/backup_page.cpp"
 	"${BACKUP}/backup_boot.cpp"
 	"${BACKUP}/backup_collation.cpp"
@@ -264,8 +266,6 @@ BACKUP_CATALOG_SRCS=(
 )
 # Values stored off row (PR 3): the walker above and the `_mssql_lob` map.
 BACKUP_LOB_SRCS=("${BACKUP}/backup_lob_map.cpp")
-# ROW-compressed records (spec 086 PR 1): the CD walk and the values' uncompressed forms.
-BACKUP_CD_SRCS=("${BACKUP}/backup_cd_record.cpp")
 # The log tail (spec 085 PR 5): its blocks and records, and D11's summary of them.
 BACKUP_LOG_SRCS=("${BACKUP}/backup_log_tail.cpp" "${BACKUP}/backup_fuzzy.cpp")
 BACKUP_OBJS=""
@@ -289,10 +289,8 @@ if want backup_lob; then
 	build_harness fuzz_backup_lob fuzz_backup_lob.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS} ${BACKUP_LOB_OBJS}
 fi
 # ROW-compressed records (spec 086 PR 1): ReadCdRecord, CdRow::Read, DecodeCompressedUnicode, DecodeVardecimal.
-if want backup_cd; then
-	BACKUP_CD_OBJS="$(compile_objs backup_cd "${BACKUP_CD_SRCS[@]}")"
-	build_harness fuzz_backup_cd fuzz_backup_cd.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS} ${BACKUP_CD_OBJS}
-fi
+# (backup_cd_record.cpp is among the catalog's sources: the system-table reader takes CD records too.)
+want backup_cd && build_harness fuzz_backup_cd fuzz_backup_cd.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS}
 # The log tail (spec 085 PR 5): ParseLogBlock, RestoreSectorParity, RowLogElements, LogTailCursor,
 # SummarizeLogTail.
 if want backup_log; then
@@ -301,10 +299,7 @@ if want backup_log; then
 fi
 
 # PAGE compression (spec 086 PR 2): ReadPageCompression, and CdRow::Read with a page's compression information.
-if want backup_page_ci; then
-	BACKUP_PAGE_CI_OBJS="$(compile_objs backup_page_ci "${BACKUP_CD_SRCS[@]}")"
-	build_harness fuzz_backup_page_ci fuzz_backup_page_ci.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS} ${BACKUP_PAGE_CI_OBJS}
-fi
+want backup_page_ci && build_harness fuzz_backup_page_ci fuzz_backup_page_ci.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS}
 
 # 6. The STAGED read path (spec 059 D4): parser in raw-row mode feeding
 #    codec::staging::RowStager. Deliberately NOT in the default TARGETS — it is

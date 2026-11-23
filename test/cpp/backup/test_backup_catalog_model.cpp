@@ -86,11 +86,23 @@ int main() {
 			[&]() { m = BuildCatalogModel(*pages->store, ReadBootstrapTables(*pages->store, ReadBootPage(boot))); });
 		const CatalogTable *items = m.FindTable("dbo", "items");
 		const CatalogTable *events = m.FindTable("dbo", "events");
-		Check(error.empty() && m.tables.size() == 2 && items && events && m.views.empty() && m.SchemaName(1) == "dbo" &&
-				  m.SchemaName(4) == "sys",
+		size_t user = 0, system = 0, internal = 0;
+		bool resource = false;
+		for (const auto &t : m.tables) {
+			user += t.type == "U";
+			system += t.type == "S";
+			internal += t.type == "IT";
+			resource = resource || t.object_id < 0;
+		}
+		const CatalogTable *schobjs = m.FindTable("sys", "sysschobjs");
+		// Every table of the database is described (owner, 2026-11-22): the system base tables and the internal
+		// ones beside the user tables; the resource database's (sys.trace_xe_*, negative ids) are not this one's.
+		Check(error.empty() && user == 2 && system == 72 && internal == 43 && !resource && items && events && schobjs &&
+				  schobjs->is_ms_shipped && schobjs->decodable && !items->is_ms_shipped && m.views.empty() &&
+				  m.SchemaName(1) == "dbo" && m.SchemaName(4) == "sys",
 			  form.front() +
-				  ": dbo.items and dbo.events, no other user table (the MS-shipped trace_xe_* left out), "
-				  "no view; schemas dbo and sys" +
+				  ": dbo.items and dbo.events, the 72 system base tables and 43 internal ones, no resource-database "
+				  "table, no view; schemas dbo and sys" +
 				  (error.empty() ? "" : " -- " + error));
 		{
 			// Task 16e: a scope builds only the objects it names; the schemas are every one either way.
@@ -197,9 +209,9 @@ int main() {
 			  "a module's text stored as UTF-16 with an odd number of bytes is refused");
 	}
 
-	// The sysobjvalues rows that may leave (DQ-11), over a synthetic catalog: a view, an encrypted view,
-	// a default, a procedure, a trigger, a multi-statement function whose return table has a computed
-	// column, a user table with one, an MS-shipped view, and partition function 65536.
+	// The sysobjvalues rows the model describes (ObjectValueFilter), over a synthetic catalog: a view, an encrypted
+	// view, a default, a procedure, a trigger, a multi-statement function whose return table has a computed column, a
+	// user table with one, an MS-shipped view, and partition function 65536.
 	{
 		BootstrapTables t;
 		auto object = [&](int32_t id, const char *type, int32_t status) {
@@ -228,14 +240,15 @@ int main() {
 		column(106, 2, COLUMN_COMPUTED);
 		column(106, 3, 0);
 		const ObjectValueFilter f(t, {65536});
-		Check(f.Keep(1, 100, 0, 0) && f.Keep(1, 102, 0, 0) && f.Keep(2, 106, 2, 0) && f.Keep(30, 65536, 1, 1) &&
-				  f.Keep(30, 65536, 3, 1),
-			  "DQ-11 serves: a view's and a default's definition, a user table's computed column, the boundaries "
-			  "of a partition function");
+		Check(
+			f.Keep(1, 100, 0, 0) && f.Keep(1, 102, 0, 0) && f.Keep(2, 106, 2, 0) && f.Keep(30, 65536, 1, 1) &&
+				f.Keep(30, 65536, 3, 1),
+			"the model describes: a view's and a default's definition, a user table's computed column, the boundaries "
+			"of a partition function");
 		Check(!f.Keep(1, 101, 0, 0) && !f.Keep(1, 103, 0, 0) && !f.Keep(1, 104, 0, 0) && !f.Keep(1, 105, 0, 0) &&
 				  !f.Keep(1, 107, 0, 0) && !f.Keep(2, 105, 2, 0) && !f.Keep(2, 106, 3, 0) && !f.Keep(30, 999, 1, 1) &&
 				  !f.Keep(60, 106, 1, 0) && !f.Keep(1, 100, 1, 0) && !f.Keep(1, 100, 0, 1) && !f.Keep(2, 106, 2, 1),
-			  "DQ-11 keeps back: an encrypted view, a procedure, a trigger, a function and its return table's "
+			  "not the model's: an encrypted view, a procedure, a trigger, a function and its return table's "
 			  "computed column, an MS-shipped view, a plain column, another object's boundaries, another class, "
 			  "another subobjid or valnum");
 	}

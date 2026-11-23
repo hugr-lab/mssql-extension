@@ -3,14 +3,16 @@
 //
 // backup/backup_catalog_model.hpp
 //
-// Spec 085 PR 2b step 6 (task 12): the database's catalog as the backup holds it -- schemas, user
-// tables (their columns, rowsets, allocation units, layout and the defaults of columns added after
-// rows were written) and views (their definitions) -- derived from the system base tables
-// (backup_system_tables). What mssql_backup_tables / _views report, and what the scan binds.
+// Spec 085 PR 2b step 6 (task 12): the database's catalog as the backup holds it -- schemas, every
+// table (user, system base and internal ones: owner, 2026-11-22; their columns, rowsets, allocation
+// units, layout and the defaults of columns added after rows were written) and views (their
+// definitions) -- derived from the system base tables (backup_system_tables). What
+// mssql_backup_tables / _views report, and what the scan binds.
 //
 // Pinned on the catalog fixture (2022; spec 085 § Rules, catalog, lists them):
-//  - a user table is a sysschobjs row of type 'U ' without status bit 0x1 (the MS-shipped
-//    trace_xe_* tables every database lists have it, and no rowset); a view one of type 'V ', bit
+//  - a table is a sysschobjs row of type 'U ', 'S ' or 'IT' with an id >= 0 (the trace_xe_* tables every
+//    database lists are the resource database's: a negative id, no rowset), status bit 0x1 when
+//    MS-shipped; a view one of type 'V ', bit
 //    0x10000 when WITH ENCRYPTION;
 //  - syscolpars.status: 0x1 NOT NULL, 0x4 identity, 0x8 ROWGUIDCOL, 0x10 computed, 0x40 persisted,
 //    0x1000000 sparse, 0x2000000 a column set; a type's name is its sysscalartypes row (by utype:
@@ -63,8 +65,11 @@ static constexpr int32_t COLUMN_PERSISTED = 0x40;
 static constexpr int32_t COLUMN_SPARSE = 0x1000000;
 static constexpr int32_t COLUMN_SET = 0x2000000;
 
-//! A user table: type 'U ', not MS-shipped (the trace_xe_* tables every database lists are).
-bool IsUserTable(const SysObject &o);
+//! A table of the database, whoever made it (sys.objects.type): a user table ('U ', MS-shipped or not), a
+//! system base table ('S ', the catalog's own) or an internal table ('IT', a feature's: Query Store, a
+//! queue's messages, change tracking, ...). Every one is described and read alike (owner, 2026-11-22: no
+//! table is refused).
+bool IsTable(const SysObject &o);
 //! A view, not MS-shipped (encrypted or not: VIEW_ENCRYPTED tells).
 bool IsUserView(const SysObject &o);
 //! A view whose definition may be read: a user view not WITH ENCRYPTION.
@@ -72,12 +77,13 @@ bool IsReadableView(const SysObject &o);
 //! A default constraint (type 'D '), not MS-shipped.
 bool IsUserDefault(const SysObject &o);
 
-//! The sysobjvalues rows that may leave the reader (DQ-11: module source never does), each checked
-//! against the object it belongs to: valclass 1 of a readable view or a default, with subobjid and
-//! valnum 0; valclass 2 (a computed column's definition) of a computed column of a user table -- not by
+//! The sysobjvalues rows the model describes (a view's, a default's, a computed column's definition; a
+//! partition boundary), each checked against the object it belongs to: valclass 1 of a readable view or a default, with
+//! subobjid and valnum 0; valclass 2 (a computed column's definition) of a computed column of a user table -- not by
 //! the class alone, since a multi-statement function's return table can have a computed column and its
 //! definition is a valclass 2 row of the function (measured: an encrypted TVF's); valclass 30 of a
-//! partition function (sysclsobjs class 30). Any other row is kept back.
+//! partition function (sysclsobjs class 30). Any other row is not the model's (mssql_backup_catalog
+//! gives the table whole: spec 085 § Security, revised 2026-11-21).
 class ObjectValueFilter {
 public:
 	ObjectValueFilter(const BootstrapTables &tables, std::set<int32_t> partition_functions);
@@ -88,9 +94,6 @@ private:
 	std::set<std::pair<int32_t, int32_t>> computed_;
 	std::set<int32_t> partition_functions_;
 };
-
-//! The partition functions of the database: sysclsobjs class 30, read through `store`.
-std::set<int32_t> ReadPartitionFunctions(const PageStore &store, const BootstrapTables &tables);
 
 //! A module's text (a view's definition, a computed column's): read when in row; an off-row one is
 //! kept as its LOB root and read on demand (ReadModuleDefinition), so listing a catalog never reads
@@ -215,6 +218,12 @@ struct CatalogTable {
 	int32_t schema_id = 0;
 	std::string schema_name;
 	std::string name;
+	//! sys.objects.type, trimmed: "U" a user table, "S" a system base table, "IT" an internal table.
+	std::string type = "U";
+	//! sys.objects.is_ms_shipped: made by SQL Server (every S and IT table, and a U table a feature creates).
+	bool is_ms_shipped = false;
+	//! sysschobjs.pid: an internal table's parent (a queue's, an XML index's table), else 0.
+	int32_t parent_object_id = 0;
 	std::string created;  // datetime, 8 bytes in record form (ticks, then days)
 	std::string modified;
 	TableShape shape = TableShape::Heap;
@@ -250,6 +259,8 @@ struct CatalogView {
 	std::string created;
 	std::string modified;
 	bool is_encrypted = false;
+	//! sys.objects' is_ms_shipped. False for every view listed today: IsUserView leaves the MS-shipped ones out.
+	bool is_ms_shipped = false;
 	//! The T-SQL text; Absent for an encrypted view (its bytes are obfuscated, never read).
 	ModuleDefinition definition;
 	//! Why the view's own row cannot be trusted (its schema is not one); empty otherwise.

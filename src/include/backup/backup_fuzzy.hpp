@@ -32,6 +32,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -111,11 +113,12 @@ struct FuzzySummary {
 bool FormattedInTail(const FuzzySummary &tail, uint16_t file, uint32_t page);
 
 //! The summary of the records `tail` gives, for a backup set with those LSNs. `poll`, when given, is
-//! called every SUMMARY_POLL_RECORDS records: a log backup's whole log is read here, and its caller ends
-//! the read by throwing from it (an interrupt).
+//! called every SUMMARY_POLL_RECORDS records with what the summary holds so far, in bytes (an estimate,
+//! as MemoryBytes): a log backup's whole log is read here, and its caller reserves that memory as it
+//! grows and ends the read by throwing from it (an interrupt, a reservation refused).
 constexpr uint64_t SUMMARY_POLL_RECORDS = 4096;
 FuzzySummary SummarizeLogTail(const LogTailReader &tail, const Lsn &first, const Lsn &last, const Lsn &checkpoint,
-							  const std::function<void()> &poll = std::function<void()>());
+							  const std::function<void(uint64_t bytes)> &poll = std::function<void(uint64_t)>());
 //! The same over records already read (the tests, the fuzz harness).
 FuzzySummary SummarizeLogRecords(const std::vector<LogRecord> &records, const Lsn &first, const Lsn &last,
 								 const Lsn &checkpoint);
@@ -155,6 +158,28 @@ struct TableFuzziness {
 //! does not have holds none of it). Measured on the load fixture: by the transaction alone, a table whose
 //! open transaction wrote only after the copies read dirty while equal to the RESTORE.
 TableFuzziness FuzzinessOf(const FuzzySummary &summary, const std::vector<uint64_t> &units, const PageStore &pages);
+
+//! FuzzinessOf's answers kept per allocation unit, for one summary over one PageStore -- an OpenedBackup's
+//! tail and its own pages, for its life -- so a table's page copies are read once, not at every statement
+//! and for every listing (review of #591: on a backup taken under load, tens of thousands of reads, a range
+//! request each over s3://). Thread-safe; two statements asking at once may both compute a unit, the
+//! same answer.
+class FuzzinessMemo {
+public:
+	TableFuzziness Of(const FuzzySummary &summary, const std::vector<uint64_t> &units, const PageStore &pages);
+	//! What it holds, for the opened-file cache's estimate.
+	size_t MemoryBytes() const;
+
+private:
+	//! A unit's transactions whose changes show: open ones (dirty) and finished ones (stale).
+	struct UnitShows {
+		std::vector<uint64_t> dirty;
+		std::vector<uint64_t> stale;
+	};
+	mutable std::mutex lock_;
+	std::unordered_map<uint64_t, std::shared_ptr<const UnitShows>> units_;
+	size_t transactions_ = 0;  // over every unit kept
+};
 
 //! A table's base rowsets' allocation units (index 0, a heap, or 1, its clustered index: in-row,
 //! row-overflow and LOB): what its scan reads, what its status is over.

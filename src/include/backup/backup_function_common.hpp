@@ -50,10 +50,11 @@ std::string FuzzyParameterOf(const named_argument_map_t &named, const char *func
 TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
 						  const CatalogTable &table, FuzzyMode mode, const char *function);
 //! The same over allocation units (a system base table's, which the model does not describe), named `name`
-//! ("dbo.t") in what it says.
+//! ("dbo.t") in what it says; `memo`, when given, keeps the units' answers (the backup's FuzzinessMemo,
+//! whose tail and pages these are).
 TableFuzziness CheckFuzzyUnits(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
 							   const std::vector<uint64_t> &units, const std::string &name, FuzzyMode mode,
-							   const char *function);
+							   const char *function, FuzzinessMemo *memo = nullptr);
 //! CheckFuzzyUnits with the tail of `catalog`'s backup read for the statement (stage 5), through its files:
 //! what every function that reads a table's pages does before it reads them. A tail that cannot be read
 //! leaves the status unknown: refused under 'error', said under 'warn' (naming `given`, the table as the

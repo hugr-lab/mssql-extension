@@ -24,6 +24,7 @@ constexpr size_t RECORD_WITH_PAGE = 32;
 constexpr size_t RECORD_WITH_UNIT = 48;
 //! The tail is read in chunks of this many bytes, a block never cut across two.
 constexpr size_t CHUNK = 4u << 20;
+static_assert(CHUNK + (1u << 16) <= LOG_CURSOR_BYTES, "a cursor's chunk and one block (a u16 size) within it");
 
 uint16_t U16(const uint8_t *p) {
 	return static_cast<uint16_t>(p[0] | (p[1] << 8));

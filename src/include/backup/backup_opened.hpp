@@ -40,6 +40,10 @@
 #include <vector>
 
 namespace duckdb {
+class BufferManager;
+}
+
+namespace duckdb {
 class ClientContext;
 
 namespace mssql {
@@ -141,6 +145,29 @@ private:
 	std::unordered_map<uint64_t, std::shared_ptr<const std::vector<PagePointer>>> units_;
 };
 
+//! Memory the reader allocates itself -- the log tail's summary, the chunk its cursor reads (D17) -- held
+//! against DuckDB's memory_limit (BufferManager::ReserveMemory) in steps of STEP, and given back by Hold(0)
+//! or the destructor (DuckDB resets its attached databases and its ObjectCache before its buffer manager).
+//! One holder grows it: not thread-safe. Past what DuckDB can give, an OutOfMemoryException naming `what`.
+class ReservedBytes {
+public:
+	static constexpr uint64_t STEP = 4ull << 20;
+	ReservedBytes(BufferManager &buffers, std::string what) : buffers_(buffers), what_(std::move(what)) {}
+	~ReservedBytes();
+	ReservedBytes(const ReservedBytes &) = delete;
+	ReservedBytes &operator=(const ReservedBytes &) = delete;
+	//! Holds `bytes`, rounded up to a step: grown or shrunk to it.
+	void Hold(uint64_t bytes);
+	uint64_t Held() const {
+		return reserved_;
+	}
+
+private:
+	BufferManager &buffers_;
+	std::string what_;
+	uint64_t reserved_ = 0;
+};
+
 //! Stages 1-4 but the model, held for every statement that opens the same files (spec 085 D9, task
 //! 22): the DuckDB instance's ObjectCache entry, keyed by every file's path, size and version tag,
 //! evictable by its memory. Stages 2-4 (the pages, the boot page checked against the trailer, the
@@ -183,9 +210,22 @@ public:
 	//! MQTL streams (the tail is in that family only, E2§6), through the statement's files bound to the
 	//! thread -- and kept. Read outside the entry's locks; a second statement waits for the first's read in
 	//! 100 ms slices that ask `context` for an interrupt. A FormatError naming the backup when the tail is
-	//! not a log's (asked again, it is read again). Meaningful for a data backup (a log backup's records
-	//! are its whole content, not a tail). `built`: whether this call read it.
+	//! not a log's, or not read whole: kept too and thrown again whenever asked (review of #591: each
+	//! statement read the whole tail again only to throw again; the files of an entry do not change). An
+	//! interrupt, or memory DuckDB cannot give, keeps nothing. Meaningful for a data backup (a log backup's
+	//! records are its whole content, not a tail). `built`: whether this call read it.
+	//! The summary's memory, and the cursor's while it reads, is reserved with DuckDB as it grows (D17) and
+	//! held by the entry (ReleaseTailReservation).
 	const FuzzySummary &Fuzzy(ClientContext &context, bool *built = nullptr) const;
+	//! Gives back what the summary holds reserved: once the opened-file cache holds the entry, whose estimate
+	//! counts the summary (Reweigh), it is the cache's reservation. An entry not cached keeps it for its life.
+	void ReleaseTailReservation() const;
+	//! Whether the entry still holds its summary's memory reserved (ReleaseTailReservation not yet called).
+	bool HoldsTailReservation() const;
+	//! The tables' D11 status over this backup's tail and its own pages, kept per unit (FuzzinessMemo).
+	FuzzinessMemo &Fuzziness() const {
+		return fuzziness_;
+	}
 
 	static std::string ObjectType() {
 		return "mssql_backup_opened";
@@ -211,8 +251,21 @@ private:
 	mutable std::condition_variable fuzzy_built_;
 	mutable bool fuzzy_building_ = false;
 	mutable std::unique_ptr<FuzzySummary> fuzzy_;
+	//! Why the tail was not read, when it could not be (a FormatError's text): thrown again.
+	mutable std::string fuzzy_error_;
+	//! The summary's memory reserved with DuckDB, until ReleaseTailReservation (fuzzy_lock_).
+	mutable std::unique_ptr<ReservedBytes> fuzzy_memory_;
+	mutable FuzzinessMemo fuzziness_;
+	//! Held from a Reweigh's measure to its publication (review of #591: two at once could publish the
+	//! older, smaller measure last, the entry charged for less than it held).
+	std::mutex weigh_lock_;
 	std::atomic<size_t> estimate_{0};
 };
+
+//! `backup` put in the instance's ObjectCache under `key`, its estimate measured first when it still holds
+//! its tail's summary reserved, which it then gives back: the cache's reservation counts it. Every Put of an
+//! OpenedBackup goes through here; never under the cache's lock (Reweigh, OpenedBackup::Reweigh).
+void PutInCache(ObjectCache &cache, const std::string &key, const shared_ptr<OpenedBackup> &backup);
 
 //! A backup as one statement opened it: the shared state (from the cache, or built for it), the
 //! statement's files and their binding to it. Reads of the backup run inside a BindFiles of `binding`.

@@ -204,6 +204,10 @@ ValueRef LocateValue(const RecordView &record, size_t var_count, const RowsetLay
 //! The record `record` through `layout`: one value per column (dropped and uniquifier columns NULL,
 //! a bit as one byte 0 / 1, LocateValue's rules and errors).
 std::vector<SystemValue> DecodeRecord(const RecordView &record, const RowsetLayout &layout);
+struct RowRecord;
+//! The same over a row as a reader takes it (backup_cd_record.hpp): a FixedVar record, or a ROW / PAGE-compressed
+//! one whose values CdRow has put in the uncompressed form (a bit in its byte at bit_position, as either holds it).
+std::vector<SystemValue> DecodeRow(const RowRecord &row, const RowsetLayout &layout);
 
 //! Value `value` of column `column` of `layout` as an integer (tinyint / smallint / int / bigint /
 //! bit; tinyint and bit unsigned, the others sign-extended), a string (nvarchar / nchar as UTF-16, every unit kept;
@@ -373,16 +377,16 @@ const RowsetLayout &BootstrapLayout(const std::string &name);
 //! records of types 0 and 1. A FormatError when the database has no such system table.
 SystemTable ReadSystemTable(const PageStore &store, const BootstrapTables &tables, const std::string &name);
 
-//! The most physical columns the system-table decoder takes: it keeps a value per column of every
-//! row, so a crafted description of a million columns must not multiply into every record. System
-//! tables have a few dozen; a user table's rows are PR 2d's columnar decoder's.
+//! The most physical columns a table has (SQL Server's limit for a table that is not wide): a description of more
+//! is damaged, a FormatError, not a table refused. The system-table decoder keeps a value per column of every row,
+//! so a crafted description of a million columns must not multiply into every record.
 static constexpr size_t MAX_SYSTEM_TABLE_COLUMNS = 1024;
 
 //! Calls `row` for each record of the rowset whose in-row allocation unit is `unit`, through
 //! `layout`: the unit's IAM chain, its live data pages of level 0 (each naming the unit in its
 //! header), records of types 0 and 1 (freed slots, ghosts, stubs and index records skipped; two
 //! slots of one page at one offset refused). A page's error names the table. A layout of more than
-//! MAX_SYSTEM_TABLE_COLUMNS columns is refused.
+//! MAX_SYSTEM_TABLE_COLUMNS columns is a FormatError (a damaged description).
 void ForEachRowsetRow(const PageStore &store, const SysAllocUnit &unit, const RowsetLayout &layout,
 					  const std::function<void(const SystemRow &)> &row);
 //! The pages the IAM chain of `unit` lists, in chain order (its single pages, then every page of its

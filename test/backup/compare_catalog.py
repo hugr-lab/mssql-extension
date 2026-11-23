@@ -13,8 +13,10 @@ to the microsecond); per column: id, name, type name (sql_type's base, or an ali
 type's schema (type_schema),
 system type id, length, precision, scale, collation, nullable, identity, computed, sparse; per view:
 object id, encrypted, and the definition's length and SHA-256 over UTF-16LE (sys.sql_modules'
-nvarchar). mssql_backup_catalog: every base table it lists read whole, its count the rowset's, and the
-sysobjvalues rows it serves exactly <set>.modules.txt's (DQ-11: no module source). Partitioning (PR 2c):
+nvarchar) -- the user tables, as sys.tables lists them. Every other table of the database (the system base
+tables, the internal ones, the MS-shipped ones: owner, 2026-11-22, no table refused) listed readable and read
+whole by the scan, its count the rowset's, and <set>.modules.txt's sysobjvalues rows among the ones read (the
+table whole since spec 085 § Security's revision, 2026-11-21). Partitioning (PR 2c):
 per partitioned table its function, scheme, column, parameter type, side, fanout and NEXT USED, every
 boundary (as the server prints it, a datetimeoffset as its UTC instant), and every table's partitions
 (filegroup, rows, compression). A full set with no
@@ -212,7 +214,8 @@ def compare_partitioning(c, db, name, arg, texts):
     ours = keyed(db.query(
         "SELECT schema_name, table_name, p.partition_number::VARCHAR AS partition_number, p.filegroup, "
         "p.rows::VARCHAR AS rows, upper(p.compression) AS compression, shape FROM "
-        f"(SELECT schema_name, table_name, shape, unnest(partitions) AS p FROM mssql_backup_tables({arg}))"),
+        f"(SELECT schema_name, table_name, shape, unnest(partitions) AS p FROM mssql_backup_tables({arg}) "
+        f"WHERE {USER_TABLE})"),
         "schema_name", "table_name", "partition_number")
     theirs = keyed(parse_golden(texts[f"{name}.partitions.txt"]), "schema_name", "table_name", "partition_number")
     compare_keys(c, f"{name}: partitions", ours, theirs)
@@ -235,19 +238,26 @@ SYSTEM_TYPE_NAMES = {
 }
 
 
+# A user table, as sys.tables lists the golden's (is_ms_shipped = 0): what the server's catalog is compared on.
+USER_TABLE = "type = 'U' AND NOT is_ms_shipped"
+
+
 def compare_set(c, db, name, arg, texts):
     tables = db.query("SELECT schema_name, table_name, object_id::VARCHAR AS object_id, shape, "
                       "partition_count::VARCHAR AS partition_count, row_count::VARCHAR AS row_count, "
-                      f"created::VARCHAR AS created, modified::VARCHAR AS modified FROM mssql_backup_tables({arg})")
+                      f"created::VARCHAR AS created, modified::VARCHAR AS modified FROM mssql_backup_tables({arg}) "
+                      f"WHERE {USER_TABLE}")
     columns = db.query("SELECT schema_name, table_name, c.column_id::VARCHAR AS column_id, c.name, c.sql_type, "
                        "c.type_schema, "
                        "c.system_type_id::VARCHAR AS system_type_id, c.max_length::VARCHAR AS max_length, "
                        "c.precision::VARCHAR AS precision, c.scale::VARCHAR AS scale, c.collation, "
                        "c.is_nullable::VARCHAR AS is_nullable, c.is_identity::VARCHAR AS is_identity, "
                        "c.is_computed::VARCHAR AS is_computed, c.is_sparse::VARCHAR AS is_sparse "
-                       f"FROM (SELECT schema_name, table_name, unnest(columns) AS c FROM mssql_backup_tables({arg}))")
+                       f"FROM (SELECT schema_name, table_name, unnest(columns) AS c FROM mssql_backup_tables({arg}) "
+                       f"WHERE {USER_TABLE})")
     listed = db.query("SELECT schema_name, table_name, column_id::VARCHAR AS column_id, column_name, sql_type, "
-                      f"type_schema, system_type FROM mssql_backup_columns({arg})")
+                      f"type_schema, system_type FROM mssql_backup_columns({arg}) WHERE (schema_name, table_name) IN "
+                      f"(SELECT schema_name, table_name FROM mssql_backup_tables({arg}) WHERE {USER_TABLE})")
     views = db.query("SELECT schema_name, view_name, object_id::VARCHAR AS object_id, "
                      "is_encrypted::VARCHAR AS is_encrypted, definition, reason, is_indexed::VARCHAR AS is_indexed, "
                      f"row_count::VARCHAR AS row_count FROM mssql_backup_views({arg})")
@@ -327,6 +337,7 @@ def compare_set(c, db, name, arg, texts):
     if f"{name}.schemas.txt" in texts:
         schemas = db.query("SELECT schema_id::VARCHAR AS schema_id, schema_name, table_count::VARCHAR AS table_count, "
                            f"view_count::VARCHAR AS view_count FROM mssql_backup_schemas({arg})")
+        every = db.query(f"SELECT schema_name FROM mssql_backup_tables({arg})")
         ours = keyed(schemas, "schema_id")
         theirs = keyed(parse_golden(texts[f"{name}.schemas.txt"]), "schema_id")
         compare_keys(c, f"{name}: schemas", ours, theirs)
@@ -334,30 +345,38 @@ def compare_set(c, db, name, arg, texts):
             o = ours[k]
             where = f"{name}: schema {k[0]}"
             c.check(where, "schema_name", o["schema_name"], theirs[k]["schema_name"])
+            # Every table of the schema, whoever made it (the tables of schema sys too): the listing's own count.
             c.check(where, "table_count", o["table_count"],
-                    str(sum(1 for t in tables if t["schema_name"] == o["schema_name"])))
+                    str(sum(1 for t in every if t["schema_name"] == o["schema_name"])))
             c.check(where, "view_count", o["view_count"],
                     str(sum(1 for v in views if v["schema_name"] == o["schema_name"])))
 
-    # mssql_backup_catalog: every base table it lists reads whole (an xtype a version adds fails here),
-    # its count the rowset's; and sysobjvalues serves exactly the rows the server says it may (DQ-11).
-    listed = db.query(f"SELECT base_table, row_count::VARCHAR AS row_count FROM mssql_backup_catalog({arg})")
-    c.check(f"{name}: mssql_backup_catalog", "lists sysschobjs", any(r["base_table"] == "sysschobjs" for r in listed),
-            True)
-    # Every table in one statement: one DuckDB process rather than one a table (each call still opens the backup).
-    served = {r["base_table"]: r["n"] for r in db.query(" UNION ALL ".join(
-        f"SELECT {sql_string(r['base_table'])} AS base_table, count(*)::VARCHAR AS n "
-        f"FROM mssql_backup_catalog({arg}, {sql_string(r['base_table'])})" for r in listed))} if listed else {}
+    # Every other table of the database -- the system base tables, the internal ones, the MS-shipped ones --
+    # is listed readable and reads whole through the scan, as a user table (owner, 2026-11-22: no table
+    # refused; an xtype or a storage form a version adds fails here), its count the rowset's; and
+    # sysobjvalues holds every row the server's catalog views name.
+    listed = db.query("SELECT schema_name, table_name, decodable::VARCHAR AS decodable, reason, "
+                      f"row_count::VARCHAR AS row_count FROM mssql_backup_tables({arg}) WHERE NOT ({USER_TABLE})")
+    c.check(f"{name}: system tables", "lists sys.sysschobjs",
+            any((r["schema_name"], r["table_name"]) == ("sys", "sysschobjs") for r in listed), True)
     for r in listed:
-        if r["row_count"] is not None:
-            c.check(f"{name}: mssql_backup_catalog {r['base_table']}", "rows", served[r["base_table"]], r["row_count"])
+        c.check(f"{name}: {r['schema_name']}.{r['table_name']}", "decodable", r["decodable"], "true")
+    readable = [r for r in listed if r["decodable"] == "true"]
+    # Every table in one statement: one DuckDB process rather than one a table (each call still opens the backup).
+    served = {(r["s"], r["t"]): r["n"] for r in db.query(" UNION ALL ".join(
+        f"SELECT {sql_string(r['schema_name'])} AS s, {sql_string(r['table_name'])} AS t, count(*)::VARCHAR AS n "
+        f"FROM mssql_backup_scan({arg}, {sql_string(r['schema_name'])}, {sql_string(r['table_name'])})"
+        for r in readable))} if readable else {}
+    for r in readable:
+        c.check(f"{name}: {r['schema_name']}.{r['table_name']}", "rows", served.get((r["schema_name"], r["table_name"])),
+                r["row_count"])
     # main() requires <set>.modules.txt beside .tables.txt.
     ours = {(r["valclass"], r["objid"], r["subobjid"]) for r in db.query(
         "SELECT DISTINCT valclass::VARCHAR AS valclass, objid::VARCHAR AS objid, subobjid::VARCHAR AS subobjid "
         f"FROM mssql_backup_catalog({arg}, 'sysobjvalues')")}
     theirs = {(r["valclass"], r["objid"], r["subobjid"]) for r in parse_golden(texts[f"{name}.modules.txt"])}
-    c.check(f"{name}: mssql_backup_catalog sysobjvalues", "rows served (valclass, objid, subobjid)",
-            sorted(ours), sorted(theirs))
+    c.check(f"{name}: mssql_backup_catalog sysobjvalues", "rows the catalog views name, missing",
+            sorted(theirs - ours), [])
 
 
 def main():

@@ -17,10 +17,34 @@ SELECT database_name, readonly, type FROM duckdb_databases() WHERE database_name
 bk	true	mssql_backup
 
 query TTI
-SELECT schema_name, table_name, column_count FROM duckdb_tables() WHERE database_name = 'bk' ORDER BY ALL;
+SELECT schema_name, table_name, column_count FROM duckdb_tables() WHERE database_name = 'bk' AND schema_name = 'dbo' ORDER BY ALL;
 ----
 dbo	events	4
 dbo	items	7
+
+# Every table of the database is an entry, whoever made it (owner, 2026-11-22: the attached catalog is the
+# way a backup is read): the system base tables and the internal ones in schema sys, read as any table.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'bk' AND schema_name = 'sys';
+----
+115
+
+query I
+SELECT count(*) FROM bk.sys.sysschobjs;
+----
+2909
+
+query TT
+SELECT name, type FROM bk.sys.sysschobjs WHERE name IN ('items', 'sysschobjs', 'plan_persist_query') ORDER BY 1;
+----
+items	U
+plan_persist_query	IT
+sysschobjs	S
+
+query I
+SELECT count(*) FROM bk.sys.plan_persist_query_text WHERE query_sql_text LIKE '%INSERT INTO dbo.items%';
+----
+1
 
 # The entries' columns are the scan's.
 query I
@@ -145,7 +169,7 @@ SELECT count(*) FROM mssql_backup_scan('bk', 'dbo', 'items');
 2000
 
 query T
-SELECT list(table_name ORDER BY table_name) FROM mssql_backup_tables('bk');
+SELECT list(table_name ORDER BY table_name) FROM mssql_backup_tables('bk') WHERE type = 'U';
 ----
 [events, items]
 
@@ -160,9 +184,9 @@ SELECT backup_type FROM mssql_backup_info('bk');
 full
 
 query I
-SELECT count(*) > 0 FROM mssql_backup_catalog('bk', 'sysschobjs');
+SELECT count(*) FROM mssql_backup_catalog('bk', 'sysschobjs');
 ----
-true
+2909
 
 # No TYPE mssql state: no pool.
 query I
@@ -249,12 +273,12 @@ statement ok
 ATTACH 'test/data/backup/full.bak' AS bx1 (TYPE mssql_backup, table_exclude '^EV');
 
 query T
-SELECT list(table_name) FROM duckdb_tables() WHERE database_name = 'bx1';
+SELECT list(table_name) FROM duckdb_tables() WHERE database_name = 'bx1' AND schema_name = 'dbo';
 ----
 [items]
 
 query T
-SELECT list(table_name ORDER BY table_name) FROM mssql_backup_tables('bx1');
+SELECT list(table_name ORDER BY table_name) FROM mssql_backup_tables('bx1') WHERE type = 'U';
 ----
 [items]
 
@@ -269,7 +293,7 @@ statement ok
 ATTACH 'test/data/backup/full.bak' AS bx2 (TYPE mssql_backup, table_filter 'e', table_exclude '^items$');
 
 query T
-SELECT list(table_name) FROM duckdb_tables() WHERE database_name = 'bx2';
+SELECT list(table_name) FROM duckdb_tables() WHERE database_name = 'bx2' AND schema_name = 'dbo';
 ----
 [events]
 
@@ -277,9 +301,15 @@ statement ok
 ATTACH 'test/data/backup/full.bak' AS bx3 (TYPE mssql_backup, schema_exclude '^dbo$');
 
 query I
-SELECT count(*) FROM duckdb_tables() WHERE database_name = 'bx3';
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'bx3' AND schema_name = 'dbo';
 ----
 0
+
+# The filters keep or drop schema sys's tables as any: only sys's here.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'bx3';
+----
+115
 
 query I
 SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'bx3' AND schema_name = 'dbo';
@@ -299,6 +329,11 @@ query T
 SELECT list(schema_name ORDER BY schema_name) FROM mssql_backup_schemas('bx5');
 ----
 [dbo]
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'bx5' AND schema_name = 'sys';
+----
+0
 
 statement error
 ATTACH 'test/data/backup/full.bak' AS bx4 (TYPE mssql_backup, table_exclude '(');

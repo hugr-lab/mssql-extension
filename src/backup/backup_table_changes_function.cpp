@@ -207,16 +207,17 @@ void OpenChangesStates(ClientContext &context, TableChangesBindData &data) {
 //! D11 for the change listing (review of #591: it read a dirty or stale state without a word, and under
 //! mssql_backup_fuzzy = 'error' too): each state's table checked against that state's log tail, as the scan
 //! checks the one it reads -- a WARNING each under 'warn', refused by name under 'error'. One state: nothing
-//! is read, nothing checked.
-void CheckChangesFuzzy(ClientContext &context, TableChangesBindData &data) {
+//! is read, nothing checked. At init, as the scan's: a DESCRIBE reads no tail (review of #591).
+void CheckChangesFuzzy(ClientContext &context, const TableChangesBindData &data) {
 	if (data.states.same) {
 		return;
 	}
-	if (data.fuzzy.empty() && data.paths.size() == 1) {
+	std::string fuzzy = data.fuzzy;
+	if (fuzzy.empty() && data.paths.size() == 1) {
 		// Over an attached name, the ATTACH's fuzzy option before the setting, as the scan takes it.
-		data.fuzzy = AttachedFuzzy(context, data.paths.front());
+		fuzzy = AttachedFuzzy(context, data.paths.front());
 	}
-	const FuzzyMode mode = FuzzyModeOf(context, data.fuzzy, data.function);
+	const FuzzyMode mode = FuzzyModeOf(context, fuzzy, data.function);
 	const std::string given = data.schema + "." + data.table;
 	const std::string name = data.new_table->schema_name + "." + data.new_table->name;
 	CheckStatementFuzzy(context, *data.states.new_catalog, BaseUnitsOf(*data.new_table), name + " (the newer state)",
@@ -283,7 +284,6 @@ unique_ptr<FunctionData> TableChangesBind(ClientContext &context, TableFunctionB
 	data->function = ChangesFunction(listing);
 	ReadChangesArguments(*data, input);
 	OpenChangesStates(context, *data);
-	CheckChangesFuzzy(context, *data);
 	data->columns = ScanColumnsOf(*data->new_table);
 	PairOldColumns(*data);
 	names.emplace_back("change_type");
@@ -316,6 +316,7 @@ unique_ptr<GlobalTableFunctionState> TableChangesInit(ClientContext &context, Ta
 	if (data.states.same) {
 		return std::move(state);
 	}
+	CheckChangesFuzzy(context, data);
 	try {
 		BindFiles bound_new(data.states.new_catalog->Binding());
 		BindFiles bound_old(data.states.old_catalog->Binding());

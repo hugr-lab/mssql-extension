@@ -5,7 +5,9 @@
 // lands -- page_count (the allocation pages, PR 2) and each file's backup_size_bytes (the page index).
 // consistent / open_transactions / committed_after_checkpoint / rolled_back_after_checkpoint are D11's database level
 // (task 27): the log tail read (stage 5, kept by the opened-file cache); NULL for a log backup, whose records are not
-// a tail. The database's version, level and collation come from the trailer SCIN.
+// a tail. The headers are read at bind, the tail at init and only when one of those four is selected (review of
+// #591: a DESCRIBE, or a header question, read the whole tail -- over s3://, downloaded it). The database's
+// version, level and collation come from the trailer SCIN.
 
 #include "backup/backup_info_function.hpp"
 
@@ -143,8 +145,33 @@ Value FileValue(const DatabaseFile &f, bool present) {
 	return Value::STRUCT(std::move(fields));
 }
 
-//! The row of the backup set the files of `opened` hold.
-std::vector<Value> InfoRow(const OpenedHeaders &opened, const FuzzySummary *tail) {
+//! The place of `name` among Columns().
+idx_t ColumnIndex(const char *name) {
+	const auto columns = Columns();
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (std::string(columns[i].name) == name) {
+			return i;
+		}
+	}
+	throw InternalException("mssql_backup_info: no column %s", name);
+}
+
+//! D11's four columns (consistent, open_transactions, committed_after_checkpoint,
+//! rolled_back_after_checkpoint), in Columns()'s order from the first: what the tail is read for.
+constexpr idx_t D11_COLUMNS = 4;
+
+//! D11's columns from `tail`, at their places in `row`; NULL with none.
+void PutTail(std::vector<Value> &row, const FuzzySummary *tail) {
+	const idx_t at = ColumnIndex("consistent");
+	const Value no_int(LogicalType::INTEGER);
+	row[at] = tail ? Value::BOOLEAN(tail->Consistent()) : Value(LogicalType::BOOLEAN);
+	row[at + 1] = tail ? Value::INTEGER(static_cast<int32_t>(tail->open_transactions)) : no_int;
+	row[at + 2] = tail ? Value::INTEGER(static_cast<int32_t>(tail->committed_after_checkpoint)) : no_int;
+	row[at + 3] = tail ? Value::INTEGER(static_cast<int32_t>(tail->rolled_back_after_checkpoint)) : no_int;
+}
+
+//! The row of the backup set the files of `opened` hold, D11's columns NULL (PutTail).
+std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	const auto &set = opened.Set();
 	const auto &first = *opened.families.front();
 	uint64_t backup_size = 0;
@@ -229,12 +256,12 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened, const FuzzySummary *tail
 												 : Value(LogicalType::BIGINT));
 	row.push_back(Value(LogicalType::BIGINT));	// page_count: the allocation pages (PR 2)
 	row.push_back(Value::BIGINT(static_cast<int64_t>(log_tail)));
-	row.push_back(tail ? Value::BOOLEAN(tail->Consistent()) : Value(LogicalType::BOOLEAN));	 // consistent: D11
-	row.push_back(tail ? Value::INTEGER(static_cast<int32_t>(tail->open_transactions)) : no_int);
-	row.push_back(tail ? Value::INTEGER(static_cast<int32_t>(tail->committed_after_checkpoint)) : no_int);
-	row.push_back(tail ? Value::INTEGER(static_cast<int32_t>(tail->rolled_back_after_checkpoint)) : no_int);
+	for (idx_t i = 0; i < D11_COLUMNS; i++) {
+		row.push_back(Value());	 // D11's: NULL of its type below, the tail's at init (PutTail)
+	}
 	row.push_back(Value(RecoveryModelName(set.recovery_model)));
 	row.push_back(Value::LIST(FileType(), std::move(files)));
+	PutTail(row, nullptr);
 	return row;
 }
 
@@ -243,6 +270,9 @@ struct BackupInfoBindData : public TableFunctionData {
 	BackupAt at;  // task 24b
 	std::vector<Value> row;
 	bool reread = false;
+	//! A data backup's: its tail holds D11's columns. Its set's GUID, to tell its files from others at init.
+	bool has_tail = false;
+	std::string set_guid;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<BackupInfoBindData>();
@@ -250,6 +280,8 @@ struct BackupInfoBindData : public TableFunctionData {
 		copy->at = at;
 		copy->row = row;
 		copy->reread = reread;
+		copy->has_tail = has_tail;
+		copy->set_guid = set_guid;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -266,6 +298,8 @@ struct BackupInfoBindData : public TableFunctionData {
 };
 
 struct BackupInfoState : public GlobalTableFunctionState {
+	std::vector<Value> row;
+	std::vector<column_t> column_ids;  // the columns asked for (projection pushdown)
 	bool done = false;
 };
 
@@ -303,21 +337,46 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		// takes them, and so does a catalog call after this one.
 		auto opened = OpenBackup(context, std::vector<std::string>(data->paths.begin(), data->paths.end()),
 								 std::vector<std::string>(), data->at);
-		// D11's database level from the log tail (stage 5): a data backup's only.
-		const FuzzySummary *tail = nullptr;
-		if (opened.backup->Headers().Set().kind != BackupKind::Log) {
-			BindFiles bound(opened.binding);
-			tail = TailOrWarn(context, opened, "mssql_backup_info");
-		}
-		data->row = InfoRow(opened.backup->Headers(), tail);
+		// D11's database level from the log tail (stage 5): a data backup's only, read at init.
+		data->has_tail = opened.backup->Headers().Set().kind != BackupKind::Log;
+		data->set_guid = opened.backup->Headers().Set().backup_set_guid.ToString();
+		data->row = InfoRow(opened.backup->Headers());
 	} catch (FormatError &e) {
 		throw InvalidInputException("mssql_backup_info: %s", e.what());
 	}
 	return std::move(data);
 }
 
-unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<BackupInfoState>();
+unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionInitInput &input) {
+	const auto &data = input.bind_data->Cast<BackupInfoBindData>();
+	auto state = make_uniq<BackupInfoState>();
+	state->row = data.row;
+	state->column_ids = input.column_ids;
+	const idx_t first = ColumnIndex("consistent");
+	bool asked = false;
+	for (auto id : state->column_ids) {
+		asked = asked || (id >= first && id < first + D11_COLUMNS);
+	}
+	if (!asked || !data.has_tail) {
+		return std::move(state);
+	}
+	try {
+		// The files opened again for the statement (the opened-file cache's entry, when it holds them, with
+		// its tail): the bind's row stands for them only while they hold the same backup set.
+		auto opened = OpenBackup(context, std::vector<std::string>(data.paths.begin(), data.paths.end()),
+								 std::vector<std::string>(), data.at);
+		if (opened.backup->Headers().Set().backup_set_guid.ToString() != data.set_guid) {
+			throw InvalidInputException(
+				"mssql_backup_info: the files hold another backup set (%s) than when the statement was bound (%s): "
+				"rewritten since; reread := true binds again on every EXECUTE",
+				opened.backup->Headers().Set().backup_set_guid.ToString(), data.set_guid);
+		}
+		BindFiles bound(opened.binding);
+		PutTail(state->row, TailOrWarn(context, opened, "mssql_backup_info"));
+	} catch (FormatError &e) {
+		throw InvalidInputException("mssql_backup_info: %s", e.what());
+	}
+	return std::move(state);
 }
 
 void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
@@ -326,9 +385,11 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 		output.SetChildCardinality(0);
 		return;
 	}
-	const auto &row = input.bind_data->Cast<BackupInfoBindData>().row;
-	for (idx_t c = 0; c < row.size(); c++) {
-		output.data[c].SetValue(0, row[c]);
+	for (idx_t c = 0; c < state.column_ids.size(); c++) {
+		const column_t id = state.column_ids[c];
+		if (id < state.row.size()) {
+			output.data[c].SetValue(0, state.row[id]);
+		}
 	}
 	output.SetChildCardinality(1);
 	state.done = true;
@@ -341,6 +402,7 @@ void RegisterBackupInfoFunction(ExtensionLoader &loader) {
 	const vector<LogicalType> arguments{LogicalType(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)};
 	for (const auto &argument : arguments) {
 		TableFunction f("mssql_backup_info", {argument}, Execute, Bind, Init);
+		f.projection_pushdown = true;  // D11's columns cost the log tail's read (Init)
 		f.GetSignature().AddKeywordOnly("position", LogicalType::INTEGER, Value::INTEGER(1));
 		f.GetSignature().AddKeywordOnly("reread", LogicalType::BOOLEAN, Value::BOOLEAN(false));
 		AddVersionParameters(f);

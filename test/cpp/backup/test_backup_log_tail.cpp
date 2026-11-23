@@ -322,15 +322,22 @@ int main() {
 		LogTailReader tail(file, layout, LogBlockHeaderBytes(16));
 		const Lsn none;
 		uint64_t polls = 0;
-		const FuzzySummary summary = SummarizeLogTail(tail, none, none, none, [&]() { polls++; });
+		uint64_t first_bytes = 0, last_bytes = 0;
+		const FuzzySummary summary = SummarizeLogTail(tail, none, none, none, [&](uint64_t bytes) {
+			first_bytes = polls++ ? first_bytes : bytes;
+			last_bytes = bytes;
+		});
 		const FuzzySummary unasked = SummarizeLogTail(tail, none, none, none);
 		Check(summary.records == 1628 && unasked.records == 1628 &&
 				  polls == (1628 + SUMMARY_POLL_RECORDS - 1) / SUMMARY_POLL_RECORDS,
 			  "the summary polls once every SUMMARY_POLL_RECORDS records, from the first");
+		// What it says it holds grows as it reads, from the empty summary on (the caller reserves it).
+		Check(first_bytes >= sizeof(FuzzySummary) && first_bytes <= last_bytes && last_bytes < (1u << 20),
+			  "the poll is given the summary's bytes so far");
 		bool stopped = false;
 		uint64_t seen = 0;
 		try {
-			SummarizeLogTail(tail, none, none, none, [&]() {
+			SummarizeLogTail(tail, none, none, none, [&](uint64_t) {
 				seen++;
 				throw std::runtime_error("interrupted");
 			});

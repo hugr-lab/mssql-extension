@@ -135,13 +135,13 @@ no version finished by 2026-11-09 22:35:28
 
 # The file functions as the catalog's own, DuckLake's form: a version where the function takes one.
 query TI
-SELECT table_name, row_count FROM h.tables() ORDER BY 1;
+SELECT table_name, row_count FROM h.tables() WHERE type = 'U' ORDER BY 1;
 ----
 events	2572
 items	2500
 
 query TI
-SELECT table_name, row_count FROM h.tables(version := 1) ORDER BY 1;
+SELECT table_name, row_count FROM h.tables(version := 1) WHERE type = 'U' ORDER BY 1;
 ----
 events	3000
 items	2000

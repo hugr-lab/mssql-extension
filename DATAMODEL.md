@@ -1544,16 +1544,16 @@ flowchart BT
   idx --> alloc["AllocationMap<br/>GAM (lazy), PFS → live"]
   alloc --> store["PageStore<br/>a live page's latest copy, checked<br/>(Present / Pending)"]
   store --> iam["IAM chains<br/>an AU's pages"]
-  iam --> sys["system base tables<br/>bootstrap five by literal layouts,<br/>checked against sysrscols;<br/>any other by its own description"]
-  sys --> model["CatalogModel<br/>schemas, tables, columns,<br/>layouts + defaults, partitioning, views"]
+  iam --> sys["system base tables (the bootstrap)<br/>five by literal layouts, checked against sysrscols;<br/>any other by its own description;<br/>FixedVar or CD records (RowRecord)"]
+  sys --> model["CatalogModel<br/>schemas, every table (U / S / IT), columns,<br/>layouts + defaults, partitioning, views"]
   model --> tables["mssql_backup_tables<br/>mssql_backup_views"]
-  sys --> basetables["mssql_backup_catalog<br/>(allow-list; sysobjvalues by DQ-11)"]
   model --> rec["records of a partition's in-row unit<br/>RecordView, LocateValue (types 0 / 1)"]
   rec --> stager["RecordStager<br/>codec staging + family kernels<br/>(FinalizeStagedColumn, shared with RowStager)"]
   rec --> lob["backup_lob (PR 2b; rows in PR 3)<br/>off-row pointer → LOB tree / row-overflow,<br/>every node checked; _mssql_lob map"]
   store --> lob
   lob --> stager
   stager --> scan["mssql_backup_scan<br/>+ _mssql_page / _mssql_rid / _mssql_page_lsn / _mssql_lob"]
+  scan --> basetables["mssql_backup_catalog = the scan of schema sys<br/>(bk.sys.* when attached)"]
   model --> att["ATTACH … (TYPE mssql_backup)<br/>MSSQLBackupCatalog: schema / table entries,<br/>read-only; AttachedBackup holds the opened backup<br/>and its model"]
   att --> scan
   idx -. "a differential: PageIndex::SetBase<br/>(its passes, then the full's)" .-> idx
@@ -1568,11 +1568,13 @@ flowchart BT
 - **The log tail and D11's fuzzy status** (spec 085 PR 5, stage 5): `OpenedBackup::Fuzzy` reads family
   1's MQTL streams once (`LogTailReader` / `LogTailCursor`: 512-byte sectors put back, the slot array,
   each record's header; E3§6, checked against `fn_dump_dblog` record by record) into a `FuzzySummary`,
-  kept with the opened backup and in its cache estimate: the transactions (state at LastLSN, begin / end
+  kept with the opened backup and in its cache estimate (reserved with DuckDB in 4 MiB steps as it is
+  read, `ReservedBytes`, until the cache's reservation counts it; a tail that fails its checks kept as
+  its error, not read again; read at a function's init, never at bind): the transactions (state at LastLSN, begin / end
   LSN, the BEGIN's name) and, per allocation unit and page, each transaction's oldest and newest row
   change (`IsRowOperation` in an `IsRowContext`: not PFS, interior index pages, FORMAT_PAGE or
   EXPUNGE_ROWS, which named a table's unit on pages holding none of its rows). A table's status
-  (`FuzzinessOf`, over its base rowsets' units) compares those with the page copies through the
+  (`FuzzinessOf`, over its base rowsets' units, kept per unit by the backup's `FuzzinessMemo`) compares those with the page copies through the
   `PageStore`: stale when a finished transaction's newest change is newer than its page's copy (a page
   not live in the backup: only after CheckpointLSN), dirty when an open one's oldest is not (the copy
   holds what RESTORE undoes). The listings give NULL when the tail cannot be read (`TailOrWarn`); the
@@ -1633,8 +1635,8 @@ flowchart LR
   never a resync. `make fuzz-backup-replay` replays the seven harnesses (`fuzz/fuzz_backup_*`) over
   their corpora, which `fuzz/gen_backup_seeds.cc` builds from synthetic files only.
 - **DuckDB-free parsers.** Everything but `backup_source`, `backup_open_pass`, `backup_opened`,
-  `backup_function_common` and the functions (`backup_info_function`, `backup_tables_function`,
-  `backup_catalog_function`; marked `[DuckDB]` in their headers) builds without libduckdb (spec 085 D15), so the
+  `backup_function_common` and the functions (`backup_info_function`, `backup_tables_function`; marked
+  `[DuckDB]` in their headers) builds without libduckdb (spec 085 D15), so the
   fuzz harnesses link no DuckDB. `test/cpp/backup/` runs in `make test-cpp`. `backup_record_stager` and
   `backup_scan_function` are `[DuckDB]` too (the codec's vectors).
 - **I/O through DuckDB only** (D3 / D3a): a read is a byte range through `CachingFileSystem`, so
@@ -1673,15 +1675,19 @@ flowchart LR
   on the views, computed columns and added-default tables that need `sysobjvalues` / `sysseobjvalues`
   rather than failing the listing). A table's pages come from its allocation unit's IAM chain (DQ-40,
   `backup_iam`), the page header's AU only a check.
-- **The catalog's base tables** (`backup_system_tables`, PR 2b): one FixedVar decoder through a
-  rowset's physical layout (sysrscols, named by syscolpars). The five bootstrap tables cannot be
+- **The catalog's base tables** (`backup_system_tables`, PR 2b): the bootstrap's decoder through a
+  rowset's physical layout (sysrscols, named by syscolpars), a FixedVar record or a ROW / PAGE-compressed
+  CD one alike (`DecodeRow` over `RowRecord`, the scan's `CdRow`; the layout carries `cmprlevel`). The five bootstrap tables cannot be
   described before they are read, so their layouts are literals decoded by the same decoder:
   sysallocunits along its leaf chain from the boot page's `dbi_firstSysIndexes` (and its own IAM
   chain must list the same pages), the other four through their IAM chains by their fixed AU ids.
   Every literal is then checked against the tables' own description of themselves, so a version
   that moves a field is refused by name, not misread. Any other system table is read through its
   own description (`ReadSystemTable`).
-- **The catalog model** (`backup_catalog_model`, PR 2b): schemas, user tables (columns with their
+- **The catalog model** (`backup_catalog_model`, PR 2b): schemas, every table of the database -- user ('U'),
+  system base ('S'), internal ('IT', its parent), `is_ms_shipped`; owner, 2026-11-22: one description and one
+  scan for all, `mssql_backup_catalog` the scan of schema `sys`, an attached backup's `bk.sys.*` entries; the
+  resource database's (negative ids, no rowset here) left out -- (columns with their
   type names from `sysscalartypes`, rowsets, allocation units, shape, rows, the base rowset's layout
   with the defaults of columns added after rows were written) and views (definitions, Latin-1 or
   UTF-16, an off-row one read by `backup_lob`). A table the scan cannot read is listed, `decodable`

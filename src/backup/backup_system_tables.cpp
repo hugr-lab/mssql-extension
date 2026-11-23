@@ -1,5 +1,6 @@
 #include "backup/backup_system_tables.hpp"
 
+#include "backup/backup_cd_record.hpp"
 #include "backup/backup_iam.hpp"
 
 #include <algorithm>
@@ -98,7 +99,48 @@ uint16_t SlotOffset(const Page &page, uint16_t slot) {
 	return static_cast<uint16_t>(page.bytes[at] | (page.bytes[at + 1] << 8));
 }
 
-// The data records of one page through `layout`, each handed to `row`.
+//! The rows of a ROW- or PAGE-compressed rowset's page (spec 086): CD records, each value put in its uncompressed
+//! form by CdRow -- the scan's reading -- a PAGE page's symbols and prefixes through its compression information
+//! (header flag 0x80). Ghosts and stubs skipped, as the FixedVar path skips them; `offsets` the live records'
+//! starts, sorted: a record ends at or before the next one's start.
+void CompressedPageRows(const Page &page, const RowsetLayout &layout, const std::vector<uint16_t> &offsets,
+						const std::string &what, const std::function<void(const SystemRow &)> &row) {
+	const size_t slot_array = PAGE_SIZE - 2u * page.header.slot_count;
+	PageCompression ci;
+	if (layout.compression == 2 && (page.header.type_flags & 0x80)) {
+		ReadPageCompression(page.bytes.data(), PAGE_SIZE, slot_array, what.c_str(), ci);
+		if (!offsets.empty() && offsets.front() < ci.end) {
+			throw FormatError("backup: " + what + " has a record at offset " + std::to_string(offsets.front()) +
+							  " inside its compression information (to " + std::to_string(ci.end) + ")");
+		}
+	}
+	CdRecord cd;
+	CdRow values;
+	SystemRow out;
+	for (uint16_t s = 0; s < page.header.slot_count; s++) {
+		const uint16_t offset = SlotOffset(page, s);
+		if (offset < PAGE_HEADER_SIZE) {
+			continue;  // a freed slot
+		}
+		ReadCdRecord(page.bytes.data(), PAGE_SIZE, slot_array, offset, what.c_str(), cd);
+		auto next = std::upper_bound(offsets.begin(), offsets.end(), offset);
+		if (next != offsets.end() && static_cast<uint32_t>(offset) + cd.end > *next) {
+			throw FormatError("backup: " + what + " has a record at offset " + std::to_string(offset) +
+							  " that runs past the next record's start (" + std::to_string(*next) + ")");
+		}
+		if (cd.kind == CdRecord::Kind::Ghost || cd.kind == CdRecord::Kind::Stub) {
+			continue;  // ghosts, stubs (the row is read where it lives)
+		}
+		values.Read(cd, layout, nullptr, ci.present ? &ci : nullptr);
+		out.values = DecodeRow(RowRecord::Compressed(cd, values), layout);
+		out.page = page.header.page_id;
+		out.slot = s;
+		row(out);
+	}
+}
+
+// The data records of one page through `layout`, each handed to `row`: FixedVar ones, or a compressed
+// rowset's CD ones (CompressedPageRows).
 void PageRows(const Page &page, const RowsetLayout &layout, const std::function<void(const SystemRow &)> &row) {
 	const std::string what = layout.table + " page " + page.header.page_id.ToString();
 	if (page.bytes.size() != PAGE_SIZE) {
@@ -121,6 +163,10 @@ void PageRows(const Page &page, const RowsetLayout &layout, const std::function<
 	std::sort(offsets.begin(), offsets.end());
 	if (std::adjacent_find(offsets.begin(), offsets.end()) != offsets.end()) {
 		throw FormatError("backup: " + what + " has two slots pointing to one record");
+	}
+	if (layout.compression == 1 || layout.compression == 2) {
+		CompressedPageRows(page, layout, offsets, what, row);
+		return;
 	}
 	// Records lie apart: a FixedVar record ends at or before the next record's start (its variable
 	// columns are bounded by the slot array alone otherwise, so one could take the next record's bytes
@@ -425,21 +471,26 @@ ValueRef LocateValue(const RecordView &record, size_t var_count, const RowsetLay
 }
 
 std::vector<SystemValue> DecodeRecord(const RecordView &record, const RowsetLayout &layout) {
+	return DecodeRow(RowRecord::Fixed(record, RowVarCount(record, layout.table)), layout);
+}
+
+std::vector<SystemValue> DecodeRow(const RowRecord &row, const RowsetLayout &layout) {
 	std::vector<SystemValue> values(layout.columns.size());
-	const size_t var_count = RowVarCount(record, layout.table);
 	for (size_t k = 0; k < layout.columns.size(); k++) {
 		const PhysicalColumn &c = layout.columns[k];
 		if (c.Uniquifier()) {
 			continue;
 		}
-		const ValueRef ref = LocateValue(record, var_count, layout, k);
+		const ValueRef ref = row.Locate(layout, k);
 		SystemValue &v = values[k];
 		if (ref.state == ValueState::Null) {
 			continue;
 		}
 		v.is_null = false;
 		v.off_row = ref.state == ValueState::OffRow;
-		if (c.xtype == XTYPE_BIT && c.offset > 0 && ref.state == ValueState::Inline) {
+		// A bit in its byte at bit_position: a FixedVar record's shared byte, or a compressed row's, which CdRow
+		// puts there as the uncompressed record holds it.
+		if (c.xtype == XTYPE_BIT && (row.cd || c.offset > 0) && ref.state == ValueState::Inline) {
 			v.bytes.assign(1, static_cast<char>((ref.data[0] >> c.bit_position) & 1));
 		} else {
 			v.bytes.assign(reinterpret_cast<const char *>(ref.data), ref.size);
@@ -677,6 +728,10 @@ RowsetLayout BootstrapTables::LayoutOf(int32_t object_id, const SysRowset &base)
 	RowsetLayout layout;
 	layout.table = name;
 	layout.rowset_id = base.rowset_id;
+	// Its records' form: a compressed rowset's (ROW / PAGE, spec 086) are CD records, read through CdRow by the
+	// scan and by PageRows alike (a system table's too: oracle lane, 2017's syscsrowgroups).
+	layout.compression = base.compression;
+	const bool cd = base.compression == 1 || base.compression == 2;
 	// rscol_order_ is sorted by (rowset, rscolid): the rowset's columns are one range of it.
 	const std::vector<SysRsCol> &rc = rscols;
 	auto first = std::lower_bound(rscol_order_.begin(), rscol_order_.end(), base.rowset_id,
@@ -691,6 +746,10 @@ RowsetLayout BootstrapTables::LayoutOf(int32_t object_id, const SysRowset &base)
 		c.rscolid = r.rscolid;
 		c.hbcolid = r.hbcolid;
 		SetTypeInfo(c, static_cast<uint32_t>(r.ti));
+		if (cd && (c.xtype == XTYPE_DECIMAL || c.xtype == XTYPE_NUMERIC)) {
+			// A compressed rowset's ti carries 0x80 in a decimal's precision above 18 (E22: 19 -> 147, 38 -> 166).
+			c.precision &= 0x7F;
+		}
 		c.collation = r.collation;
 		c.status = r.status;
 		c.offset = r.offset;
@@ -763,8 +822,8 @@ bool ReadUnitDataPage(const PageStore &store, const SysAllocUnit &unit, const Pa
 void ForEachPageRow(const Page &page, const RowsetLayout &layout, const std::function<void(const SystemRow &)> &row) {
 	if (layout.columns.size() > MAX_SYSTEM_TABLE_COLUMNS) {
 		throw FormatError("backup: " + layout.table + " is described with " + std::to_string(layout.columns.size()) +
-						  " physical columns, more than the system-table reader takes (" +
-						  std::to_string(MAX_SYSTEM_TABLE_COLUMNS) + ")");
+						  " physical columns, more than a table that is not wide has (" +
+						  std::to_string(MAX_SYSTEM_TABLE_COLUMNS) + "): its description is damaged");
 	}
 	PageRows(page, layout, row);
 }
@@ -781,8 +840,8 @@ void ForEachRowsetRow(const PageStore &store, const SysAllocUnit &unit, const Ro
 					  const std::function<void(const SystemRow &)> &row) {
 	if (layout.columns.size() > MAX_SYSTEM_TABLE_COLUMNS) {
 		throw FormatError("backup: " + layout.table + " is described with " + std::to_string(layout.columns.size()) +
-						  " physical columns, more than the system-table reader takes (" +
-						  std::to_string(MAX_SYSTEM_TABLE_COLUMNS) + ")");
+						  " physical columns, more than a table that is not wide has (" +
+						  std::to_string(MAX_SYSTEM_TABLE_COLUMNS) + "): its description is damaged");
 	}
 	ForEachDataPage(store, unit, layout.table, [&](const Page &page) { PageRows(page, layout, row); });
 }
