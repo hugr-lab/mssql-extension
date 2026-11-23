@@ -494,7 +494,7 @@ A raw `mssql_scan` takes the type from UDT_INFO's type name (geometry, geography
 - **The codec**: `codec/clr/spatial_codec` (`FinalizeKernel::Spatial`, the per-value and constant
   paths). A GEOMETRY target is decoded whatever `geometry_as` says (a raw scan's `column_types :=
   ['GEOMETRY']` under `'native'`); a BLOB target is the WKB under `'wkb'`, the binary kernel's bytes
-  under `'native'`. A malformed value (bytes that are not MS-SSCLRT) is NULL too, with a `WARNING` of its own naming the column, the count and the first value's fault, in every mode that decodes: one value that cannot be read never fails the scan of its table (owner, 2026-11-20). A compound curve's segments are checked before a curve is answered NULL, so corrupt segments are a malformed value, not a curve (review of T5).
+  under `'native'`. A malformed value (bytes that are not MS-SSCLRT) is NULL too, with a `WARNING` of its own naming the column and the first value's fault, in every mode that decodes: one value that cannot be read never fails the scan of its table (owner, 2026-11-20). A compound curve's segments are checked before a curve is answered NULL, so corrupt segments are a malformed value, not a curve (review of T5).
 - **`geometry_as`**: an ATTACH option of `TYPE mssql` only (no setting: DQ-45 names an ATTACH option),
   parsed before the network (`ParseGeometryAs`), held in `MSSQLCatalogStartup::geometry_as` and set on
   `tds::ColumnMetadata::geometry_as` by every reader of a catalog's COLMETADATA -- the stream after

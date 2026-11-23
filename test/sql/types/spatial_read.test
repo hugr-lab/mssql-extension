@@ -435,6 +435,40 @@ SELECT * FROM mssql_scan('sp', 'SELECT g.AsTextZM() AS t FROM dbo.SpatialReadW W
 ----
 CIRCULARSTRING (0 0, 1 1, 2 0)
 
+# A geography column is GEOMETRY('OGC:CRS84'), so what is written into it is cast to that: a source with no
+# CRS or with OGC:CRS84 is written as before; one labelled with another CRS is refused by DuckDB's binder,
+# which reprojects nothing (review of #594: until T5 the column was a plain GEOMETRY and took it, relabelled).
+# The way through is the cast that drops the label.
+statement ok
+INSERT INTO sp.dbo.SpatialReadG (id, name, g) SELECT 200, 'no crs', 'POINT(10 50)'::GEOMETRY;
+
+statement ok
+INSERT INTO sp.dbo.SpatialReadG (id, name, g) SELECT 201, 'crs84', 'POINT(10 50)'::GEOMETRY('OGC:CRS84');
+
+statement error
+INSERT INTO sp.dbo.SpatialReadG (id, name, g) SELECT 202, 'crs83', 'POINT(10 50)'::GEOMETRY('OGC:CRS83');
+----
+Cannot cast GEOMETRY with CRS 'OGC:CRS83' to GEOMETRY with different CRS 'OGC:CRS84'
+
+statement error
+UPDATE sp.dbo.SpatialReadG SET g = 'POINT(11 51)'::GEOMETRY('OGC:CRS83') WHERE id = 200;
+----
+Cannot cast GEOMETRY with CRS 'OGC:CRS83' to GEOMETRY with different CRS 'OGC:CRS84'
+
+statement ok
+INSERT INTO sp.dbo.SpatialReadG (id, name, g) SELECT 203, 'crs83, label dropped', 'POINT(10 50)'::GEOMETRY('OGC:CRS83')::GEOMETRY;
+
+query IT
+SELECT id, g::VARCHAR FROM sp.dbo.SpatialReadG WHERE id >= 200 ORDER BY id;
+----
+200	POINT (10 50)
+201	POINT (10 50)
+203	POINT (10 50)
+
+# A geometry column has no CRS of its own and takes any.
+statement ok
+INSERT INTO sp.dbo.SpatialReadW (id, g) SELECT 300, 'POINT(10 50)'::GEOMETRY('OGC:CRS83');
+
 statement ok
 SELECT mssql_exec('sp', 'DROP TABLE dbo.SpatialReadM; DROP TABLE dbo.SpatialReadG; DROP TABLE dbo.SpatialReadW');
 
