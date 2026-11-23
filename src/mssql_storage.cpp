@@ -1149,10 +1149,11 @@ string MSSQLTranslateConnectionError(const string &error, const string &host, ui
 			port, error);
 	}
 
-	// Unreachable: no route to the host, the host down, no network. Before the DNS arm, whose bare "host"
-	// matches "No route to host" (review of #610: an unreachable server was told to check its name).
+	// Unreachable: no route to the host, the host down, no network -- the dial's own words, not a bare
+	// "unreachable" (an integrated-auth hint says the KDC is). Before the DNS arm, whose bare "host" matches
+	// "No route to host" (review of #610: an unreachable server was told to check its name).
 	if (lower_error.find("no route to host") != string::npos || lower_error.find("host is down") != string::npos ||
-		lower_error.find("unreachable") != string::npos) {
+		lower_error.find("network is unreachable") != string::npos) {
 		return StringUtil::Format("Cannot reach %s:%d - check network connectivity and firewall settings. Details: %s",
 								  host, port, error);
 	}

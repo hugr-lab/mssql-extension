@@ -157,6 +157,16 @@ void TestNonLoginFailuresStillClassified() {
 		CHECK(Contains(out, "check network connectivity"));
 		CHECK(!Contains(out, "Cannot resolve hostname"));
 	}
+	// An integrated-auth login whose KDC cannot be reached has reached SQL Server already: the hint's
+	// "unreachable" is the KDC's, not the server's (review of the fix above, job 2574).
+	for (const char *kdc : {"Kerberos authentication failed: Cannot contact any KDC for realm 'EXAMPLE.COM' (Hint: "
+							"KDC unreachable. Check /etc/krb5.conf and network path to the AD domain controllers.)",
+							"SSPI authentication failed: SEC_E_NO_AUTHENTICATING_AUTHORITY (Hint: KDC / domain "
+							"controller unreachable. Verify network connectivity and DNS resolution for the target "
+							"realm.)"}) {
+		const string out = MSSQLTranslateConnectionError(kdc, "s", 1433, "u", "db");
+		CHECK(!Contains(out, "Cannot reach s:1433"));
+	}
 	const string unresolved = MSSQLTranslateConnectionError(
 		"Failed to resolve hostname: nodename nor servname provided, or not known", "s", 1433, "u", "db");
 	CHECK(Contains(unresolved, "Cannot resolve hostname 's'"));
