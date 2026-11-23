@@ -80,7 +80,7 @@ RoundTrip WriteAndRead(const Value &v) {
 	col.name = "v";
 	col.type_id = tds::TDS_TYPE_SQL_VARIANT;
 	Vector back(LogicalType::VARIANT(), 1);
-	codec::variant::DecodeFromTds(envelope, col, back, 0);
+	codec::variant::DecodeFromTds(envelope, col, back, 0, nullptr);
 	RecursiveUnifiedVectorFormat format;
 	Vector::RecursiveToUnifiedFormat(back, format);
 	const UnifiedVariantVectorData data(format);

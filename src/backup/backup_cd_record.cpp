@@ -1058,6 +1058,10 @@ void CdRow::Read(const CdRecord &record, const RowsetLayout &layout, const std::
 	}
 }
 
+// File-local: undefined, so a unity build does not carry them into another file (review of #609).
+#undef CD_COLD
+#undef CD_INLINE
+
 }  // namespace backup
 }  // namespace mssql
 }  // namespace duckdb

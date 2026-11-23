@@ -444,6 +444,9 @@ A raw `mssql_scan` takes the type from UDT_INFO's type name (geometry, geography
   own is a point of NaN coordinates (K1).
 - **The write.** `STGeomFromWKB` takes ISO Z / M / ZM, so the write keeps them. The server refuses a
   NaN point, which is DuckDB's POINT EMPTY: the writer sends `POINT EMPTY` (G7).
+  A NaN in Z is taken: a value with Z on some points only (read with NaN for the missing ones)
+  writes back as the stored value, byte for byte, its NaNs the server's NULL (measured 2026-11-23 on
+  the row path, `spatial_read.test` `line_zpartial`; review of #594).
 - **POINT EMPTY** is read as POINT EMPTY, the value as stored (owner, 2026-11-20).
 
 **Write** (T6).
