@@ -151,6 +151,9 @@ private:
 	//! connection under way, and the options every connected socket gets.
 	bool ConnectAddress(const struct addrinfo &address, int addr_index, int timeout_seconds);
 	bool AwaitConnect(int addr_index, int timeout_seconds);
+	//! A failed dial's error as last_error_, unless it is a local failure (no route, no address of the
+	//! family) and an address tried before left a reason already.
+	void NoteDialError(int error);
 	void ConfigureConnectedSocket();
 
 	//! Send and Receive through the TLS layer, once it is enabled.
