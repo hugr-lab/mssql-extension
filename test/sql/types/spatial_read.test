@@ -388,6 +388,22 @@ SET mssql_dml_pushdown = false;
 statement ok
 INSERT INTO sp.dbo.SpatialReadW (id, g) SELECT 1, g FROM sp.dbo.SpatialReadM WHERE name = 'point_zm';
 
+# Z on some points only (review of #594): the read gives the missing ordinate as NaN, STGeomFromWKB takes it
+# back as the server's NULL -- the value written is the stored one, byte for byte (G7 measured NaN refused in x
+# / y only).
+query T
+SELECT g::VARCHAR FROM sp.dbo.SpatialReadM WHERE name = 'line_zpartial';
+----
+LINESTRING Z (0 0 1, 1 1 nan)
+
+statement ok
+INSERT INTO sp.dbo.SpatialReadW (id, g) SELECT 4, g FROM sp.dbo.SpatialReadM WHERE name = 'line_zpartial';
+
+query TTT
+SELECT * FROM mssql_scan('sp', 'SELECT w.g.AsTextZM() AS t, m.g.AsTextZM() AS o, CASE WHEN CAST(w.g AS varbinary(max)) = CAST(m.g AS varbinary(max)) THEN ''same'' ELSE ''differ'' END AS b FROM dbo.SpatialReadW w CROSS JOIN dbo.SpatialReadM m WHERE w.id = 4 AND m.name = ''line_zpartial''');
+----
+LINESTRING (0 0 1, 1 1)	LINESTRING (0 0 1, 1 1)	same
+
 statement ok
 RESET mssql_dml_pushdown;
 

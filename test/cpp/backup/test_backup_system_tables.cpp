@@ -351,6 +351,71 @@ int main() {
 			  "a fixed column past the record's fixed part is refused");
 	}
 
+	{
+		// The fixed types and their widths, pinned (review of #601): KnownFixedXtype answers from
+		// FixedLength's table, so a type added there becomes a known fixed type -- read at a fixed offset
+		// by every decoder -- with no decision of its own. A change to the table fails here, and is made on
+		// purpose: the set below and its widths edited with it.
+		struct Width {
+			uint8_t xtype;
+			uint8_t precision, scale;
+			uint16_t length;
+			uint16_t bytes;
+		};
+		const std::vector<Width> fixed = {{XTYPE_TINYINT, 0, 0, 0, 1},
+										  {XTYPE_BIT, 0, 0, 0, 1},
+										  {XTYPE_SMALLINT, 0, 0, 0, 2},
+										  {XTYPE_DATE, 0, 0, 0, 3},
+										  {XTYPE_INT, 0, 0, 0, 4},
+										  {XTYPE_SMALLDATETIME, 0, 0, 0, 4},
+										  {XTYPE_REAL, 0, 0, 0, 4},
+										  {XTYPE_SMALLMONEY, 0, 0, 0, 4},
+										  {XTYPE_BIGINT, 0, 0, 0, 8},
+										  {XTYPE_DATETIME, 0, 0, 0, 8},
+										  {XTYPE_FLOAT, 0, 0, 0, 8},
+										  {XTYPE_MONEY, 0, 0, 0, 8},
+										  {XTYPE_TIMESTAMP, 0, 0, 0, 8},
+										  {XTYPE_UNIQUEIDENTIFIER, 0, 0, 0, 16},
+										  {XTYPE_TIME, 0, 7, 0, 5},
+										  {XTYPE_DATETIME2, 0, 2, 0, 6},
+										  {XTYPE_DATETIMEOFFSET, 0, 4, 0, 9},
+										  {XTYPE_DECIMAL, 19, 2, 0, 9},
+										  {XTYPE_NUMERIC, 38, 0, 0, 17},
+										  {XTYPE_BINARY, 0, 0, 12, 12},
+										  {XTYPE_CHAR, 0, 0, 3, 3},
+										  {XTYPE_NCHAR, 0, 0, 20, 20}};
+		std::set<int> fixed_set;
+		bool widths_ok = true;
+		for (const auto &w : fixed) {
+			fixed_set.insert(w.xtype);
+			PhysicalColumn c;
+			c.name = "c";
+			c.xtype = w.xtype;
+			c.precision = w.precision;
+			c.scale = w.scale;
+			c.length = w.length;
+			if (c.FixedLength("t") != w.bytes) {
+				std::cout << "    xtype " << int(w.xtype) << ": " << c.FixedLength("t") << " bytes, not " << w.bytes
+						  << std::endl;
+				widths_ok = false;
+			}
+		}
+		std::set<int> known_fixed;
+		bool disjoint = true;
+		for (int x = 0; x < 256; x++) {
+			if (KnownFixedXtype(static_cast<uint8_t>(x))) {
+				known_fixed.insert(x);
+				disjoint = disjoint && !KnownVariableXtype(static_cast<uint8_t>(x));
+			}
+		}
+		Check(known_fixed == fixed_set,
+			  "the known fixed types are exactly these 22 (" + std::to_string(known_fixed.size()) + " now)");
+		Check(widths_ok,
+			  "each with its width: its own, a time part's by its scale, a decimal's by its precision, "
+			  "the declared length");
+		Check(disjoint, "no type is both fixed and variable");
+	}
+
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;
 	return failures ? 1 : 0;
 }

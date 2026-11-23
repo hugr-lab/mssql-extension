@@ -49,11 +49,11 @@ struct SpatialColumnNotes {
 //! GEOMETRY cannot hold -- is set NULL in `out` and counted in `notes`. NULL rows are left to
 //! PublishStagedValidity.
 void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta, Vector &out,
-							SpatialColumnNotes *notes = nullptr);
+							SpatialColumnNotes *notes);
 //! One value, for the per-value path (TypeConverter::ConvertValue) and the constant one; NULL and counted
 //! as above.
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &meta, Vector &out, idx_t row,
-				   SpatialColumnNotes *notes = nullptr);
+				   SpatialColumnNotes *notes);
 
 }  // namespace spatial
 }  // namespace codec

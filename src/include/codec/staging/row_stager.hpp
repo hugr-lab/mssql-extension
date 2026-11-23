@@ -90,10 +90,13 @@ struct StagingCounters {
 //! FinalizeKernel::Text the issue-#89 rendering as text; None does nothing (the values were written
 //! straight into the vector). Validity is not touched: PublishStagedValidity. Shared by RowStager and
 //! the backup reader's RecordStager (spec 085 PR 2d), so a column decodes the one way.
-//! `variant_notes`, for a Variant column: what its values needed beyond their decode (spec 093 T1).
+//! `variant_notes`, for a Variant column: what its values needed beyond their decode (spec 093 T1);
+//! `spatial_notes`, for a Spatial one: the values read as NULL (T5). No defaults: a caller says where its
+//! notes go, or passes nullptr when its kernels are never Variant or Spatial (a WARNING is not lost by
+//! omission).
 void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
-						  Vector &out, variant::VariantColumnNotes *variant_notes = nullptr,
-						  spatial::SpatialColumnNotes *spatial_notes = nullptr);
+						  Vector &out, variant::VariantColumnNotes *variant_notes,
+						  spatial::SpatialColumnNotes *spatial_notes);
 
 //! AND the staged NULLs of `count` rows into `out`'s mask (a kernel may have set NULLs of its own,
 //! which must stay); nothing when the column staged none.
