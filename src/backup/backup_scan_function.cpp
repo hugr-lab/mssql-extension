@@ -64,6 +64,8 @@ namespace backup {
 namespace {
 
 const char *const FUNCTION = "mssql_backup_scan";
+//! The scan of a table of schema sys, under the name a catalog mirror calls it by.
+const char *const CATALOG_FUNCTION = "mssql_backup_catalog";
 
 const column_t PAGE_COLUMN = VIRTUAL_COLUMN_START;
 const column_t RID_COLUMN = VIRTUAL_COLUMN_START + 1;
@@ -99,7 +101,7 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 											  std::vector<std::string>(data.diff.begin(), data.diff.end()), data.at)
 								.release());
 	} catch (FormatError &e) {
-		throw InvalidInputException("%s: %s", FUNCTION, e.what());
+		throw InvalidInputException("%s: %s", data.function.c_str(), e.what());
 	}
 	data.entry = data.catalog->Model().FindTable(data.schema, data.table);
 	if (!data.entry) {
@@ -111,7 +113,7 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 		throw InvalidInputException(
 			"%s: %s.%s is a view that stores no rows: only an indexed view's (a unique "
 			"clustered index on it) are read (mssql_backup_views says which)",
-			FUNCTION, data.schema, data.table);
+			data.function.c_str(), data.schema, data.table);
 	}
 	if (!data.entry) {
 		auto attached = data.attached ? data.attached : FindAttachedBackup(context, data.paths.front(), data.at);
@@ -120,15 +122,16 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 				"%s: the backup attached as %s has no table or indexed view %s.%s that its filters keep "
 				"(schema_filter / table_filter, schema_exclude / table_exclude; mssql_backup_tables('%s') and "
 				"mssql_backup_views('%s') list them)",
-				FUNCTION, attached->name, data.schema, data.table, attached->name, attached->name);
+				data.function.c_str(), attached->name, data.schema, data.table, attached->name, attached->name);
 		}
 		throw InvalidInputException(
 			"%s: the backup has no table or indexed view %s.%s (mssql_backup_tables and "
 			"mssql_backup_views list them)",
-			FUNCTION, data.schema, data.table);
+			data.function.c_str(), data.schema, data.table);
 	}
 	if (!data.entry->decodable) {
-		throw InvalidInputException("%s: %s.%s is not read: %s", FUNCTION, data.schema, data.table, data.entry->reason);
+		throw InvalidInputException("%s: %s.%s is not read: %s", data.function.c_str(), data.schema, data.table,
+									data.entry->reason);
 	}
 	ScanColumns columns = ScanColumnsOf(*data.entry);
 	data.column_ids = std::move(columns.column_ids);
@@ -142,22 +145,26 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 	}
 }
 
-unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-							  vector<Identifier> &names) {
+//! The scan of table `table` of schema `schema` of the backup on `paths` (a path, a list, an attached name),
+//! with the call's named parameters: mssql_backup_scan's, and mssql_backup_catalog's (schema sys).
+unique_ptr<FunctionData> BindScan(ClientContext &context, const char *function, const Value &paths, const Value &schema,
+								  const Value &table, TableFunctionBindInput &input, vector<LogicalType> &return_types,
+								  vector<Identifier> &names) {
 	auto data = make_uniq<ScanBindData>();
-	data->paths = PathsOf(input.inputs[0], FUNCTION);
-	data->diff = DiffPathsOf(input.named_parameters, FUNCTION);
-	data->at = BackupAtOf(input.named_parameters, FUNCTION);
+	data->function = function;
+	data->paths = PathsOf(paths, function);
+	data->diff = DiffPathsOf(input.named_parameters, function);
+	data->at = BackupAtOf(input.named_parameters, function);
 	if (data->paths.size() == 1) {
 		// Over an attached backup, the version pinned now by its files (task 24b, owner 2026-11-19).
 		PinAttachedVersion(context, data->paths.front(), data->at);
 	}
-	if (input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
-		throw InvalidInputException("%s: the schema and the table must not be NULL", FUNCTION);
+	if (schema.IsNull() || table.IsNull()) {
+		throw InvalidInputException("%s: the schema and the table must not be NULL", function);
 	}
-	data->schema = input.inputs[1].ToString();
-	data->table = input.inputs[2].ToString();
-	data->fuzzy = FuzzyParameterOf(input.named_parameters, FUNCTION);
+	data->schema = schema.ToString();
+	data->table = table.ToString();
+	data->fuzzy = FuzzyParameterOf(input.named_parameters, function);
 	if (data->fuzzy.empty() && data->paths.size() == 1) {
 		// Over an attached name, the ATTACH's fuzzy option before the setting, as its tables' scans take it.
 		data->fuzzy = AttachedFuzzy(context, data->paths.front());
@@ -165,14 +172,14 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	for (const auto &kv : input.named_parameters) {
 		if (kv.first == "max_threads" && !kv.second.IsNull()) {
 			if (kv.second.GetValue<int64_t>() < 1) {
-				throw InvalidInputException("%s: max_threads must be at least 1, not %s", FUNCTION,
+				throw InvalidInputException("%s: max_threads must be at least 1, not %s", function,
 											kv.second.ToString());
 			}
 			data->max_threads = static_cast<idx_t>(kv.second.GetValue<int64_t>());
 			const idx_t threads = static_cast<idx_t>(context.db->NumberOfThreads());
 			if (data->max_threads > threads) {
 				DUCKDB_LOG_WARNING(context, "%s: max_threads %llu is above DuckDB's threads (%llu): clamped to it",
-								   FUNCTION, static_cast<unsigned long long>(data->max_threads),
+								   function, static_cast<unsigned long long>(data->max_threads),
 								   static_cast<unsigned long long>(threads));
 			}
 		}
@@ -196,16 +203,16 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 			}
 			if (!parsed) {
 				throw InvalidInputException("%s: max_memory '%s' is not a size (as memory_limit takes, e.g. '2GB')",
-											FUNCTION, kv.second.ToString());
+											function, kv.second.ToString());
 			}
 			if (bytes.IsValid() && bytes.GetIndex() == 0) {
-				throw InvalidInputException("%s: max_memory must be more than 0", FUNCTION);
+				throw InvalidInputException("%s: max_memory must be more than 0", function);
 			}
 			data->max_memory = bytes.IsValid() ? bytes.GetIndex() : 0;
 			const idx_t limit = BufferManager::GetBufferManager(context).GetMaxMemory();
 			if (data->max_memory > limit) {
 				DUCKDB_LOG_WARNING(context, "%s: max_memory %s is above DuckDB's memory_limit (%s): clamped to it",
-								   FUNCTION, StringUtil::BytesToHumanReadableString(data->max_memory),
+								   function, StringUtil::BytesToHumanReadableString(data->max_memory),
 								   StringUtil::BytesToHumanReadableString(limit));
 			}
 		}
@@ -213,6 +220,19 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	BindTable(context, *data, &names);
 	return_types = data->types;
 	return std::move(data);
+}
+
+unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
+							  vector<Identifier> &names) {
+	return BindScan(context, FUNCTION, input.inputs[0], input.inputs[1], input.inputs[2], input, return_types, names);
+}
+
+//! mssql_backup_catalog(path, base_table): the table of schema sys, read by the scan as any table (owner,
+//! 2026-11-22: one reader for every table; a system base table, an internal one, an MS-shipped one).
+unique_ptr<FunctionData> CatalogBind(ClientContext &context, TableFunctionBindInput &input,
+									 vector<LogicalType> &return_types, vector<Identifier> &names) {
+	return BindScan(context, CATALOG_FUNCTION, input.inputs[0], Value("sys"), input.inputs[1], input, return_types,
+					names);
 }
 
 void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p, const BoundTableFunction &) {
@@ -234,6 +254,7 @@ void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_dat
 	serializer.WritePropertyWithDefault<Value>(110, "at_value", data.at.value, Value());
 	serializer.WritePropertyWithDefault<std::string>(111, "at_key", data.at.key);
 	serializer.WritePropertyWithDefault<std::string>(112, "fuzzy", data.fuzzy);
+	serializer.WritePropertyWithDefault<std::string>(113, "function", data.function, FUNCTION);
 }
 
 unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunction &) {
@@ -251,6 +272,7 @@ unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunct
 	data->at.value = deserializer.ReadPropertyWithExplicitDefault<Value>(110, "at_value", Value());
 	data->at.key = deserializer.ReadPropertyWithDefault<std::string>(111, "at_key");
 	data->fuzzy = deserializer.ReadPropertyWithDefault<std::string>(112, "fuzzy");
+	data->function = deserializer.ReadPropertyWithExplicitDefault<std::string>(113, "function", FUNCTION);
 	BindTable(deserializer.Get<ClientContext &>(), *data, nullptr);
 	// The plan's column positions and vectors are those it was bound with: a file at the same path that
 	// reads otherwise now (a nightly backup replaced: a column added, dropped, renamed or retyped) is
@@ -263,7 +285,7 @@ unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunct
 		throw InvalidInputException(
 			"%s: %s.%s in the backup at the same path reads otherwise than when the "
 			"query was planned (the file changed): plan the query again",
-			FUNCTION, data->schema, data->table);
+			data->function.c_str(), data->schema, data->table);
 	}
 	return std::move(data);
 }
@@ -476,7 +498,7 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 	// and two EXECUTEs logged three WARNINGs).
 	CheckStatementFuzzy(context, *data.catalog, BaseUnitsOf(*data.entry),
 						data.entry->schema_name + "." + data.entry->name, data.schema + "." + data.table,
-						FuzzyModeOf(context, data.fuzzy, FUNCTION), FUNCTION);
+						FuzzyModeOf(context, data.fuzzy, data.function.c_str()), data.function.c_str());
 	auto state = make_uniq<ScanGlobalState>();
 	std::vector<int32_t> &staged = state->staged;
 	for (idx_t c = 0; c < input.column_ids.size(); c++) {
@@ -493,13 +515,13 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 			state->empty_outputs.push_back(c);
 		} else if (id >= UNREAD_COLUMN_START && id - UNREAD_COLUMN_START < data.unread.size()) {
 			const UnreadColumn &u = data.unread[id - UNREAD_COLUMN_START];
-			throw InvalidInputException("%s: %s.%s.%s is not read: %s", FUNCTION, data.schema, data.table, u.name,
-										u.reason);
+			throw InvalidInputException("%s: %s.%s.%s is not read: %s", data.function.c_str(), data.schema, data.table,
+										u.name, u.reason);
 		} else if (id < data.column_ids.size()) {
 			staged.push_back(data.column_ids[id]);
 			state->stager_outputs.push_back(c);
 		} else {
-			throw InternalException("%s: column id %llu is none of the scan's", FUNCTION,
+			throw InternalException("%s: column id %llu is none of the scan's", data.function.c_str(),
 									static_cast<unsigned long long>(id));
 		}
 	}
@@ -581,7 +603,8 @@ unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &execution, Table
 	local->stager->MapOffRow(global.lob_output != DConstants::INVALID_INDEX);
 	// A value stored off row on a Pending page, as the policy treats an in-row one: NULL under 'warn'
 	// (said once a table and scan) and 'ignore', the scan refused under 'error' (review of #591).
-	local->stager->PendingValuesAsNull(FuzzyModeOf(execution.client, data.fuzzy, FUNCTION) != FuzzyMode::Error);
+	local->stager->PendingValuesAsNull(FuzzyModeOf(execution.client, data.fuzzy, data.function.c_str()) !=
+									   FuzzyMode::Error);
 	return std::move(local);
 }
 
@@ -779,12 +802,12 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 			// replays it). Until then the table's other pages are read as of the copy, as every fuzzy table
 			// is -- what was committed when the backup began is in them -- and the page is named: refused
 			// under fuzzy := 'error', said under 'warn', passed over under 'ignore'.
-			const FuzzyMode mode = FuzzyModeOf(context, data.fuzzy, FUNCTION);
+			const FuzzyMode mode = FuzzyModeOf(context, data.fuzzy, data.function.c_str());
 			if (mode == FuzzyMode::Error) {
 				throw InvalidInputException(
 					"%s: %s.%s: %s (fuzzy := 'error'; under 'warn' the table's other pages "
 					"are read)",
-					FUNCTION, data.schema, data.table, e.what());
+					data.function.c_str(), data.schema, data.table, e.what());
 			}
 			// One WARNING per table and scan, as for the table's status (review of #591): the first page met.
 			if (mode == FuzzyMode::Warn && local.pending_warned && !local.pending_warned->exchange(true)) {
@@ -792,7 +815,7 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 								   "%s: %s.%s: %s; its rows are not read, the table's other pages are (a fuzzy "
 								   "backup: spec 090 replays the tail; any further such page of the table is "
 								   "passed over without another WARNING)",
-								   FUNCTION, data.schema, data.table, e.what());
+								   data.function.c_str(), data.schema, data.table, e.what());
 			}
 			continue;
 		}
@@ -1056,12 +1079,13 @@ void StageRows(ClientContext &context, const ScanBindData &data, ScanGlobalState
 void WarnPendingValues(ClientContext &context, const ScanBindData &data, ScanGlobalState &global,
 					   const ScanLocalState &local) {
 	if (local.pending_appended > 0 && !global.pending_values_warned.load() &&
-		FuzzyModeOf(context, data.fuzzy, FUNCTION) == FuzzyMode::Warn && !global.pending_values_warned.exchange(true)) {
+		FuzzyModeOf(context, data.fuzzy, data.function.c_str()) == FuzzyMode::Warn &&
+		!global.pending_values_warned.exchange(true)) {
 		DUCKDB_LOG_WARNING(context,
 						   "%s: %s.%s: a value stored off row is read as NULL, its row read: %s (a fuzzy backup: "
 						   "spec 090 replays the tail; further such values of the table are NULL without another "
 						   "WARNING; fuzzy := 'error' refuses the table)",
-						   FUNCTION, data.schema, data.table, local.stager->FirstPending().c_str());
+						   data.function.c_str(), data.schema, data.table, local.stager->FirstPending().c_str());
 	}
 }
 
@@ -1079,13 +1103,14 @@ void WarnPendingValues(ClientContext &context, const ScanBindData &data, ScanGlo
 		throw InvalidInputException(
 			"%s: %s.%s: %s need%s up to %s, past the scan's half (%s) of "
 			"max_memory %s; raise max_memory or memory_limit (temp_directory %s)",
-			FUNCTION, data.schema, data.table, what, reserving.row.empty() ? "s" : "", need,
+			data.function.c_str(), data.schema, data.table, what, reserving.row.empty() ? "s" : "", need,
 			StringUtil::BytesToHumanReadableString(global.gate->Budget()), max, temp);
 	}
 	throw OutOfMemoryException(
 		"%s: %s.%s: %s need%s up to %s and DuckDB cannot make room for it "
 		"with nothing else of the scan held (max_memory %s, temp_directory %s): %s",
-		FUNCTION, data.schema, data.table, what, reserving.row.empty() ? "s" : "", need, max, temp, e.duckdb_reason);
+		data.function.c_str(), data.schema, data.table, what, reserving.row.empty() ? "s" : "", need, max, temp,
+		e.duckdb_reason);
 }
 
 void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -1132,9 +1157,9 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		// A value stored off row on a Pending page under fuzzy := 'error' (the stager reads it as NULL
 		// otherwise). Any other Pending page met here (an IAM page) is the FormatError below.
 		throw InvalidInputException("%s: %s.%s: %s (fuzzy := 'error'; under 'warn' the value is read as NULL)",
-									FUNCTION, data.schema, data.table, e.what());
+									data.function.c_str(), data.schema, data.table, e.what());
 	} catch (FormatError &e) {
-		throw InvalidInputException("%s: %s", FUNCTION, e.what());
+		throw InvalidInputException("%s: %s", data.function.c_str(), e.what());
 	} catch (ReservationInterrupted &) {
 		throw InterruptException();
 	} catch (ReservationRefused &e) {
@@ -1142,8 +1167,13 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 	}
 }
 
-TableFunction MakeScanFunction(const LogicalType &path) {
-	TableFunction f(FUNCTION, {path, LogicalType::VARCHAR, LogicalType::VARCHAR}, Execute, Bind, Init, InitLocal);
+//! mssql_backup_scan's table function over `path`'s type; `catalog`: mssql_backup_catalog's (schema sys, its
+//! table the second argument), the same scan.
+TableFunction MakeScanFunction(const LogicalType &path, bool catalog = false) {
+	TableFunction f =
+		catalog ? TableFunction(CATALOG_FUNCTION, {path, LogicalType::VARCHAR}, Execute, CatalogBind, Init, InitLocal)
+				: TableFunction(FUNCTION, {path, LogicalType::VARCHAR, LogicalType::VARCHAR}, Execute, Bind, Init,
+								InitLocal);
 	// NULL (the default): DuckDB's threads.
 	f.GetSignature().AddKeywordOnly("max_threads", LogicalType::BIGINT, Value(LogicalType::BIGINT));
 	// NULL (the default): DuckDB's memory_limit. A size as memory_limit takes it ('2GB').
@@ -1243,10 +1273,24 @@ void RegisterBackupScanFunction(ExtensionLoader &loader) {
 		set.AddFunction(MakeScanFunction(path));
 	}
 	RegisterBackupTableChangesFunctions(loader, paths);
+	TableFunctionSet catalog(CATALOG_FUNCTION);
+	for (const auto &path : paths) {
+		catalog.AddFunction(MakeScanFunction(path, true));
+	}
+	mssql::RegisterDocumentedFunction(
+		loader, std::move(catalog),
+		{{},
+		 "Reads a table of schema sys of a SQL Server full backup -- a system base table (the catalog's own, as "
+		 "sysschobjs), an internal one (Query Store's, a queue's messages, ...) or an MS-shipped one -- as "
+		 "mssql_backup_scan(path, 'sys', table) reads it: its rows typed as TYPE mssql reads them and the same "
+		 "virtual columns. mssql_backup_tables lists every table, of every kind (its type column).",
+		 {"SELECT id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs')",
+		  "SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak', 'plan_persist_query_text')"},
+		 {"backup"}});
 	mssql::RegisterDocumentedFunction(
 		loader, std::move(set),
 		{{},
-		 "Reads a user table's rows from a SQL Server full backup, with no SQL Server, typed as TYPE mssql reads "
+		 "Reads a table's rows from a SQL Server full backup, with no SQL Server, typed as TYPE mssql reads "
 		 "them, values stored off row (LOBs, row-overflow, text) included; a type whose conversion is still to "
 		 "come is its stored bytes. Virtual columns: _mssql_page (the row's page), _mssql_rid (its identity: a "
 		 "heap row's original place, a clustered row's key), _mssql_page_lsn (the page's last change) and "

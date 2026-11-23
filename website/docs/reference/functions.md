@@ -251,15 +251,15 @@ refused). `reread := true` makes a prepared statement read the file again on eve
 
 ### mssql_backup_tables() / mssql_backup_views()
 
-List the user tables, and the views with their definitions, of the database in a SQL Server full
-backup, read from the file alone. See [Backup Files](../reading/backups.md#tables-and-views) for
+List every table (`type`: `U` user, `S` system base, `IT` internal), and the views with their definitions,
+of the database in a SQL Server full backup, read from the file alone. See [Backup Files](../reading/backups.md#tables-and-views) for
 every column.
 
 **Signature:** `mssql_backup_tables(path VARCHAR | VARCHAR[]) -> TABLE(...)`,
 `mssql_backup_views(path VARCHAR | VARCHAR[]) -> TABLE(...)`
 
 ```sql
-SELECT schema_name, table_name, row_count FROM mssql_backup_tables('/backups/sales_full.bak');
+SELECT schema_name, table_name, row_count FROM mssql_backup_tables('/backups/sales_full.bak') WHERE type = 'U';
 SELECT view_name, definition FROM mssql_backup_views('/backups/sales_full.bak');
 ```
 
@@ -288,20 +288,21 @@ SELECT column_name, sql_type, system_type, state FROM mssql_backup_columns('/bac
 
 ### mssql_backup_catalog()
 
-A system base table of the database in a SQL Server full backup, as stored, with the virtual
-`_mssql_page` and `_mssql_rid`; with no table, the base tables it serves. See
-[Backup Files](../reading/backups.md#the-catalogs-base-tables).
+A table of schema `sys` of the database in a SQL Server full backup -- a system base table, an internal
+one or an MS-shipped one -- read as `mssql_backup_scan(path, 'sys', base_table)` reads it, with the same
+parameters and virtual columns. Attached, the same table is `bk.sys.<table>`. See
+[Backup Files](../reading/backups.md#system-and-internal-tables).
 
-**Signature:** `mssql_backup_catalog(path VARCHAR | VARCHAR[] [, base_table VARCHAR]) -> TABLE(...)`
+**Signature:** `mssql_backup_catalog(path VARCHAR | VARCHAR[], base_table VARCHAR) -> TABLE(...)`
 
 ```sql
-SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak');
 SELECT id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs');
+SELECT query_sql_text FROM mssql_backup_catalog('/backups/sales_full.bak', 'plan_persist_query_text');
 ```
 
 ### mssql_backup_scan()
 
-A user table's rows from a SQL Server full backup, with no SQL Server, typed as `TYPE mssql` reads
+A table's rows from a SQL Server full backup (a user table, or one of schema `sys`), with no SQL Server, typed as `TYPE mssql` reads
 them, values stored off row included; virtual columns `_mssql_page`, `_mssql_rid`, `_mssql_page_lsn`
 and `_mssql_lob`. See
 [Backup Files](../reading/backups.md#rows).

@@ -363,18 +363,9 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 		why = std::string("its physical layout: ") + e.what();
 		return false;
 	}
-	layout.compression = rowset.compression;
-	// ROW compression (spec 086 PR 1, E22): every column a CD index, whatever its type; and a decimal's
-	// precision in sysrscols.ti carries 0x80 when it is above 18 (measured: 19 -> 147, 38 -> 166). PAGE
-	// compression's records are CD records too (spec 086 PR 2, E23).
+	// ROW compression (spec 086 PR 1, E22): every column a CD index, whatever its type (a decimal's precision
+	// without its 0x80: LayoutOf). PAGE compression's records are CD records too (spec 086 PR 2, E23).
 	const bool cd = rowset.compression == 1 || rowset.compression == 2;
-	if (cd) {
-		for (auto &physical : layout.columns) {
-			if (IsDecimalXtype(physical.xtype)) {
-				physical.precision &= 0x7F;
-			}
-		}
-	}
 	for (auto &physical : layout.columns) {
 		if (physical.Dropped() || physical.Uniquifier()) {
 			continue;
@@ -884,8 +875,8 @@ bool ByName(const std::string &as, const std::string &an, const std::string &bs,
 
 }  // namespace
 
-bool IsUserTable(const SysObject &o) {
-	return o.type == "U " && !(o.status & OBJECT_MS_SHIPPED);
+bool IsTable(const SysObject &o) {
+	return o.type == "U " || o.type == "S " || o.type == "IT";
 }
 
 bool IsUserView(const SysObject &o) {
@@ -902,17 +893,17 @@ bool IsUserDefault(const SysObject &o) {
 
 ObjectValueFilter::ObjectValueFilter(const BootstrapTables &tables, std::set<int32_t> partition_functions)
 	: partition_functions_(std::move(partition_functions)) {
-	std::set<int32_t> user_tables;
+	std::set<int32_t> tables_of;
 	for (const auto &o : tables.objects) {
 		if (IsReadableView(o) || IsUserDefault(o)) {
 			definitions_.insert(o.id);
 		}
-		if (IsUserTable(o)) {
-			user_tables.insert(o.id);
+		if (IsTable(o)) {
+			tables_of.insert(o.id);
 		}
 	}
 	for (const auto &c : tables.columns) {
-		if (c.number == 0 && (c.status & COLUMN_COMPUTED) && user_tables.count(c.object_id)) {
+		if (c.number == 0 && (c.status & COLUMN_COMPUTED) && tables_of.count(c.object_id)) {
 			computed_.insert(std::make_pair(c.object_id, c.column_id));
 		}
 	}
@@ -1252,6 +1243,9 @@ CatalogTable ModelBuilder::Describe(const SysObject &o, const std::string &schem
 	t.schema_name = schema_name;
 	t.reason = schema_reason;
 	t.name = o.name;
+	t.type = o.type == "IT" ? "IT" : o.type.substr(0, 1);
+	t.is_ms_shipped = (o.status & OBJECT_MS_SHIPPED) != 0;
+	t.parent_object_id = o.type == "IT" ? o.parent_id : 0;
 	t.created = o.created;
 	t.modified = o.modified;
 	std::vector<const SysColumn *> &cols = columns_of_[o.id];
@@ -1318,10 +1312,12 @@ CatalogModel ModelBuilder::Build() {
 			columns_of_[c.object_id].push_back(&c);
 		}
 	}
-	std::vector<const SysObject *> user_tables, views;
+	std::vector<const SysObject *> table_objects, views;
 	for (const auto &o : tables_.objects) {
-		if (IsUserTable(o)) {
-			user_tables.push_back(&o);
+		// A negative id is the resource database's (sys.trace_xe_event_map, ...): listed in sysschobjs, its rows
+		// are in mssqlsystemresource, which a database's backup does not hold (no rowset of it in sysrowsets).
+		if (IsTable(o) && o.id >= 0) {
+			table_objects.push_back(&o);
 		} else if (IsUserView(o)) {
 			views.push_back(&o);
 		}
@@ -1329,7 +1325,7 @@ CatalogModel ModelBuilder::Build() {
 	ReadTexts();
 	partition_catalog_ = ReadPartitionCatalog(store_, tables_, classes);
 	ReadDefaults();
-	for (const SysObject *o : user_tables) {
+	for (const SysObject *o : table_objects) {
 		std::string schema_reason;
 		std::string schema_name = SchemaOf(*o, schema_reason);
 		if (!scope_.WantsTable(schema_name, o->name)) {

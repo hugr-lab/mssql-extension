@@ -343,6 +343,13 @@ is encryption's job, not the reader's. `mssql_backup_catalog` serves every syste
 unique clustered key, `sysobjvalues` with module source and `sysowners` included, and the log's records
 are given whole. What the lake mirrors is the importer's choice (022 D3), as it always was.
 
+**And 2026-11-22 (review of #612): no table is refused, and the attached catalog is the way a backup is read.**
+A table the reader cannot decode yet is a defect to fix, not a refusal to name: every table of the database --
+user, system base (S), internal (IT), MS-shipped -- is described by the catalog model and read by the one scan
+(heap, non-unique key, ROW / PAGE compression included), `mssql_backup_catalog(path, t)` being
+`mssql_backup_scan(path, 'sys', t)`, and an attached backup has every one as an entry (`bk.sys.sysschobjs`):
+functions never stand in for the catalog.
+
 ### DQ-12 — How does lake state reach the reader?
 
 **Blocks** 089 PR 1 (task 2). Affects 089 D10, 090, 023 D2 / D3.
@@ -1037,7 +1044,7 @@ RESEARCH or an experiment already answers these, and the drafts were aligned to 
   - `reflected_lsn` (was `prev_last_lsn`);
   - `base :=` with 089's fixed file names (was `catalog_base`, `lob_side`, `alloc_base`, `pending`);
   - `xids`;
-  - `mssql_backup_catalog(path)` with no table lists the base tables it reads;
+  - `mssql_backup_tables(path)` lists every table, `type` saying which (`mssql_backup_catalog` takes a table);
   - pending pages come from `mssql_backup_pending_pages`, not from the export.
 - **The stale set** is lake state, not a reader input. The importer checks healing (089 D10, 023 D7);
   a failed check is a named error at that file, the way out a rebase (DQ-06, accepted).

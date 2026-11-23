@@ -112,6 +112,9 @@ std::vector<Column> TableColumns() {
 	return {{"schema_name", LogicalType::VARCHAR},
 			{"table_name", LogicalType::VARCHAR},
 			{"object_id", LogicalType::INTEGER},
+			{"type", LogicalType::VARCHAR},
+			{"is_ms_shipped", LogicalType::BOOLEAN},
+			{"parent_object_id", LogicalType::INTEGER},
 			{"shape", LogicalType::VARCHAR},
 			{"compression", LogicalType::VARCHAR},
 			{"partition_count", LogicalType::INTEGER},
@@ -338,6 +341,11 @@ std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, con
 	row.push_back(Text(t.schema_name));
 	row.push_back(Text(t.name));
 	row.push_back(Value::INTEGER(t.object_id));
+	// sys.objects' type and is_ms_shipped: a user table "U", a system base table "S", an internal one "IT"
+	// with its parent (a queue's messages, an XML index's nodes); every one read alike.
+	row.push_back(Value(t.type));
+	row.push_back(Value::BOOLEAN(t.is_ms_shipped));
+	row.push_back(t.parent_object_id ? Value::INTEGER(t.parent_object_id) : Value(LogicalType::INTEGER));
 	row.push_back(Text(ShapeName(t.shape)));
 	row.push_back(OptionalText(compression));
 	row.push_back(Value::INTEGER(static_cast<int32_t>(t.partitions.size())));

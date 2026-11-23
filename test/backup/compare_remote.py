@@ -151,8 +151,10 @@ def statements(local):
             for listing in ("tables", "views", "columns", "schemas"):
                 out.append((f"{listing} {sub}{label}",
                             f"SELECT * FROM mssql_backup_{listing}({flisted}{over}) ORDER BY ALL"))
+            # The user tables' rows, each a statement (the listings above hold every table, those of schema sys
+            # too; their rows compare_catalog.py reads whole).
             tables = db.query(at(f"SELECT schema_name, table_name FROM mssql_backup_tables({flisted}{over}) "
-                                 f"WHERE decodable ORDER BY ALL", local))
+                                 f"WHERE decodable AND type = 'U' ORDER BY ALL", local))
             if not isinstance(tables, list) or not tables:
                 problems.append(f"tables {sub}{label}: no table read locally ({tables})")
             for t in tables if isinstance(tables, list) else []:

@@ -107,14 +107,15 @@ Each of these is refused by name, before any value is returned:
 
 ## Tables and views
 
-`mssql_backup_tables(path)` lists the user tables of a full backup, one row each, read from the
-database's own catalog inside the file; `mssql_backup_views(path)` its views with their T-SQL
+`mssql_backup_tables(path)` lists every table of a full backup, one row each, read from the
+database's own catalog inside the file -- the user tables and those SQL Server makes for itself (`type`
+below); every one is read; `mssql_backup_views(path)` its views with their T-SQL
 definitions. A log backup holds no data pages and is refused; a differential is read over its full
 backup, which comes in a later release, and is refused too.
 
 ```sql
 SELECT schema_name, table_name, shape, row_count, decodable, reason
-FROM mssql_backup_tables('/backups/sales_full.bak');
+FROM mssql_backup_tables('/backups/sales_full.bak') WHERE type = 'U';
 
 -- One table's columns: the SQL Server type and the DuckDB type the extension reads it as
 SELECT c.name, c.sql_type, c.duckdb_type, c.collation, c.is_nullable
@@ -129,6 +130,9 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 | column | type | meaning |
 |---|---|---|
 | `schema_name`, `table_name`, `object_id` | `VARCHAR`, `VARCHAR`, `INTEGER` | |
+| `type` | `VARCHAR` | as `sys.objects` says: `U` a user table, `S` a system base table (the catalog's own, `sys.sysschobjs` ...), `IT` an internal table (Query Store's, a queue's messages, change tracking ...) |
+| `is_ms_shipped` | `BOOLEAN` | made by SQL Server: every `S` and `IT` table, and a `U` table a feature creates |
+| `parent_object_id` | `INTEGER` | an internal table's parent (a queue, the table of an XML index), else NULL |
 | `shape` | `VARCHAR` | `heap`, `clustered` or `columnstore` |
 | `compression` | `VARCHAR` | `none`, `row`, `page`, `columnstore`, `columnstore_archive` (`level n` for a level the reader does not name); `mixed` when partitions differ |
 | `partition_count`, `row_count` | `INTEGER`, `BIGINT` | the row count the catalog keeps (`sys.partitions.rows`); NULL when a partition's count is negative (an upgraded database can hold one until `DBCC UPDATEUSAGE`). For a clustered columnstore it includes the delta stores the tuple mover has not dropped yet, as SQL Server 2022 counts them (2025 does not); exact once columnstores are read |
@@ -141,8 +145,9 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 | `partitions` | `LIST(STRUCT(…))` | every partition: `partition_number`, `rows`, `compression`, `filegroup` |
 
 `mssql_backup_schemas(path)` lists the database's schemas as `sys.schemas` does (the system schemas
-and the roles' included): `schema_id`, `schema_name`, and the `table_count` and `view_count` of user
-tables and views in each.
+and the roles' included): `schema_id`, `schema_name`, and the `table_count` and `view_count` of the
+tables (every one `mssql_backup_tables` lists: `sys` counts its system and internal tables) and user views
+in each.
 
 `mssql_backup_columns(path [, schema [, table]])` lists every column of the user tables, one row
 each, with its state at a glance: `schema_name`, `table_name`, `column_id`, `column_name`,
@@ -190,24 +195,32 @@ The oracle lane compares both with the server's own catalog of the same database
 its name, type, length, precision, scale, collation and flags, per view its definition (length and
 SHA-256), on backups made by SQL Server 2017 to 2025.
 
-### The catalog's base tables
+### System and internal tables
 
-`mssql_backup_catalog(path, base_table)` returns a system base table of the database as stored,
-for a tool that mirrors the catalog: its rows, its columns typed by its own description (a
-`sql_variant` column as its raw bytes), and two virtual columns that `SELECT *` leaves out:
-`_mssql_page`, the row's page (`'01'`, then the file and page number in hex), and `_mssql_rid`, the
-row's clustered key. With no `base_table` it lists the tables it reads: every system base table of
-the database with a unique clustered key (`sysschobjs`, `syscolpars`, `sysobjvalues`, `sysowners`,
-...), each with its rowset's `row_count`. A table is read whole: `sysobjvalues` holds module source
-and `sysowners` contained users' password hashes. Whoever holds the backup can read all of it anyway;
-protecting a backup is encryption's job. A system table without such a key, or one stored compressed, is refused by name. A
-value it cannot give (one stored off row past 64 MiB, or past 1 GiB of them in one call; bytes not of
-their type) is NULL, with one WARNING in `duckdb_logs` for the column, and its row is read.
+Every table of the database is read, not only the user tables: the system base tables (the catalog's own:
+`sysschobjs`, `syscolpars`, `sysobjvalues`, `sysowners`, ...), the internal tables SQL Server keeps for a
+feature (Query Store's `plan_persist_*`, a Service Broker queue's `queue_messages_*`, change tracking's
+`syscommittab`, ...) and the MS-shipped ones. They are in schema `sys`, and read as any table: by the scan,
+with its types and virtual columns, whatever their shape or storage (a heap, a non-unique key, a ROW- or
+PAGE-compressed one). Attached, they are catalog entries:
 
 ```sql
-SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak');
-SELECT _mssql_page, id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs');
+ATTACH '/backups/sales_full.bak' AS bk (TYPE mssql_backup);
+SELECT id, name, type FROM bk.sys.sysschobjs WHERE type = 'U';
+SELECT query_sql_text FROM bk.sys.plan_persist_query_text;
 ```
+
+Over a path, `mssql_backup_catalog(path, base_table)` is `mssql_backup_scan(path, 'sys', base_table)`:
+
+```sql
+SELECT _mssql_page, id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs');
+SELECT schema_name, table_name, type, row_count FROM mssql_backup_tables('/backups/sales_full.bak') WHERE type <> 'U';
+```
+
+A table is read whole: `sysobjvalues` holds module source and `sysowners` contained users' password
+hashes. Whoever holds the backup can read all of it anyway; protecting a backup is encryption's job. The
+resource database's tables (`sys.trace_xe_event_map`, ...) are listed by the database but stored in
+`mssqlsystemresource`, which a database's backup does not hold: they are not listed.
 
 ## Rows
 
@@ -409,7 +422,8 @@ each naming the files.
 
 ## Attaching a backup
 
-A full backup can be attached as a read-only catalog, its schemas and user tables DuckDB entries:
+A full backup can be attached as a read-only catalog, its schemas and every table DuckDB entries -- the
+user tables, and in schema `sys` the system and internal ones ([System and internal tables](#system-and-internal-tables)):
 
 ```sql
 ATTACH '/backups/sales_full.bak' AS bk (TYPE mssql_backup);

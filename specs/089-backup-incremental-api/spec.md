@@ -73,8 +73,8 @@ leaves the hooks.
   bootstrap tables, `sysseobjvalues`, `sysclsobjs`) plus `sysobjvalues`, `sysidxstats`, `sysiscols`,
   the columnstore tables (088) and E7's partitioning tables (`systypedsubobjs`, `syssingleobjrefs`;
   `sysclsobjs` classes 30 / 31 and `sysobjvalues` valclass 30 are already in) -- the importer's own
-  set, named here, not `mssql_backup_catalog(path)`'s listing: since 085 § Security's revision
-  (owner, 2026-11-21) that lists every system base table, read whole. Of `sysobjvalues` the mirror
+  set, named here, not the reader's listing: since 085 § Security's revision (owner, 2026-11-21, and
+  2026-11-22) `mssql_backup_tables` lists every table of the database, each read whole. Of `sysobjvalues` the mirror
   takes view definitions, partition boundaries (valclass 30), and computed-column and default
   definitions, and of `syssingleobjrefs` classes 7, 8, 30 and 31 only; whether a lake keeps module
   source or `sysowners` is the importer's decision, not the reader's.

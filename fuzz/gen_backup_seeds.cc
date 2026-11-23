@@ -6,7 +6,7 @@
 //       src/backup/backup_mtf.cpp src/backup/backup_page_index.cpp src/backup/backup_pass_search.cpp \
 //       src/backup/backup_allocation.cpp src/backup/backup_record.cpp src/backup/backup_page.cpp \
 //       src/backup/backup_container.cpp src/backup/backup_xpress.cpp src/backup/backup_system_tables.cpp \
-//       src/backup/backup_iam.cpp -o /tmp/gen_backup_seeds && /tmp/gen_backup_seeds fuzz/corpus   # from the root
+//       src/backup/backup_iam.cpp src/backup/backup_cd_record.cpp -o /tmp/gen_backup_seeds && /tmp/gen_backup_seeds fuzz/corpus   # from the root
 //
 // backup_mtf: the builder's image as a full, a log, a differential, a forked and an ANSI-string backup.
 // backup_container: a full backup whose pass is real pages, in an MSSQLBAK container laid out as E13

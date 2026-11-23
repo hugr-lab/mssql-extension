@@ -177,7 +177,6 @@ set(EXTENSION_SOURCES
     src/backup/backup_allocation.cpp
     src/backup/backup_boot.cpp
     src/backup/backup_bytes.cpp
-    src/backup/backup_catalog_function.cpp
     src/backup/backup_catalog_model.cpp
     src/backup/backup_changes_function.cpp
     src/backup/backup_cd_record.cpp

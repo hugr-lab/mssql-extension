@@ -181,7 +181,9 @@ def main():
     ok, tables = session.query(
         f"SELECT schema_name, table_name, shape, decodable, reason, fuzzy_status, open_transactions, stale_transactions, "
         f"to_json([{{'name': c.name, 'decodable': c.decodable, 'reason': c.reason}} FOR c IN columns]) AS columns "
-        f"FROM mssql_backup_tables({paths}{opts}) ORDER BY schema_name, table_name")
+        # The user tables, which the RESTOREd database gives through TYPE mssql (a system or internal table is
+        # read through the DAC only); compare_catalog.py reads every other table whole.
+        f"FROM mssql_backup_tables({paths}{opts}) WHERE type = 'U' AND NOT is_ms_shipped ORDER BY schema_name, table_name")
     if not ok:
         sys.exit(f"compare_rows: mssql_backup_tables failed on {args.backup}:\n{tables}")
 

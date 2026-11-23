@@ -86,11 +86,23 @@ int main() {
 			[&]() { m = BuildCatalogModel(*pages->store, ReadBootstrapTables(*pages->store, ReadBootPage(boot))); });
 		const CatalogTable *items = m.FindTable("dbo", "items");
 		const CatalogTable *events = m.FindTable("dbo", "events");
-		Check(error.empty() && m.tables.size() == 2 && items && events && m.views.empty() && m.SchemaName(1) == "dbo" &&
-				  m.SchemaName(4) == "sys",
+		size_t user = 0, system = 0, internal = 0;
+		bool resource = false;
+		for (const auto &t : m.tables) {
+			user += t.type == "U";
+			system += t.type == "S";
+			internal += t.type == "IT";
+			resource = resource || t.object_id < 0;
+		}
+		const CatalogTable *schobjs = m.FindTable("sys", "sysschobjs");
+		// Every table of the database is described (owner, 2026-11-22): the system base tables and the internal
+		// ones beside the user tables; the resource database's (sys.trace_xe_*, negative ids) are not this one's.
+		Check(error.empty() && user == 2 && system == 72 && internal == 43 && !resource && items && events && schobjs &&
+				  schobjs->is_ms_shipped && schobjs->decodable && !items->is_ms_shipped && m.views.empty() &&
+				  m.SchemaName(1) == "dbo" && m.SchemaName(4) == "sys",
 			  form.front() +
-				  ": dbo.items and dbo.events, no other user table (the MS-shipped trace_xe_* left out), "
-				  "no view; schemas dbo and sys" +
+				  ": dbo.items and dbo.events, the 72 system base tables and 43 internal ones, no resource-database "
+				  "table, no view; schemas dbo and sys" +
 				  (error.empty() ? "" : " -- " + error));
 		{
 			// Task 16e: a scope builds only the objects it names; the schemas are every one either way.

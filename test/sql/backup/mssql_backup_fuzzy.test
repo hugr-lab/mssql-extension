@@ -46,7 +46,7 @@ full	1
 
 query TTII
 SELECT table_name, fuzzy_status, open_transactions, stale_transactions
-FROM mssql_backup_tables('test/data/backup/open_tail/open_tail_full.bak') ORDER BY 1;
+FROM mssql_backup_tables('test/data/backup/open_tail/open_tail_full.bak') WHERE type = 'U' ORDER BY 1;
 ----
 changed	dirty	1	0
 control	consistent	0	0
@@ -55,7 +55,7 @@ static	consistent	0	0
 query TTII
 SELECT table_name, fuzzy_status, open_transactions, stale_transactions
 FROM mssql_backup_tables('test/data/backup/open_tail/open_tail_base.bak', diff := 'test/data/backup/open_tail/open_tail_diff.bak')
-ORDER BY 1;
+WHERE type = 'U' ORDER BY 1;
 ----
 changed	dirty	1	0
 control	consistent	0	0

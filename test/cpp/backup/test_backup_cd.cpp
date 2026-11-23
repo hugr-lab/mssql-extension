@@ -55,8 +55,8 @@ struct OnPage {
 	}
 };
 
-PhysicalColumn Column(const std::string &name, uint8_t xtype, int16_t offset, uint16_t length = 0, uint8_t precision = 0,
-					  uint8_t scale = 0) {
+PhysicalColumn Column(const std::string &name, uint8_t xtype, int16_t offset, uint16_t length = 0,
+					  uint8_t precision = 0, uint8_t scale = 0) {
 	PhysicalColumn c;
 	c.name = name;
 	c.xtype = xtype;
@@ -173,7 +173,9 @@ int main() {
 	}
 	{
 		// A forwarded record (0x31): its back pointer is its last 8 bytes.
-		OnPage p(Hex("3102a28301010004006162636490010000010035" "00"));
+		OnPage p(
+			Hex("3102a28301010004006162636490010000010035"
+				"00"));
 		uint32_t page = 0;
 		uint16_t file = 0, slot = 0;
 		p.record.BackPointer(page, file, slot);
@@ -197,7 +199,10 @@ int main() {
 				  version_ghost.record.end == 15,
 			  "row versioning: a tagged row, a tagged ghost, a version ghost (the header and its tag only)");
 		// A tagged forwarded record (0x33): its back pointer after its data, then the tag.
-		OnPage fwd(Hex("3302a28301010004006162636490010000010035" "00" "0800000009000a009f0300000000"));
+		OnPage fwd(
+			Hex("3302a28301010004006162636490010000010035"
+				"00"
+				"0800000009000a009f0300000000"));
 		uint32_t page = 0;
 		uint16_t file = 0, slot = 0;
 		fwd.record.BackPointer(page, file, slot);
@@ -234,13 +239,17 @@ int main() {
 		 Column("v", XTYPE_DECIMAL, -2, 0, 38, 10), "00ffffffff3f228a097ac4865aa84c3b4b"},
 		{"datetime 2026-11-16 10:11:12.123", Record(8, "80b50400a7df25"), Column("v", XTYPE_DATETIME, -2),
 		 "25dfa70004b50000"},
-		{"datetime 1899-12-31 23:59:59.997", Record(6, "7f018b81ff"), Column("v", XTYPE_DATETIME, -2), "ff818b01ffffffff"},
-		{"smalldatetime 1900-12-31 (the day alone)", Record(3, "6c01"), Column("v", XTYPE_SMALLDATETIME, -2), "00006c01"},
+		{"datetime 1899-12-31 23:59:59.997", Record(6, "7f018b81ff"), Column("v", XTYPE_DATETIME, -2),
+		 "ff818b01ffffffff"},
+		{"smalldatetime 1900-12-31 (the day alone)", Record(3, "6c01"), Column("v", XTYPE_SMALLDATETIME, -2),
+		 "00006c01"},
 		{"date as it is", Record(4, "42240b"), Column("v", XTYPE_DATE, -2), "42240b"},
 		{"char(10) 'abc', padded", Record(4, "616263"), Column("v", XTYPE_CHAR, -2, 10), "61626320202020202020"},
 		{"binary(8) 0x01, padded", Record(2, "01"), Column("v", XTYPE_BINARY, -2, 8), "0100000000000000"},
 		{"nchar(10) 'жук' (SCSU), padded", Record(6, "12b6c3ba10"), Column("v", XTYPE_NCHAR, -2, 20),
-		 "3604430" "43a04" "2000200020002000200020002000"},
+		 "3604430"
+		 "43a04"
+		 "2000200020002000200020002000"},
 		{"nvarchar 'mixedЖ日𝄞end' (SCSU: SQ2, SQU)", Record(CD_LONG, "6d6978656403960e65e50ed8340edd1e656e64"),
 		 Column("v", XTYPE_NVARCHAR, -2, 80), "6d0069007800650064001604e56534d81edd65006e006400"},
 		{"nvarchar '𝄞𝄞' (even: UTF-16 as it is)", Record(9, "34d81edd34d81edd"), Column("v", XTYPE_NVARCHAR, -2, 80),
@@ -250,8 +259,8 @@ int main() {
 		{"NULL", Record(0, ""), Column("v", XTYPE_INT, -2), "NULL"},
 		{"rowversion 0x7D1 (big-endian, leading zeros left out)", Record(3, "07d1"), Column("v", XTYPE_TIMESTAMP, -2),
 		 "00000000000007d1"},
-		{"binary(8) NULL under ANSI_PADDING OFF: as stored", Record(2, "01"), Unpadded(Column("v", XTYPE_BINARY, -2, 8)),
-		 "01"},
+		{"binary(8) NULL under ANSI_PADDING OFF: as stored", Record(2, "01"),
+		 Unpadded(Column("v", XTYPE_BINARY, -2, 8)), "01"},
 	};
 	for (const auto &c : cases) {
 		std::string got;
@@ -301,7 +310,8 @@ int main() {
 		Check(hex(row.Value(0)) == "03000000" && row.Value(1).state == ValueState::Inline && hex(row.Value(1)) == "81",
 			  "needed id only (v past the vector): id converted, v located as stored");
 		row.Read(p.record, layout);
-		Check(hex(row.Value(0)) == "03000000" && hex(row.Value(1)) == "01000000", "no `needed`: every column converted");
+		Check(hex(row.Value(0)) == "03000000" && hex(row.Value(1)) == "01000000",
+			  "no `needed`: every column converted");
 	}
 
 	// Malformed records: named, never read past.
@@ -313,20 +323,71 @@ int main() {
 		  "a header bit the reader does not know (0x40)");
 	Check(Throws([] { Value(Record(6, "0ff2610010"), Column("v", XTYPE_NVARCHAR, -2, 80)); }, "reserved SCSU tag 242"),
 		  "the reserved SCSU tag 0xF2 in Unicode mode");
-	Check(Throws([] { OnPage p(Hex("012022220222222022022222202202222220188181828384867988898b8c8d72909192936b9697989a9b649d9f")); },
-				 "cluster array says"),
+	Check(Throws(
+			  [] {
+				  OnPage p(Hex(
+					  "012022220222222022022222202202222220188181828384867988898b8c8d72909192936b9697989a9b649d9f"));
+			  },
+			  "cluster array says"),
 		  "a cluster array that disagrees with the CD array");
 	Check(Throws([] { OnPage p(Hex("2102a283010200040061626364")); }, "long region lists"),
 		  "a long region that lists another count than the CD array");
 	Check(Throws([] { Value(Record(3, "c019"), Column("v", XTYPE_DECIMAL, -2, 0, 5, 0)); }, "past its precision") ==
 				  false &&
-			  Throws([] { Value(Record(CD_LONG, "e5f9fe7f9fe7f9fe7f9fe7f9fe7f9fe7f780"), Column("v", XTYPE_DECIMAL, -2, 0, 9, 0)); },
-					 "past its precision"),
+			  Throws(
+				  [] {
+					  Value(Record(CD_LONG, "e5f9fe7f9fe7f9fe7f9fe7f9fe7f9fe7f780"),
+							Column("v", XTYPE_DECIMAL, -2, 0, 9, 0));
+				  },
+				  "past its precision"),
 		  "a vardecimal value past its column's precision");
 	Check(Throws([] { Value(Record(4, "616e0e"), Column("v", XTYPE_NVARCHAR, -2, 80)); }, "inside an SCSU sequence"),
 		  "a truncated SCSU sequence");
 	Check(Throws([] { Value(Record(12, ""), Column("v", XTYPE_INT, -2)); }, "page-dictionary symbol"),
 		  "a page-dictionary symbol outside PAGE compression");
+
+	// The system-table reader (the bootstrap, and every table it reads before the model exists) takes a ROW
+	// page as the scan does (owner, 2026-11-22: no table refused; oracle lane, 2017's syscsrowgroups): two CD
+	// rows, id 3 / v 1 and id 4 / v NULL, then a ghost (CD type 3), passed over.
+	{
+		Page page;
+		page.bytes.assign(PAGE, 0);
+		page.header.page_id.file = 1;
+		page.header.page_id.page = 77;
+		page.header.slot_count = 3;
+		const std::vector<uint8_t> first = Hex("010222838100000080");	// id 3, v 1
+		const std::vector<uint8_t> second = Hex("010202840000000000");	// id 4, v NULL (code 0)
+		std::vector<uint8_t> ghost = first;
+		ghost[0] = 0x0D;  // CD type 3 (bits 2-4): a ghost record
+		const uint16_t at[3] = {96, 105, 114};
+		const std::vector<uint8_t> *records[3] = {&first, &second, &ghost};
+		for (int s = 0; s < 3; s++) {
+			std::memcpy(page.bytes.data() + at[s], records[s]->data(), records[s]->size());
+			page.bytes[PAGE - 2 * (s + 1)] = static_cast<uint8_t>(at[s] & 0xFF);
+			page.bytes[PAGE - 2 * (s + 1) + 1] = static_cast<uint8_t>(at[s] >> 8);
+		}
+		RowsetLayout layout;
+		layout.table = "sys.test";
+		layout.compression = 1;
+		layout.columns.push_back(Column("id", XTYPE_INT, -1));
+		layout.columns.push_back(Column("v", XTYPE_INT, -2));
+		std::vector<SystemRow> rows;
+		std::string error;
+		try {
+			ForEachPageRow(page, layout, [&](const SystemRow &r) { rows.push_back(r); });
+		} catch (std::exception &e) {
+			error = e.what();
+		}
+		Check(error.empty() && rows.size() == 2,
+			  "a ROW page's rows read by the system-table reader, the ghost passed over" +
+				  (error.empty() ? std::string() : ": " + error));
+		if (rows.size() == 2) {
+			Check(ValueInt(layout, 0, rows[0].values[0]) == 3 && ValueInt(layout, 1, rows[0].values[1]) == 1 &&
+					  ValueInt(layout, 0, rows[1].values[0]) == 4 && rows[1].values[1].is_null && rows[0].slot == 0 &&
+					  rows[1].slot == 1,
+				  "their values in the uncompressed form, as the scan reads them");
+		}
+	}
 
 	if (failures) {
 		std::cout << failures << " check(s) failed" << std::endl;

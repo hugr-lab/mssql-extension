@@ -12,7 +12,7 @@
 require mssql
 
 query TTITTTTTTTT
-SELECT * FROM mssql_backup_columns('test/data/backup/full.bak') ORDER BY table_name, column_id;
+SELECT * FROM mssql_backup_columns('test/data/backup/full.bak') WHERE schema_name = 'dbo' ORDER BY table_name, column_id;
 ----
 dbo	events	1	event_id	event_id	bigint	sys	bigint	BIGINT	converted	NULL
 dbo	events	2	item_id	item_id	int	sys	int	INTEGER	converted	NULL
@@ -25,6 +25,14 @@ dbo	items	4	price	price	decimal(12,2)	sys	decimal(12,2)	DECIMAL(12,2)	converted	
 dbo	items	5	created	created	datetime2(3)	sys	datetime2(3)	TIMESTAMP_MS	converted	NULL
 dbo	items	6	flag	flag	bit	sys	bit	BOOLEAN	converted	NULL
 dbo	items	7	blob	blob	varbinary(64)	sys	varbinary(64)	BLOB	converted	NULL
+
+# The tables of schema sys are listed too, read as any table: every column converted, a sql_variant one as
+# its stored bytes (spec 093 T1's VARIANT for a backup is still to come).
+query TI
+SELECT state, count(*) FROM mssql_backup_columns('test/data/backup/full.bak', 'sys') GROUP BY ALL ORDER BY ALL;
+----
+converted	1265
+stored_bytes	4
 
 # One schema's, one table's; every family of a striped set, a compressed one.
 query I

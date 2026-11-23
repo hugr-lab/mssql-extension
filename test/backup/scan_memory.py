@@ -64,7 +64,7 @@ def main():
 
     started = time.time()
     code, out, err, rss = run(args.duckdb, f"SELECT schema_name, table_name, row_count FROM mssql_backup_tables({paths}) "
-                                           "WHERE decodable ORDER BY schema_name, table_name;")
+                                           "WHERE decodable AND type = 'U' ORDER BY schema_name, table_name;")
     if code != 0:
         sys.exit(f"scan_memory: mssql_backup_tables failed:\n{err}{out}")
     tables = json.loads(out) if out.strip() else []

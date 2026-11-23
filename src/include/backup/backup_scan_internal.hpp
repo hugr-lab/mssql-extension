@@ -26,6 +26,8 @@ namespace mssql {
 namespace backup {
 
 struct ScanBindData : public TableFunctionData {
+	//! The function the call named, for what it says: mssql_backup_scan, or mssql_backup_catalog (schema sys).
+	std::string function = "mssql_backup_scan";
 	vector<std::string> paths;
 	vector<std::string> diff;  // task 24: a differential over the full on `paths`
 	BackupAt at;			   // task 24b: a version of the history of `paths`
@@ -52,6 +54,7 @@ struct ScanBindData : public TableFunctionData {
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<ScanBindData>();
+		copy->function = function;
 		copy->paths = paths;
 		copy->diff = diff;
 		copy->at = at;
