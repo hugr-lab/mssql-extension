@@ -74,7 +74,7 @@ const column_t PAGE_LSN_COLUMN = VIRTUAL_COLUMN_START + 2;
 //! PR 3 (task 20, DQ-46): the row's values stored off row and their trees (backup_lob_map), NULL when
 //! it has none.
 const column_t LOB_COLUMN = VIRTUAL_COLUMN_START + 3;
-//! The columns the scan cannot read (no stored value, a sparse one) are
+//! The columns the scan cannot read (no stored value: a computed one not persisted, a column set) are
 //! virtual from here on: `SELECT *` leaves them out, and naming one refuses the query by name, with
 //! its reason (owner, review of #552).
 const column_t UNREAD_COLUMN_START = VIRTUAL_COLUMN_START + 16;
@@ -1000,7 +1000,7 @@ bool ReadScanRow(const ScanBindData &data, ScanLocalState &local, const RowsetLa
 		if (fixed.Type() == RECORD_FORWARDED) {
 			at = ForwardedFrom(fixed, layout.table);
 		}
-		row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
+		row = RowRecord::Fixed(fixed, layout);
 		record_end = fixed.End();
 	}
 	if (static_cast<uint32_t>(local.offsets[slot]) + record_end > local.bounds[slot]) {

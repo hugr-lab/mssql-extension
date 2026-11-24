@@ -160,8 +160,7 @@ The states:
 |---|---|
 | `converted` | read as `duckdb_type` |
 | `stored_bytes` | read as its stored bytes (`BLOB`): a type whose conversion comes later (`xml`, `vector`, `json`), and a user CLR type, opaque by design |
-| `not_stored` | a computed column that is not persisted: it has no stored value |
-| `storage_format` | a sparse column or a column set: its value is in the row's sparse vector, read in a later release |
+| `not_stored` | a computed column that is not persisted, or a column set: it has no stored value (a column set's sparse columns are read one by one) |
 
 A value stored off row -- `text` / `ntext` / `image`, a MAX type's long value, a value pushed off a
 row past 8,060 bytes -- is read like one in row, so it has no state of its own. The `schema` and
@@ -239,9 +238,10 @@ bytes. A `sql_variant` is a `VARIANT`, each value in its own base type, as `TYPE
 string under a collation with no code page here, its bytes, with one WARNING per column). A type whose
 conversion comes in a later release -- `xml`, `vector`,
 `json` -- and a user CLR type are returned as their stored bytes, a `BLOB`; no column is refused for
-its type. A column the scan cannot read -- a computed column that is not persisted (no
-stored value) or a sparse column -- is left out of `SELECT *`; a query that names it is refused,
-with the reason (`mssql_backup_tables.columns`).
+its type. Sparse columns are read like the others, from the row's sparse vector. A column the scan
+cannot read -- a computed column that is not persisted, or a column set (neither has a stored value; a
+column set's sparse columns are read one by one) -- is left out of `SELECT *`; a query that names it is
+refused, with the reason (`mssql_backup_tables.columns`).
 
 Values stored off row are read like the others: `text` / `ntext` / `image`, a `varchar(max)` /
 `nvarchar(max)` / `varbinary(max)` / `xml` value too long for its row, and a value a row past 8,060

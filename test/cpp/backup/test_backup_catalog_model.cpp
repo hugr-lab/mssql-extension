@@ -605,18 +605,18 @@ int main() {
 		CatalogTable narrow;
 		narrow.decodable = true;
 		narrow.columns = {column(1, XTYPE_INT, 4),	 column(2, XTYPE_VARCHAR, 20), column(3, XTYPE_VARBINARY, -1),
-						  column(4, XTYPE_TEXT, 16), column(5, XTYPE_INT, 4),	   column(6, XTYPE_INT, 4)};
+						  column(4, XTYPE_TEXT, 16), column(5, XTYPE_INT, 4),	   column(6, XTYPE_INT, 4),
+						  column(7, XTYPE_XML, -1)};
 		narrow.columns[4].is_computed = true;
 		narrow.columns[5].is_sparse = true;
-		auto state = [](const CatalogTable &t, size_t i) {
-			return std::string(StateOf(t, t.columns[i], TypeForms()).state);
-		};
+		narrow.columns[6].is_column_set = true;
+		auto state = [](const CatalogTable &t, size_t i) { return std::string(StateOf(t, t.columns[i], TypeForms()).state); };
 		Check(state(narrow, 0) == "converted" && StateOf(narrow, narrow.columns[0], TypeForms()).reason.empty() &&
 				  state(narrow, 1) == "converted" && state(narrow, 2) == "converted" &&
 				  state(narrow, 3) == "converted" && state(narrow, 4) == "not_stored" &&
-				  state(narrow, 5) == "storage_format",
-			  "states: converted (an int, a varchar(20), a MAX and a text: read off row too since PR 3), a "
-			  "computed column not_stored, a sparse one storage_format");
+				  state(narrow, 5) == "converted" && state(narrow, 6) == "not_stored",
+			  "states: converted (an int, a varchar(20), a MAX and a text: read off row too since PR 3; a sparse "
+			  "int, read from the sparse vector since spec 086 PR 3), a computed column and a column set not_stored");
 		CatalogTable variant;
 		variant.decodable = true;
 		variant.columns = {column(1, XTYPE_INT, 4), column(2, XTYPE_SQL_VARIANT, 8016), column(3, XTYPE_VARCHAR, 100)};

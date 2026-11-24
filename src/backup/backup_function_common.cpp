@@ -635,8 +635,11 @@ ColumnReading ReadingOf(const CatalogColumn &c, const TypeForms &forms) {
 	if (c.is_computed && !c.is_persisted) {
 		return not_readable("a computed column that is not persisted has no stored value");
 	}
-	if (c.is_sparse || c.is_column_set) {
-		return not_readable("a sparse column's value is in the row's sparse vector, read from spec 086");
+	// A sparse column is read from the row's sparse vector (spec 086 PR 3); the column set over them is not
+	// stored -- no physical column, no entry (E24) -- but computed from them, read like a computed column
+	// that is not persisted (owner, 2026-11-24): its columns are read one by one.
+	if (c.is_column_set) {
+		return not_readable("a column set is computed from the sparse columns, not stored; they are read one by one");
 	}
 	return r;
 }
@@ -647,11 +650,8 @@ ColumnState StateOf(const CatalogTable &t, const CatalogColumn &c, const TypeFor
 	auto join = [](const std::string &a, const std::string &b) { return a.empty() ? b : b.empty() ? a : a + "; " + b; };
 	// A value stored off row is read like one in row since spec 085 PR 3 (row-overflow, LOB trees,
 	// text pointers: backup_lob), so where a value lives says nothing about its state.
-	if (c.is_computed && !c.is_persisted) {
+	if ((c.is_computed && !c.is_persisted) || c.is_column_set) {
 		s.state = "not_stored";
-		s.reason = r.note;
-	} else if (c.is_sparse || c.is_column_set) {
-		s.state = "storage_format";
 		s.reason = r.note;
 	} else if (r.raw) {
 		s.state = "stored_bytes";

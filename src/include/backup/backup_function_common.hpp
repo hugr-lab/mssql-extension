@@ -96,8 +96,8 @@ Value LsnValue(const Lsn &lsn);
 //! spec 093 T8); a type whose conversion is still to come -- xml, a user CLR type, vector, json, a type
 //! the reader does not know, a text whose collation is newer than the code-page tables -- is its stored bytes as
 //! they are, a BLOB (`raw`), until its decoder (086, together with the TDS path's). What is not a
-//! type gap is not readable: a computed column that is not persisted (no stored value) and a sparse
-//! column (its value is in the row's sparse vector, a storage format: 086). One answer for
+//! type gap is not readable: a computed column that is not persisted (no stored value) and a column
+//! set (computed from the sparse columns, which are read from the row's sparse vector: 086 PR 3). One answer for
 //! mssql_backup_tables' `columns` and the scan (RecordStager).
 struct ColumnReading {
 	LogicalType type = LogicalType::BLOB;
@@ -110,10 +110,9 @@ struct ColumnReading {
 ColumnReading ReadingOf(const CatalogColumn &c, const TypeForms &forms);
 
 //! Column `c` of table `t` at a glance (mssql_backup_columns, task 16d; owner, 2026-11-11), from
-//! ReadingOf: `not_stored` (a computed column not persisted), `storage_format` (sparse, a column
-//! set: 086), `stored_bytes` (a type whose conversion is still to come, read as its stored bytes) or
-//! `converted` -- in row or off row alike since PR 3 (`off_row_pending` is gone); `reason` says why (empty when
-//! converted), and that the table is not read when mssql_backup_tables says so.
+//! ReadingOf: `not_stored` (a computed column not persisted, a column set), `stored_bytes` (a type whose conversion is
+//! still to come, read as its stored bytes) or `converted` -- in row or off row alike since PR 3 (`off_row_pending` is
+//! gone); `reason` says why (empty when converted), and that the table is not read when mssql_backup_tables says so.
 struct ColumnState {
 	const char *state = "converted";
 	std::string reason;

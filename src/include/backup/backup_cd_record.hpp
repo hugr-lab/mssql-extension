@@ -195,14 +195,22 @@ private:
 struct RowRecord {
 	const uint8_t *data = nullptr;	// the record's first byte, in its page (which record it is)
 	const RecordView *fixed = nullptr;
-	size_t var_count = 0;  // the table's variable columns of a FixedVar record (RowVarCount)
+	//! The table's variable columns of a FixedVar record (RowVarCount), its sparse vector not counted: a
+	//! regular column at the vector's index is not stored (NULL, or a uniquifier of 0).
+	size_t var_count = 0;
+	SparseVector sparse;  // a FixedVar record's sparse vector (FindSparseVector; spec 086 PR 3)
 	const CdRow *cd = nullptr;
 
-	static RowRecord Fixed(const RecordView &record, size_t var_count) {
+	//! A FixedVar record of `layout`: its variable columns (RowVarCount) and its sparse vector found once.
+	static RowRecord Fixed(const RecordView &record, const RowsetLayout &layout) {
 		RowRecord r;
 		r.data = record.data;
 		r.fixed = &record;
-		r.var_count = var_count;
+		r.var_count = RowVarCount(record, layout.table);
+		r.sparse = FindSparseVector(record, r.var_count, layout);
+		if (r.sparse.data) {
+			r.var_count--;
+		}
 		return r;
 	}
 	static RowRecord Compressed(const CdRecord &record, const CdRow &row) {
@@ -212,7 +220,7 @@ struct RowRecord {
 		return r;
 	}
 	ValueRef Locate(const RowsetLayout &layout, size_t k) const {
-		return cd ? cd->Value(k) : LocateValue(*fixed, var_count, layout, k);
+		return cd ? cd->Value(k) : LocateValue(*fixed, var_count, sparse, layout, k);
 	}
 };
 

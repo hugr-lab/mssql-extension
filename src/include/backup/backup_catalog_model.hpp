@@ -387,12 +387,11 @@ void AssignDuckDBNames(std::vector<CatalogColumn> &columns);
 //! through `store`. What one object's rows get wrong is named on that object (D13): a table the scan
 //! cannot read -- its schema or a column's type not in the catalog, an added column's default it
 //! cannot use, a feature not read yet -- is listed with `decodable` false and its reason; a
-//! definition that cannot be read is Unreadable with its reason. Coarser than D13 for now: a sparse
-//! column or an unusable default refuses the table, not the column (the scan's column-level refusal
-//! is PR 2d's). A FormatError only for what the model as a whole rests on (a system table missing,
-//! a malformed row of sysclsobjs or sysscalartypes).
-//! Only the tables and views `scope` asks for are described and listed: their columns, layouts,
-//! defaults, partitioning and definitions are the per-object cost; the system tables are read whole.
+//! definition that cannot be read is Unreadable with its reason. Coarser than D13 for now: an unusable
+//! default refuses the table, not the column. A FormatError only for what the model as a whole rests on (a system table
+//! missing, a malformed row of sysclsobjs or sysscalartypes). Only the tables and views `scope` asks for are described
+//! and listed: their columns, layouts, defaults, partitioning and definitions are the per-object cost; the system
+//! tables are read whole.
 CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables,
 							   const BoundaryCheck &check = BoundaryCheck(),
 							   const CatalogScope &scope = CatalogScope());

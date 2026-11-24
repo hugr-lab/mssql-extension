@@ -334,6 +334,12 @@ bool CheckLiveColumn(const std::map<int32_t, const CatalogColumn *> &by_id, cons
 	if ((c.system_type_id == XTYPE_CHAR || c.system_type_id == XTYPE_BINARY) && c.is_nullable && !c.is_ansi_padded) {
 		physical.unpadded = true;
 	}
+	// Sparse by sysrscols (status 0x100) and by syscolpars alike, or a value would be looked for where it is not.
+	if (physical.Sparse() != c.is_sparse) {
+		why = "column " + c.name + " is " + (c.is_sparse ? "" : "not ") + "sparse in syscolpars, and " +
+			  (physical.Sparse() ? "" : "not ") + "sparse in sysrscols";
+		return false;
+	}
 	return CheckStorageForm(physical, c, cd, t.name, why);
 }
 
@@ -425,8 +431,8 @@ void DecideDecodable(const BootstrapTables &tables, const AddedDefaults &default
 		}
 	}
 	std::map<int32_t, const CatalogColumn *> by_id;
-	// A sparse column (and the column set over them) is not readable, the narrowest refusal (D13): its
-	// value is in the row's sparse vector, a storage format of 086's; the table's other columns are.
+	// A sparse column has no place of its own (sysrscols offset 0, no null bit): its value is its entry in the
+	// row's sparse vector (spec 086 PR 3, E24), so its storage form is not checked here.
 	for (const auto &c : t.columns) {
 		by_id[c.column_id] = &c;
 	}

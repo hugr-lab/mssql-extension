@@ -413,10 +413,160 @@ RowLocation ForwardedFrom(const RecordView &record, const std::string &table) {
 	return at;
 }
 
-ValueRef LocateValue(const RecordView &record, size_t var_count, const RowsetLayout &layout, size_t k) {
+void IndexSparse(RowsetLayout &layout) {
+	layout.sparse = false;
+	layout.var_null_bits.clear();
+	for (const auto &c : layout.columns) {
+		layout.sparse = layout.sparse || c.Sparse();
+		if (c.offset < 0) {
+			const size_t i = static_cast<size_t>(-static_cast<int32_t>(c.offset)) - 1;
+			if (layout.var_null_bits.size() <= i) {
+				layout.var_null_bits.resize(i + 1, 0);
+			}
+			// The uniquifier is not stored when it is 0, whatever its null bit says: it never keeps the vector from
+			// its index (a uniquifier is 4 bytes, not complex: the vector's tag tells them apart).
+			layout.var_null_bits[i] = c.Uniquifier() ? 0 : c.null_bit;
+		}
+	}
+}
+
+namespace {
+
+constexpr uint16_t SPARSE_VECTOR_TAG = 0x0005;
+constexpr size_t SPARSE_VECTOR_HEADER = 4;	// the tag, the count
+
+// Variable index `i`'s regular column holds a value in `record`: its null bit says so (a column added after
+// the record, past its column count, holds none; a record without a null bitmap holds every column).
+bool VarHoldsValue(const RecordView &record, const RowsetLayout &layout, size_t i) {
+	const uint16_t bit = layout.var_null_bits[i];
+	if (bit == 0) {
+		return false;  // no column at this index
+	}
+	if (!record.HasNullBitmap()) {
+		return true;
+	}
+	return bit <= record.column_count && !record.IsNull(bit - 1);
+}
+
+uint16_t SparseU16(const uint8_t *data, size_t at) {
+	return static_cast<uint16_t>(data[at] | (data[at + 1] << 8));
+}
+
+}  // namespace
+
+SparseVector FindSparseVector(const RecordView &record, size_t var_count, const RowsetLayout &layout) {
+	SparseVector s;
+	if (!layout.sparse || var_count == 0) {
+		return s;
+	}
+	// The vector follows every regular variable column that holds a value (E24: with r1 and r2 NULL it is
+	// variable column 0, with both set column 2), so it can only be the last one.
+	const size_t last = var_count - 1;
+	for (size_t i = last; i < layout.var_null_bits.size(); i++) {
+		if (VarHoldsValue(record, layout, i)) {
+			return s;
+		}
+	}
+	const uint16_t start = record.VarStart(last);
+	const uint16_t size = static_cast<uint16_t>(record.VarEnd(last) - start);
+	const uint8_t *data = record.data + start;
+	const bool tagged =
+		record.VarComplex(last) && size >= SPARSE_VECTOR_HEADER && SparseU16(data, 0) == SPARSE_VECTOR_TAG;
+	auto fail = [&](const std::string &why) -> SparseVector {
+		throw FormatError("backup: the record of " + layout.table + " at offset " + std::to_string(record.offset) +
+						  " has a sparse vector " + why);
+	};
+	if (!tagged) {
+		if (last < layout.var_null_bits.size()) {
+			return s;  // a regular column's NULL, kept: no vector
+		}
+		throw FormatError("backup: the record of " + layout.table + " at offset " + std::to_string(record.offset) +
+						  " has a variable column past its table's that is not a sparse vector");
+	}
+	const uint16_t count = SparseU16(data, 2);
+	const size_t values = SPARSE_VECTOR_HEADER + 4 * static_cast<size_t>(count);
+	if (count == 0 || values > size) {
+		return fail("of " + std::to_string(count) + " columns in " + std::to_string(size) + " bytes");
+	}
+	size_t previous_end = values;
+	for (size_t i = 0; i < count; i++) {
+		if (i > 0 &&
+			SparseU16(data, SPARSE_VECTOR_HEADER + 2 * i) <= SparseU16(data, SPARSE_VECTOR_HEADER + 2 * (i - 1))) {
+			return fail("whose column ids do not ascend");
+		}
+		const size_t end = SparseU16(data, SPARSE_VECTOR_HEADER + 2 * (count + i)) & 0x7FFF;
+		if (end < previous_end || end > size) {
+			return fail("whose value " + std::to_string(i) + " ends at " + std::to_string(end) + ", outside " +
+						std::to_string(previous_end) + " to " + std::to_string(size));
+		}
+		previous_end = end;
+	}
+	s.data = data;
+	s.size = size;
+	s.count = count;
+	return s;
+}
+
+ValueRef SparseVector::Find(int32_t hbcolid) const {
+	ValueRef v;
+	if (!data || hbcolid < 0 || hbcolid > 0xFFFF) {
+		return v;
+	}
+	// The ids ascend (checked by FindSparseVector): a binary search.
+	size_t lo = 0;
+	size_t hi = count;
+	while (lo < hi) {
+		const size_t mid = (lo + hi) / 2;
+		const uint16_t id = SparseU16(data, SPARSE_VECTOR_HEADER + 2 * mid);
+		if (id == hbcolid) {
+			const size_t ends = SPARSE_VECTOR_HEADER + 2 * static_cast<size_t>(count);
+			const uint16_t raw = SparseU16(data, ends + 2 * mid);
+			const size_t start =
+				mid == 0 ? ends + 2 * static_cast<size_t>(count) : SparseU16(data, ends + 2 * (mid - 1)) & 0x7FFF;
+			v.state = (raw & 0x8000) ? ValueState::OffRow : ValueState::Inline;
+			v.data = data + start;
+			v.size = static_cast<uint32_t>((raw & 0x7FFF) - start);
+			return v;
+		}
+		if (id < hbcolid) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return v;
+}
+
+ValueRef LocateValue(const RecordView &record, size_t var_count, const SparseVector &sparse, const RowsetLayout &layout,
+					 size_t k) {
 	const PhysicalColumn &c = layout.columns[k];
 	ValueRef v;
 	if (c.Dropped()) {
+		return v;
+	}
+	if (c.Sparse()) {
+		// No null bit, no place of its own: the vector's entry of its hbcolid (E24), absent = NULL. An entry
+		// of a dropped column's hbcolid (DROP SPARSE, a dropped column) is never asked for.
+		v = sparse.Find(c.hbcolid);
+		// A type the reader does not know is read as its bytes, as at a variable index; a fixed one it knows has
+		// its whole width.
+		const bool fixed = KnownFixedXtype(c.xtype);
+		if (v.state == ValueState::OffRow && fixed) {
+			throw FormatError("backup: " + layout.table + "." + c.name + ", a sparse " + XtypeName(c.xtype) +
+							  ", is off row in the record at offset " + std::to_string(record.offset));
+		}
+		if (v.state == ValueState::Inline && fixed) {
+			// A fixed type's entry is its whole width (E24: a bit one byte, a char padded), which the stager's
+			// fixed arms copy without a test.
+			const uint16_t width = c.FixedLength(layout.table);
+			if (v.size != width) {
+				throw FormatError("backup: " + layout.table + "." + c.name + "'s sparse entry is " +
+								  std::to_string(v.size) + " bytes, where its type takes " + std::to_string(width));
+			}
+		}
+		if (v.state == ValueState::Inline) {
+			v.size = c.Unpadded(v.data, v.size);
+		}
 		return v;
 	}
 	if (record.HasNullBitmap() && c.null_bit > record.column_count) {
@@ -475,7 +625,7 @@ ValueRef LocateValue(const RecordView &record, size_t var_count, const RowsetLay
 }
 
 std::vector<SystemValue> DecodeRecord(const RecordView &record, const RowsetLayout &layout) {
-	return DecodeRow(RowRecord::Fixed(record, RowVarCount(record, layout.table)), layout);
+	return DecodeRow(RowRecord::Fixed(record, layout), layout);
 }
 
 std::vector<SystemValue> DecodeRow(const RowRecord &row, const RowsetLayout &layout) {
@@ -758,7 +908,8 @@ RowsetLayout BootstrapTables::LayoutOf(int32_t object_id, const SysRowset &base)
 		c.status = r.status;
 		c.offset = r.offset;
 		c.null_bit = r.null_bit;
-		c.bit_position = r.bit_position;
+		// A sparse bit is a byte of its own in its entry (E24: bitpos 0 measured): no position to shift by.
+		c.bit_position = (r.status & 0x100) ? 0 : r.bit_position;
 		c.ordkey = r.ordkey;
 		if (!c.Dropped() && !c.Uniquifier()) {
 			auto named = column_index_.find(std::make_pair(object_id, r.rscolid));
@@ -773,6 +924,7 @@ RowsetLayout BootstrapTables::LayoutOf(int32_t object_id, const SysRowset &base)
 	if (layout.columns.empty()) {
 		throw FormatError("backup: " + name + "'s base rowset has no column in sysrscols");
 	}
+	IndexSparse(layout);
 	return layout;
 }
 

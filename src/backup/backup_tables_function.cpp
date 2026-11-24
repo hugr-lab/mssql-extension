@@ -835,7 +835,7 @@ void RegisterBackupTablesFunctions(ExtensionLoader &loader) {
 		"a glance (sql_type as declared, an alias type by its name, system_type the type underneath): converted (read "
 		"as duckdb_type), stored_bytes (read as its stored bytes until its type's "
 		"conversion comes), not_stored (a "
-		"computed column not persisted) or storage_format (a sparse column, a column set), and why. Optionally "
+		"computed column not persisted, a column set), and why. Optionally "
 		"one schema's or one table's (names as stored). The path is one file, a glob, or a list: every family of "
 		"one media set.",
 		{"SELECT table_name, column_name, state, reason FROM mssql_backup_columns('/backups/sales_full.bak') "
