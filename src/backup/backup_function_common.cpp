@@ -95,12 +95,6 @@ std::string FuzzyParameterOf(const named_argument_map_t &named, const char *func
 	return text;
 }
 
-TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
-						  const CatalogTable &table, FuzzyMode mode, const char *function) {
-	return CheckFuzzyUnits(context, tail, pages, BaseUnitsOf(table), table.schema_name + "." + table.name, mode,
-						   function);
-}
-
 TableFuzziness CheckFuzzyUnits(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
 							   const std::vector<uint64_t> &units, const std::string &name, FuzzyMode mode,
 							   const char *function, FuzzinessMemo *memo) {

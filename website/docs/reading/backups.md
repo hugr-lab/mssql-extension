@@ -317,8 +317,11 @@ included. What the log records otherwise is not counted yet: a bulk load logged 
 rows, a `TRUNCATE TABLE`, a partition switch and other DDL run while the backup ran leave the tables
 they touched `consistent` (for now), though `RESTORE` would give them as those left them.
 
-What a scan does with a table that is not consistent is `fuzzy :=` on `mssql_backup_scan`, the `fuzzy`
-option of `ATTACH … (TYPE mssql_backup)` for its tables, or the `mssql_backup_fuzzy` setting:
+What a function that reads a table's rows does with one that is not consistent is its `fuzzy :=`
+parameter, else the `fuzzy` option of `ATTACH … (TYPE mssql_backup)`, else the `mssql_backup_fuzzy`
+setting. `mssql_backup_scan` and an attached backup's tables take it; so do
+`mssql_backup_table_changes` / `_insertions` / `_deletions` (each of the two states' tables is checked
+against its own backup's tail) and `mssql_backup_catalog` (the base table it reads):
 
 | `fuzzy` | |
 |---|---|
@@ -347,6 +350,9 @@ backup began is in them -- and the page is passed over: with a WARNING naming it
 silently under `'ignore'`; `'error'` refuses the table by name. A value stored off row (a `varchar(max)`
 past the row, say) on such a page is read as NULL and its row read, with a WARNING of its own under
 `'warn'`. `RESTORE` holds its rows and values, and so will the reader once it replays the tail.
+`mssql_backup_catalog` passes such a page over in the same way. The change listing does not, whatever
+`fuzzy` says: a row moved onto a page it skipped would read as deleted, so it refuses the table and
+names the page.
 
 ### The log a backup carries
 
@@ -390,6 +396,9 @@ LOB fragment), its values are stored off row (their pages are the backup's, not 
 or it is ROW- or PAGE-compressed (for now). The names of tables need the backup's catalog: a log backup's
 records, and a differential's given without its full, name allocation units only. Both are on an
 attached backup as `b.transactions()` and `b.transaction_records()`, with `version :=` / `as_of :=`.
+A transaction's state is known only at the log's end, so a listing that selects `transaction_status`
+reads the whole log before its first row; one that does not (and does not `SELECT *`) streams from the
+start, and `contents` is decoded only when selected.
 The oracle lane compares every record with `fn_dump_dblog` over the same files on SQL Server 2017-2025.
 
 ## A differential over its full
@@ -450,7 +459,7 @@ It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, 
 | `table_exclude` | A regex: the tables and views it matches are left out |
 | `diff` | A differential backup to read over the attached full ([above](#a-differential-over-its-full)) |
 | `history`, `snapshot_version`, `snapshot_time` | A history of backups ([below](#a-history-of-backups)) |
-| `fuzzy` | What a scan of its tables does with one that is not consistent: `'warn'`, `'error'` or `'ignore'` ([above](#a-backup-taken-under-writes)); unset, the `mssql_backup_fuzzy` setting |
+| `fuzzy` | What a scan of its tables -- and the change listing or `mssql_backup_catalog` over its name -- does with one that is not consistent: `'warn'`, `'error'` or `'ignore'` ([above](#a-backup-taken-under-writes)); unset, the `mssql_backup_fuzzy` setting |
 
 The filters work as `TYPE mssql`'s. An object is kept when it passes the filter -- it matches it, or
 no filter is given -- and does not match the exclusion, so an exclusion alone keeps everything else:
