@@ -61,9 +61,8 @@ void TestTrustServerCertificate() {
 	// Regression: each of these read as yes.
 	for (const char *other : {"off", "", "disabled", "n", "f", "nope", "ture", "2"}) {
 		const auto refusal = Refusal(BASE + ";TrustServerCertificate=" + other);
-		Check(refusal.find("TrustServerCertificate must be yes or no") == 0 &&
-				  refusal.find(std::string("'") + other + "'") != std::string::npos,
-			  std::string("TrustServerCertificate=") + other + " is refused, naming the value (" + refusal + ")");
+		Check(refusal == "TrustServerCertificate must be yes or no (also true / false, 1 / 0).",
+			  std::string("TrustServerCertificate=") + other + " is refused (" + refusal + ")");
 	}
 	Check(Refusal("mssql://u:p@h:1433/d?trustservercertificate=off").find("TrustServerCertificate must be") == 0,
 		  "in a URI too");
@@ -103,14 +102,46 @@ void TestPort() {
 	Check(Refusal("mssql://u:p@[::1]/d").find("Invalid port in Server parameter") == 0 &&
 			  Parse("mssql://u:p@[::1]:1433/d")->host == "[::1]",
 		  "a bracketed IPv6 literal with no port is refused; with one, the brackets stay in the host");
-	Check(Refusal("Server=h,0;Database=d;User Id=u;Password=p") == "Port must be between 1 and 65535. Got: 0" &&
-			  Refusal("Server=h,70000;Database=d;User Id=u;Password=p") ==
-				  "Port must be between 1 and 65535. Got: 70000" &&
-			  Refusal("Server=h,-1;Database=d;User Id=u;Password=p") == "Port must be between 1 and 65535. Got: -1",
-		  "a number outside 1-65535 is refused by its range, as before");
-	Check(Refusal("Server=h,abc;Database=d;User Id=u;Password=p") == "Invalid port in Server parameter: 'abc'" &&
-			  Refusal("Server=h,;Database=d;User Id=u;Password=p") == "Invalid port in Server parameter: ''",
-		  "no number at all is refused, as before");
+	Check(Refusal("Server=h,0;Database=d;User Id=u;Password=p") == "Port must be between 1 and 65535." &&
+			  Refusal("Server=h,70000;Database=d;User Id=u;Password=p") == "Port must be between 1 and 65535." &&
+			  Refusal("Server=h,-1;Database=d;User Id=u;Password=p") == "Port must be between 1 and 65535.",
+		  "a number outside 1-65535 is refused by its range");
+	Check(Refusal("Server=h,abc;Database=d;User Id=u;Password=p").find("Invalid port in Server parameter") == 0 &&
+			  Refusal("Server=h,;Database=d;User Id=u;Password=p").find("Invalid port in Server parameter") == 0,
+		  "no number at all is refused");
+}
+
+//! Review of #625 (spec 047, T028a): an ATTACH error never echoes a password, and what a refusal quotes
+//! can be one. A URI whose password holds an unencoded '?' is cut there, so the password's start is read as
+//! the port; with the ';' after a value missing, what follows is part of that value.
+void TestNothingOfThePasswordIsQuoted() {
+	std::cout << "A refusal quotes nothing that can be a password" << std::endl;
+	struct Case {
+		const char *connection_string;
+		const char *secret;
+		const char *what;
+	};
+	const Case cases[] = {
+		{"mssql://u:12ab?cd@host/db", "12ab", "a URI password's start, read as a port that is no number"},
+		{"mssql://u:Zx9!?cd@host/db", "Zx9", "a URI password that starts with no digit"},
+		{"mssql://u:99999?cd@host/db", "99999", "a URI password's digits, read as a port out of range"},
+		{"mssql://u:0?cd@host/db", "Got", "a port of 0: no value is said at all"},
+		{"Server=h;Database=d;User Id=u;TrustServerCertificate=yes Password=hunter2", "hunter2",
+		 "a Password after a TrustServerCertificate with no ';'"},
+		{"Server=h,1433 Password=hunter2;Database=d;User Id=u;Password=p", "hunter2",
+		 "a Password after a port with no ';'"}};
+	for (const auto &c : cases) {
+		const auto refusal = Refusal(c.connection_string, true);
+		Check(!refusal.empty() && refusal.find(c.secret) == std::string::npos,
+			  std::string(c.what) + " is refused without it (" + refusal + ")");
+		std::string thrown;
+		try {
+			MSSQLConnectionInfo::FromConnectionString(c.connection_string, true);
+		} catch (std::exception &e) {
+			thrown = e.what();
+		}
+		Check(!thrown.empty() && thrown.find(c.secret) == std::string::npos, "and so is what ATTACH throws");
+	}
 }
 
 void TestForms() {
@@ -158,6 +189,7 @@ void TestForms() {
 int main() {
 	TestTrustServerCertificate();
 	TestPort();
+	TestNothingOfThePasswordIsQuoted();
 	TestForms();
 	std::cout << (failures ? "FAILED" : "all passed") << std::endl;
 	return failures ? 1 : 0;

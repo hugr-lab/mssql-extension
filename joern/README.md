@@ -53,7 +53,7 @@ and has no flag to move it.
 | Scope | Input | Why |
 |---|---|---|
 | `tds` (default) | `src/tds/**`, `src/connection/instance_resolver.cpp`, `src/codec/staging/{row_stager,column_ops}.cpp` | The code that reads the wire. DuckDB-free — the same isolation finding the fuzz harnesses rely on — so it parses in seconds and the graph carries no DuckDB template noise. 183 files, 2.2k methods, 20k calls. |
-| `all` | `src/**` | Whole-extension questions (q6 in particular: credentials live in `src/azure/`, `src/connection/`, `mssql_storage.cpp`). 285 files, 3k methods, 65k calls. CDT resolves fewer callees inside DuckDB-templated code, so call-graph answers are less trustworthy here. |
+| `all` | `src/**` | Whole-extension questions (q6 in particular: credentials live in `src/azure/`, `src/connection/`, `mssql_connection_info.cpp`). 285 files, 3k methods, 65k calls. CDT resolves fewer callees inside DuckDB-templated code, so call-graph answers are less trustworthy here. |
 
 The `tds` scope is staged as a tree of symlinks under `joern/out/stage-tds/`,
 because the frontend takes a single input path.
@@ -84,7 +84,7 @@ Three queries have a known, benign baseline. The signal is a **new** entry, not
 the entries themselves:
 
 - **q6 (`all` scope) = 2**, both `secret->GetType()` in a "Secret '%s' is not of
-  type …" message (`mssql_storage.cpp:188`, `azure_secret_reader.cpp:44`). They
+  type …" message (`mssql_connection_info.cpp`, `azure_secret_reader.cpp:44`). They
   match because the receiver is named `secret`; it is the secret's *type* that
   is logged, not its value. Identifiers ending in `_name`/`_type`/`_id` are
   already filtered out for the same reason — a credential's name is not the

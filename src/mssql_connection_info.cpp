@@ -491,6 +491,12 @@ static string ValidateServerPort(const string &server) {
 	if (comma_pos == string::npos) {
 		return "";
 	}
+	// What is refused is said without the text that was read as the port. A URI whose password holds an
+	// unencoded '?' is cut there, and the password's start is then where the port is looked for
+	// (mssql://u:12ab?cd@host/db: host "u", port "12ab"): quoted, an ATTACH error echoed part of a
+	// password, which it must never do (spec 047, T028a; review of #625). The number is not said either:
+	// it can be such a password's digits.
+	static const char *const NOT_A_NUMBER = "Invalid port in Server parameter: it is not a number from 1 to 65535.";
 	auto port_str = server.substr(comma_pos + 1);
 	try {
 		// The whole value, but for blanks around it: stoi alone takes the digits it finds and leaves the
@@ -498,13 +504,13 @@ static string ValidateServerPort(const string &server) {
 		size_t parsed = 0;
 		int port = std::stoi(port_str, &parsed);
 		if (port_str.find_first_not_of(" \t", parsed) != string::npos) {
-			return StringUtil::Format("Invalid port in Server parameter: '%s'", port_str);
+			return NOT_A_NUMBER;
 		}
 		if (port < 1 || port > 65535) {
-			return StringUtil::Format("Port must be between 1 and 65535. Got: %d", port);
+			return "Port must be between 1 and 65535.";
 		}
 	} catch (...) {
-		return StringUtil::Format("Invalid port in Server parameter: '%s'", port_str);
+		return NOT_A_NUMBER;
 	}
 	return "";
 }
@@ -554,8 +560,9 @@ string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_st
 	// value, a typo -- and the connection then accepted any certificate, without a word.
 	auto trust = params.find("trustservercertificate");
 	if (trust != params.end() && !IsYesOrNo(trust->second)) {
-		return StringUtil::Format("TrustServerCertificate must be yes or no (also true / false, 1 / 0). Got: '%s'",
-								  trust->second);
+		// The value is not quoted: with the ';' after it missing, what follows -- a Password, say -- is
+		// part of it (review of #625).
+		return "TrustServerCertificate must be yes or no (also true / false, 1 / 0).";
 	}
 
 	return "";	// Valid

@@ -49,11 +49,13 @@ static string UrlDecode(const string &str) {
 	return result;
 }
 
+namespace {
 //! A spelling of a connection parameter and the one name the rest of the code reads it by.
 struct KeyAlias {
 	const char *alias;	// lowercase
 	const char *canonical;
 };
+}  // namespace
 
 //! `key` = `value` into `result` under the key's canonical name; a key that is none of `aliases` is kept
 //! as written (the map is case-insensitive). An authenticator's value is lowercased (Spec 042: krb5 /
@@ -198,10 +200,12 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 // Returns trimmed key/value pairs; brace markers are stripped from the
 // returned value but every inner character (including `;`, `=`, raw `{`,
 // and the post-`}}` literal `}`) is preserved verbatim.
+namespace {
 struct ConnStringPair {
 	string key;
 	string value;
 };
+}  // namespace
 
 static bool IsBlank(char c) {
 	return c == ' ' || c == '\t';

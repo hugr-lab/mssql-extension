@@ -105,6 +105,7 @@ static int64_t IntegerAttachOption(const string &name, const Value &value) {
 	return result;
 }
 
+namespace {
 //! What the ATTACH's own options say. They are taken out of AttachOptions so DuckDB's StorageOptions does
 //! not refuse them as unrecognized. A `_specified` flag tells an option given empty (which clears the
 //! connection's own value) from one not given; -1 is "not given" for the switches a setting backs.
@@ -136,6 +137,7 @@ struct MSSQLAttachOptions {
 	bool preload = false;		   // Issue #324: preload the catalog at ATTACH
 	int64_t min_connections = -1;  // Issue #324: ATTACH-level mssql_min_connections
 };
+}  // namespace
 
 //! Who to connect as, and under what name. False for an option that is not one of these.
 static bool TakeIdentityOption(const string &lower_name, const Value &value, MSSQLAttachOptions &out) {
