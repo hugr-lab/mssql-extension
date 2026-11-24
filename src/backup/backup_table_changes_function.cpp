@@ -232,12 +232,27 @@ void CheckChangesFuzzy(ClientContext &context, const TableChangesBindData &data)
 //! A page of either state that became live while its backup ran: its rows are in that backup's log tail
 //! only. The scan passes such a page over; a change listing cannot -- a row moved onto it would read as
 //! deleted -- so it is refused whatever fuzzy := says, and said so. A zero copy (2017) is told from a
-//! misplaced one by the tail of the state that holds it.
+//! misplaced one by the tail of the state that holds it: the state whose page store met the page (both
+//! states have the same page numbers; review of #607), named in the message.
 [[noreturn]] void ThrowChangesError(ClientContext &context, const TableChangesBindData &data, const FormatError &e) {
 	std::string what = e.what();
-	bool pending = dynamic_cast<const PendingPageError *>(&e) != nullptr;
+	const auto *pending_page = dynamic_cast<const PendingPageError *>(&e);
 	const auto *zero = dynamic_cast<const ZeroCopyError *>(&e);
-	for (const auto &catalog : {data.states.new_catalog, data.states.old_catalog}) {
+	const PageStore *store = pending_page ? pending_page->store : zero ? zero->store : nullptr;
+	const OpenedCatalog *state = nullptr;
+	const char *which = "";
+	if (store && data.states.new_catalog && data.states.new_catalog->pages->store.get() == store) {
+		state = data.states.new_catalog.get();
+		which = " (the newer state)";
+	} else if (store && data.states.old_catalog && data.states.old_catalog->pages->store.get() == store) {
+		state = data.states.old_catalog.get();
+		which = " (the older state)";
+	}
+	bool pending = pending_page != nullptr;
+	// The state that met the page; a store of neither (no reader has one today) asks both, as before.
+	const OpenedCatalog *newer = data.states.new_catalog.get();
+	const OpenedCatalog *older = data.states.old_catalog.get();
+	for (const OpenedCatalog *catalog : {state ? state : newer, state ? nullptr : older}) {
 		if (!zero || pending || !catalog) {
 			continue;
 		}
@@ -253,12 +268,12 @@ void CheckChangesFuzzy(ClientContext &context, const TableChangesBindData &data)
 	}
 	if (pending) {
 		throw InvalidInputException(
-			"%s: %s.%s: %s. A table's changes cannot be told past such a page (a row moved onto it would read as "
+			"%s: %s.%s%s: %s. A table's changes cannot be told past such a page (a row moved onto it would read as "
 			"deleted), so it is not passed over, whatever fuzzy := says; mssql_backup_scan reads the table's other "
 			"pages",
-			data.function, data.schema, data.table, what);
+			data.function, data.schema, data.table, which, what);
 	}
-	throw InvalidInputException("%s: %s", data.function, what);
+	throw InvalidInputException("%s: %s%s", data.function, what, which);
 }
 
 //! The newer state's columns the older state's table reads too: staged from it, cast to the newer's types.

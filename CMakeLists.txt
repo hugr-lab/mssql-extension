@@ -284,13 +284,18 @@ set(EXTENSION_SOURCES
     src/table_scan/filter_encoder.cpp
     src/table_scan/function_mapping.cpp
     src/table_scan/table_scan.cpp
+    src/table_scan/table_scan_pushdown.cpp
+    src/table_scan/table_scan_serialize.cpp
     src/table_scan/mssql_optimizer.cpp
     src/pushdown/mssql_expression_vocabulary.cpp
     src/pushdown/mssql_node_writer.cpp
+    src/pushdown/mssql_node_writer_aggregates.cpp
     src/pushdown/mssql_node_writer_from.cpp
     src/pushdown/mssql_node_writer_dml.cpp
     src/pushdown/mssql_merge_shape.cpp
+    src/pushdown/mssql_node_writer_order.cpp
     src/pushdown/mssql_node_writer_select.cpp
+    src/pushdown/mssql_node_writer_setops.cpp
     src/pushdown/mssql_node_writer_subqueries.cpp
     src/pushdown/mssql_node_writer_values.cpp
     src/pushdown/mssql_node_writer_windows.cpp

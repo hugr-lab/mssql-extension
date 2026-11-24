@@ -95,12 +95,6 @@ std::string FuzzyParameterOf(const named_argument_map_t &named, const char *func
 	return text;
 }
 
-TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
-						  const CatalogTable &table, FuzzyMode mode, const char *function) {
-	return CheckFuzzyUnits(context, tail, pages, BaseUnitsOf(table), table.schema_name + "." + table.name, mode,
-						   function);
-}
-
 TableFuzziness CheckFuzzyUnits(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
 							   const std::vector<uint64_t> &units, const std::string &name, FuzzyMode mode,
 							   const char *function, FuzzinessMemo *memo) {
@@ -166,10 +160,12 @@ void ThrowPendingOrFormat(ClientContext &context, const OpenedForStatement &open
 									  std::to_string(tail->formatted.size()) + " pages formatted in it)"
 								: why));
 	}
-	throw PendingPageError("backup: page " + e.page.ToString() +
-						   " became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
-						   "backup), which is not replayed yet (a zero copy in a backup of one data pass, the page "
-						   "formatted in its tail)");
+	throw PendingPageError(
+		"backup: page " + e.page.ToString() +
+			" became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
+			"backup), which is not replayed yet (a zero copy in a backup of one data pass, the page "
+			"formatted in its tail)",
+		e.store);
 }
 
 Value RecordDatetimeValue(const std::string &record_form) {

@@ -1,0 +1,88 @@
+# name: test/sql/backup/mssql_backup_clr.test
+# description: CLR columns of every storage form, read as their stored bytes (spec 093; a Format.Native user type at a fixed offset)
+# group: [mssql]
+#
+# test/data/backup/clr (test/backup/gen/clr.sql, SQL Server 2025): the user types of test/clr/TestTypes.cs --
+# dbo.TestPoint, Format.Native, 9 bytes, and dbo.TestLabel, MaxByteSize -1 -- beside hierarchyid and
+# geometry, in one table uncompressed, ROW- and PAGE-compressed and as a heap. sysrscols describes a
+# TestPoint as binary(9), stored at a fixed offset (8 and 17) where the rowset is uncompressed; the
+# reader refused such a table ("stored as xtype 173 ..., which its declaration does not say"), and read a
+# nullable one's trailing zero bytes as ANSI_PADDING OFF padding. The bytes below are the server's own
+# (CAST(... AS varbinary), printed by clr.sql). No SQL Server is needed.
+
+require mssql
+
+statement ok
+SET VARIABLE clr = 'test/data/backup/clr/clr_full.bak';
+
+query TTTT
+SELECT table_name, shape, compression, decodable FROM mssql_backup_tables(getvariable('clr'))
+WHERE schema_name = 'dbo' ORDER BY 1;
+----
+clr_heap	heap	none	true
+clr_page	clustered	page	true
+clr_plain	clustered	none	true
+clr_row	clustered	row	true
+
+query TTTT
+SELECT column_name, sql_type, duckdb_type, state FROM mssql_backup_columns(getvariable('clr'), 'dbo', 'clr_plain')
+ORDER BY column_id;
+----
+id	int	INTEGER	converted
+p	TestPoint	BLOB	stored_bytes
+pn	TestPoint	BLOB	stored_bytes
+l	TestLabel	BLOB	stored_bytes
+h	hierarchyid	BLOB	stored_bytes
+g	geometry	BLOB	stored_bytes
+c	char(3)	VARCHAR	converted
+
+# The uncompressed table: TestPoint at its fixed offset; row 3's ends in zero bytes, which are its value's.
+query ITTITTT
+SELECT id, hex(p), hex(pn), octet_length(l), hex(h), hex(g), c FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_plain')
+ORDER BY id;
+----
+1	008000000180000002	008000000380000004	4	58	00000000010C000000000000F03F0000000000000040	abc
+2	NULL	007FFFFFF9FFFFFFFF	9002	5B40	NULL	NULL
+3	008000000080000000	000000000080000000	NULL	NULL	00000000011400000000000000000000000000000000000000000000F03F000000000000F03F	z
+
+# Every other form reads the same rows, TestLabel's included: the same multiset both ways.
+query TII
+SELECT 'clr_heap', (SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_heap') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_plain'))),
+	(SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_plain') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_heap')))
+UNION ALL
+SELECT 'clr_page', (SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_page') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_plain'))),
+	(SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_plain') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_page')))
+UNION ALL
+SELECT 'clr_row', (SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_row') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_plain'))),
+	(SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_plain') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_row')))
+ORDER BY 1;
+----
+clr_heap	0	0
+clr_page	0	0
+clr_row	0	0
+
+query TI
+SELECT 'clr_heap', count(*) FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_heap')
+UNION ALL SELECT 'clr_page', count(*) FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_page')
+UNION ALL SELECT 'clr_row', count(*) FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_row') ORDER BY 1;
+----
+clr_heap	3
+clr_page	3
+clr_row	3
+
+# The attached catalog reads them too.
+statement ok
+ATTACH 'test/data/backup/clr/clr_full.bak' AS clr (TYPE mssql_backup);
+
+query IT
+SELECT id, hex(p) FROM clr.dbo.clr_row ORDER BY id;
+----
+1	008000000180000002
+2	NULL
+3	008000000080000000

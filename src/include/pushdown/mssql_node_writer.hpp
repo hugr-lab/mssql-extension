@@ -4,8 +4,10 @@
 // Spec 079: the node writer behind SQLWriter -- INTERNAL to src/pushdown.
 // Its methods are split by concern: mssql_node_writer_from.cpp (relations,
 // column resolution, FROM, derived tables, CTEs, keys and the gain),
-// _select.cpp (a SELECT node, its select list, aggregates, groups, ORDER BY,
-// set operations), _values.cpp (constants, arithmetic, casts, CASE,
+// _select.cpp (a SELECT node: its steps, its select list, LIMIT / OFFSET),
+// _aggregates.cpp (GROUP BY and the aggregates), _order.cpp (ORDER BY, and the
+// sort keys of an ordered aggregate or a window), _setops.cpp (set
+// operations), _values.cpp (constants, arithmetic, casts, CASE,
 // comparisons, IN / BETWEEN / LIKE, predicates), _subqueries.cpp (correlation
 // and subquery expressions); the free helpers below in mssql_node_writer.cpp.
 // The public SQLWriter, ColumnTypeName, the counters and PushesMoreThanScan
@@ -26,6 +28,7 @@
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
@@ -237,7 +240,66 @@ public:
 	bool WriteMerge(const MergeQueryNode &node);
 
 private:
+	//! Write's steps, in its order. The CTEs registered, the node's shape checked (GROUP BY ALL, SAMPLE,
+	//! no FROM), the select list's aliases noted.
+	bool BeginSelect(const SelectNode &node);
+	//! The relations collected and aliased, their columns' nullability, and the FROM written.
+	bool WriteRelations(const SelectNode &node, std::string &from_sql);
+	//! A node's DISTINCT / ORDER BY / LIMIT, as it wrote them.
+	struct SelectModifiers {
+		const OrderModifier *order = nullptr;
+		const LimitModifier *limit = nullptr;
+		int64_t limit_value = -1;  // -1: no LIMIT
+		int64_t offset_value = 0;
+		bool Limited() const {
+			return limit_value >= 0;
+		}
+	};
+	//! The modifiers the writer takes (one DISTINCT, one ORDER BY, one LIMIT, in that order); CollectModifiers
+	//! finds them, ReadModifiers also reads the LIMIT / OFFSET counts and notes them.
+	bool CollectModifiers(const SelectNode &node, SelectModifiers &modifiers);
+	bool ReadModifiers(const SelectNode &node, SelectModifiers &modifiers);
+	//! Whether the node aggregates: HAVING, or an aggregate in the select list, QUALIFY or ORDER BY.
+	void NoteAggregates(const SelectNode &node, const OrderModifier *order);
+	//! Under DISTINCT every result column is one the server compares as DuckDB does.
+	bool CheckDistinctOutputs();
+	bool WriteWhere(const SelectNode &node);
+	bool WriteGroupByHaving(const SelectNode &node, const std::string &group_sql);
+	//! ORDER BY, and OFFSET / FETCH when the node has an OFFSET (a LIMIT alone is the select's TOP).
+	bool WriteOrderAndPaging(const SelectModifiers &modifiers);
+	//! The CROSS links no key equality of WHERE bounds.
+	void CountUnboundedLinks(const SelectNode &node);
+	//! WrittenQuery::gain_uncertain, and its value_divergence and input sizes.
+	void NoteGain(bool limited);
+	void NoteResultFacts();
+
 	bool WriteSetOperation(const SetOperationNode &node);
+	//! WriteSetOperation's steps. The T-SQL keyword, spaces around it; a veto for BY NAME and for
+	//! EXCEPT ALL / INTERSECT ALL.
+	bool SetOperationKeyword(const SetOperationNode &node, const char *&keyword);
+	//! Every member written by a writer of its own (kept in `children`, its result in `child_outs`) and
+	//! joined by the keyword.
+	bool WriteSetOperationMembers(const SetOperationNode &node, const char *keyword,
+								  std::vector<WrittenQuery> &child_outs, std::vector<unique_ptr<NodeWriter>> &children,
+								  std::string &sql);
+	//! What the members say of one result column: every member a plain column of one server shape, any of
+	//! them nullable, any of them a value that diverges.
+	struct SetOperationColumn {
+		bool plain = true;
+		bool nullable = false;
+		bool divergent = false;
+	};
+	//! One member's column `i` against the first member's: the vetoes, and `state` updated.
+	bool CheckSetOperationMember(const NodeWriter &child, const WrittenQuery &child_out, const NodeWriter &first,
+								 const WrittenQuery &first_out, idx_t i, bool compares, SetOperationColumn &state);
+	//! Its string and server-converted types: columns of one type and collation, or a veto.
+	bool CheckSetOperationServerTypes(const NodeWriter &child, const OutputColumn &output, const NodeWriter &first,
+									  const OutputColumn &reference);
+	//! The set operation's result column `i`, named and typed by the first member's.
+	void AddSetOperationOutput(const NodeWriter &first, const WrittenQuery &first_out, idx_t i,
+							   const SetOperationColumn &state);
+	//! The members' picks_rows, gain, divergence and input sizes, into this node's.
+	void MergeMemberFacts(const std::vector<WrittenQuery> &child_outs);
 	//! The column of `columns` (the first `count`) a SET (`role` "SET") or an
 	//! INSERT column list ("INSERT") names, by case-insensitive name, and not in
 	//! `taken`, which it joins. A veto otherwise: no such column, two of them
@@ -308,6 +370,16 @@ private:
 	bool WriteGroups(const SelectNode &node, std::string &sql);
 	bool GroupKeyColumn(const SelectNode &node, const ParsedExpression &key, idx_t &out);
 	bool WriteAggregate(const AggregateCall &call, AggregateKind kind, Operand &out);
+	//! WriteAggregate's parts. Where an aggregate may stand and which calls are ours; its FILTER's
+	//! condition (empty without one); then by kind: count of a constant (the rows), COUNT, MIN / MAX,
+	//! and SUM / AVG / STDEV / VAR.
+	bool CheckAggregateCall(const AggregateCall &call, AggregateKind kind);
+	bool WriteAggregateFilter(const AggregateCall &call, std::string &filter);
+	bool WriteCountOfConstant(const AggregateCall &call, AggregateKind kind, const ParsedExpression &constant,
+							  const std::string &filter, Operand &out);
+	bool WriteCount(const AggregateCall &call, const Operand &arg, Operand &out);
+	bool WriteMinMax(const AggregateCall &call, AggregateKind kind, const Operand &arg, Operand &out);
+	bool WriteNumericAggregate(const AggregateCall &call, AggregateKind kind, const Operand &arg, Operand &out);
 	bool WriteStringAgg(const AggregateCall &call, const Operand &arg, const std::string &filter, Operand &out);
 	//! A window function (spec 079 PR E2): mssql_node_writer_windows.cpp.
 	bool WriteWindow(const WindowExpression &window, Operand &out);
@@ -318,6 +390,22 @@ private:
 	bool WriteQualified(const SelectNode &node);
 	bool WriteQualifyColumn(const SelectNode &node);
 	bool WriteSelectList(const SelectNode &node);
+	//! One select-list item appended to `list`: a *, a column, an integer constant or a computed value.
+	bool WriteSelectItem(const ParsedExpression &item, std::string &list);
+	bool WriteStarItem(const StarExpression &star, std::string &list);
+	bool WriteConstantItem(const ParsedExpression &item, std::string &list);
+	bool WriteComputedItem(const ParsedExpression &item, const std::string &alias, std::string &list);
+	//! The relation `r.*` names (INVALID for a bare *); a veto for another relation or a SEMI / ANTI one.
+	bool StarRelation(const StarExpression &star, idx_t &only);
+	//! Whether a * (of relation `only`, or of every relation) leaves column `index` out.
+	bool StarLeavesOut(idx_t index, idx_t only) const;
+	//! Table column `index` as a result column, named `alias` (empty: its own name).
+	bool AddResultColumn(idx_t index, const std::string &alias, std::string &list);
+	//! Its read expression appended to `list`, and whether it is read as itself (`entry.plain_read`).
+	void WriteColumnRead(idx_t index, const std::string &output, const std::string &as, std::string &list,
+						 OutputColumn &entry);
+	//! A veto when a result column is already named `output`.
+	bool CheckNewResultName(const std::string &output);
 	bool WritePredicate(const ParsedExpression &expr, std::string &sql);
 	bool WritePredicateImpl(const ParsedExpression &expr, std::string &sql);
 	bool WriteComparison(const ComparisonExpression &cmp, std::string &sql);
@@ -374,12 +462,22 @@ private:
 	//! a USING column of the right side only once (on the left).
 	bool IsHiddenUsingColumn(idx_t index) const;
 	bool WriteOrder(const OrderModifier &order, bool limited, std::string &sql);
+	//! WriteOrder's steps for one key. What it names: a table column (`index`), or a value (`computed`,
+	//! `index` INVALID) -- a result column by name or position, a column of the FROM, an expression.
+	bool ResolveOrderKey(const ParsedExpression &key, idx_t &index, Operand &computed);
+	//! Whether the key is a result column the server can name in an ORDER BY under DISTINCT.
+	bool IsNamedResultColumn(idx_t index, const Operand &computed) const;
+	bool WriteOrderTerm(const OrderByNode &node, idx_t index, const Operand &computed, bool limited, bool is_last_key,
+						std::string &term);
+	//! A key's direction and NULL placement, the session's defaults filled in.
+	void OrderDirection(const OrderByNode &node, OrderType &type, OrderByNullType &null_order) const;
 	//! The ORDER BY of an ordered aggregate (`string_agg(x, ',' ORDER BY k)`)
 	//! or of a window: keys named from the FROM, never a result name or a
 	//! position. The server sorts these rows whatever the key, so a UTF-8
 	//! varchar goes by its bytes and NULL placement is emulated without the
 	//! LIMIT a statement's ORDER BY needs for either (spec 079 PR E2).
 	bool WriteSortKeys(const std::vector<OrderByNode> &orders, std::string &sql);
+	bool WriteSortKeyTerm(const OrderByNode &node, const Operand &key, bool is_last_key, std::string &term);
 	bool ConstantCount(const ParsedExpression &expr, int64_t &out, const char *what = "LIMIT / OFFSET");
 
 	const SQLWriterOptions &options_;

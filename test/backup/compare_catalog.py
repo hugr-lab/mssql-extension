@@ -26,6 +26,7 @@ difference, or when fewer than --min-fields fields were compared.
 import argparse
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -368,8 +369,15 @@ def compare_set(c, db, name, arg, texts):
         f"FROM mssql_backup_scan({arg}, {sql_string(r['schema_name'])}, {sql_string(r['table_name'])})"
         for r in readable))} if readable else {}
     for r in readable:
-        c.check(f"{name}: {r['schema_name']}.{r['table_name']}", "rows", served.get((r["schema_name"], r["table_name"])),
-                r["row_count"])
+        where = f"{name}: {r['schema_name']}.{r['table_name']}"
+        n = served.get((r["schema_name"], r["table_name"]))
+        if r["row_count"] is None:
+            # The count is a statistic: a negative one (an upgraded database until DBCC UPDATEUSAGE) or a
+            # sum past int64 lists it NULL. The table must still read whole; there is no count to compare.
+            c.check(where, "read", n is not None, True)
+            c.skip(f"{where} rows (row_count unknown: a negative partition count or a sum past int64)")
+            continue
+        c.check(where, "rows", n, r["row_count"])
     # main() requires <set>.modules.txt beside .tables.txt.
     ours = {(r["valclass"], r["objid"], r["subobjid"]) for r in db.query(
         "SELECT DISTINCT valclass::VARCHAR AS valclass, objid::VARCHAR AS objid, subobjid::VARCHAR AS subobjid "
@@ -422,6 +430,14 @@ def main():
                     refused = ("became live while the backup ran" in out and "(reading sysobjvalues)" not in out
                                and "(reading sysseobjvalues)" not in out)
                     c.check(f"{name}: {function} (no golden)", "lists or refuses by name", ok or refused, True)
+                # How often a table that is not the user's reads dirty or stale under a workload (review of
+                # #607: mssql_backup_catalog under fuzzy := 'error' refuses those): said, not checked.
+                ok, out = db.try_query(
+                    "SELECT type, coalesce(fuzzy_status, 'unknown') AS status, count(*)::VARCHAR AS n "
+                    f"FROM mssql_backup_tables({arg}) WHERE type <> 'U' GROUP BY ALL ORDER BY ALL")
+                if ok:
+                    print(f"compare_catalog: {name}: fuzzy status of the tables not the user's: " +
+                          ", ".join(f"{r['type']} {r['status']} {r['n']}" for r in json.loads(out or "[]")))
             continue
         for kind in ("columns", "views", "modules", "partitioning", "boundaries", "partitions"):
             if f"{name}.{kind}.txt" not in texts:

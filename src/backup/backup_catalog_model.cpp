@@ -251,10 +251,12 @@ bool CheckDeclaredType(const PhysicalColumn &physical, const CatalogColumn &c, s
 	const bool scaled =
 		physical.xtype == XTYPE_TIME || physical.xtype == XTYPE_DATETIME2 || physical.xtype == XTYPE_DATETIMEOFFSET;
 	// A CLR type's column can be described as varbinary in sysrscols (E22: hierarchyid, geometry of a
-	// ROW-compressed rowset, and of an uncompressed one SELECT INTO made); its bytes are the type's as
-	// stored, read as such (ReadingOf).
-	const bool clr_as_varbinary = c.system_type_id == XTYPE_CLR && physical.xtype == XTYPE_VARBINARY;
-	if ((physical.xtype != c.system_type_id && !clr_as_varbinary) || (decimal && physical.precision != c.precision) ||
+	// ROW-compressed rowset, and of an uncompressed one SELECT INTO made), and a user type of Format.Native
+	// as binary of its size, stored at a fixed offset (measured on 2022 and 2025: a 9-byte type at offsets 8 and 17;
+	// fixture test/data/backup/clr); its bytes are the type's as stored, read as such (ReadingOf).
+	const bool clr_as_binary =
+		c.system_type_id == XTYPE_CLR && (physical.xtype == XTYPE_VARBINARY || physical.xtype == XTYPE_BINARY);
+	if ((physical.xtype != c.system_type_id && !clr_as_binary) || (decimal && physical.precision != c.precision) ||
 		((decimal || scaled) && physical.scale != c.scale)) {
 		why = "column " + c.name + " is stored as xtype " + std::to_string(physical.xtype) + " (precision " +
 			  std::to_string(physical.precision) + ", scale " + std::to_string(physical.scale) +
@@ -326,8 +328,10 @@ bool CheckLiveColumn(const std::map<int32_t, const CatalogColumn *> &by_id, cons
 	// A nullable char / binary under ANSI_PADDING OFF is read as the server returns it, its trailing
 	// spaces / zero bytes left out (E22, measured: DATALENGTH 1 for 0x0100 in a binary(8)). An
 	// uncompressed rowset stores it at a fixed offset, padded, and a CD one trimmed: only the column
-	// says which. nchar and NOT NULL columns are padded whatever the setting (is_ansi_padded).
-	if ((physical.xtype == XTYPE_CHAR || physical.xtype == XTYPE_BINARY) && c.is_nullable && !c.is_ansi_padded) {
+	// says which. nchar and NOT NULL columns are padded whatever the setting (is_ansi_padded). By the
+	// declared type: a CLR column sysrscols describes as binary (a Format.Native user type) has no
+	// ANSI_PADDING status and its trailing zero bytes are its value's (fixture test/data/backup/clr).
+	if ((c.system_type_id == XTYPE_CHAR || c.system_type_id == XTYPE_BINARY) && c.is_nullable && !c.is_ansi_padded) {
 		physical.unpadded = true;
 	}
 	return CheckStorageForm(physical, c, cd, t.name, why);

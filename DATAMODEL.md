@@ -1578,8 +1578,10 @@ flowchart BT
   `PageStore`: stale when a finished transaction's newest change is newer than its page's copy (a page
   not live in the backup: only after CheckpointLSN), dirty when an open one's oldest is not (the copy
   holds what RESTORE undoes). The listings give NULL when the tail cannot be read (`TailOrWarn`); the
-  scan acts by `fuzzy :=` (`CheckFuzzy`). `mssql_backup_transaction_records` walks the tail again
-  through a cursor, a row image laid on a page of its own and staged by `RecordStager` into the
+  scan, the change listing and `mssql_backup_catalog` act by `fuzzy :=` (`CheckStatementFuzzy`: a user
+  table by its base units, a base table by its own; the change listing each state against its own
+  tail). `mssql_backup_transaction_records` walks the tail again through a cursor -- the summary read
+  only when `transaction_status` is selected --, a row image laid on a page of its own and staged by `RecordStager` into the
   table's columns, built into a VARIANT.
 
 - **A differential over its full** (spec 085 PR 4c, `diff :=`): its own `OpenedBackup`, whose base is

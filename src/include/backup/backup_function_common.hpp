@@ -44,14 +44,11 @@ FuzzyMode FuzzyModeOf(ClientContext &context, const std::string &given, const ch
 //! The `fuzzy :=` keyword parameter (VARCHAR), on a function's signature; its value as given, "" when absent.
 void AddFuzzyParameter(TableFunction &function);
 std::string FuzzyParameterOf(const named_argument_map_t &named, const char *function);
-//! `table`'s status in the backup whose log tail is `tail` and pages `pages`, acted on as `mode` says: a
-//! table that is not consistent gets one WARNING in duckdb_logs (warn) or is refused by name (error);
-//! `function` names the caller. Returns the status.
-TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
-						  const CatalogTable &table, FuzzyMode mode, const char *function);
-//! The same over allocation units (a system base table's, which the model does not describe), named `name`
-//! ("dbo.t") in what it says; `memo`, when given, keeps the units' answers (the backup's FuzzinessMemo,
-//! whose tail and pages these are).
+//! The status, in the backup whose log tail is `tail` and pages `pages`, of the table whose rows are in
+//! `units` (a user table's BaseUnitsOf; a system base table's, which the model does not describe), acted
+//! on as `mode` says: one that is not consistent gets one WARNING in duckdb_logs (warn) or is refused by
+//! name (error). `name` ("dbo.t") is what it is called there, `function` the caller; `memo`, when given,
+//! keeps the units' answers (the backup's FuzzinessMemo, whose tail and pages these are). Returns the status.
 TableFuzziness CheckFuzzyUnits(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
 							   const std::vector<uint64_t> &units, const std::string &name, FuzzyMode mode,
 							   const char *function, FuzzinessMemo *memo = nullptr);
