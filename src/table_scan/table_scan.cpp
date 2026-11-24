@@ -177,61 +177,60 @@ static void RefuseStaleTable(ClientContext &context, const MSSQLCatalogScanBindD
 												   error.RawMessage(), name, what, then));
 }
 
-static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
-	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: START");
+// Virtual/special column identifiers start at 2^63
+static constexpr column_t VIRTUAL_COL_START = UINT64_C(9223372036854775808);
 
-	// Use the existing MSSQLCatalogScanBindData for backward compatibility
-	auto &bind_data = input.bind_data->Cast<MSSQLCatalogScanBindData>();
-	auto result = make_uniq<MSSQLScanGlobalState>();
-	result->context_name = bind_data.context_name;
+//! How a column is read: the settings and the catalog's answers BuildReadExpression takes.
+struct ScanReadOptions {
+	bool convert_varchar_max;
+	bool client_transcode;
+	bool utf8_on_wire;
+};
 
-	// Issue #451: the statement writes to this catalog and joins its own DuckDB
-	// transaction there. Join before taking any connection -- this scan may be
-	// initialised before the sink is (a join's build side, a MERGE's source),
-	// and a scan that took a pool connection while the sink joined would read
-	// on the wrong one. Whichever comes first pins; the rest find it pinned.
-	if (bind_data.joins_statement) {
-		ConnectionProvider::JoinStatementTransaction(context, bind_data.context_name);
-	}
-
-	// Build column list based on projection pushdown (column_ids)
-	// column_ids contains the indices of columns needed from the table
-	// Note: column_ids may contain special identifiers like COLUMN_IDENTIFIER_ROW_ID or
-	// COLUMN_IDENTIFIER_EMPTY for operations like COUNT(*). These are virtual column IDs
-	// that start at 2^63, so any value >= that is a special identifier to skip.
-	string column_list;
-	// Spec 080 D3, rung 3: a hidden key column reads its physical column, so
-	// from here on it is an ordinary (possibly repeated) projected column.
+//! What InitGlobal works out of the projection before anything is sent: the SELECT list and, for a
+//! rowid, where the key columns are in the statement's result and in the output chunk.
+struct ScanProjection {
+	//! The projection (column_ids), a hidden key column resolved to its physical column (spec 080 D3,
+	//! rung 3): from there on an ordinary (possibly repeated) projected column.
 	vector<column_t> column_ids;
+	//! Those of them that are table columns: special identifiers (COLUMN_IDENTIFIER_ROW_ID,
+	//! COLUMN_IDENTIFIER_EMPTY for COUNT(*), ...) start at 2^63 and are skipped.
+	vector<column_t> valid_column_ids;
+	bool rowid_requested = false;
+	idx_t rowid_output_idx = 0;
+	string column_list;
+	//! The columns of the SELECT list, in its order: what the stream's COLMETADATA is
+	//! checked against (spec 092 D1).
+	vector<const MSSQLColumnInfo *> read_columns;
+	vector<string> sql_column_names;  // Column names in order of SQL SELECT
+	vector<idx_t> pk_result_indices;  // Indices of PK columns in OUTPUT CHUNK (not SQL result)
+	vector<idx_t> pk_sql_indices;	  // Indices of PK columns in SQL result
+	bool pk_columns_added = false;	  // True if PK columns were added (not in user projection)
+};
+
+//! The projection's column ids and whether it asks for the rowid (spec 001-pk-rowid-semantics).
+static void ResolveProjection(const TableFunctionInitInput &input, const MSSQLCatalogScanBindData &bind_data,
+							  ScanProjection &projection) {
+	auto &column_ids = projection.column_ids;
 	column_ids.reserve(input.column_ids.size());
 	for (const auto column_id : input.column_ids) {
 		column_ids.push_back(ResolveKeylessKeyColumn(column_id));
 	}
-
-	// Virtual/special column identifiers start at 2^63
-	constexpr column_t VIRTUAL_COL_START = UINT64_C(9223372036854775808);
-
 	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: projection has %zu columns (table has %zu)", column_ids.size(),
 						 bind_data.all_column_names.size());
-
-	//===----------------------------------------------------------------------===//
-	// RowId Detection (Spec 001-pk-rowid-semantics)
-	//===----------------------------------------------------------------------===//
-	bool rowid_requested = false;
-	idx_t rowid_output_idx = 0;
 
 	// Check for COLUMN_IDENTIFIER_ROW_ID in column_ids
 	for (idx_t i = 0; i < column_ids.size(); i++) {
 		if (column_ids[i] == COLUMN_IDENTIFIER_ROW_ID) {
-			rowid_requested = true;
-			rowid_output_idx = i;
+			projection.rowid_requested = true;
+			projection.rowid_output_idx = i;
 			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: rowid requested at output index %llu", (unsigned long long)i);
 			break;
 		}
 	}
 
 	// If rowid is requested, validate PK availability from bind_data
-	if (rowid_requested) {
+	if (projection.rowid_requested) {
 		if (!bind_data.rowid_requested) {
 			// This shouldn't happen - GetScanFunction should have set this
 			throw BinderException("MSSQL: rowid requested but PK info not available in bind data");
@@ -242,183 +241,204 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: PK has %zu columns, composite=%s",
 							 bind_data.pk_column_names.size(), bind_data.pk_is_composite ? "true" : "false");
 	}
+}
 
+static ScanReadOptions LoadReadOptions(ClientContext &context, const MSSQLCatalogScanBindData &bind_data) {
+	ScanReadOptions options;
 	// Load VARCHAR(MAX) conversion setting (Spec 026)
-	bool convert_varchar_max = LoadConvertVarcharMax(context);
-	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: convert_varchar_max=%s", convert_varchar_max ? "true" : "false");
+	options.convert_varchar_max = LoadConvertVarcharMax(context);
+	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: convert_varchar_max=%s",
+						 options.convert_varchar_max ? "true" : "false");
 	// Issue #405: a UTF-8 char(n) is read as itself only when the logins were
 	// granted UTF8SUPPORT; otherwise -- or before any login answered -- as
 	// NCHAR(n), so its padding never reaches DuckDB.
 	auto &scan_catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name)).Cast<MSSQLCatalog>();
-	const bool utf8_on_wire = scan_catalog.UTF8SupportObserved() == MSSQLCatalog::Utf8Support::Granted;
-	const bool client_transcode = scan_catalog.ClientTranscode();
-	// The columns of the SELECT list, in its order: what the stream's COLMETADATA is
-	// checked against (spec 092 D1).
-	vector<const MSSQLColumnInfo *> read_columns;
+	options.utf8_on_wire = scan_catalog.UTF8SupportObserved() == MSSQLCatalog::Utf8Support::Granted;
+	options.client_transcode = scan_catalog.ClientTranscode();
+	return options;
+}
 
+//! One column appended to the SELECT list as its read expression: bare, or the server's cast (spec 026,
+//! spec 092).
+static void AppendReadColumn(const MSSQLColumnInfo &col_info, const string &col_name, const ScanReadOptions &options,
+							 ScanProjection &projection) {
+	if (!projection.column_list.empty()) {
+		projection.column_list += ", ";
+	}
+	projection.column_list += BuildColumnExpression(col_info, col_name, options.convert_varchar_max,
+													options.client_transcode, options.utf8_on_wire);
+	projection.read_columns.push_back(&col_info);
+}
+
+//! The first position of `name` in `names`; 0 when it is not there, which the callers' names always are.
+static idx_t IndexOfName(const vector<string> &names, const string &name) {
+	for (idx_t i = 0; i < names.size(); i++) {
+		if (names[i] == name) {
+			return i;
+		}
+	}
+	return 0;
+}
+
+//! The output chunk's position of table column `name`, UINT64_MAX when the projection has not got it.
+static idx_t OutputIndexOfColumn(const vector<column_t> &column_ids, const MSSQLCatalogScanBindData &bind_data,
+								 const string &name) {
+	// column_ids maps output positions to table column indices
+	for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
+		if (column_ids[out_col] < VIRTUAL_COL_START && bind_data.all_column_names[column_ids[out_col]] == name) {
+			return out_col;
+		}
+	}
+	return UINT64_MAX;	// Sentinel for "not in output"
+}
+
+//! The SELECT list of a scan that reads the rowid: the projected columns, then the key columns the
+//! projection lacks; and where each key column is, in the statement's result and in the output chunk.
+static void BuildRowIdSelectList(const MSSQLCatalogScanBindData &bind_data, const ScanReadOptions &options,
+								 ScanProjection &projection) {
+	// Build a set of already-projected column names for deduplication
+	std::unordered_set<string> projected_columns;
+	for (const auto &col_idx : projection.valid_column_ids) {
+		projected_columns.insert(bind_data.all_column_names[col_idx]);
+	}
+
+	// Start with valid projected columns
+	for (const auto &col_idx : projection.valid_column_ids) {
+		const string &col_name = bind_data.all_column_names[col_idx];
+		AppendReadColumn(bind_data.mssql_columns[col_idx], col_name, options, projection);
+		projection.sql_column_names.push_back(col_name);
+	}
+
+	// Add PK columns if not already projected
+	for (idx_t pk_idx = 0; pk_idx < bind_data.pk_column_names.size(); pk_idx++) {
+		const string &pk_col = bind_data.pk_column_names[pk_idx];
+		if (projected_columns.find(pk_col) == projected_columns.end()) {
+			// Add to SELECT - these are "extra" columns for rowid construction
+			const auto &col_info = bind_data.mssql_columns[IndexOfName(bind_data.all_column_names, pk_col)];
+			AppendReadColumn(col_info, pk_col, options, projection);
+			projection.sql_column_names.push_back(pk_col);
+			projection.pk_columns_added = true;
+			MSSQL_SCAN_DEBUG_LOG(2, "  added PK column for rowid: %s at SQL index %zu", pk_col.c_str(),
+								 projection.sql_column_names.size() - 1);
+		}
+
+		// Record the SQL result index of this PK column
+		const idx_t sql_result_idx = IndexOfName(projection.sql_column_names, pk_col);
+		projection.pk_sql_indices.push_back(sql_result_idx);
+
+		// Find the output chunk index for this PK column (if it's in user projection)
+		const idx_t output_idx = OutputIndexOfColumn(projection.column_ids, bind_data, pk_col);
+		projection.pk_result_indices.push_back(output_idx);
+		MSSQL_SCAN_DEBUG_LOG(2, "  PK column %s: sql_idx=%llu, output_idx=%s", pk_col.c_str(),
+							 (unsigned long long)sql_result_idx,
+							 output_idx == UINT64_MAX ? "N/A (extra)" : std::to_string(output_idx).c_str());
+	}
+}
+
+//! The SELECT list (projection pushdown), with the key columns a rowid needs.
+static void BuildSelectList(const MSSQLCatalogScanBindData &bind_data, const ScanReadOptions &options,
+							ScanProjection &projection) {
 	// Filter out special column identifiers and collect valid column indices
-	vector<column_t> valid_column_ids;
-	for (const auto &col_idx : column_ids) {
+	for (const auto &col_idx : projection.column_ids) {
 		if (col_idx < VIRTUAL_COL_START && col_idx < bind_data.all_column_names.size()) {
-			valid_column_ids.push_back(col_idx);
+			projection.valid_column_ids.push_back(col_idx);
 		} else {
 			MSSQL_SCAN_DEBUG_LOG(2, "  skipping special/invalid column_id=%llu", (unsigned long long)col_idx);
 		}
 	}
 
-	//===----------------------------------------------------------------------===//
-	// Build Column List (including PK columns for rowid if needed)
-	//===----------------------------------------------------------------------===//
-
-	// Track which columns are in the SQL result and their indices
-	vector<string> sql_column_names;  // Column names in order of SQL SELECT
-	vector<idx_t> pk_result_indices;  // Indices of PK columns in OUTPUT CHUNK (not SQL result)
-	vector<idx_t> pk_sql_indices;	  // Indices of PK columns in SQL result
-	bool pk_columns_added = false;	  // True if PK columns were added (not in user projection)
-
-	if (rowid_requested) {
-		// Build a set of already-projected column names for deduplication
-		std::unordered_set<string> projected_columns;
-		for (const auto &col_idx : valid_column_ids) {
-			projected_columns.insert(bind_data.all_column_names[col_idx]);
-		}
-
-		// Start with valid projected columns
-		for (const auto &col_idx : valid_column_ids) {
-			const string &col_name = bind_data.all_column_names[col_idx];
-			if (!column_list.empty()) {
-				column_list += ", ";
-			}
-			// The read expression: bare, or the server's cast (spec 026, spec 092).
-			const auto &col_info = bind_data.mssql_columns[col_idx];
-			column_list +=
-				BuildColumnExpression(col_info, col_name, convert_varchar_max, client_transcode, utf8_on_wire);
-			read_columns.push_back(&col_info);
-			sql_column_names.push_back(col_name);
-		}
-
-		// Add PK columns if not already projected
-		for (idx_t pk_idx = 0; pk_idx < bind_data.pk_column_names.size(); pk_idx++) {
-			const string &pk_col = bind_data.pk_column_names[pk_idx];
-
-			// Check if this PK column is already in the projection
-			bool already_projected = projected_columns.find(pk_col) != projected_columns.end();
-
-			if (!already_projected) {
-				// Add to SELECT - these are "extra" columns for rowid construction
-				if (!column_list.empty()) {
-					column_list += ", ";
-				}
-				// Find column index for VARCHAR→NVARCHAR conversion (Spec 026)
-				idx_t pk_col_idx = 0;
-				for (idx_t i = 0; i < bind_data.all_column_names.size(); i++) {
-					if (bind_data.all_column_names[i] == pk_col) {
-						pk_col_idx = i;
-						break;
-					}
-				}
-				const auto &col_info = bind_data.mssql_columns[pk_col_idx];
-				column_list +=
-					BuildColumnExpression(col_info, pk_col, convert_varchar_max, client_transcode, utf8_on_wire);
-				read_columns.push_back(&col_info);
-				sql_column_names.push_back(pk_col);
-				pk_columns_added = true;
-				MSSQL_SCAN_DEBUG_LOG(2, "  added PK column for rowid: %s at SQL index %zu", pk_col.c_str(),
-									 sql_column_names.size() - 1);
-			}
-
-			// Record the SQL result index of this PK column
-			idx_t sql_result_idx = 0;
-			for (idx_t j = 0; j < sql_column_names.size(); j++) {
-				if (sql_column_names[j] == pk_col) {
-					sql_result_idx = j;
-					break;
-				}
-			}
-			pk_sql_indices.push_back(sql_result_idx);
-
-			// Find the output chunk index for this PK column (if it's in user projection)
-			// column_ids maps output positions to table column indices
-			idx_t output_idx = UINT64_MAX;	// Sentinel for "not in output"
-			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
-				if (column_ids[out_col] < VIRTUAL_COL_START &&
-					bind_data.all_column_names[column_ids[out_col]] == pk_col) {
-					output_idx = out_col;
-					break;
-				}
-			}
-			pk_result_indices.push_back(output_idx);
-			MSSQL_SCAN_DEBUG_LOG(2, "  PK column %s: sql_idx=%llu, output_idx=%s", pk_col.c_str(),
-								 (unsigned long long)sql_result_idx,
-								 output_idx == UINT64_MAX ? "N/A (extra)" : std::to_string(output_idx).c_str());
-		}
-	} else if (valid_column_ids.empty()) {
+	if (projection.rowid_requested) {
+		BuildRowIdSelectList(bind_data, options, projection);
+	} else if (projection.valid_column_ids.empty()) {
 		// No valid columns projected (e.g., COUNT(*))
 		// Select only the first column to minimize data transfer while still returning rows
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: no valid columns, selecting first column only for row counting");
 		if (!bind_data.all_column_names.empty()) {
-			column_list = mssql::QuoteIdentifier(bind_data.all_column_names[0]);
+			projection.column_list = mssql::QuoteIdentifier(bind_data.all_column_names[0]);
 		} else {
 			// Fallback to constant if table has no columns (shouldn't happen)
-			column_list = "1";
+			projection.column_list = "1";
 		}
 	} else {
 		// Build SELECT with only valid projected columns (no rowid)
-		for (idx_t i = 0; i < valid_column_ids.size(); i++) {
-			if (i > 0) {
-				column_list += ", ";
-			}
-			column_t col_idx = valid_column_ids[i];
-			// The read expression: bare, or the server's cast (spec 026, spec 092).
-			const auto &col_info = bind_data.mssql_columns[col_idx];
-			column_list += BuildColumnExpression(col_info, bind_data.all_column_names[col_idx], convert_varchar_max,
-												 client_transcode, utf8_on_wire);
-			read_columns.push_back(&col_info);
-			MSSQL_SCAN_DEBUG_LOG(2, "  column[%llu] = %s", (unsigned long long)i,
-								 bind_data.all_column_names[col_idx].c_str());
+		for (const auto col_idx : projection.valid_column_ids) {
+			AppendReadColumn(bind_data.mssql_columns[col_idx], bind_data.all_column_names[col_idx], options,
+							 projection);
 		}
 	}
+}
 
-	// Store rowid state in global state for Execute phase
-	result->rowid_requested = rowid_requested;
-	result->rowid_output_idx = rowid_output_idx;
-	result->pk_result_indices = pk_result_indices;
-	result->pk_is_composite = bind_data.pk_is_composite;
-	result->rowid_type = bind_data.rowid_type;
-	result->pk_column_types = bind_data.pk_column_types;
-	result->pk_columns_added = pk_columns_added;
-	result->pk_sql_indices = pk_sql_indices;
+//! The rowid's state, kept for Execute.
+static void StoreRowIdState(const MSSQLCatalogScanBindData &bind_data, const ScanProjection &projection,
+							MSSQLScanGlobalState &result) {
+	result.rowid_requested = projection.rowid_requested;
+	result.rowid_output_idx = projection.rowid_output_idx;
+	result.pk_result_indices = projection.pk_result_indices;
+	result.pk_is_composite = bind_data.pk_is_composite;
+	result.rowid_type = bind_data.rowid_type;
+	result.pk_column_types = bind_data.pk_column_types;
+	result.pk_columns_added = projection.pk_columns_added;
+	result.pk_sql_indices = projection.pk_sql_indices;
 
 	// Track special cases for rowid handling:
 	// 1. pk_direct_to_rowid: rowid-only with scalar PK - write PK directly to rowid position
 	// 2. composite_pk_direct_to_struct: rowid-only with composite PK - write to STRUCT children
 	// 3. pk_columns_added: rowid + other columns, but PK not in user projection - write extra PK columns
-	result->pk_direct_to_rowid = (rowid_requested && valid_column_ids.empty() && !bind_data.pk_is_composite);
-	result->composite_pk_direct_to_struct = (rowid_requested && valid_column_ids.empty() && bind_data.pk_is_composite);
+	const bool rowid_only = projection.rowid_requested && projection.valid_column_ids.empty();
+	result.pk_direct_to_rowid = rowid_only && !bind_data.pk_is_composite;
+	result.composite_pk_direct_to_struct = rowid_only && bind_data.pk_is_composite;
 	MSSQL_SCAN_DEBUG_LOG(
 		1, "TableScanInitGlobal: pk_direct_to_rowid=%s, composite_pk_direct_to_struct=%s, pk_columns_added=%s",
-		result->pk_direct_to_rowid ? "true" : "false", result->composite_pk_direct_to_struct ? "true" : "false",
-		result->pk_columns_added ? "true" : "false");
+		result.pk_direct_to_rowid ? "true" : "false", result.composite_pk_direct_to_struct ? "true" : "false",
+		result.pk_columns_added ? "true" : "false");
+}
 
-	// Generate the query: SELECT [col1], [col2], ... FROM [schema].[table]
-	string full_table_name =
-		mssql::QuoteIdentifier(bind_data.schema_name) + "." + mssql::QuoteIdentifier(bind_data.table_name);
-
-	// Build SELECT prefix (with optional TOP N from ORDER BY + LIMIT pushdown, Spec 039)
-	string select_prefix = "SELECT ";
-	if (bind_data.top_n > 0) {
-		select_prefix += "TOP " + std::to_string(bind_data.top_n) + " ";
-		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: TOP %lld pushdown", (long long)bind_data.top_n);
+//! A filter the encoder refused, armed to run over the output chunk. 2.0 does not re-check TableFilters
+//! behind a filter_pushdown scan, so every refused filter is executed client-side. The filter's expression
+//! references its column as BoundReference(0) -- the same convention the combiner used when it built the
+//! filter.
+static void ArmClientFilter(ClientContext &context, const MSSQLCatalogScanBindData &bind_data,
+							const vector<column_t> &column_ids, idx_t out_col, const TableFilter &filter,
+							MSSQLScanGlobalState &result) {
+	LogicalType col_type;
+	if (out_col < column_ids.size() && column_ids[out_col] == COLUMN_IDENTIFIER_ROW_ID) {
+		col_type = bind_data.rowid_type;
+	} else if (out_col < column_ids.size() && column_ids[out_col] < bind_data.all_types.size()) {
+		col_type = bind_data.all_types[column_ids[out_col]];
+	} else {
+		// Same failure class as the catch below, same answer: a filter
+		// we can neither push nor arm client-side must fail by name,
+		// not return a superset of rows (PR #267 review, finding 5).
+		throw NotImplementedException(
+			"MSSQL scan: cannot apply pushed-down filter at projected column %llu client-side",
+			(unsigned long long)out_col);
 	}
-	string query = select_prefix + column_list + " FROM " + full_table_name;
+	try {
+		BoundReferenceExpression col_ref(col_type, 0ULL);
+		mssql::ClientTableFilter cf;
+		cf.out_col = out_col;
+		cf.expr = filter.ToExpression(col_ref);
+		cf.executor = make_uniq<ExpressionExecutor>(context);
+		cf.executor->AddExpression(*cf.expr);
+		result.client_filters.push_back(std::move(cf));
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: client-side filter armed on output col %llu",
+							 (unsigned long long)out_col);
+	} catch (const std::exception &e) {
+		// A filter that cannot even build an expression cannot be
+		// applied anywhere — fail loudly instead of returning a
+		// superset of rows.
+		throw NotImplementedException("MSSQL scan: cannot apply pushed-down filter client-side: %s", e.what());
+	}
+}
 
-	// Build WHERE clause from filter pushdown
-	// Combine: simple filters (from FilterEncoder::Encode) + complex filters (from pushdown_complex_filter)
+//! The WHERE clause, empty for none: the simple filters (FilterEncoder::Encode over the TableFilterSet of
+//! filter_pushdown) and the complex ones (stored by pushdown_complex_filter), joined by AND. The filters the
+//! encoder refuses are armed client-side; `params` takes the parameters the simple filters add.
+static string BuildWhereClause(ClientContext &context, const TableFunctionInitInput &input,
+							   const MSSQLCatalogScanBindData &bind_data, const vector<column_t> &column_ids,
+							   mssql::SqlParamSet &params, MSSQLScanGlobalState &result) {
 	std::vector<std::string> where_conditions;
 	bool needs_duckdb_filter = false;
-	// Spec 076: the plan-time parameters first (the complex clause names them
-	// @p0..), then whatever the simple filters add.
-	mssql::SqlParamSet params = bind_data.complex_filter_params;
 	const bool parameterize = LoadScanParameterizeFilters(context);
 
 	// 1. Encode simple filters (TableFilterSet from filter_pushdown)
@@ -437,42 +457,8 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		}
 
 		needs_duckdb_filter = encode_result.needs_duckdb_filter;
-
-		// 2.0 does not re-check TableFilters behind a filter_pushdown scan, so
-		// every refused filter is executed client-side over the output chunk.
-		// The filter's expression references its column as BoundReference(0) —
-		// the same convention the combiner used when it built the filter.
 		for (auto &uf : encode_result.unhandled) {
-			const idx_t out_col = uf.first;
-			LogicalType col_type;
-			if (out_col < column_ids.size() && column_ids[out_col] == COLUMN_IDENTIFIER_ROW_ID) {
-				col_type = bind_data.rowid_type;
-			} else if (out_col < column_ids.size() && column_ids[out_col] < bind_data.all_types.size()) {
-				col_type = bind_data.all_types[column_ids[out_col]];
-			} else {
-				// Same failure class as the catch below, same answer: a filter
-				// we can neither push nor arm client-side must fail by name,
-				// not return a superset of rows (PR #267 review, finding 5).
-				throw NotImplementedException(
-					"MSSQL scan: cannot apply pushed-down filter at projected column %llu client-side",
-					(unsigned long long)out_col);
-			}
-			try {
-				BoundReferenceExpression col_ref(col_type, 0ULL);
-				mssql::ClientTableFilter cf;
-				cf.out_col = out_col;
-				cf.expr = uf.second->ToExpression(col_ref);
-				cf.executor = make_uniq<ExpressionExecutor>(context);
-				cf.executor->AddExpression(*cf.expr);
-				result->client_filters.push_back(std::move(cf));
-				MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: client-side filter armed on output col %llu",
-									 (unsigned long long)out_col);
-			} catch (const std::exception &e) {
-				// A filter that cannot even build an expression cannot be
-				// applied anywhere — fail loudly instead of returning a
-				// superset of rows.
-				throw NotImplementedException("MSSQL scan: cannot apply pushed-down filter client-side: %s", e.what());
-			}
+			ArmClientFilter(context, bind_data, column_ids, uf.first, *uf.second, result);
 		}
 	}
 
@@ -484,25 +470,310 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	}
 
 	// 3. Combine all conditions with AND
-	if (!where_conditions.empty()) {
-		std::string combined_where;
-		for (idx_t i = 0; i < where_conditions.size(); i++) {
-			if (i > 0) {
-				combined_where += " AND ";
-			}
-			combined_where += where_conditions[i];
+	std::string combined_where;
+	for (idx_t i = 0; i < where_conditions.size(); i++) {
+		if (i > 0) {
+			combined_where += " AND ";
 		}
-		query += " WHERE " + combined_where;
+		combined_where += where_conditions[i];
+	}
+	if (!combined_where.empty()) {
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: final WHERE clause: %s", combined_where.c_str());
 	}
-
 	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: needs_duckdb_filter=%s", needs_duckdb_filter ? "true" : "false");
+	return combined_where;
+}
+
+//! The statement: SELECT [TOP n] <list> FROM [schema].[table] [WHERE ...] [ORDER BY ...].
+static string BuildScanQuery(const MSSQLCatalogScanBindData &bind_data, const string &column_list,
+							 const string &where_clause) {
+	string full_table_name =
+		mssql::QuoteIdentifier(bind_data.schema_name) + "." + mssql::QuoteIdentifier(bind_data.table_name);
+
+	// Build SELECT prefix (with optional TOP N from ORDER BY + LIMIT pushdown, Spec 039)
+	string select_prefix = "SELECT ";
+	if (bind_data.top_n > 0) {
+		select_prefix += "TOP " + std::to_string(bind_data.top_n) + " ";
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: TOP %lld pushdown", (long long)bind_data.top_n);
+	}
+	string query = select_prefix + column_list + " FROM " + full_table_name;
+	if (!where_clause.empty()) {
+		query += " WHERE " + where_clause;
+	}
 
 	// Append ORDER BY clause from optimizer pushdown (Spec 039)
 	if (!bind_data.order_by_clause.empty()) {
 		query += " ORDER BY " + bind_data.order_by_clause;
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: ORDER BY pushdown: %s", bind_data.order_by_clause.c_str());
 	}
+	return query;
+}
+
+// Issue #559: a keyless table's hidden key columns (spec 080 D3, rung 3) refuse a value read as
+// NULL for not fitting, by name: keyed NULL-safely, the row would match another one. Here, in
+// the scan, because such a plan has every filter on the server (`PlanKeylessDml`), so every row
+// read is a row to write. A rowid's key is checked where the DML takes it instead (its columns
+// are NOT NULL: `RefuseNullKeyValue`), after DuckDB's own filters.
+static void RefuseOutOfRangeKeys(const TableFunctionInitInput &input, const MSSQLCatalogScanBindData &bind_data,
+								 const vector<const MSSQLColumnInfo *> &read_columns, MSSQLResultStream &stream) {
+	std::unordered_set<const MSSQLColumnInfo *> key_columns;
+	for (const auto column_id : input.column_ids) {
+		if (IsKeylessKeyColumn(column_id)) {
+			key_columns.insert(&bind_data.mssql_columns[ResolveKeylessKeyColumn(column_id)]);
+		}
+	}
+	if (key_columns.empty()) {
+		return;
+	}
+	std::vector<bool> refuse(read_columns.size(), false);
+	for (idx_t i = 0; i < read_columns.size(); i++) {
+		refuse[i] = key_columns.count(read_columns[i]) > 0;
+	}
+	stream.RefuseOutOfRangeIn(std::move(refuse), mssql::QuoteIdentifier(bind_data.schema_name) + "." +
+													 mssql::QuoteIdentifier(bind_data.table_name));
+}
+
+// A bare read assumed its collation's page. The stream decodes by the wire's,
+// so a disagreement reads correctly, but the catalog is stale: say so (spec 092
+// D1), or nobody learns why a column is labelled with the wrong collation.
+static void CheckWireCodePages(ClientContext &context, const vector<const MSSQLColumnInfo *> &read_columns,
+							   bool client_transcode, MSSQLResultStream &stream) {
+	const auto &wire_columns = stream.GetColumnMetadata();
+	for (idx_t i = 0; i < read_columns.size() && i < wire_columns.size(); i++) {
+		const auto *page = MSSQLColumnInfo::ClientTranscodedPage(read_columns[i]->sql_type_name,
+																 read_columns[i]->collation_name, client_transcode);
+		if (!page) {
+			continue;
+		}
+		const auto undecodable =
+			mssql::codec::code_page::UndecodableBareRead(wire_columns[i], read_columns[i]->collation_name);
+		if (!undecodable.empty()) {
+			throw InvalidInputException(undecodable);
+		}
+		const auto mismatch =
+			mssql::codec::code_page::NamedCodePageMismatch(wire_columns[i], *page, read_columns[i]->collation_name);
+		if (!mismatch.empty()) {
+			DUCKDB_LOG_WARNING(context, "%s", mismatch);
+		}
+	}
+}
+
+//! The output chunk's positions of the projected table columns, in the statement's order: the rowid's
+//! position is skipped (it is populated from the key columns), and so is any other virtual identifier.
+//! Example: SELECT id, rowid, name -> column_ids [0, ROWID, 1] -> output [id, rowid, name];
+//! SQL returns [id, name] -> mapping [0, 2] (SQL col 0 -> output 0, SQL col 1 -> output 2).
+static vector<idx_t> UserColumnOutputs(const vector<column_t> &column_ids) {
+	vector<idx_t> output_mapping;
+	for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
+		if (column_ids[out_col] == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
+		if (column_ids[out_col] < VIRTUAL_COL_START) {
+			MSSQL_SCAN_DEBUG_LOG(2, "  SQL col %llu -> output col %llu (user col)",
+								 (unsigned long long)output_mapping.size(), (unsigned long long)out_col);
+			output_mapping.push_back(out_col);
+		}
+	}
+	return output_mapping;
+}
+
+//! Which of the statement's columns the stream fills, and into which output columns, by the rowid's case.
+static void ConfigureStreamOutput(const MSSQLCatalogScanBindData &bind_data, const ScanProjection &projection,
+								  MSSQLScanGlobalState &result) {
+	auto &stream = *result.result_stream;
+	const auto &column_ids = projection.column_ids;
+	const idx_t user_columns = projection.valid_column_ids.size();
+	const idx_t rowid_output_idx = projection.rowid_output_idx;
+	if (result.pk_direct_to_rowid) {
+		// Special case: only rowid requested with scalar PK
+		// SQL returns 1 column (PK), we write it directly to rowid output position
+		stream.SetColumnsToFill(1);	 // Fill 1 column (the PK)
+		vector<idx_t> output_mapping;
+		output_mapping.push_back(rowid_output_idx);	 // SQL col 0 -> rowid position
+		stream.SetOutputColumnMapping(std::move(output_mapping));
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: pk_direct_to_rowid mode - SQL col 0 -> output %llu",
+							 (unsigned long long)rowid_output_idx);
+	} else if (result.composite_pk_direct_to_struct) {
+		// Special case: only rowid requested with composite PK
+		// SQL returns N columns (PK columns), we write them directly to STRUCT children
+		// The STRUCT is at rowid_output_idx in the output chunk
+		idx_t pk_count = bind_data.pk_column_names.size();
+		stream.SetColumnsToFill(pk_count);	// Fill all PK columns
+		// Use special marker (-1) to indicate STRUCT mode - data will be written in PopulateRowIdVector
+		// Actually, we need to skip ProcessRow entirely and handle this in PopulateRowIdVector
+		// Set columns_to_fill to 0 so ProcessRow doesn't write anything
+		stream.SetColumnsToFill(0);
+		// Store pk_result_indices as SQL column indices (0, 1, 2, ...)
+		result.pk_result_indices.clear();
+		for (idx_t i = 0; i < pk_count; i++) {
+			result.pk_result_indices.push_back(i);
+		}
+		// Mark pk_columns_added as false - Execute uses this to distinguish from mixed case
+		result.pk_columns_added = false;
+		MSSQL_SCAN_DEBUG_LOG(
+			1, "TableScanInitGlobal: composite_pk_direct_to_struct mode - %llu PK columns -> STRUCT at output %llu",
+			(unsigned long long)pk_count, (unsigned long long)rowid_output_idx);
+	} else if (projection.rowid_requested && projection.pk_columns_added && !bind_data.pk_is_composite) {
+		// Special case: rowid + other columns, scalar PK NOT in user projection
+		// SQL returns [user_cols..., pk_col]
+		// Write user columns to their positions, write PK column directly to rowid position
+		idx_t total_sql_cols = user_columns + 1;  // user cols + 1 PK col
+		stream.SetColumnsToFill(total_sql_cols);
+
+		// Build mapping: SQL column index -> output chunk index
+		vector<idx_t> output_mapping = UserColumnOutputs(column_ids);
+		// Map the extra PK column (last SQL column) to rowid position
+		MSSQL_SCAN_DEBUG_LOG(2, "  SQL col %llu -> output col %llu (PK to rowid)",
+							 (unsigned long long)output_mapping.size(), (unsigned long long)rowid_output_idx);
+		output_mapping.push_back(rowid_output_idx);
+
+		stream.SetOutputColumnMapping(std::move(output_mapping));
+		// Mark that PK was written directly to rowid
+		result.pk_direct_to_rowid = true;
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: pk_columns_added scalar mode - %llu cols with PK -> rowid",
+							 (unsigned long long)total_sql_cols);
+	} else if (projection.rowid_requested && projection.pk_columns_added && bind_data.pk_is_composite) {
+		// Special case: rowid + other columns, composite PK NOT in user projection
+		// SQL returns [user_cols..., pk_cols...]
+		// Write user columns normally, write PK columns to STRUCT children via target_vectors
+		// For now, use columns_to_fill for user cols only, handle PK in Execute
+		stream.SetColumnsToFill(user_columns);
+		stream.SetOutputColumnMapping(UserColumnOutputs(column_ids));
+		// Mark for special handling in Execute
+		result.composite_pk_direct_to_struct = true;
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: pk_columns_added composite mode - user cols + STRUCT handling");
+	} else if (projection.rowid_requested) {
+		// Rowid with other columns, PK IS in user projection
+		// The output chunk has positions for all columns including rowid
+		stream.SetColumnsToFill(user_columns);
+		stream.SetOutputColumnMapping(UserColumnOutputs(column_ids));
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: rowid with PK in projection - %llu user cols",
+							 (unsigned long long)user_columns);
+	} else {
+		// No rowid - simple case
+		stream.SetColumnsToFill(user_columns);
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: set columns_to_fill=%zu", static_cast<size_t>(user_columns));
+	}
+}
+
+//! The output shape, derived the same way DuckDB derives it for Execute:
+//! one slot per column_id, the rowid slot carrying the bind data's rowid
+//! type and any other virtual/empty identifier carrying a placeholder that
+//! is never written (projected_column_count bounds what FillChunk fills).
+static vector<LogicalType> OutputChunkTypes(const MSSQLCatalogScanBindData &bind_data,
+											const vector<column_t> &column_ids) {
+	vector<LogicalType> chunk_types;
+	chunk_types.reserve(column_ids.size());
+	for (idx_t i = 0; i < column_ids.size(); i++) {
+		if (column_ids[i] == COLUMN_IDENTIFIER_ROW_ID) {
+			chunk_types.push_back(bind_data.rowid_type);
+		} else if (column_ids[i] >= VIRTUAL_COL_START || column_ids[i] >= bind_data.all_types.size()) {
+			chunk_types.push_back(LogicalType::BIGINT);
+		} else {
+			chunk_types.push_back(bind_data.all_types[column_ids[i]]);
+		}
+	}
+	return chunk_types;
+}
+
+// Issue #239: drain now, so the connection is Idle before the next scan on this
+// catalog initializes.
+//
+// Only reachable when MSSQLOptimizer set the flag, which it does for a plan
+// holding more than one scan of this catalog (or a scan and a sink into it)
+// inside an explicit transaction — the case where all of them share the one
+// pinned connection — and, since issue #380, in autocommit on a catalog whose
+// pool holds a single connection, which they share by taking turns. Streaming
+// is untouched everywhere else.
+//
+// The drain deliberately reuses the normal execution path rather than a second
+// row reader: FillChunk applies the projection, the rowid construction and the
+// warnings exactly as a streaming scan would, so a materialized scan and a
+// streamed one cannot diverge in what they produce.
+static void MaterializeScan(ClientContext &context, const MSSQLCatalogScanBindData &bind_data,
+							const vector<column_t> &column_ids, MSSQLScanGlobalState &result) {
+	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: materializing (issue #239 — shared pinned connection)");
+	const vector<LogicalType> chunk_types = OutputChunkTypes(bind_data, column_ids);
+	// ClientContext, not Allocator::Get(context) (#318, found by @oluies). The
+	// Allocator overload builds an IN_MEMORY_ALLOCATOR collection — unaccounted
+	// against the buffer manager and unable to spill — so a large materialized
+	// scan grew in process memory until it OOMed, while the docs promised the
+	// opposite. The ClientContext overload defaults to BUFFER_MANAGER_ALLOCATOR.
+	// The chunk below deliberately keeps the plain Allocator: it is one DataChunk,
+	// not the accumulating collection.
+	result.materialized = make_uniq<ColumnDataCollection>(context, chunk_types);
+	DataChunk chunk;
+	chunk.Initialize(Allocator::Get(context), chunk_types);
+	// What Execute's first call does for its own output chunk.
+	BindRowIdTargetVectors(result, chunk);
+	idx_t total = 0;
+	try {
+		for (;;) {
+			chunk.Reset();
+			idx_t rows = result.result_stream->FillChunk(chunk);
+			if (rows == 0) {
+				break;
+			}
+			PopulateRowIdVector(result, chunk, rows);
+			// The filters the encoder did not push run here, as in Execute: the
+			// collection is served as it stands, and DuckDB does not re-check a
+			// filter it handed to the scan (issue #451 -- a materialized scan
+			// returned rows such a filter rejects, so an UPDATE in a transaction
+			// changed them).
+			if (!result.client_filters.empty()) {
+				rows = ApplyClientFilters(context, result, chunk, rows);
+				if (rows == 0) {
+					continue;
+				}
+			}
+			result.materialized->Append(chunk);
+			total += rows;
+		}
+	} catch (...) {
+		// The stream closed (ATTENTION, then the drain) while the materialize lock is still held:
+		// unwinding would release the lock first, and another scan on the pinned connection could
+		// start while it still answers (review of #560).
+		result.result_stream.reset();
+		throw;
+	}
+	result.result_stream->SurfaceWarnings(context);
+	// Closing the stream is what releases the connection back to Idle. Without
+	// it the drain would have read every row and still deadlocked the next scan.
+	result.result_stream.reset();
+	result.materialized->InitializeScan(result.materialized_scan);
+	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: materialized %llu row(s), connection released",
+						 (unsigned long long)total);
+}
+
+static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: START");
+
+	// Use the existing MSSQLCatalogScanBindData for backward compatibility
+	auto &bind_data = input.bind_data->Cast<MSSQLCatalogScanBindData>();
+	auto result = make_uniq<MSSQLScanGlobalState>();
+	result->context_name = bind_data.context_name;
+
+	// Issue #451: the statement writes to this catalog and joins its own DuckDB
+	// transaction there. Join before taking any connection -- this scan may be
+	// initialised before the sink is (a join's build side, a MERGE's source),
+	// and a scan that took a pool connection while the sink joined would read
+	// on the wrong one. Whichever comes first pins; the rest find it pinned.
+	if (bind_data.joins_statement) {
+		ConnectionProvider::JoinStatementTransaction(context, bind_data.context_name);
+	}
+
+	// The statement: its SELECT list from the projection, its WHERE from the filters.
+	ScanProjection projection;
+	ResolveProjection(input, bind_data, projection);
+	const ScanReadOptions options = LoadReadOptions(context, bind_data);
+	BuildSelectList(bind_data, options, projection);
+	StoreRowIdState(bind_data, projection, *result);
+
+	// Spec 076: the plan-time parameters first (the complex clause names them
+	// @p0..), then whatever the simple filters add.
+	mssql::SqlParamSet params = bind_data.complex_filter_params;
+	const string where_clause = BuildWhereClause(context, input, bind_data, projection.column_ids, params, *result);
+	string query = BuildScanQuery(bind_data, projection.column_list, where_clause);
 
 	// Spec 083: with parameters, the statement goes as an RPC call of
 	// sp_executesql -- one fixed text per shape, the values bound as typed
@@ -534,254 +805,22 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		throw;
 	}
 
-	// COLMETADATA is known now, so say what is wrong with the columns before any
-	// rows move. Waiting for the drain-end call loses this entirely on a query
-	// that stops early -- any LIMIT (issue #224).
-	if (result->result_stream) {
-		result->result_stream->MarkCatalogScan();
-		// Issue #559: a keyless table's hidden key columns (spec 080 D3, rung 3) refuse a value read as
-		// NULL for not fitting, by name: keyed NULL-safely, the row would match another one. Here, in
-		// the scan, because such a plan has every filter on the server (`PlanKeylessDml`), so every row
-		// read is a row to write. A rowid's key is checked where the DML takes it instead (its columns
-		// are NOT NULL: `RefuseNullKeyValue`), after DuckDB's own filters.
-		std::unordered_set<const MSSQLColumnInfo *> key_columns;
-		for (const auto column_id : input.column_ids) {
-			if (IsKeylessKeyColumn(column_id)) {
-				key_columns.insert(&bind_data.mssql_columns[ResolveKeylessKeyColumn(column_id)]);
-			}
-		}
-		if (!key_columns.empty()) {
-			std::vector<bool> refuse(read_columns.size(), false);
-			for (idx_t i = 0; i < read_columns.size(); i++) {
-				refuse[i] = key_columns.count(read_columns[i]) > 0;
-			}
-			result->result_stream->RefuseOutOfRangeIn(
-				std::move(refuse),
-				mssql::QuoteIdentifier(bind_data.schema_name) + "." + mssql::QuoteIdentifier(bind_data.table_name));
-		}
-		// A bare read assumed its collation's page. The stream decodes by the wire's,
-		// so a disagreement reads correctly, but the catalog is stale: say so (spec 092
-		// D1), or nobody learns why a column is labelled with the wrong collation.
-		const auto &wire_columns = result->result_stream->GetColumnMetadata();
-		for (idx_t i = 0; i < read_columns.size() && i < wire_columns.size(); i++) {
-			const auto *page = MSSQLColumnInfo::ClientTranscodedPage(read_columns[i]->sql_type_name,
-																	 read_columns[i]->collation_name, client_transcode);
-			if (!page) {
-				continue;
-			}
-			const auto undecodable =
-				mssql::codec::code_page::UndecodableBareRead(wire_columns[i], read_columns[i]->collation_name);
-			if (!undecodable.empty()) {
-				throw InvalidInputException(undecodable);
-			}
-			const auto mismatch =
-				mssql::codec::code_page::NamedCodePageMismatch(wire_columns[i], *page, read_columns[i]->collation_name);
-			if (!mismatch.empty()) {
-				DUCKDB_LOG_WARNING(context, "%s", mismatch);
-			}
-		}
-		result->result_stream->SurfaceWarnings(context);
-	}
-
 	// Set the number of columns to actually fill in the output chunk
 	// When valid_column_ids is empty (e.g., COUNT(*)), we don't fill any columns
 	// EXCEPT when pk_direct_to_rowid is true - then we fill the PK directly to rowid position
-	result->projected_column_count = valid_column_ids.size();
+	result->projected_column_count = projection.valid_column_ids.size();
 	if (result->result_stream) {
-		if (result->pk_direct_to_rowid) {
-			// Special case: only rowid requested with scalar PK
-			// SQL returns 1 column (PK), we write it directly to rowid output position
-			result->result_stream->SetColumnsToFill(1);	 // Fill 1 column (the PK)
-			vector<idx_t> output_mapping;
-			output_mapping.push_back(rowid_output_idx);	 // SQL col 0 -> rowid position
-			result->result_stream->SetOutputColumnMapping(std::move(output_mapping));
-			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: pk_direct_to_rowid mode - SQL col 0 -> output %llu",
-								 (unsigned long long)rowid_output_idx);
-		} else if (result->composite_pk_direct_to_struct) {
-			// Special case: only rowid requested with composite PK
-			// SQL returns N columns (PK columns), we write them directly to STRUCT children
-			// The STRUCT is at rowid_output_idx in the output chunk
-			idx_t pk_count = bind_data.pk_column_names.size();
-			result->result_stream->SetColumnsToFill(pk_count);	// Fill all PK columns
-			// Use special marker (-1) to indicate STRUCT mode - data will be written in PopulateRowIdVector
-			// Actually, we need to skip ProcessRow entirely and handle this in PopulateRowIdVector
-			// Set columns_to_fill to 0 so ProcessRow doesn't write anything
-			result->result_stream->SetColumnsToFill(0);
-			// Store pk_result_indices as SQL column indices (0, 1, 2, ...)
-			result->pk_result_indices.clear();
-			for (idx_t i = 0; i < pk_count; i++) {
-				result->pk_result_indices.push_back(i);
-			}
-			// Mark pk_columns_added as false - Execute uses this to distinguish from mixed case
-			result->pk_columns_added = false;
-			MSSQL_SCAN_DEBUG_LOG(
-				1, "TableScanInitGlobal: composite_pk_direct_to_struct mode - %llu PK columns -> STRUCT at output %llu",
-				(unsigned long long)pk_count, (unsigned long long)rowid_output_idx);
-		} else if (rowid_requested && pk_columns_added && !bind_data.pk_is_composite) {
-			// Special case: rowid + other columns, scalar PK NOT in user projection
-			// SQL returns [user_cols..., pk_col]
-			// Write user columns to their positions, write PK column directly to rowid position
-			idx_t total_sql_cols = valid_column_ids.size() + 1;	 // user cols + 1 PK col
-			result->result_stream->SetColumnsToFill(total_sql_cols);
-
-			// Build mapping: SQL column index -> output chunk index
-			vector<idx_t> output_mapping;
-			idx_t sql_col = 0;
-			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
-				if (column_ids[out_col] == COLUMN_IDENTIFIER_ROW_ID) {
-					continue;  // Skip rowid - PK column will be written there
-				}
-				if (column_ids[out_col] < VIRTUAL_COL_START) {
-					output_mapping.push_back(out_col);
-					MSSQL_SCAN_DEBUG_LOG(2, "  SQL col %llu -> output col %llu (user col)", (unsigned long long)sql_col,
-										 (unsigned long long)out_col);
-					sql_col++;
-				}
-			}
-			// Map the extra PK column (last SQL column) to rowid position
-			output_mapping.push_back(rowid_output_idx);
-			MSSQL_SCAN_DEBUG_LOG(2, "  SQL col %llu -> output col %llu (PK to rowid)", (unsigned long long)sql_col,
-								 (unsigned long long)rowid_output_idx);
-
-			result->result_stream->SetOutputColumnMapping(std::move(output_mapping));
-			// Mark that PK was written directly to rowid
-			result->pk_direct_to_rowid = true;
-			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: pk_columns_added scalar mode - %llu cols with PK -> rowid",
-								 (unsigned long long)total_sql_cols);
-		} else if (rowid_requested && pk_columns_added && bind_data.pk_is_composite) {
-			// Special case: rowid + other columns, composite PK NOT in user projection
-			// SQL returns [user_cols..., pk_cols...]
-			// Write user columns normally, write PK columns to STRUCT children via target_vectors
-			// For now, use columns_to_fill for user cols only, handle PK in Execute
-			result->result_stream->SetColumnsToFill(valid_column_ids.size());
-
-			vector<idx_t> output_mapping;
-			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
-				if (column_ids[out_col] == COLUMN_IDENTIFIER_ROW_ID) {
-					continue;
-				}
-				if (column_ids[out_col] < VIRTUAL_COL_START) {
-					output_mapping.push_back(out_col);
-				}
-			}
-			result->result_stream->SetOutputColumnMapping(std::move(output_mapping));
-			// Mark for special handling in Execute
-			result->composite_pk_direct_to_struct = true;
-			MSSQL_SCAN_DEBUG_LOG(1,
-								 "TableScanInitGlobal: pk_columns_added composite mode - user cols + STRUCT handling");
-		} else if (rowid_requested) {
-			// Rowid with other columns, PK IS in user projection
-			// Build mapping: SQL column index -> output chunk index
-			result->result_stream->SetColumnsToFill(valid_column_ids.size());
-
-			// The output chunk has positions for all columns including rowid
-			// Example: SELECT id, rowid, name -> column_ids [0, ROWID, 1] -> output [id, rowid, name]
-			// SQL returns [id, name] -> mapping [0, 2] (SQL col 0->output 0, SQL col 1->output 2)
-			// Skip the rowid position in the output
-			vector<idx_t> output_mapping;
-			idx_t sql_col = 0;
-			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
-				if (column_ids[out_col] == COLUMN_IDENTIFIER_ROW_ID) {
-					// Skip rowid position - it will be populated from PK columns
-					continue;
-				}
-				if (column_ids[out_col] < VIRTUAL_COL_START) {
-					output_mapping.push_back(out_col);
-					MSSQL_SCAN_DEBUG_LOG(2, "  SQL col %llu -> output col %llu", (unsigned long long)sql_col,
-										 (unsigned long long)out_col);
-					sql_col++;
-				}
-			}
-			result->result_stream->SetOutputColumnMapping(std::move(output_mapping));
-			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: rowid with PK in projection - %llu user cols",
-								 (unsigned long long)valid_column_ids.size());
-		} else {
-			// No rowid - simple case
-			result->result_stream->SetColumnsToFill(valid_column_ids.size());
-			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: set columns_to_fill=%zu", valid_column_ids.size());
-		}
-	}
-
-	// Issue #239: drain now, so the connection is Idle before the next scan on this
-	// catalog initializes.
-	//
-	// Only reachable when MSSQLOptimizer set the flag, which it does for a plan
-	// holding more than one scan of this catalog (or a scan and a sink into it)
-	// inside an explicit transaction — the case where all of them share the one
-	// pinned connection — and, since issue #380, in autocommit on a catalog whose
-	// pool holds a single connection, which they share by taking turns. Streaming
-	// is untouched everywhere else.
-	//
-	// The drain deliberately reuses the normal execution path rather than a second
-	// row reader: FillChunk applies the projection, the rowid construction and the
-	// warnings exactly as a streaming scan would, so a materialized scan and a
-	// streamed one cannot diverge in what they produce.
-	if (bind_data.requires_materialization && result->result_stream) {
-		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: materializing (issue #239 — shared pinned connection)");
-		// The output shape, derived the same way DuckDB derives it for Execute:
-		// one slot per column_id, the rowid slot carrying the bind data's rowid
-		// type and any other virtual/empty identifier carrying a placeholder that
-		// is never written (projected_column_count bounds what FillChunk fills).
-		vector<LogicalType> chunk_types;
-		chunk_types.reserve(column_ids.size());
-		for (idx_t i = 0; i < column_ids.size(); i++) {
-			if (column_ids[i] == COLUMN_IDENTIFIER_ROW_ID) {
-				chunk_types.push_back(bind_data.rowid_type);
-			} else if (column_ids[i] >= VIRTUAL_COL_START || column_ids[i] >= bind_data.all_types.size()) {
-				chunk_types.push_back(LogicalType::BIGINT);
-			} else {
-				chunk_types.push_back(bind_data.all_types[column_ids[i]]);
-			}
-		}
-		// ClientContext, not Allocator::Get(context) (#318, found by @oluies). The
-		// Allocator overload builds an IN_MEMORY_ALLOCATOR collection — unaccounted
-		// against the buffer manager and unable to spill — so a large materialized
-		// scan grew in process memory until it OOMed, while the docs promised the
-		// opposite. The ClientContext overload defaults to BUFFER_MANAGER_ALLOCATOR.
-		// The chunk below deliberately keeps the plain Allocator: it is one DataChunk,
-		// not the accumulating collection.
-		result->materialized = make_uniq<ColumnDataCollection>(context, chunk_types);
-		DataChunk chunk;
-		chunk.Initialize(Allocator::Get(context), chunk_types);
-		// What Execute's first call does for its own output chunk.
-		BindRowIdTargetVectors(*result, chunk);
-		idx_t total = 0;
-		try {
-			for (;;) {
-				chunk.Reset();
-				idx_t rows = result->result_stream->FillChunk(chunk);
-				if (rows == 0) {
-					break;
-				}
-				PopulateRowIdVector(*result, chunk, rows);
-				// The filters the encoder did not push run here, as in Execute: the
-				// collection is served as it stands, and DuckDB does not re-check a
-				// filter it handed to the scan (issue #451 -- a materialized scan
-				// returned rows such a filter rejects, so an UPDATE in a transaction
-				// changed them).
-				if (!result->client_filters.empty()) {
-					rows = ApplyClientFilters(context, *result, chunk, rows);
-					if (rows == 0) {
-						continue;
-					}
-				}
-				result->materialized->Append(chunk);
-				total += rows;
-			}
-		} catch (...) {
-			// The stream closed (ATTENTION, then the drain) while the materialize lock is still held:
-			// unwinding would release the lock first, and another scan on the pinned connection could
-			// start while it still answers (review of #560).
-			result->result_stream.reset();
-			throw;
-		}
+		// COLMETADATA is known now, so say what is wrong with the columns before any
+		// rows move. Waiting for the drain-end call loses this entirely on a query
+		// that stops early -- any LIMIT (issue #224).
+		result->result_stream->MarkCatalogScan();
+		RefuseOutOfRangeKeys(input, bind_data, projection.read_columns, *result->result_stream);
+		CheckWireCodePages(context, projection.read_columns, options.client_transcode, *result->result_stream);
 		result->result_stream->SurfaceWarnings(context);
-		// Closing the stream is what releases the connection back to Idle. Without
-		// it the drain would have read every row and still deadlocked the next scan.
-		result->result_stream.reset();
-		result->materialized->InitializeScan(result->materialized_scan);
-		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: materialized %llu row(s), connection released",
-							 (unsigned long long)total);
+		ConfigureStreamOutput(bind_data, projection, *result);
+		if (bind_data.requires_materialization) {
+			MaterializeScan(context, bind_data, projection.column_ids, *result);
+		}
 	}
 
 	return std::move(result);
