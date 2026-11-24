@@ -165,9 +165,14 @@ std::unordered_map<uint64_t, UnitOwner> OwnersOf(const CatalogModel &model) {
 class RowImageDecoder {
 public:
 	explicit RowImageDecoder(const CatalogTable &table) : table_(table) {
-		const ScanColumns columns = ScanColumnsOf(table);
+		// Spec 093 T8: a geometry / geography value as its ISO WKB (a BLOB in the VARIANT), whatever an
+		// ATTACH's geometry_as says: no value is lost -- a curve or FullGlobe, which a GEOMETRY cannot hold,
+		// would be NULL with nothing to say it, the records having no WARNING of their own.
+		TypeForms forms;
+		forms.geometry_as = tds::GeometryAs::Wkb;
+		const ScanColumns columns = ScanColumnsOf(table, forms);
 		names_ = columns.names;
-		stager_.reset(new RecordStager(table, columns.column_ids));
+		stager_.reset(new RecordStager(table, columns.column_ids, forms));
 		chunk_.Initialize(Allocator::DefaultAllocator(), stager_->Types());
 		page_.assign(PAGE_SIZE, 0);
 	}

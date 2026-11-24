@@ -13,6 +13,7 @@
 
 #include "backup/backup_catalog_model.hpp"
 #include "backup/backup_opened.hpp"
+#include "backup/backup_type_forms.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/table_column.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -40,7 +41,7 @@ struct ScanColumns {
 	vector<std::string> names;
 	std::vector<UnreadColumn> unread;
 };
-ScanColumns ScanColumnsOf(const CatalogTable &table);
+ScanColumns ScanColumnsOf(const CatalogTable &table, const TypeForms &forms);
 //! The scan's virtual columns: the unread ones, then D8's (_mssql_page, _mssql_rid, _mssql_page_lsn,
 //! _mssql_lob) -- what a table entry of an attached backup reports, so the binder's column ids are the
 //! scan's.
@@ -52,7 +53,7 @@ virtual_column_map_t ScanVirtualColumns(const std::vector<UnreadColumn> &unread)
 TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &entry,
 								   std::shared_ptr<const AttachedBackup> attached, const std::string &key,
 								   const std::string &schema, const std::string &table, const std::string &fuzzy,
-								   unique_ptr<FunctionData> &bind_data);
+								   const std::string &geometry_as, unique_ptr<FunctionData> &bind_data);
 
 void RegisterBackupScanFunction(ExtensionLoader &loader);
 

@@ -1,0 +1,189 @@
+# name: test/sql/backup/mssql_backup_clr_types.test
+# description: geometry, geography and hierarchyid read from a backup by the TDS path's kernels (spec 093 T8)
+# group: [mssql]
+#
+# test/data/backup/clr_types (test/backup/gen/clr_types.sql, SQL Server 2025): T5's spatial values (every
+# OGC type, EMPTY, Z / M, curves, an invalid polygon, FullGlobe) and T4's hierarchyid forms, in a
+# clustered table, ROW- and PAGE-compressed, a heap, and a line stored off row. The oracle lane compares
+# every table with a RESTORE through TYPE mssql, which reads them with the same kernels. No SQL Server
+# is needed.
+
+require mssql
+
+statement ok
+SET VARIABLE ct = 'test/data/backup/clr_types/clr_types_full.bak';
+
+statement ok
+SET mssql_backup_fuzzy = 'ignore';
+
+# Every column converted: TYPE mssql's types, geography labelled OGC:CRS84.
+query TTTT
+SELECT table_name, column_name, duckdb_type, state FROM mssql_backup_columns(getvariable('ct'), 'dbo')
+WHERE column_name IN ('g', 'p', 'h') AND table_name IN ('mixed_page', 'nodes', 'places', 'shapes') ORDER BY 1, 2;
+----
+mixed_page	g	GEOMETRY	converted
+mixed_page	h	VARCHAR	converted
+mixed_page	p	GEOMETRY('OGC:CRS84')	converted
+nodes	h	VARCHAR	converted
+places	g	GEOMETRY('OGC:CRS84')	converted
+shapes	g	GEOMETRY	converted
+
+# geometry: Z / M kept, a curve NULL (geometry_as 'geometry'), an invalid polygon as stored, EMPTY.
+query ITT
+SELECT id, name, ST_AsText(g) FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'shapes')
+WHERE id IN (1, 3, 5, 6, 14, 30, 33, 35, 43, 101) ORDER BY id;
+----
+1	point	POINT (1 2)
+3	point_empty	POINT EMPTY
+5	point_zm	POINT ZM (1 2 3 4)
+6	point_m	POINT M (1 2 4)
+14	poly	POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))
+30	circ	NULL
+33	curvepoly	NULL
+35	bowtie_invalid	POLYGON ((0 0, 2 2, 2 0, 0 2, 0 0))
+43	big_coords	POINT (1.7976931348623157e+308 -1.7976931348623157e+308)
+101	null	NULL
+
+# The line stored off row (2000 points, 32 KB of WKB), assembled before the kernel.
+query TI
+SELECT ST_AsText(g)[1:30], octet_length(ST_AsWKB(g)) FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'shapes') WHERE id = 100;
+----
+LINESTRING (1 1, 2 2, 3 3, 4 4	32009
+
+# geography: longitude first, the column's label whatever a value's SRID; FullGlobe and curves NULL.
+query ITT
+SELECT id, name, ST_AsText(g) FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'places') WHERE id IN (1, 2, 6, 9, 10, 11, 14, 15, 101) ORDER BY id;
+----
+1	g_point	POINT (10 50)
+2	g_point_z	POINT Z (10 50 100)
+6	g_poly_big	POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0))
+9	g_fullglobe	NULL
+10	g_circ	NULL
+11	g_srid4269	POINT (10 50)
+14	g_point_m	POINT M (10 50 7)
+15	g_line_zm	LINESTRING ZM (10 50 1 2, 11 51 3 4)
+101	null	NULL
+
+query T
+SELECT DISTINCT typeof(g) FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'places');
+----
+GEOMETRY('OGC:CRS84')
+
+# hierarchyid: ToString()'s text, every label range's edge, negative and fractional labels.
+query IT
+SELECT id, h FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'nodes') WHERE id IN (1, 4, 5, 6, 16, 17, 24, 25, 26, 27, 28) ORDER BY id;
+----
+1	/
+4	/-1/
+5	/1.5/
+6	/1.-2/
+16	/1103/
+17	/1104/
+24	/-4168/
+25	/-4169/
+26	/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17/18/19/20/
+27	/2.1.1/
+28	NULL
+
+# Every storage form reads the same rows, the off-row line included: the same multiset both ways.
+query TII
+SELECT 'mixed_heap', (SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_heap') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_plain'))),
+	(SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_plain') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_heap')))
+UNION ALL
+SELECT 'mixed_page', (SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_page') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_plain'))),
+	(SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_plain') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_page')))
+UNION ALL
+SELECT 'mixed_row', (SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_row') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_plain'))),
+	(SELECT count(*) FROM (FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_plain') EXCEPT ALL
+	FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_row')))
+ORDER BY 1;
+----
+mixed_heap	0	0
+mixed_page	0	0
+mixed_row	0	0
+
+# geometry_as 'wkb': ISO WKB in a BLOB, the curves included (CircularString 8, CurvePolygon 10).
+query IT
+SELECT id, hex(g)[1:10] FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'shapes', geometry_as := 'wkb')
+WHERE id IN (1, 30, 33) ORDER BY id;
+----
+1	0101000000
+30	0108000000
+33	010A000000
+
+# geometry_as 'native': the stored MS-SSCLRT bytes (SRID 0, version 1, a point's flags 0x0C).
+query IT
+SELECT id, hex(g) FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'shapes', geometry_as := 'native') WHERE id = 1;
+----
+1	00000000010C000000000000F03F0000000000000040
+
+statement error
+SELECT * FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'shapes', geometry_as := 'png');
+----
+mssql_backup_scan: geometry_as must be 'geometry'
+
+# An empty geometry_as is refused, as TYPE mssql's option refuses it (NULL is the default).
+statement error
+SELECT * FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'shapes', geometry_as := '');
+----
+mssql_backup_scan: geometry_as must be 'geometry'
+
+query I
+SELECT count(*) FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'shapes', geometry_as := NULL);
+----
+47
+
+# One WARNING a column a statement for the curves and FullGlobe read as NULL; none under 'wkb'.
+statement ok
+SET enable_logging = true;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# count(g): the column read (a count(*) decodes no column and says nothing).
+query II
+SELECT (SELECT count(g) FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'shapes', max_threads := 4)),
+	(SELECT count(g) FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'places', geometry_as := 'wkb'));
+----
+39	19
+
+query T
+SELECT string_agg(regexp_extract(message, 'column (\S+) \((\w+)\)', 1), ', ' ORDER BY message) FROM duckdb_logs
+WHERE message LIKE 'mssql_backup_scan: column % holds values a GEOMETRY cannot hold%';
+----
+dbo.shapes.g
+
+statement ok
+SET enable_logging = false;
+
+# The ATTACH option: its tables' columns and every function over its name.
+statement ok
+ATTACH 'test/data/backup/clr_types/clr_types_full.bak' AS ct (TYPE mssql_backup, geometry_as 'wkb');
+
+query TT
+SELECT typeof(g), hex(g)[1:10] FROM ct.dbo.shapes WHERE id = 30;
+----
+BLOB	0108000000
+
+query TT
+SELECT column_name, duckdb_type FROM mssql_backup_columns('ct', 'dbo', 'mixed_row') WHERE column_name IN ('g', 'p', 'h') ORDER BY 1;
+----
+g	BLOB
+h	VARCHAR
+p	BLOB
+
+# The call's geometry_as wins over the ATTACH's.
+query T
+SELECT typeof(g) FROM mssql_backup_scan('ct', 'dbo', 'shapes', geometry_as := 'geometry') LIMIT 1;
+----
+GEOMETRY
+
+statement error
+ATTACH 'test/data/backup/clr_types/clr_types_full.bak' AS bad (TYPE mssql_backup, geometry_as 'svg');
+----
+geometry_as must be 'geometry'

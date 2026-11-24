@@ -608,8 +608,10 @@ int main() {
 						  column(4, XTYPE_TEXT, 16), column(5, XTYPE_INT, 4),	   column(6, XTYPE_INT, 4)};
 		narrow.columns[4].is_computed = true;
 		narrow.columns[5].is_sparse = true;
-		auto state = [](const CatalogTable &t, size_t i) { return std::string(StateOf(t, t.columns[i]).state); };
-		Check(state(narrow, 0) == "converted" && StateOf(narrow, narrow.columns[0]).reason.empty() &&
+		auto state = [](const CatalogTable &t, size_t i) {
+			return std::string(StateOf(t, t.columns[i], TypeForms()).state);
+		};
+		Check(state(narrow, 0) == "converted" && StateOf(narrow, narrow.columns[0], TypeForms()).reason.empty() &&
 				  state(narrow, 1) == "converted" && state(narrow, 2) == "converted" &&
 				  state(narrow, 3) == "converted" && state(narrow, 4) == "not_stored" &&
 				  state(narrow, 5) == "storage_format",
@@ -618,7 +620,7 @@ int main() {
 		CatalogTable variant;
 		variant.decodable = true;
 		variant.columns = {column(1, XTYPE_INT, 4), column(2, XTYPE_SQL_VARIANT, 8016), column(3, XTYPE_VARCHAR, 100)};
-		const ColumnState v = StateOf(variant, variant.columns[1]);
+		const ColumnState v = StateOf(variant, variant.columns[1], TypeForms());
 		Check(std::string(v.state) == "stored_bytes" && v.reason.find("sql_variant") != std::string::npos &&
 				  v.reason.find("off row") == std::string::npos && state(variant, 2) == "converted",
 			  "a sql_variant: stored_bytes, its reason the type's alone; a varchar(100) beside it converted, though "
@@ -638,7 +640,7 @@ int main() {
 		CatalogTable unread = with_max;
 		unread.decodable = false;
 		unread.reason = "PAGE compression";
-		Check(StateOf(unread, unread.columns[2]).reason == "the table is not read: PAGE compression",
+		Check(StateOf(unread, unread.columns[2], TypeForms()).reason == "the table is not read: PAGE compression",
 			  "a table not read says so in each column's reason");
 	}
 

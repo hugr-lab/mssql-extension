@@ -7,7 +7,7 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs"): samples.sql, the database of the
+# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types"): samples.sql, the database of the
 # committed samples; catalog.sql, the catalog fixture (spec 085 PR 2b); partition.sql, E7's partitioning
 # database and more boundary types (PR 2c); files.sql, two data files and a second
 # filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
@@ -31,7 +31,9 @@
 # not run by default; committed under test/data/backup/history_break, made by its generate.sh);
 # clr.sql, CLR columns of every storage form: a Format.Native user type (test/clr's assembly) stored at a fixed
 # offset as binary, a user type past 8000 bytes, hierarchyid and geometry, uncompressed, ROW, PAGE and a heap
-# (clr_full; not run by default; committed under test/data/backup/clr, made by its generate.sh);
+# (clr_full; not run by default; committed under test/data/backup/clr, made by its generate.sh); clr_types.sql,
+# the CLR system types -- every geometry / geography form T5 reads, hierarchyid's -- in every storage form and
+# off row (spec 093 T8: clr_types_full; 2025's committed under test/data/backup/clr_types);
 # bench_changes.sql, a benchmark of 10 million rows and differentials of 10k / 110k / 1.1M changes and an index rebuild
 # (PR 4c-3: bench_full, bench_diff_*, each also compressed as *_x; not run by default). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
@@ -49,7 +51,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs}"
+FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -383,6 +385,9 @@ for fixture in ${FIXTURES}; do
 	switch_in)
 		# A partition switched in with no shrink after it (spec 085 PR 4c-3): only the catalog tells.
 		sets+=("switch_full|switch_full.bak" "switch_diff|switch_diff.bak")
+		;;
+	clr_types)
+		sets+=("clr_types_full|clr_types_full.bak")
 		;;
 	history_break)
 		# A full restored over its database between two fulls (review of #612): a new recovery fork.

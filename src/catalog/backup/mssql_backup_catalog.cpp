@@ -49,8 +49,9 @@ using mssql::backup::CatalogTable;
 MSSQLBackupCatalog::MSSQLBackupCatalog(AttachedDatabase &db, std::string name,
 									   std::shared_ptr<const BackupHistory> history, mssql::backup::BackupAt default_at,
 									   uint64_t default_version, std::shared_ptr<const AttachedBackup> default_backup,
-									   Opener opener, Reader reader)
+									   Opener opener, Reader reader, std::string geometry_as)
 	: Catalog(db), name_(std::move(name)), opener_(std::move(opener)), reader_(std::move(reader)) {
+	geometry_as_ = std::move(geometry_as);	// before the first state's tables are built, below
 	// The file functions on the catalog's name as its own table functions (DuckLake's `db.snapshots()`),
 	// parsed once for every schema of every version.
 	std::string literal = "'";
@@ -514,7 +515,8 @@ MSSQLBackupCatalog &MSSQLBackupSchemaEntry::BackupCatalog() const {
 }
 
 void MSSQLBackupSchemaEntry::AddTable(const CatalogTable &table) {
-	auto columns = mssql::backup::ScanColumnsOf(table);
+	auto columns = mssql::backup::ScanColumnsOf(
+		table, mssql::backup::TypeFormsOf(BackupCatalog().GeometryAs(), "the attached backup's geometry_as"));
 	CreateTableInfo info;
 	info.SetTableName(Identifier(table.name));
 	for (size_t i = 0; i < columns.names.size(); i++) {
@@ -609,7 +611,8 @@ TableFunction MSSQLBackupTableEntry::GetScanFunction(ClientContext &context, uni
 	// The version by its key: a plan run or deserialized after a refresh reads this one.
 	return mssql::backup::AttachedScanFunction(context, *this, backup, MSSQLBackupCatalog::StateKey(*backup),
 											   schema_name_, table_name_,
-											   ParentCatalog().Cast<MSSQLBackupCatalog>().Fuzzy(), bind_data);
+											   ParentCatalog().Cast<MSSQLBackupCatalog>().Fuzzy(),
+											   ParentCatalog().Cast<MSSQLBackupCatalog>().GeometryAs(), bind_data);
 }
 
 TableStorageInfo MSSQLBackupTableEntry::GetStorageInfo(ClientContext &) {
@@ -669,6 +672,14 @@ std::shared_ptr<const AttachedBackup> mssql::backup::FindAttachedBackup(ClientCo
 	return catalog.Cast<MSSQLBackupCatalog>().BackupAt(context, at);
 }
 
+std::string mssql::backup::AttachedGeometryAs(ClientContext &context, const std::string &name) {
+	auto db = DatabaseManager::Get(context).GetDatabase(Identifier(name));
+	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
+		return std::string();
+	}
+	return db->GetCatalog().Cast<MSSQLBackupCatalog>().GeometryAs();
+}
+
 std::string mssql::backup::AttachedFuzzy(ClientContext &context, const std::string &name) {
 	auto db = DatabaseManager::Get(context).GetDatabase(Identifier(name));
 	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
@@ -698,7 +709,8 @@ struct BackupAttachOptions {
 	std::shared_ptr<MSSQLCatalogFilter> filter = std::make_shared<MSSQLCatalogFilter>();
 	std::shared_ptr<MSSQLCatalogFilter> exclude = std::make_shared<MSSQLCatalogFilter>();
 	std::vector<std::string> diff;
-	std::string fuzzy;	// D11 (task 27): "" = the setting
+	std::string fuzzy;		  // D11 (task 27): "" = the setting
+	std::string geometry_as;  // spec 093 T8: "" = 'geometry'
 	bool history_mode = false;
 	mssql::backup::BackupAt default_at;
 };
@@ -774,6 +786,12 @@ bool TakeOption(const string &name, const std::string &key, const Value &value, 
 		TakeDefaultVersion(name, key, value, o);
 	} else if (key == "fuzzy") {
 		TakeFuzzy(name, value, o);
+	} else if (key == "geometry_as") {
+		// Spec 093 T8: TYPE mssql's option, checked now.
+		o.geometry_as = value.IsNull()
+							? std::string()
+							: mssql::backup::GeometryAsGiven(
+								  value.ToString(), ("ATTACH " + name + " (TYPE mssql_backup): geometry_as").c_str());
 	} else if (key == "diff") {
 		TakeDiff(value, o);
 	} else if (IsFilterOption(key)) {
@@ -799,7 +817,7 @@ BackupAttachOptions ReadAttachOptions(const string &name, AttachOptions &options
 		throw InvalidInputException(
 			"ATTACH %s (TYPE mssql_backup): '%s' is not an option of an attached backup "
 			"(schema_filter, table_filter, schema_exclude, table_exclude, diff, history, snapshot_version, "
-			"snapshot_time, fuzzy)",
+			"snapshot_time, fuzzy, geometry_as)",
 			name, option.first);
 	}
 	return o;
@@ -933,7 +951,7 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 		}
 		auto catalog =
 			make_uniq<MSSQLBackupCatalog>(db, catalog_name, std::move(history), o.default_at, default_version,
-										  std::move(attached), std::move(opener), std::move(reader));
+										  std::move(attached), std::move(opener), std::move(reader), o.geometry_as);
 		catalog->SetFuzzy(o.fuzzy);
 		return std::move(catalog);
 	} catch (mssql::backup::FormatError &e) {

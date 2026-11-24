@@ -27,6 +27,7 @@
 #include "backup/backup_record_stager.hpp"
 #include "backup/backup_reservation.hpp"
 #include "backup/backup_schema_changes.hpp"
+#include "codec/clr/ssclrt_wkb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/radix_partitioning.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
@@ -133,7 +134,7 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 		throw InvalidInputException("%s: %s.%s is not read: %s", data.function.c_str(), data.schema, data.table,
 									data.entry->reason);
 	}
-	ScanColumns columns = ScanColumnsOf(*data.entry);
+	ScanColumns columns = ScanColumnsOf(*data.entry, data.Forms());
 	data.column_ids = std::move(columns.column_ids);
 	data.types = std::move(columns.types);
 	data.names = std::move(columns.names);
@@ -169,6 +170,15 @@ unique_ptr<FunctionData> BindScan(ClientContext &context, const char *function, 
 		// Over an attached name, the ATTACH's fuzzy option before the setting, as its tables' scans take it.
 		data->fuzzy = AttachedFuzzy(context, data->paths.front());
 	}
+	// Spec 093 T8: the call's geometry_as, else the ATTACH's; checked now.
+	auto geometry_as = input.named_parameters.find("geometry_as");
+	if (geometry_as != input.named_parameters.end() && !geometry_as->second.IsNull()) {
+		data->geometry_as =
+			GeometryAsGiven(geometry_as->second.ToString(), (std::string(function) + ": geometry_as").c_str());
+	} else if (data->paths.size() == 1) {
+		data->geometry_as = AttachedGeometryAs(context, data->paths.front());
+	}
+	data->Forms();
 	for (const auto &kv : input.named_parameters) {
 		if (kv.first == "max_threads" && !kv.second.IsNull()) {
 			if (kv.second.GetValue<int64_t>() < 1) {
@@ -256,6 +266,7 @@ void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_dat
 	serializer.WritePropertyWithDefault<std::string>(111, "at_key", data.at.key);
 	serializer.WritePropertyWithDefault<std::string>(112, "fuzzy", data.fuzzy);
 	serializer.WritePropertyWithDefault<std::string>(113, "function", data.function, FUNCTION);
+	serializer.WritePropertyWithDefault<std::string>(114, "geometry_as", data.geometry_as);
 }
 
 unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunction &) {
@@ -274,6 +285,7 @@ unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunct
 	data->at.key = deserializer.ReadPropertyWithDefault<std::string>(111, "at_key");
 	data->fuzzy = deserializer.ReadPropertyWithDefault<std::string>(112, "fuzzy");
 	data->function = deserializer.ReadPropertyWithExplicitDefault<std::string>(113, "function", FUNCTION);
+	data->geometry_as = deserializer.ReadPropertyWithDefault<std::string>(114, "geometry_as");
 	BindTable(deserializer.Get<ClientContext &>(), *data, nullptr);
 	// The plan's column positions and vectors are those it was bound with: a file at the same path that
 	// reads otherwise now (a nightly backup replaced: a column added, dropped, renamed or retyped) is
@@ -330,6 +342,7 @@ struct ScanGlobalState : public GlobalTableFunctionState {
 	idx_t lsn_output = DConstants::INVALID_INDEX;
 	idx_t lob_output = DConstants::INVALID_INDEX;
 	std::vector<idx_t> empty_outputs;  // COLUMN_IDENTIFIER_EMPTY (count(*)): a constant NULL
+	SpatialWarnings spatial_warnings;  // spec 093 T8
 
 	std::mutex claim;
 	std::shared_ptr<const PartitionCursor> cutting;	 // the partition units are being cut from
@@ -549,7 +562,7 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 	// twice a row's variable values (buffers grow by doubling) -- and the virtual values, for a vector of
 	// the widest rows, or CHUNK_RESERVATION_BYTES with the chunk closing on what it staged; never past
 	// the budget unless one row is (then refused by name at the first chunk).
-	RecordStager probe(*data.entry, state->staged);
+	RecordStager probe(*data.entry, state->staged, data.Forms());
 	const uint64_t fixed = probe.FixedStagingBytes();
 	const uint64_t virtual_row = VirtualRowBytes(*state);
 	const uint64_t row = 2 * probe.VarRowBytes() + virtual_row;
@@ -582,7 +595,7 @@ unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &execution, Table
 	const auto &global = global_state->Cast<ScanGlobalState>();
 	auto local = make_uniq<ScanLocalState>();
 	local->pending_warned = &global.pending_warned;
-	local->stager = make_uniq<RecordStager>(*data.entry, global.staged);
+	local->stager = make_uniq<RecordStager>(*data.entry, global.staged, data.Forms());
 	local->stager->LimitBytes(global.chunk_allowance, global.virtual_row);
 	const PageStore &store = *data.catalog->pages->store;
 	const std::string fragment = "a fragment of a value of " + data.schema + "." + data.table + " stored off row";
@@ -1148,6 +1161,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		global.rows_read += count;
 		WarnPendingValues(context, data, global, local);
 		local.stager->FinalizeChunk();
+		global.spatial_warnings.Say(context, data.function.c_str(), local.stager->SpatialNotes());
 		WriteVirtual(global, local, output, count);
 		for (idx_t c : global.empty_outputs) {
 			output.data[c].SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -1181,6 +1195,8 @@ TableFunction MakeScanFunction(const LogicalType &path, bool catalog = false) {
 	f.GetSignature().AddKeywordOnly("max_memory", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	AddDiffParameter(f);
 	AddFuzzyParameter(f);
+	// Spec 093 T8: TYPE mssql's geometry_as; NULL (the default): the ATTACH's, else 'geometry'.
+	f.GetSignature().AddKeywordOnly("geometry_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	AddVersionParameters(f);
 	f.projection_pushdown = true;
 	f.get_partition_data = PartitionData;
@@ -1194,11 +1210,34 @@ TableFunction MakeScanFunction(const LogicalType &path, bool catalog = false) {
 
 }  // namespace
 
-ScanColumns ScanColumnsOf(const CatalogTable &table) {
+void SpatialWarnings::Say(ClientContext &context, const char *function,
+						  const std::vector<RecordStager::SpatialNote> &notes) {
+	for (const auto &n : notes) {
+		std::lock_guard<std::mutex> guard(lock_);
+		if (n.notes.not_geometry > 0 && said_.insert(n.name + "|curve").second) {
+			DUCKDB_LOG_WARNING(context,
+							   "%s: column %s (%s) holds values a GEOMETRY cannot hold (a CircularString, "
+							   "CompoundCurve, CurvePolygon or FullGlobe, or collections nested deeper than 15), "
+							   "read as NULL, their rows read; geometry_as 'wkb' (ISO WKB, the curves included) or "
+							   "'native' (the stored bytes), on the call or as an ATTACH option, reads them",
+							   function, n.name.c_str(), n.type.c_str());
+		}
+		if (n.notes.malformed > 0 && said_.insert(n.name + "|malformed").second) {
+			DUCKDB_LOG_WARNING(context,
+							   "%s: column %s (%s) holds values whose stored bytes cannot be read as %s (the "
+							   "first: %s), read as NULL, their rows read; geometry_as 'native' reads the stored "
+							   "bytes",
+							   function, n.name.c_str(), n.type.c_str(), n.type.c_str(),
+							   codec::ssclrt::DescribeStatus(n.notes.first_malformed));
+		}
+	}
+}
+
+ScanColumns ScanColumnsOf(const CatalogTable &table, const TypeForms &forms) {
 	ScanColumns result;
 	std::vector<UnreadColumn> unread;
 	for (const auto &c : table.columns) {
-		const ColumnReading reading = ReadingOf(c);
+		const ColumnReading reading = ReadingOf(c, forms);
 		if (!reading.readable) {
 			unread.push_back(UnreadColumn{c.DuckDBName(), reading.type, reading.note});
 			continue;
@@ -1247,7 +1286,7 @@ virtual_column_map_t ScanVirtualColumns(const std::vector<UnreadColumn> &unread)
 TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &entry,
 								   std::shared_ptr<const AttachedBackup> attached, const std::string &key,
 								   const std::string &schema, const std::string &table, const std::string &fuzzy,
-								   unique_ptr<FunctionData> &bind_data) {
+								   const std::string &geometry_as, unique_ptr<FunctionData> &bind_data) {
 	auto data = make_uniq<ScanBindData>();
 	data->paths = {attached->name};
 	// A plan deserialized finds the version again by its backups and files, not its number.
@@ -1256,6 +1295,7 @@ TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &en
 	data->table = table;
 	data->table_entry = &entry;
 	data->fuzzy = fuzzy;
+	data->geometry_as = geometry_as;
 	data->attached = std::move(attached);
 	BindTable(context, *data, nullptr);
 	bind_data = std::move(data);

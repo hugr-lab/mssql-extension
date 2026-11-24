@@ -50,7 +50,7 @@ std::string ErrorOf(const std::function<void()> &f) {
 // `row` with its chunk and index. Returns the chunk count.
 size_t ScanTable(const PageStore &store, const CatalogTable &table, const std::vector<int32_t> &ids,
 				 const std::function<void(DataChunk &, idx_t)> &row) {
-	RecordStager stager(table, ids);
+	RecordStager stager(table, ids, TypeForms());
 	const CatalogPartition &p = table.partitions[0];
 	stager.UseLayout(table.Layout(p));
 	const SysAllocUnit *in_row = nullptr;
@@ -279,7 +279,7 @@ int main() {
 											" bad" + (first_bad.empty() ? "" : ", first " + first_bad) + ")");
 		Check(chunks >= 1, "items: " + std::to_string(chunks) + " chunk(s)");
 		Check(items->columns.size() == 7 &&
-				  RecordStager(*items, AllColumns(*items)).Types()[4].id() == LogicalTypeId::TIMESTAMP_MS,
+				  RecordStager(*items, AllColumns(*items), TypeForms()).Types()[4].id() == LogicalTypeId::TIMESTAMP_MS,
 			  "D6's types: datetime2(3) as TIMESTAMP_MS");
 
 		// events (event_id bigint, item_id int, note varchar(100) NULL, at datetime), a heap, 3000 rows:
@@ -421,7 +421,7 @@ int main() {
 		for (int32_t i = 1; i <= 21; i++) {
 			ids.push_back(i);
 		}
-		RecordStager stager(t, ids);
+		RecordStager stager(t, ids, TypeForms());
 		stager.UseLayout(layout);
 		DataChunk chunk;
 		chunk.Initialize(Allocator::DefaultAllocator(), stager.Types());
@@ -485,7 +485,7 @@ int main() {
 			};
 			LobUnits units;
 			units.row_overflow = static_cast<uint64_t>(9) << 16;
-			RecordStager reads(t, {21});
+			RecordStager reads(t, {21}, TypeForms());
 			reads.UseLayout(layout);
 			reads.UseOffRow(&fetch, units);
 			reads.MapOffRow(true);
@@ -504,7 +504,7 @@ int main() {
 				  "... and the row's map: column 21, row-overflow, its pointer and its one fragment");
 		}
 		// ... which a projection without the column reads past.
-		RecordStager narrow(t, {1, 9});
+		RecordStager narrow(t, {1, 9}, TypeForms());
 		narrow.UseLayout(layout);
 		DataChunk two;
 		two.Initialize(Allocator::DefaultAllocator(), narrow.Types());
@@ -520,28 +520,43 @@ int main() {
 		refused.columns.back().is_computed = true;
 		refused.columns.push_back(Col(23, "sp", XTYPE_INT, "int", 4));
 		refused.columns.back().is_sparse = true;
-		Check(ErrorOf([&]() { RecordStager(refused, {22}); }).find("dbo.synthetic.computed: a computed column") !=
-					  std::string::npos &&
-				  ErrorOf([&]() { RecordStager(refused, {23}); }).find("sparse vector") != std::string::npos,
-			  "a computed column that is not persisted and a sparse column are not readable, by name");
+		Check(
+			ErrorOf([&]() {
+				RecordStager(refused, {22}, TypeForms());
+			}).find("dbo.synthetic.computed: a computed column") != std::string::npos &&
+				ErrorOf([&]() { RecordStager(refused, {23}, TypeForms()); }).find("sparse vector") != std::string::npos,
+			"a computed column that is not persisted and a sparse column are not readable, by name");
 		const std::vector<std::pair<CatalogColumn, std::string>> raws = {
 			{Col(30, "variant", XTYPE_SQL_VARIANT, "sql_variant", 8016), "sql_variant"},
 			{Col(31, "doc", XTYPE_XML, "xml", -1), "binary XML"},
-			{Col(32, "shape", XTYPE_CLR, "geometry", -1), "geometry"},
-			{Col(33, "node", XTYPE_CLR, "hierarchyid", 892), "hierarchyid"},
+			{Col(32, "point", XTYPE_CLR, "", 9), "a user CLR type"},
 			{Col(34, "j", 244, "json", -1), "json"},
 			{Col(35, "mystery", 250, "", 16), "does not know"}};
 		bool all_raw = true;
 		for (const auto &rc : raws) {
-			const ColumnReading reading = ReadingOf(rc.first);
+			const ColumnReading reading = ReadingOf(rc.first, TypeForms());
 			all_raw = all_raw && reading.readable && reading.raw && reading.type.id() == LogicalTypeId::BLOB &&
 					  reading.note.find(rc.second) != std::string::npos;
 		}
-		Check(all_raw, "sql_variant, xml, geometry, hierarchyid, json and an unknown type: their stored bytes, a BLOB");
+		Check(all_raw, "sql_variant, xml, a user CLR type, json and an unknown type: their stored bytes, a BLOB");
+		// Spec 093 T8: the CLR system types read by the TDS path's kernels; geometry_as as TYPE mssql's.
+		TypeForms wkb;
+		wkb.geometry_as = tds::GeometryAs::Wkb;
+		const CatalogColumn shape = Col(32, "shape", XTYPE_CLR, "geometry", -1);
+		const CatalogColumn earth = Col(33, "earth", XTYPE_CLR, "geography", -1);
+		const CatalogColumn node = Col(36, "node", XTYPE_CLR, "hierarchyid", 892);
+		Check(!ReadingOf(shape, TypeForms()).raw && ReadingOf(shape, TypeForms()).type == LogicalType::GEOMETRY() &&
+				  ReadingOf(earth, TypeForms()).type == LogicalType::GEOMETRY("OGC:CRS84") &&
+				  ReadingOf(node, TypeForms()).type == LogicalType::VARCHAR,
+			  "geometry GEOMETRY, geography GEOMETRY('OGC:CRS84'), hierarchyid VARCHAR: converted");
+		Check(!ReadingOf(shape, wkb).raw && ReadingOf(shape, wkb).type == LogicalType::BLOB &&
+				  ReadingOf(earth, wkb).type == LogicalType::BLOB && ReadingOf(node, wkb).type == LogicalType::VARCHAR,
+			  "geometry_as 'wkb': geometry / geography a BLOB, hierarchyid still its text");
 		CatalogColumn odd_collation = Col(36, "t", XTYPE_VARCHAR, "varchar", 10, 0, 0, 0x7fffffffu);
-		Check(ReadingOf(odd_collation).raw &&
-				  ReadingOf(odd_collation).note.find("newer than the code-page tables") != std::string::npos,
-			  "a varchar of a collation newer than the tables: its stored bytes");
+		Check(
+			ReadingOf(odd_collation, TypeForms()).raw &&
+				ReadingOf(odd_collation, TypeForms()).note.find("newer than the code-page tables") != std::string::npos,
+			"a varchar of a collation newer than the tables: its stored bytes");
 		// A raw column through the stager: a sql_variant's bytes as stored, a BLOB.
 		CatalogTable with_variant = t;
 		with_variant.columns.push_back(Col(37, "variant", XTYPE_SQL_VARIANT, "sql_variant", 8016));
@@ -549,7 +564,7 @@ int main() {
 		variant_layout.columns.push_back(Phys(37, XTYPE_SQL_VARIANT, -2, 19));
 		const std::vector<uint8_t> variant = {0x38, 0x01, 0x2a, 0x00, 0x00, 0x00};	// an int 42 in a sql_variant
 		const Page variant_page = PageOf({Record(fixed, 19, 0, {note, variant})});
-		RecordStager variant_stager(with_variant, {37});
+		RecordStager variant_stager(with_variant, {37}, TypeForms());
 		variant_stager.UseLayout(variant_layout);
 		DataChunk variant_chunk;
 		variant_chunk.Initialize(Allocator::DefaultAllocator(), variant_stager.Types());
@@ -559,12 +574,12 @@ int main() {
 		Check(variant_stager.Types()[0].id() == LogicalTypeId::BLOB &&
 				  variant_chunk.GetValue(0, 0).ToString() == "8\\x01*\\x00\\x00\\x00",
 			  "a sql_variant column reads as its stored bytes: " + variant_chunk.GetValue(0, 0).ToString());
-		Check(ErrorOf([&]() { RecordStager(t, {99}); }).find("has no column 99") != std::string::npos,
+		Check(ErrorOf([&]() { RecordStager(t, {99}, TypeForms()); }).find("has no column 99") != std::string::npos,
 			  "a column the table does not have");
 		RowsetLayout wrong = layout;
 		wrong.columns[0].xtype = XTYPE_SMALLMONEY;	// 4 bytes where money takes 8
 		Check(ErrorOf([&]() {
-				  RecordStager s(t, {1});
+				  RecordStager s(t, {1}, TypeForms());
 				  s.UseLayout(wrong);
 			  }).find("where its type takes 8 fixed bytes") != std::string::npos,
 			  "a physical column of another width than its type is refused");
@@ -578,7 +593,7 @@ int main() {
 		stager.FinalizeChunk(chunk);
 		Check(chunk.size() == 1 && chunk.GetValue(8, 0) == Value::UTINYINT(200), "and BeginChunk starts a clean one");
 		// A refused layout leaves the stager on the one it had.
-		RecordStager kept(t, {9, 1});
+		RecordStager kept(t, {9, 1}, TypeForms());
 		kept.UseLayout(layout);
 		RowsetLayout refused_layout = layout;
 		refused_layout.columns[0].xtype = XTYPE_SMALLMONEY;
@@ -655,7 +670,7 @@ int main() {
 		const std::vector<uint8_t> n_odd = {'a', 0, 'b'};
 		const Page page =
 			PageOf({Record(fixed, 9, 0, {m, nm, u8, Utf16("ok")}), Record(fixed, 9, 0, {m, nm, u8, n_odd})});
-		RecordStager stager(t, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+		RecordStager stager(t, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, TypeForms());
 		stager.UseLayout(layout);
 		DataChunk chunk;
 		chunk.Initialize(Allocator::DefaultAllocator(), stager.Types());
@@ -709,8 +724,8 @@ int main() {
 			t.name = "dbcs";
 			t.columns = {Col(1, "c", XTYPE_CHAR, "char", 8, 0, 0, id),
 						 Col(2, "v", XTYPE_VARCHAR, "varchar", 20, 0, 0, id)};
-			Check(!ReadingOf(t.columns[0]).raw && ReadingOf(t.columns[0]).note.empty() &&
-					  !ReadingOf(t.columns[1]).raw && ReadingOf(t.columns[1]).note.empty(),
+			Check(!ReadingOf(t.columns[0], TypeForms()).raw && ReadingOf(t.columns[0], TypeForms()).note.empty() &&
+					  !ReadingOf(t.columns[1], TypeForms()).raw && ReadingOf(t.columns[1], TypeForms()).note.empty(),
 				  std::string(pg.collation) + ": converted, not raw");
 			RowsetLayout layout;
 			layout.table = "dbcs";
@@ -718,7 +733,7 @@ int main() {
 			std::vector<uint8_t> fixed(pg.bytes);  // char(8): the text, padded with spaces
 			fixed.resize(8, 0x20);
 			const Page page = PageOf({Record(fixed, 2, 0, {pg.bytes})});
-			RecordStager stager(t, {1, 2});
+			RecordStager stager(t, {1, 2}, TypeForms());
 			stager.UseLayout(layout);
 			DataChunk chunk;
 			chunk.Initialize(Allocator::DefaultAllocator(), stager.Types());
@@ -752,7 +767,7 @@ int main() {
 		const std::vector<uint8_t> lone = {'x', 0x93};
 		const Page page =
 			PageOf({Record({}, 1, 0, {{0x95, 0x5c}}), Record({}, 1, 0, {longer}), Record({}, 1, 0, {lone})});
-		RecordStager stager(t, {1});
+		RecordStager stager(t, {1}, TypeForms());
 		stager.UseLayout(layout);
 		DataChunk chunk;
 		chunk.Initialize(Allocator::DefaultAllocator(), stager.Types());
@@ -787,13 +802,13 @@ int main() {
 		const std::vector<uint8_t> odd = {1, 2, 3, 4, 5, 6};
 		const std::vector<uint8_t> pointer(16, 0x11), doc = {0xdf, 0xff, 0x01, 0xb0, 0x04};
 		const Page page = PageOf({Record(odd, 4, 0x04, {pointer, {}, doc})});
-		const ColumnReading notes = ReadingOf(t.columns[1]), nnotes = ReadingOf(t.columns[2]);
+		const ColumnReading notes = ReadingOf(t.columns[1], TypeForms()), nnotes = ReadingOf(t.columns[2], TypeForms());
 		Check(notes.readable && nnotes.readable && notes.type.id() == LogicalTypeId::VARCHAR &&
 				  nnotes.type.id() == LogicalTypeId::VARCHAR,
 			  "text and ntext are readable, as VARCHAR");
 		{
 			// text in row: 16 bytes of text in the row, no complex bit.
-			RecordStager inline_text(t, {2});
+			RecordStager inline_text(t, {2}, TypeForms());
 			inline_text.UseLayout(layout);
 			DataChunk c;
 			c.Initialize(Allocator::DefaultAllocator(), inline_text.Types());
@@ -845,7 +860,7 @@ int main() {
 			const Page rows = PageOf({Record(odd, 4, 0, {root_pointer(300, 0), root_pointer(300, 3), doc}, 0x3),
 									  Record(odd, 4, 0, {root_pointer(300, 2), root_pointer(300, 1), doc}, 0x3),
 									  Record(odd, 4, 0, {root_pointer(999, 0), root_pointer(300, 1), doc}, 0x3)});
-			RecordStager pointed(t, {2, 3});
+			RecordStager pointed(t, {2, 3}, TypeForms());
 			pointed.UseLayout(layout);
 			pointed.UseOffRow(&fetch, units);
 			DataChunk c;
@@ -875,7 +890,7 @@ int main() {
 			pointed.FinalizeChunk(c);
 			Check(c.size() == 1 && c.GetValue(0, 0).ToString() == "abc", "... and the next chunk reads on");
 			// The map lists every off-row value of the row, the columns not projected included.
-			RecordStager mapped(t, {2});
+			RecordStager mapped(t, {2}, TypeForms());
 			mapped.UseLayout(layout);
 			mapped.UseOffRow(&fetch, units);
 			mapped.MapOffRow(true);
@@ -893,7 +908,7 @@ int main() {
 					  entries[1].nodes[2].offset == 3000,
 				  "the map: notes and nnotes (not projected), nnotes's root and its two leaves");
 		}
-		RecordStager stager(t, {1, 4});
+		RecordStager stager(t, {1, 4}, TypeForms());
 		stager.UseLayout(layout);
 		Check(stager.Types()[0].id() == LogicalTypeId::BLOB && stager.Types()[1].id() == LogicalTypeId::BLOB,
 			  "an unknown type and xml as BLOB");
@@ -905,11 +920,11 @@ int main() {
 		Check(chunk.GetValue(0, 0).ToString() == "\\x01\\x02\\x03\\x04\\x05\\x06" &&
 				  StringValue::Get(chunk.GetValue(1, 0)).size() == 5,
 			  "an unknown fixed type's 6 bytes at its offset, xml's stored bytes");
-		Check(ReadingOf(t.columns[0]).note.find("does not know") != std::string::npos &&
+		Check(ReadingOf(t.columns[0], TypeForms()).note.find("does not know") != std::string::npos &&
 				  SqlTypeText("", "int", XTYPE_INT, 4, 10, 0) == "int",
 			  "an unknown type says so; a type with no row of its own is named by its system type");
 		// The stager's own order: an Append before a BeginChunk, and vectors of another type, are refused.
-		RecordStager unbegun(t, {1});
+		RecordStager unbegun(t, {1}, TypeForms());
 		unbegun.UseLayout(layout);
 		DataChunk wrong;
 		wrong.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
@@ -956,7 +971,7 @@ int main() {
 		Put(root, 0, 2);
 		const std::vector<uint8_t> id1 = {1, 0, 0, 0}, id2 = {2, 0, 0, 0};
 		const Page rows = PageOf({Record(id1, 2, 0, {root}, 0x1), Record(id2, 2, 0, {{'s', 'm', 'a', 'l', 'l'}})});
-		RecordStager stager(t, {1, 2});
+		RecordStager stager(t, {1, 2}, TypeForms());
 		stager.UseLayout(layout);
 		stager.UseOffRow(&fetch, units);
 		DataChunk c;
@@ -1057,7 +1072,7 @@ int main() {
 		const Page rows = PageOf({Record(id1, 4, 0, {rn, rj, rl}, 0x7),
 								  Record(id2, 4, 0, {{0xE9, 0x00, 0xFC, 0x00}, {0x82, 0xA0}, {0xE9}}),
 								  Record(id3, 4, 0, {{'x', 0, 0xE9, 0}, {'y', 0x82, 0xA0}, {'z', 0xFC}})});
-		RecordStager stager(t, {2, 3, 4});
+		RecordStager stager(t, {2, 3, 4}, TypeForms());
 		stager.UseLayout(layout);
 		stager.UseOffRow(&fetch, units);
 		DataChunk c;

@@ -17,6 +17,7 @@
 #include "backup/backup_opened.hpp"
 #include "backup/backup_page.hpp"
 #include "backup/backup_sql_variant.hpp"
+#include "backup/backup_type_forms.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -105,7 +106,8 @@ struct ColumnReading {
 	//! Why the column is raw or not readable; empty for a converted one.
 	std::string note;
 };
-ColumnReading ReadingOf(const CatalogColumn &c);
+//! `forms`: how a column of a kernel's type is read (TypeForms; the call's, else the attached catalog's).
+ColumnReading ReadingOf(const CatalogColumn &c, const TypeForms &forms);
 
 //! Column `c` of table `t` at a glance (mssql_backup_columns, task 16d; owner, 2026-11-11), from
 //! ReadingOf: `not_stored` (a computed column not persisted), `storage_format` (sparse, a column
@@ -116,7 +118,7 @@ struct ColumnState {
 	const char *state = "converted";
 	std::string reason;
 };
-ColumnState StateOf(const CatalogTable &t, const CatalogColumn &c);
+ColumnState StateOf(const CatalogTable &t, const CatalogColumn &c, const TypeForms &forms);
 
 }  // namespace backup
 }  // namespace mssql

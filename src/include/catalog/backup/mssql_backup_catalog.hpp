@@ -63,7 +63,7 @@ public:
 	MSSQLBackupCatalog(AttachedDatabase &db, std::string name,
 					   std::shared_ptr<const mssql::backup::BackupHistory> history, mssql::backup::BackupAt default_at,
 					   uint64_t default_version, std::shared_ptr<const mssql::backup::AttachedBackup> default_backup,
-					   Opener opener, Reader reader);
+					   Opener opener, Reader reader, std::string geometry_as);
 	~MSSQLBackupCatalog() override;
 
 	void Initialize(bool load_builtin) override;
@@ -108,6 +108,12 @@ public:
 	}
 	const std::string &Fuzzy() const {
 		return fuzzy_;
+	}
+	//! Spec 093 T8: the `geometry_as` ATTACH option, how its tables' geometry / geography columns are read;
+	//! "" = 'geometry'. Checked at ATTACH (TypeFormsOf), given to the constructor: its first state's tables
+	//! are built there.
+	const std::string &GeometryAs() const {
+		return geometry_as_;
 	}
 
 	//! The versions now. A version named by number or time is resolved against them when a query is bound and
@@ -174,6 +180,7 @@ private:
 
 	std::string name_;
 	std::string fuzzy_;
+	std::string geometry_as_;
 	//! The version snapshot_version / snapshot_time chose at ATTACH, by its backups; empty: the latest.
 	std::string pinned_;
 	Opener opener_;
