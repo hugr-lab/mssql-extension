@@ -38,7 +38,17 @@ public:
 	//! next call reads on: a peer that stops inside a packet costs the timeout, not forever), -1 on an
 	//! error: a socket error, the peer closing, a packet that is neither a reply nor a PRELOGIN, a declared
 	//! length shorter than the header.
+	//!
+	//! Past the deadline (SetDeadline) nothing more is waited for: 0, whatever `timeout_ms` says.
 	int Receive(uint8_t *buf, size_t len, int timeout_ms);
+
+	//! The instant the whole handshake has to be done by. Each Receive is handed the handshake's timeout
+	//! anew, counted from that call: without this a peer that sends a little just inside every timeout is
+	//! never late -- a byte a call, and the handshake lasts as long as it has bytes to send.
+	void SetDeadline(std::chrono::steady_clock::time_point deadline) {
+		deadline_ = deadline;
+		has_deadline_ = true;
+	}
 
 	//! The bytes kept to send, and those of the last packet not handed out yet (for the tests).
 	size_t PendingSendBytes() const {
@@ -73,6 +83,8 @@ private:
 	uint8_t header_[8] = {};
 	bool in_payload_ = false;
 	size_t filled_ = 0;
+	std::chrono::steady_clock::time_point deadline_;
+	bool has_deadline_ = false;
 };
 
 }  // namespace tds

@@ -629,6 +629,20 @@ int TlsHandshakeTransport::Receive(uint8_t *buf, size_t len, int timeout_ms) {
 		return static_cast<int>(taken);
 	}
 
+	// The call's timeout, cut to what is left of the handshake's (SetDeadline): the caller hands every call
+	// the whole timeout, and a peer that sent something just inside each one was never late.
+	if (has_deadline_) {
+		const auto left =
+			std::chrono::duration_cast<std::chrono::milliseconds>(deadline_ - std::chrono::steady_clock::now()).count();
+		if (left <= 0) {
+			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: the handshake's deadline has passed");
+			return 0;
+		}
+		if (timeout_ms < 0 || left < timeout_ms) {
+			timeout_ms = static_cast<int>(left);
+		}
+	}
+
 	// The next packet, whole, within the timeout. One that is not whole by then is kept as far as it came:
 	// 0 like any timeout, and the next call reads on from there.
 	const int got = ReadPacket(timeout_ms);
@@ -718,6 +732,10 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 	// The TLS data must be sent inside TDS PRELOGIN packets (type 0x12)
 	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: setting up TDS-wrapped TLS I/O...");
 	auto transport = std::make_shared<TlsHandshakeTransport>(fd_, packet_id);
+	if (timeout_ms >= 0) {
+		// One deadline for the whole handshake, not a timeout per read (review of #617).
+		transport->SetDeadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
+	}
 	TlsSendCallback send_cb = [transport](const uint8_t *data, size_t len) -> int {
 		return transport->Buffer(data, len);
 	};
@@ -881,10 +899,16 @@ ssize_t TdsSocket::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 		return 0;  // Timeout
 	}
 
-	ssize_t received = recv(fd_, SOCK_BUF_CAST(buffer), max_length, 0);
+	ssize_t received;
+	int error = 0;
+	do {
+		// poll() said there is something to read, so a signal that cuts the read short is no answer:
+		// read again.
+		received = recv(fd_, SOCK_BUF_CAST(buffer), max_length, 0);
+		error = received < 0 ? SOCKET_ERROR_CODE : 0;
+	} while (received < 0 && IsInterruptedCall(error));
 	if (received < 0) {
-		const int error = SOCKET_ERROR_CODE;
-		if (WouldBlock(error) || IsInterruptedCall(error)) {
+		if (WouldBlock(error)) {
 			return 0;  // No data available
 		}
 		last_error_ = "Receive failed: " + SocketErrorText(error);
@@ -1095,7 +1119,12 @@ bool TdsSocket::WaitForReady(bool for_write, int timeout_ms) {
 
 	int ret = PollOne(pfd, timeout_ms);
 	if (ret < 0) {
+		// A signal is waited through (PollOne), so what gets here is poll() itself failing (ENOMEM,
+		// EINVAL): the connection is done. Left "connected", Receive answered 0 -- a timeout -- and a caller
+		// that waits in slices with no deadline came straight back, forever (review of #617; the same
+		// rule as issue #456).
 		last_error_ = "Poll failed: " + SocketErrorText(SOCKET_ERROR_CODE);
+		connected_ = false;
 		return false;
 	}
 	if (ret == 0) {

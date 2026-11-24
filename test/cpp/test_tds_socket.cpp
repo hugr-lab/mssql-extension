@@ -492,6 +492,10 @@ enum class ServerFault {
 	CloseInsidePayload,
 	Silent,
 	StallInsidePacket,
+	// Its answer a byte a packet, one every 200 ms: never silent for a whole timeout of 300.
+	Drip,
+	// A good handshake, then every answer 300 ms late.
+	SlowEcho,
 	// After a good handshake: TLS closed in order (close_notify), or the socket dropped without it.
 	ShutdownAfterHandshake,
 	DropAfterHandshake
@@ -572,6 +576,18 @@ void ServeTls(int fd, const ServerIdentity &identity, ServerFault fault, size_t 
 			alive = false;
 			break;
 		}
+		case ServerFault::Drip: {
+			for (size_t i = 0; i < flight.size() && i < 20; i++) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(200));
+				if (!WriteAll(fd, Packet(0x04, 0x01, Bytes(1, flight[i])))) {
+					break;	// the client gave up and closed
+				}
+			}
+			ReadUpTo(fd, 1);  // until the client gives up and closes
+			alive = false;
+			break;
+		}
+		case ServerFault::SlowEcho:
 		case ServerFault::ShutdownAfterHandshake:
 		case ServerFault::DropAfterHandshake:
 		case ServerFault::None: {
@@ -594,10 +610,13 @@ void ServeTls(int fd, const ServerIdentity &identity, ServerFault fault, size_t 
 		if (fault == ServerFault::ShutdownAfterHandshake) {
 			SSL_shutdown(ssl);
 		}
-		for (; fault == ServerFault::None;) {
+		for (; fault == ServerFault::None || fault == ServerFault::SlowEcho;) {
 			const int n = SSL_read(ssl, buffer, sizeof(buffer));
 			if (n <= 0) {
 				break;
+			}
+			if (fault == ServerFault::SlowEcho) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(300));
 			}
 			seen.application.insert(seen.application.end(), buffer, buffer + n);
 			for (int i = 0; i < n; i++) {
@@ -740,6 +759,27 @@ void TestEnableTls(const ServerIdentity &identity) {
 		server.join();
 		Check(!enabled && took >= 250 && took < 3000 && error.find("TLS handshake failed: Timeout") == 0,
 			  "a server that stops inside a packet fails the handshake at the timeout (" + error + ")");
+	}
+	{
+		// Regression (review of #617): every read was given the whole timeout anew, so a server that sent a
+		// little just inside each one was never late -- here a byte every 200 ms under a timeout of 300, which
+		// took as long as the server had bytes (4.4 s for these 20). The handshake has one deadline.
+		Pair pair;
+		ServerSeen seen;
+		std::thread server(ServeTls, pair.peer, std::cref(identity), ServerFault::Drip, size_t(1), TLS1_2_VERSION,
+						   std::ref(seen));
+		pair.peer = -1;
+		uint8_t packet_id = 1;
+		const auto start = std::chrono::steady_clock::now();
+		const bool enabled = pair.socket.EnableTls(packet_id, 300, "", trust);
+		const auto took =
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+		const std::string error = pair.socket.GetLastError();
+		pair.socket.Close();
+		server.join();
+		Check(!enabled && took >= 250 && took < 900 && error.find("TLS handshake failed: Timeout") == 0,
+			  "a server that drips its answer fails the handshake at the timeout, not when it runs dry (" +
+				  std::to_string(took) + " ms, " + error + ")");
 	}
 	{
 		// The default verifies: a self-signed certificate is refused, with the two ways out named.
@@ -1024,7 +1064,11 @@ void TestTransport() {
 //------------------------------------------------------------------------------
 // A signal during a wait
 //------------------------------------------------------------------------------
-void OnSignal(int) {}
+volatile std::sig_atomic_t signals_delivered = 0;
+
+void OnSignal(int) {
+	signals_delivered = signals_delivered + 1;
+}
 
 //! Runs `wait` on this thread while another sends it SIGUSR1 after 100 ms and, when `bytes` is not empty,
 //! writes them to `peer` 200 ms after that. The handler is installed without SA_RESTART -- poll() is not
@@ -1058,8 +1102,9 @@ long long MillisSince(std::chrono::steady_clock::time_point start) {
 //! Regressions: a signal ends poll() with EINTR, and the wait reported that as its own answer -- a timeout
 //! before the time was up (Receive, and through it a query that "timed out" or "lost its connection"), an
 //! error (the handshake's transport).
-void TestSignals() {
+void TestSignals(const ServerIdentity &identity) {
 	std::cout << "A signal during a wait" << std::endl;
+	signals_delivered = 0;
 	{
 		Pair pair;
 		const Bytes in = Pattern(24, 5);
@@ -1102,6 +1147,37 @@ void TestSignals() {
 				  std::to_string(n) + ")");
 	}
 #endif
+	{
+		// After the handshake, over TLS (review of #617): the read is an SSL_read under a receive timeout,
+		// which a signal cuts short as it does poll(); OpenSSL says "read again", and that was answered as 0,
+		// a timeout.
+		TlsOptions trust;
+		trust.verify_certificate = false;
+		Pair pair;
+		ServerSeen seen;
+		std::thread server(ServeTls, pair.peer, std::cref(identity), ServerFault::SlowEcho, size_t(1), TLS1_2_VERSION,
+						   std::ref(seen));
+		pair.peer = -1;
+		uint8_t packet_id = 1;
+		const bool enabled = pair.socket.EnableTls(packet_id, 5000, "", trust);
+		const Bytes out = {10, 20, 30, 40};
+		uint8_t buffer[64];
+		ssize_t n = -2;
+		const bool sent = enabled && pair.socket.Send(out);
+		// The answer comes 300 ms after the request; the signal at 100.
+		WithSignal(-1, Bytes(), [&]() { n = pair.socket.Receive(buffer, sizeof(buffer), 3000); });
+		Check(sent && n == 4 && Bytes(buffer, buffer + 4) == Bytes({11, 21, 31, 41}) && pair.socket.IsConnected(),
+			  "over TLS, Receive waits on through a signal and returns the answer (" + std::to_string(n) + ")");
+		const auto start = std::chrono::steady_clock::now();
+		WithSignal(-1, Bytes(), [&]() { n = pair.socket.Receive(buffer, sizeof(buffer), 400); });
+		const auto took = MillisSince(start);
+		Check(n == 0 && pair.socket.IsConnected() && took >= 350 && took < 2500,
+			  "and with nothing arriving its timeout is the whole of it (" + std::to_string(took) + " ms)");
+		pair.socket.Close();
+		server.join();
+	}
+	Check(signals_delivered == 6,
+		  "every signal of these cases was delivered (" + std::to_string(signals_delivered) + ")");
 }
 
 }  // namespace
@@ -1117,7 +1193,7 @@ int main() {
 #ifndef TDS_SOCKET_TEST_NO_TRANSPORT
 	TestTransport();
 #endif
-	TestSignals();
+	TestSignals(identity);
 	std::cout << (failures ? "FAILED" : "all passed") << std::endl;
 	return failures ? 1 : 0;
 }
