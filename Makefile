@@ -688,6 +688,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_filter_encoder.cpp \
     test/cpp/test_statistics_provider.cpp \
     test/cpp/test_connection_error_translation.cpp \
+    test/cpp/test_connection_string.cpp \
     test/cpp/test_spn_host_resolution.cpp \
     test/cpp/test_insert_bulk_sql.cpp \
     test/cpp/test_bcp_column_metadata.cpp \

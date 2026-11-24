@@ -872,6 +872,12 @@ static string ValidateAuthConflicts(const case_insensitive_map_t<string> &params
 	return "";
 }
 
+//! Whether a value is one of the words a flag is written with: yes / true / 1, no / false / 0, any case.
+static bool IsYesOrNo(const string &raw) {
+	const auto value = StringUtil::Lower(raw);
+	return value == "yes" || value == "true" || value == "1" || value == "no" || value == "false" || value == "0";
+}
+
 //! The port of a `host,port` server value: an error message when it is not a number from 1 to 65535.
 static string ValidateServerPort(const string &server) {
 	auto comma_pos = server.find(',');
@@ -880,7 +886,13 @@ static string ValidateServerPort(const string &server) {
 	}
 	auto port_str = server.substr(comma_pos + 1);
 	try {
-		int port = std::stoi(port_str);
+		// The whole value, but for blanks around it: stoi alone takes the digits it finds and leaves the
+		// rest, so `Server=host,1433x` dialled port 1433.
+		size_t parsed = 0;
+		int port = std::stoi(port_str, &parsed);
+		if (port_str.find_first_not_of(" \t", parsed) != string::npos) {
+			return StringUtil::Format("Invalid port in Server parameter: '%s'", port_str);
+		}
 		if (port < 1 || port > 65535) {
 			return StringUtil::Format("Port must be between 1 and 65535. Got: %d", port);
 		}
@@ -925,7 +937,21 @@ string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_st
 	}
 
 	// Validate server format (host or host,port)
-	return ValidateServerPort(params["server"]);
+	const string port_error = ValidateServerPort(params["server"]);
+	if (!port_error.empty()) {
+		return port_error;
+	}
+
+	// TrustServerCertificate turns certificate verification off, so it takes the words that mean yes or no
+	// and nothing else. Any other value used to read as yes -- `TrustServerCertificate=off`, an empty
+	// value, a typo -- and the connection then accepted any certificate, without a word.
+	auto trust = params.find("trustservercertificate");
+	if (trust != params.end() && !IsYesOrNo(trust->second)) {
+		return StringUtil::Format("TrustServerCertificate must be yes or no (also true / false, 1 / 0). Got: '%s'",
+								  trust->second);
+	}
+
+	return "";	// Valid
 }
 
 //! A parameter's value, empty when it is not given.
@@ -942,7 +968,9 @@ static void TakeParam(const case_insensitive_map_t<string> &params, const char *
 	}
 }
 
-//! "no" / "false" / "0" clear a flag; anything else sets it.
+//! "no" / "false" / "0" clear a flag; anything else sets it. Encrypt is read so (an unknown word keeps the
+//! session encrypted, which is the safe side); TrustServerCertificate only after ValidateConnectionString
+//! has refused every word but yes and no.
 static bool FlagValue(const string &raw) {
 	auto value = StringUtil::Lower(raw);
 	return !(value == "no" || value == "false" || value == "0");
@@ -1217,10 +1245,6 @@ string MSSQLTranslateConnectionError(const string &error, const string &host, ui
 
 	return StringUtil::Format("Connection failed to %s:%d", host, port);
 }
-
-//===----------------------------------------------------------------------===//
-// Manual Token Connection Validation (Spec 032)
-//===----------------------------------------------------------------------===//
 
 //===----------------------------------------------------------------------===//
 // Storage Extension callbacks

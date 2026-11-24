@@ -168,7 +168,7 @@ Three options, with the meanings and defaults of the Microsoft drivers (ODBC 18,
 | ADO.NET key / URI parameter / secret field | Default | Meaning |
 |---|---|---|
 | `Encrypt` / `encrypt` / `use_encrypt` | `true` | Encrypt the session. `false` sends no TLS at all, the login packet included, and the two options below are ignored. |
-| `TrustServerCertificate` / `trustservercertificate` / `trust_server_certificate` | `false` | `false`: the server's certificate chain must validate against the platform trust store, and its subject must match the host connected to. `true`: any certificate is accepted; the channel is still encrypted, what is given up is knowing who is at the other end. |
+| `TrustServerCertificate` / `trustservercertificate` / `trust_server_certificate` | `false` | `false`: the server's certificate chain must validate against the platform trust store, and its subject must match the host connected to. `true`: any certificate is accepted; the channel is still encrypted, what is given up is knowing who is at the other end. In a connection string or URI the value is `yes` / `no` (also `true` / `false`, `1` / `0`); any other value is refused. |
 | `HostNameInCertificate` / `hostnameincertificate` / `host_name_in_certificate` | the host connected to | The name the certificate must carry when it differs from the address you connect to: an IP, an SSH tunnel to `localhost`, an alias the certificate was not issued for. After a login-time routing hop (Azure SQL redirect, Fabric) the routed host is checked, unless this is set, in which case it applies to every hop. |
 
 ```sql
