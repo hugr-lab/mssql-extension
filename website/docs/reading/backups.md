@@ -233,7 +233,9 @@ included. `geometry`, `geography` and `hierarchyid` are decoded by the same code
 `hierarchyid` as its `ToString()` text (`/1/2/`). A curve or FullGlobe, which a `GEOMETRY` cannot hold,
 is NULL with one WARNING per column; `geometry_as := 'wkb'` (ISO WKB, the curves included) or
 `'native'` (the stored bytes), on the call or as an ATTACH option, reads them, as `TYPE mssql`'s ATTACH
-option does. A type whose conversion comes in a later release -- `sql_variant`, `xml`, `vector`,
+option does. A value whose stored bytes cannot be read as its type (a damaged page) is NULL with one
+WARNING per column too, its row read; `mssql_backup_transaction_records` keeps such a row image as its
+bytes. A type whose conversion comes in a later release -- `sql_variant`, `xml`, `vector`,
 `json` -- and a user CLR type are returned as their stored bytes, a `BLOB`; no column is refused for
 its type. A column the scan cannot read -- a computed column that is not persisted (no
 stored value) or a sparse column -- is left out of `SELECT *`; a query that names it is refused,

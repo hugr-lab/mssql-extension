@@ -177,6 +177,35 @@ g	BLOB
 h	VARCHAR
 p	BLOB
 
+# The change listing and mssql_backup_catalog take geometry_as as the scan does (review of #621): an
+# invalid value refused by name; on the listing a valid one types the column (the full alone is one
+# state: no changes), on the catalog it is taken (its tables have no spatial column).
+statement error
+SELECT * FROM mssql_backup_table_changes(getvariable('ct'), 'dbo', 'shapes', geometry_as := 'png');
+----
+mssql_backup_table_changes: geometry_as must be 'geometry'
+
+query I
+SELECT count(*) FROM mssql_backup_table_changes(getvariable('ct'), 'dbo', 'shapes', geometry_as := 'wkb');
+----
+0
+
+query II
+SELECT (SELECT column_type FROM (DESCRIBE SELECT g FROM mssql_backup_table_changes(getvariable('ct'), 'dbo', 'shapes'))),
+	(SELECT column_type FROM (DESCRIBE SELECT g FROM mssql_backup_table_changes(getvariable('ct'), 'dbo', 'shapes', geometry_as := 'wkb')));
+----
+GEOMETRY	BLOB
+
+query I
+SELECT count(*) > 0 FROM mssql_backup_catalog(getvariable('ct'), 'sysschobjs', geometry_as := 'wkb');
+----
+true
+
+statement error
+SELECT * FROM mssql_backup_catalog(getvariable('ct'), 'sysschobjs', geometry_as := 'png');
+----
+mssql_backup_catalog: geometry_as must be 'geometry'
+
 # The call's geometry_as wins over the ATTACH's.
 query T
 SELECT typeof(g) FROM mssql_backup_scan('ct', 'dbo', 'shapes', geometry_as := 'geometry') LIMIT 1;

@@ -306,7 +306,8 @@ void FinalizeFallbackColumn(const ColumnStaging &st, idx_t count, const tds::Col
 
 void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
 						  Vector &out, variant::VariantColumnNotes *variant_notes,
-						  spatial::SpatialColumnNotes *spatial_notes) {
+						  spatial::SpatialColumnNotes *spatial_notes,
+						  hierarchyid::HierarchyIdColumnNotes *hierarchyid_notes) {
 	switch (kernel) {
 	case FinalizeKernel::None:
 		break;
@@ -341,7 +342,7 @@ void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t 
 		spatial::DecodeChunkFromStaging(st, count, meta, out, spatial_notes);
 		break;
 	case FinalizeKernel::HierarchyId:
-		hierarchyid::DecodeChunkFromStaging(st, count, meta, out);
+		hierarchyid::DecodeChunkFromStaging(st, count, meta, out, hierarchyid_notes);
 		break;
 	case FinalizeKernel::Vector:
 		sql_vector::DecodeChunkFromStaging(st, count, meta, out);
@@ -715,7 +716,9 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		// Which kernel is a property of the column, resolved with the append arm
 		// after COLMETADATA, so this is one switch on one invariant value and the
 		// kernel's own loop carries no dispatch at all.
-		FinalizeStagedColumn(ops_[c].kernel, st, row_count, meta, *targets_[c], &variant_notes_[c], &spatial_notes_[c]);
+		// A hierarchyid the server sent is refused if it cannot be read (no notes): its own values always can.
+		FinalizeStagedColumn(ops_[c].kernel, st, row_count, meta, *targets_[c], &variant_notes_[c], &spatial_notes_[c],
+							 nullptr);
 		if (out_of_range_counted) {
 			const ValidityMask &kernel_nulls = FlatVector::Validity(*targets_[c]);
 			chunk_out_of_range_[c] = kernel_nulls.CannotHaveNull() ? 0 : row_count - kernel_nulls.CountValid(row_count);

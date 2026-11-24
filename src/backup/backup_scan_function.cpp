@@ -342,7 +342,7 @@ struct ScanGlobalState : public GlobalTableFunctionState {
 	idx_t lsn_output = DConstants::INVALID_INDEX;
 	idx_t lob_output = DConstants::INVALID_INDEX;
 	std::vector<idx_t> empty_outputs;  // COLUMN_IDENTIFIER_EMPTY (count(*)): a constant NULL
-	SpatialWarnings spatial_warnings;  // spec 093 T8
+	ClrWarnings clr_warnings;		   // spec 093 T8
 
 	std::mutex claim;
 	std::shared_ptr<const PartitionCursor> cutting;	 // the partition units are being cut from
@@ -1161,7 +1161,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		global.rows_read += count;
 		WarnPendingValues(context, data, global, local);
 		local.stager->FinalizeChunk();
-		global.spatial_warnings.Say(context, data.function.c_str(), local.stager->SpatialNotes());
+		global.clr_warnings.Say(context, data.function.c_str(), local.stager->ClrNotes());
 		WriteVirtual(global, local, output, count);
 		for (idx_t c : global.empty_outputs) {
 			output.data[c].SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -1210,11 +1210,10 @@ TableFunction MakeScanFunction(const LogicalType &path, bool catalog = false) {
 
 }  // namespace
 
-void SpatialWarnings::Say(ClientContext &context, const char *function,
-						  const std::vector<RecordStager::SpatialNote> &notes) {
+void ClrWarnings::Say(ClientContext &context, const char *function, const std::vector<RecordStager::ClrNote> &notes) {
 	for (const auto &n : notes) {
 		std::lock_guard<std::mutex> guard(lock_);
-		if (n.notes.not_geometry > 0 && said_.insert(n.name + "|curve").second) {
+		if (n.spatial.not_geometry > 0 && said_.insert(n.name + "|curve").second) {
 			DUCKDB_LOG_WARNING(context,
 							   "%s: column %s (%s) holds values a GEOMETRY cannot hold (a CircularString, "
 							   "CompoundCurve, CurvePolygon or FullGlobe, or collections nested deeper than 15), "
@@ -1222,13 +1221,20 @@ void SpatialWarnings::Say(ClientContext &context, const char *function,
 							   "'native' (the stored bytes), on the call or as an ATTACH option, reads them",
 							   function, n.name.c_str(), n.type.c_str());
 		}
-		if (n.notes.malformed > 0 && said_.insert(n.name + "|malformed").second) {
+		if (n.spatial.malformed > 0 && said_.insert(n.name + "|malformed").second) {
 			DUCKDB_LOG_WARNING(context,
 							   "%s: column %s (%s) holds values whose stored bytes cannot be read as %s (the "
 							   "first: %s), read as NULL, their rows read; geometry_as 'native' reads the stored "
 							   "bytes",
 							   function, n.name.c_str(), n.type.c_str(), n.type.c_str(),
-							   codec::ssclrt::DescribeStatus(n.notes.first_malformed));
+							   codec::ssclrt::DescribeStatus(n.spatial.first_malformed));
+		}
+		if (n.hierarchyid.malformed > 0 && said_.insert(n.name + "|hierarchyid").second) {
+			DUCKDB_LOG_WARNING(context,
+							   "%s: column %s (hierarchyid) holds values whose stored bytes cannot be read as a "
+							   "hierarchyid (the first: %s), read as NULL, their rows read",
+							   function, n.name.c_str(),
+							   codec::hierarchyid::DescribeStatus(n.hierarchyid.first_malformed));
 		}
 	}
 }

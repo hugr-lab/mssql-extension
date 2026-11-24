@@ -831,11 +831,11 @@ void RecordStager::Append(const RowRecord &row) {
 	count_++;
 }
 
-std::vector<RecordStager::SpatialNote> RecordStager::SpatialNotes() const {
-	std::vector<SpatialNote> notes;
+std::vector<RecordStager::ClrNote> RecordStager::ClrNotes() const {
+	std::vector<ClrNote> notes;
 	for (const auto &col : columns_) {
-		if (col.spatial_notes.not_geometry + col.spatial_notes.malformed > 0) {
-			notes.push_back(SpatialNote{col.name, col.meta.udt_type_name, col.spatial_notes});
+		if (col.spatial_notes.not_geometry + col.spatial_notes.malformed + col.hierarchyid_notes.malformed > 0) {
+			notes.push_back(ClrNote{col.name, col.meta.udt_type_name, col.spatial_notes, col.hierarchyid_notes});
 		}
 	}
 	return notes;
@@ -854,10 +854,11 @@ void RecordStager::FinalizeChunk() {
 	begun_ = false;
 	for (size_t i = 0; i < columns_.size(); i++) {
 		const ColumnStaging &st = arena_.Column(i);
-		// A spatial column's notes kept across chunks (spec 093 T8); a sql_variant is still its stored bytes
-		// (T8b), so the kernel is never Variant.
+		// A spatial or hierarchyid column's notes kept across chunks (spec 093 T8: a value the kernel cannot
+		// read is NULL, its row read); a sql_variant is still its stored bytes (T8b), so the kernel is never
+		// Variant.
 		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, *targets_[i],
-											 nullptr, &columns_[i].spatial_notes);
+											 nullptr, &columns_[i].spatial_notes, &columns_[i].hierarchyid_notes);
 		codec::staging::PublishStagedValidity(st, count_, *targets_[i]);
 	}
 	// The values written straight into their vectors, over their placeholders.

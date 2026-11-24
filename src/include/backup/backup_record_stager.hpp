@@ -22,6 +22,7 @@
 #include "backup/backup_record.hpp"
 #include "backup/backup_system_tables.hpp"
 #include "backup/backup_type_forms.hpp"
+#include "codec/clr/hierarchyid_codec.hpp"
 #include "codec/clr/spatial_codec.hpp"
 #include "codec/staging/column_ops.hpp"
 #include "codec/staging/column_staging.hpp"
@@ -177,15 +178,17 @@ public:
 	//! cardinality (Count()). The DataChunk form sets it.
 	void FinalizeChunk();
 	void FinalizeChunk(DataChunk &out);
-	//! A geometry / geography column's decode notes since the stager was made (spec 093 T8: values read
-	//! as NULL, a curve under GEOMETRY or bytes that are not MS-SSCLRT), with its `table.column` name; the
-	//! caller words the WARNING (SpatialWarnings, backup_scan_internal) once a column a statement.
-	struct SpatialNote {
+	//! A geometry / geography / hierarchyid column's decode notes since the stager was made (spec 093 T8:
+	//! values read as NULL -- a curve under GEOMETRY, bytes that are not MS-SSCLRT or not a hierarchyid's),
+	//! with its `table.column` name; the caller words the WARNING (ClrWarnings, backup_scan_internal) once a
+	//! column a statement.
+	struct ClrNote {
 		std::string name;
-		std::string type;  // geometry / geography
-		codec::spatial::SpatialColumnNotes notes;
+		std::string type;  // geometry / geography / hierarchyid
+		codec::spatial::SpatialColumnNotes spatial;
+		codec::hierarchyid::HierarchyIdColumnNotes hierarchyid;
 	};
-	std::vector<SpatialNote> SpatialNotes() const;
+	std::vector<ClrNote> ClrNotes() const;
 
 private:
 	struct Column {
@@ -201,7 +204,8 @@ private:
 		bool binary_kernel = false;		// published as its bytes (a BLOB, a UTF-8 text): written direct when long
 		bool utf16_kernel = false;		// decoded from UTF-16 (nvarchar, ntext): streamed when long
 		bool code_page_kernel = false;	// decoded from its code page (varchar, text): streamed when long
-		codec::spatial::SpatialColumnNotes spatial_notes;  // the Spatial kernel's, across chunks
+		codec::spatial::SpatialColumnNotes spatial_notes;			   // the Spatial kernel's, across chunks
+		codec::hierarchyid::HierarchyIdColumnNotes hierarchyid_notes;  // the HierarchyId kernel's, across chunks
 	};
 
 	//! The constructor's steps: a projected column resolved to its staging (its arm chosen by ArmOf and
