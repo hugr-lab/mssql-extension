@@ -133,6 +133,9 @@ endif()
 set(EXTENSION_SOURCES
     src/mssql_extension.cpp
     src/mssql_secret.cpp
+    src/mssql_connection_error.cpp
+    src/mssql_connection_info.cpp
+    src/mssql_connection_string.cpp
     src/mssql_storage.cpp
     src/mssql_functions.cpp
     src/mssql_function_docs.cpp
