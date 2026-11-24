@@ -4,8 +4,10 @@
 // Spec 079: the node writer behind SQLWriter -- INTERNAL to src/pushdown.
 // Its methods are split by concern: mssql_node_writer_from.cpp (relations,
 // column resolution, FROM, derived tables, CTEs, keys and the gain),
-// _select.cpp (a SELECT node, its select list, aggregates, groups, ORDER BY,
-// set operations), _values.cpp (constants, arithmetic, casts, CASE,
+// _select.cpp (a SELECT node: its steps, its select list, LIMIT / OFFSET),
+// _aggregates.cpp (GROUP BY and the aggregates), _order.cpp (ORDER BY, and the
+// sort keys of an ordered aggregate or a window), _setops.cpp (set
+// operations), _values.cpp (constants, arithmetic, casts, CASE,
 // comparisons, IN / BETWEEN / LIKE, predicates), _subqueries.cpp (correlation
 // and subquery expressions); the free helpers below in mssql_node_writer.cpp.
 // The public SQLWriter, ColumnTypeName, the counters and PushesMoreThanScan
