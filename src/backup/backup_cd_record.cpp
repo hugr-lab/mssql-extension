@@ -321,10 +321,10 @@ std::string Hex(const uint8_t *data, size_t size) {
 
 //! A vardecimal's digits (E22): ten bits a group of three digits, the last group's trailing zero bits
 //! not stored; trailing zero digits left out (they change nothing: the value is digits x
-//! 10^(exponent - n + 1)). `what` names the value in an error.
+//! 10^(exponent - n + 1)). Appended to `digits` (empty), not returned: a string built per value and
+//! moved out cost a compressed decimal about 3% (review of #605). `what` names the value in an error.
 template <class Name>
-std::string VardecimalDigits(const uint8_t *data, size_t size, const Name &what) {
-	std::string digits;
+void VardecimalDigits(const uint8_t *data, size_t size, const Name &what, std::string &digits) {
 	const size_t bits = 8 * (size - 1);
 	for (size_t at = 0; at < bits; at += 10) {
 		unsigned group = 0;
@@ -346,7 +346,6 @@ std::string VardecimalDigits(const uint8_t *data, size_t size, const Name &what)
 	while (!digits.empty() && digits.back() == '0') {
 		digits.pop_back();
 	}
-	return digits;
 }
 
 //! digits x 10^shift into `magnitude`: false when it does not fit 128 bits or a decimal of `precision`.
@@ -382,7 +381,7 @@ void DecodeVardecimal(const uint8_t *data, size_t size, uint8_t precision, uint8
 	if (size > 0) {
 		positive = (data[0] & 0x80) != 0;
 		exponent = static_cast<int>(data[0] & 0x7F) - 64;
-		digits = VardecimalDigits(data, size, what);
+		VardecimalDigits(data, size, what, digits);
 	}
 	// The unscaled value: digits x 10^shift, shift = exponent - n + 1 + scale.
 	const int shift = digits.empty() ? 0 : exponent - static_cast<int>(digits.size()) + 1 + scale;
@@ -650,6 +649,68 @@ void ReadPageCompression(const uint8_t *page, size_t page_size, size_t slot_arra
 
 namespace {
 
+// CdRow's staging is inlined into Read whole (CD_INLINE) and its refusals are built out of line
+// (CD_COLD): with each message's concatenation in the staging functions, they were too large to
+// inline, and a value paid two calls and its description through the stack (measured on #595: 8-18%
+// a value; inlined, below the switch it replaced).
+#if defined(_MSC_VER)
+#define CD_COLD __declspec(noinline)
+#define CD_INLINE __forceinline
+#else
+#define CD_COLD __attribute__((noinline, cold))
+#define CD_INLINE inline __attribute__((always_inline))
+#endif
+
+//! "backup: <table>.<column> holds <size> bytes for a <type>".
+[[noreturn]] CD_COLD void RefuseFor(const std::string &table, const std::string &column, size_t size,
+									const char *type) {
+	throw FormatError("backup: " + table + "." + column + " holds " + std::to_string(size) + " bytes for a " + type);
+}
+
+//! "... holds <size> bytes for a <width>-byte <kind>".
+[[noreturn]] CD_COLD void RefuseWidth(const std::string &table, const std::string &column, size_t size, size_t width,
+									  const char *kind) {
+	throw FormatError("backup: " + table + "." + column + " holds " + std::to_string(size) + " bytes for a " +
+					  std::to_string(width) + "-byte " + kind);
+}
+
+//! "... holds <size> bytes, past its <width>".
+[[noreturn]] CD_COLD void RefusePast(const std::string &table, const std::string &column, size_t size, size_t width) {
+	throw FormatError("backup: " + table + "." + column + " holds " + std::to_string(size) + " bytes, past its " +
+					  std::to_string(width));
+}
+
+//! "... holds <size> bytes, its type <width>".
+[[noreturn]] CD_COLD void RefuseTyped(const std::string &table, const std::string &column, size_t size, size_t width) {
+	throw FormatError("backup: " + table + "." + column + " holds " + std::to_string(size) + " bytes, its type " +
+					  std::to_string(width));
+}
+
+//! "... holds <chars> characters, past its <length>".
+[[noreturn]] CD_COLD void RefuseChars(const std::string &table, const std::string &column, size_t chars,
+									  size_t length) {
+	throw FormatError("backup: " + table + "." + column + " holds " + std::to_string(chars) + " characters, past its " +
+					  std::to_string(length));
+}
+
+//! "backup: <table>.<column><text><number><tail>".
+[[noreturn]] CD_COLD void RefuseNumber(const std::string &table, const std::string &column, const char *text,
+									   size_t number, const char *tail = "") {
+	throw FormatError("backup: " + table + "." + column + text + std::to_string(number) + tail);
+}
+
+//! "backup: <table>.<column><text><first><middle><second>".
+[[noreturn]] CD_COLD void RefuseNumbers(const std::string &table, const std::string &column, const char *text,
+										size_t first, const char *middle, size_t second) {
+	throw FormatError("backup: " + table + "." + column + text + std::to_string(first) + middle +
+					  std::to_string(second));
+}
+
+//! "backup: <table>.<column><text>".
+[[noreturn]] CD_COLD void RefuseText(const std::string &table, const std::string &column, const char *text) {
+	throw FormatError("backup: " + table + "." + column + text);
+}
+
 //! Which of CdRow's staging functions puts a type in its uncompressed form. One lookup per value:
 //! the types named here are the numeric and temporal ones, every other xtype is staged as bytes.
 enum class CdFamily : uint8_t { Bytes, Numeric, Temporal };
@@ -675,14 +736,14 @@ const CdFamilies CD_FAMILIES;
 
 }  // namespace
 
-void CdRow::Store(const Staging &s, size_t bytes) {
+CD_INLINE void CdRow::Store(const Staging &s, size_t bytes) {
 	at_[s.k] = s.start;
 	values_[s.k].size = static_cast<uint32_t>(bytes);
 }
 
 //! A PAGE value put together in rebuilt_, which the next column reuses, is kept in the row's buffer
 //! instead; anything else is pointed at where it already lies.
-void CdRow::StoreAsIs(const Staging &s) {
+CD_INLINE void CdRow::StoreAsIs(const Staging &s) {
 	if (s.rebuilt) {
 		buffer_.insert(buffer_.end(), s.p, s.p + s.size);
 		Store(s, s.size);
@@ -692,19 +753,17 @@ void CdRow::StoreAsIs(const Staging &s) {
 	}
 }
 
-void CdRow::StoreInteger(const Staging &s, size_t width) {
+CD_INLINE void CdRow::StoreInteger(const Staging &s, size_t width) {
 	if (s.size > width) {
-		throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes for a " +
-						  std::to_string(width) + "-byte integer");
+		RefuseWidth(s.layout.table, s.c.name, s.size, width, "integer");
 	}
 	PutLE(buffer_, static_cast<uint64_t>(CdInteger(s.p, s.size)), width);
 	Store(s, width);
 }
 
-void CdRow::StorePadded(const Staging &s, uint8_t pad, size_t width) {
+CD_INLINE void CdRow::StorePadded(const Staging &s, uint8_t pad, size_t width) {
 	if (s.size > width) {
-		throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes, past its " +
-						  std::to_string(width));
+		RefusePast(s.layout.table, s.c.name, s.size, width);
 	}
 	buffer_.insert(buffer_.end(), s.p, s.p + s.size);
 	buffer_.insert(buffer_.end(), width - s.size, pad);
@@ -713,11 +772,11 @@ void CdRow::StorePadded(const Staging &s, uint8_t pad, size_t width) {
 
 //! The integer, bit, vardecimal and IEEE families, each put in the uncompressed record's form. Its
 //! cases are CD_FAMILIES' Numeric types, one for one.
-void CdRow::StageNumeric(const Staging &s) {
+CD_INLINE void CdRow::StageNumeric(const Staging &s) {
 	switch (s.c.xtype) {
 	case XTYPE_TINYINT:
 		if (s.size > 1) {
-			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes for a tinyint");
+			RefuseFor(s.layout.table, s.c.name, s.size, "tinyint");
 		}
 		buffer_.push_back(s.size ? s.p[0] : 0);	 // as it is, unflipped (E22)
 		Store(s, 1);
@@ -735,10 +794,10 @@ void CdRow::StageNumeric(const Staging &s) {
 		return;
 	case XTYPE_BIT:
 		if (s.cd.code != CD_EMPTY && s.cd.code != CD_BIT_ONE) {
-			throw FormatError("backup: " + s.What() + ", a bit, holds CD code " + std::to_string(s.cd.code));
+			RefuseNumber(s.layout.table, s.c.name, ", a bit, holds CD code ", s.cd.code);
 		}
 		if (s.c.bit_position > 7) {
-			throw FormatError("backup: " + s.What() + " has bit position " + std::to_string(s.c.bit_position));
+			RefuseNumber(s.layout.table, s.c.name, " has bit position ", s.c.bit_position);
 		}
 		buffer_.push_back(s.cd.code == CD_BIT_ONE ? static_cast<uint8_t>(1u << s.c.bit_position) : 0);
 		Store(s, 1);
@@ -753,8 +812,7 @@ void CdRow::StageNumeric(const Staging &s) {
 		// The IEEE value's little-endian bytes without their low-order zero bytes (E22).
 		const size_t width = s.c.xtype == XTYPE_REAL ? 4 : 8;
 		if (s.size > width) {
-			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes for a " +
-							  std::to_string(width) + "-byte float");
+			RefuseWidth(s.layout.table, s.c.name, s.size, width, "float");
 		}
 		buffer_.insert(buffer_.end(), width - s.size, 0);
 		buffer_.insert(buffer_.end(), s.p, s.p + s.size);
@@ -765,11 +823,11 @@ void CdRow::StageNumeric(const Staging &s) {
 }
 
 //! datetime, smalldatetime, and the fixed-width date / time / guid types: CD_FAMILIES' Temporal ones.
-void CdRow::StageTemporal(const Staging &s) {
+CD_INLINE void CdRow::StageTemporal(const Staging &s) {
 	switch (s.c.xtype) {
 	case XTYPE_DATETIME: {
 		if (s.size > 8) {
-			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes for a datetime");
+			RefuseFor(s.layout.table, s.c.name, s.size, "datetime");
 		}
 		const uint64_t whole = static_cast<uint64_t>(CdInteger(s.p, s.size));  // days << 32 | ticks
 		PutLE(buffer_, whole & 0xFFFFFFFFu, 4);	 // the uncompressed form: ticks, then days
@@ -786,8 +844,7 @@ void CdRow::StageTemporal(const Staging &s) {
 		} else if (s.size == 0 || s.size == 4) {
 			StorePadded(s, 0, 4);
 		} else {
-			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) +
-							  " bytes for a smalldatetime");
+			RefuseFor(s.layout.table, s.c.name, s.size, "smalldatetime");
 		}
 		return;
 	case XTYPE_DATE:
@@ -801,8 +858,7 @@ void CdRow::StageTemporal(const Staging &s) {
 		} else if (s.size == 0) {
 			StorePadded(s, 0, width);
 		} else {
-			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes, its type " +
-							  std::to_string(width));
+			RefuseTyped(s.layout.table, s.c.name, s.size, width);
 		}
 		return;
 	}
@@ -811,14 +867,13 @@ void CdRow::StageTemporal(const Staging &s) {
 
 //! char / binary (padded or as stored), rowversion, nchar / nvarchar (SCSU), and everything
 //! else -- varchar, varbinary, the MAX and LOB types -- as stored.
-void CdRow::StageBytes(const Staging &s) {
+CD_INLINE void CdRow::StageBytes(const Staging &s) {
 	switch (s.c.xtype) {
 	case XTYPE_CHAR:
 	case XTYPE_BINARY:
 		if (s.c.unpadded) {
 			if (s.size > s.c.length) {
-				throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes, past its " +
-								  std::to_string(s.c.length));
+				RefusePast(s.layout.table, s.c.name, s.size, s.c.length);
 			}
 			StoreAsIs(s);  // nullable, under ANSI_PADDING OFF: stored and read as given (E22)
 		} else {
@@ -828,7 +883,7 @@ void CdRow::StageBytes(const Staging &s) {
 	case XTYPE_TIMESTAMP:
 		// Its 8 bytes big-endian, the leading zero bytes left out (E22: 0x7D1 -> 07 d1).
 		if (s.size > 8) {
-			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes for a rowversion");
+			RefuseFor(s.layout.table, s.c.name, s.size, "rowversion");
 		}
 		buffer_.insert(buffer_.end(), 8 - s.size, 0);
 		buffer_.insert(buffer_.end(), s.p, s.p + s.size);
@@ -840,8 +895,7 @@ void CdRow::StageBytes(const Staging &s) {
 		const size_t decoded = buffer_.size() - s.start;
 		if (s.c.xtype == XTYPE_NCHAR) {
 			if (decoded > s.c.length) {
-				throw FormatError("backup: " + s.What() + " holds " + std::to_string(decoded / 2) +
-								  " characters, past its " + std::to_string(s.c.length / 2));
+				RefuseChars(s.layout.table, s.c.name, decoded / 2, s.c.length / 2);
 			}
 			for (size_t b = decoded; b < s.c.length; b += 2) {
 				buffer_.push_back(0x20);  // nchar's trailing spaces were left out
@@ -860,13 +914,13 @@ void CdRow::StageBytes(const Staging &s) {
 
 //! `s`'s value staged into `buffer_` for column `s.k`: located only when the scan does not read
 //! it, else put in the form the uncompressed record holds it (E22).
-void CdRow::StageValue(const Staging &s, const std::vector<bool> *needed) {
+CD_INLINE void CdRow::StageValue(const Staging &s, const std::vector<bool> *needed) {
 	if (needed && (s.k >= needed->size() || !(*needed)[s.k])) {
 		StoreAsIs(s);  // located only: not read by this scan
 		return;
 	}
 	if (s.cd.code == CD_BIT_ONE && s.c.xtype != XTYPE_BIT) {
-		throw FormatError("backup: " + s.What() + " holds CD code 11 (bit 1) and is not a bit");
+		RefuseText(s.layout.table, s.c.name, " holds CD code 11 (bit 1) and is not a bit");
 	}
 	if (s.c.Uniquifier()) {
 		if (s.size == 0) {
@@ -893,16 +947,15 @@ void CdRow::StageValue(const Staging &s, const std::vector<bool> *needed) {
 //! A value's bytes under PAGE compression (E23): a symbol is its dictionary entry; an anchored
 //! column's value (an entry too) is its prefix of the anchor's value and its suffix; EMPTY there,
 //! the anchor's value whole. `p` / `size` / `rebuilt` are moved on to what the value actually is.
-void CdRow::RebuildFromPage(const PageCompression &page, const CdValue &cd, size_t index, const RowsetLayout &layout,
-							const PhysicalColumn &c, const uint8_t *&p, size_t &size, bool &rebuilt) {
-	auto what = [&]() { return layout.table + "." + c.name; };
+CD_INLINE void CdRow::RebuildFromPage(const PageCompression &page, const CdValue &cd, size_t index,
+									  const RowsetLayout &layout, const PhysicalColumn &c, const uint8_t *&p,
+									  size_t &size, bool &rebuilt) {
 	const CdValue *anchor =
 		page.has_anchor && index < page.anchor.column_count && page.anchor.values[index].code != CD_NULL
 			? &page.anchor.values[index]
 			: nullptr;
 	if (anchor && (anchor->complex || anchor->code == CD_SYMBOL)) {
-		throw FormatError("backup: " + what() + " has an anchor value the reader does not know (code " +
-						  std::to_string(anchor->code) + ")");
+		RefuseNumber(layout.table, c.name, " has an anchor value the reader does not know (code ", anchor->code, ")");
 	}
 	const uint8_t *anchor_data = anchor ? page.anchor.data + anchor->offset : nullptr;
 	const size_t anchor_size = anchor ? (anchor->code == CD_EMPTY ? 0 : anchor->size) : 0;
@@ -910,8 +963,8 @@ void CdRow::RebuildFromPage(const PageCompression &page, const CdValue &cd, size
 	if (cd.code == CD_SYMBOL) {
 		const size_t symbol = p[0];
 		if (symbol >= page.dictionary.size()) {
-			throw FormatError("backup: " + what() + " holds dictionary symbol " + std::to_string(symbol) +
-							  " of a page dictionary of " + std::to_string(page.dictionary.size()));
+			RefuseNumbers(layout.table, c.name, " holds dictionary symbol ", symbol, " of a page dictionary of ",
+						  page.dictionary.size());
 		}
 		p = page.page + page.dictionary[symbol].first;
 		size = page.dictionary[symbol].second;
@@ -922,20 +975,20 @@ void CdRow::RebuildFromPage(const PageCompression &page, const CdValue &cd, size
 	}
 	if (prefixed) {
 		if (size == 0) {
-			throw FormatError("backup: " + what() + " holds no prefix length beside its anchor");
+			RefuseText(layout.table, c.name, " holds no prefix length beside its anchor");
 		}
 		size_t prefix = p[0];
 		size_t skip = 1;
 		if (prefix & 0x80) {
 			if (size < 2) {
-				throw FormatError("backup: " + what() + " holds a two-byte prefix length of one byte");
+				RefuseText(layout.table, c.name, " holds a two-byte prefix length of one byte");
 			}
 			prefix = ((prefix & 0x7F) << 8) | p[1];
 			skip = 2;
 		}
 		if (prefix > anchor_size) {
-			throw FormatError("backup: " + what() + " holds a prefix of " + std::to_string(prefix) +
-							  " bytes of an anchor value of " + std::to_string(anchor_size));
+			RefuseNumbers(layout.table, c.name, " holds a prefix of ", prefix, " bytes of an anchor value of ",
+						  anchor_size);
 		}
 		rebuilt_.assign(anchor_data, anchor_data + prefix);
 		rebuilt_.insert(rebuilt_.end(), p + skip, p + size);
@@ -1004,6 +1057,10 @@ void CdRow::Read(const CdRecord &record, const RowsetLayout &layout, const std::
 		}
 	}
 }
+
+// File-local: undefined, so a unity build does not carry them into another file (review of #609).
+#undef CD_COLD
+#undef CD_INLINE
 
 }  // namespace backup
 }  // namespace mssql

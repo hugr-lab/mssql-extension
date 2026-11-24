@@ -42,12 +42,12 @@ item 10 ì (updated)	13.50
 
 # The listings read the overlay's catalog.
 query T
-SELECT list(table_name || ':' || row_count ORDER BY table_name) FROM mssql_backup_tables('test/data/backup/full.bak', diff := 'test/data/backup/diff.bak');
+SELECT list(table_name || ':' || row_count ORDER BY table_name) FROM mssql_backup_tables('test/data/backup/full.bak', diff := 'test/data/backup/diff.bak') WHERE type = 'U';
 ----
 ['events:2572', 'items:2500']
 
 query I
-SELECT count(*) FROM mssql_backup_columns('test/data/backup/full.bak', diff := 'test/data/backup/diff.bak');
+SELECT count(*) FROM mssql_backup_columns('test/data/backup/full.bak', diff := 'test/data/backup/diff.bak') WHERE schema_name = 'dbo';
 ----
 11
 

@@ -341,7 +341,8 @@ static LogicalType NativeStringType(const LogicalType &stream_type, bool native_
 		return stream_type;
 	}
 	MSSQLColumnInfo info(string(), 0, base, max_length, 0, 0, true, collation, string(),
-						 MSSQLDatetime2Read::Nanoseconds);	// a string column: no datetime2 read form
+						 MSSQLDatetime2Read::Nanoseconds,
+						 tds::GeometryAs::Geometry);  // a string column: no datetime2 / spatial read form
 	return info.NativeDuckDBType();
 }
 
@@ -394,7 +395,14 @@ static bool IsDeclaredTypeAmbiguous(const tds::ColumnMetadata &col, bool utf8_ac
 // nchar / nvarchar (the annotation needs no collation there), plain VARCHAR
 // for a code-page varchar and for anything IsDeclaredTypeAmbiguous.
 static LogicalType WireStringType(const tds::ColumnMetadata &col, bool native_types, bool utf8_acked,
-								  bool client_transcode) {
+								  bool client_transcode, tds::GeometryAs geometry_as) {
+	if (col.IsSpatialUdt()) {
+		// Spec 093 T5: geometry / geography as the catalog reads them (geometry_as), which COLMETADATA
+		// read off a simple query does not carry.
+		tds::ColumnMetadata spatial = col;
+		spatial.geometry_as = geometry_as;
+		return tds::encoding::TypeConverter::GetDuckDBType(spatial);
+	}
 	const LogicalType stream_type = tds::encoding::TypeConverter::GetDuckDBType(col);
 	const string base = StringBaseOf(col);
 	if (base.empty() || IsDeclaredTypeAmbiguous(col, utf8_acked, client_transcode)) {
@@ -504,7 +512,7 @@ static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQ
 // sp_prepare asks this function for its varchars' collations.
 static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection, const string &statement,
 												  const string &declarations, int timeout_ms, bool native_types,
-												  bool client_transcode) {
+												  bool client_transcode, tds::GeometryAs geometry_as) {
 	MSSQLDescribedShape shape;
 	string batch = "EXEC sp_describe_first_result_set " + mssql::NVarcharLiteral(statement) + ", " +
 				   (declarations.empty() ? string("NULL") : mssql::NVarcharLiteral(declarations)) + ", 0";
@@ -582,6 +590,7 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 			shape.reason = "the describe names a type this extension does not map: " + type_name;
 			return shape;
 		}
+		column.geometry_as = geometry_as;  // spec 093 T5: a geometry / geography as the catalog reads it
 		string collation;
 		if (collation_idx >= 0) {
 			collation = row[collation_idx];
@@ -604,7 +613,7 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 // off that token exactly as the stream reads them at execution.
 static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, const string &statement,
 											const string &declarations, int timeout_ms, int32_t &handle,
-											bool native_types, bool client_transcode) {
+											bool native_types, bool client_transcode, tds::GeometryAs geometry_as) {
 	MSSQLDescribedShape shape;
 	string batch = "DECLARE @h int;\nEXEC sp_prepare @h OUTPUT, " +
 				   (declarations.empty() ? string("NULL") : mssql::NVarcharLiteral(declarations)) + ", " +
@@ -634,7 +643,7 @@ static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, cons
 		const bool ambiguous = IsDeclaredTypeAmbiguous(col, utf8_acked, client_transcode);
 		needs_describe.push_back(ambiguous);
 		any_needs_describe = any_needs_describe || ambiguous;
-		shape.types.push_back(WireStringType(col, native_types, utf8_acked, client_transcode));
+		shape.types.push_back(WireStringType(col, native_types, utf8_acked, client_transcode, geometry_as));
 		shape.names.push_back(col.name);
 		shape.datetime2.push_back(col.type_id == tds::TDS_TYPE_DATETIME2);
 	}
@@ -652,8 +661,8 @@ static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, cons
 	// (`ok` false) changes nothing; an exception -- a cancel, a timeout, a lost
 	// connection -- is the bind's, as it would be for any query it runs.
 	if (native_types && any_needs_describe) {
-		auto described =
-			DescribeFirstResultSet(connection, statement, declarations, timeout_ms, true, client_transcode);
+		auto described = DescribeFirstResultSet(connection, statement, declarations, timeout_ms, true, client_transcode,
+												geometry_as);
 		if (described.ok) {
 			for (idx_t i = 0; i < shape.types.size() && i < described.types.size(); i++) {
 				if (described.names[i] != shape.names[i]) {
@@ -698,8 +707,10 @@ static bool ReadPreparedOption(const TableFunctionBindInput &input) {
 // the catalog scan decodes it. A datetime2 into the TIMESTAMP variant of its
 // scale (the unit is the vector's, so datetime2(7) keeps its 100 ns ticks --
 // datetime2 only: datetime and smalldatetime decode to µs whatever the vector), a
-// varbinary into GEOMETRY (STAsBinary's WKB), a string into another string
-// type (the MSSQL_VARCHAR / MSSQL_NVARCHAR labels, same physical VARCHAR).
+// varbinary into GEOMETRY (STAsBinary's WKB), a GEOMETRY into a GEOMETRY of
+// another CRS label (a geography read as plain GEOMETRY: the same WKB, spec 093
+// T5), a string into another string type (the MSSQL_VARCHAR / MSSQL_NVARCHAR
+// labels, same physical VARCHAR).
 static bool ColumnTypeFits(const LogicalType &described, const LogicalType &wanted, bool datetime2) {
 	if (described == wanted) {
 		return true;
@@ -713,7 +724,8 @@ static bool ColumnTypeFits(const LogicalType &described, const LogicalType &want
 		// microseconds written into a TIMESTAMP_NS vector would read 1000x small.
 		return datetime2 || wanted.id() == LogicalTypeId::TIMESTAMP;
 	}
-	if (described.id() == LogicalTypeId::BLOB && wanted.id() == LogicalTypeId::GEOMETRY) {
+	if ((described.id() == LogicalTypeId::BLOB || described.id() == LogicalTypeId::GEOMETRY) &&
+		wanted.id() == LogicalTypeId::GEOMETRY) {
 		return true;
 	}
 	return described.id() == LogicalTypeId::VARCHAR && wanted.id() == LogicalTypeId::VARCHAR;
@@ -955,6 +967,7 @@ static void BindDescribedScan(ClientContext &context, const char *function, MSSQ
 	const string declarations = params.Declarations();
 	const bool native_types = MSSQLReportsNativeTypes(mssql_catalog);
 	const bool client_transcode = mssql_catalog.ClientTranscode();
+	const tds::GeometryAs geometry_as = mssql_catalog.GeometryAs();
 
 	// Spec 079 PR E2, issue #410: a statement of a shape already described
 	// binds without the round trip -- or a connection. Inside an explicit transaction
@@ -1037,7 +1050,7 @@ static void BindDescribedScan(ClientContext &context, const char *function, MSSQ
 		if (wanted_prepared) {
 			int32_t handle = 0;
 			shape = PrepareStatement(*connection, bind_data.query, declarations, timeout_ms, handle, native_types,
-									 client_transcode);
+									 client_transcode, geometry_as);
 			if (shape.ok) {
 				auto session = make_shared_ptr<MSSQLPreparedSession>();
 				session->handle = handle;
@@ -1073,11 +1086,11 @@ static void BindDescribedScan(ClientContext &context, const char *function, MSSQ
 								   shape.reason.c_str());
 				bind_data.prepared = false;
 				shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms, native_types,
-											   client_transcode);
+											   client_transcode, geometry_as);
 			}
 		} else {
 			shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms, native_types,
-										   client_transcode);
+										   client_transcode, geometry_as);
 		}
 	} catch (...) {
 		ConnectionProvider::ReleaseConnection(context, mssql_catalog, std::move(connection));
@@ -1142,7 +1155,7 @@ static void BindDescribedScan(ClientContext &context, const char *function, MSSQ
 	const bool utf8_acked = stream_connection && stream_connection->UTF8SupportAcked();
 	return_types.clear();
 	for (const auto &col : result_stream->GetColumnMetadata()) {
-		return_types.push_back(WireStringType(col, native_types, utf8_acked, client_transcode));
+		return_types.push_back(WireStringType(col, native_types, utf8_acked, client_transcode, geometry_as));
 	}
 	// Before the stream is kept: thrown here, it closes and gives its connection back.
 	RequireResultSet(return_types, function);
@@ -2034,8 +2047,9 @@ void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 		 "mssql_scan with the result's shape given instead of described: columns := {'name': 'TYPE', ...} is "
 		 "returned at bind without asking the server (no connection, no describe), and the rows are checked "
 		 "against it when the query runs. The caller vouches for the shape; a stream that does not fit it fails. "
-		 "Types are read as by the catalog: tinyint UTINYINT, datetime2(7) TIMESTAMP_NS, a GEOMETRY column must "
-		 "arrive as WKB (STAsBinary()).",
+		 "Types are read as by the catalog: tinyint UTINYINT, datetime2(7) TIMESTAMP_NS, geometry / geography "
+		 "GEOMETRY (decoded on the client, or the catalog's geometry_as), a GEOMETRY from varbinary as WKB "
+		 "(STAsBinary()).",
 		 {"SELECT * FROM mssql_scan_unsafe('db', 'SELECT object_id, name FROM sys.objects', "
 		  "columns := {'object_id': 'INTEGER', 'name': 'VARCHAR'})"},
 		 {"query"}});

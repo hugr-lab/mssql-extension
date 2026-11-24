@@ -112,6 +112,9 @@ std::vector<Column> TableColumns() {
 	return {{"schema_name", LogicalType::VARCHAR},
 			{"table_name", LogicalType::VARCHAR},
 			{"object_id", LogicalType::INTEGER},
+			{"type", LogicalType::VARCHAR},
+			{"is_ms_shipped", LogicalType::BOOLEAN},
+			{"parent_object_id", LogicalType::INTEGER},
 			{"shape", LogicalType::VARCHAR},
 			{"compression", LogicalType::VARCHAR},
 			{"partition_count", LogicalType::INTEGER},
@@ -324,7 +327,8 @@ std::string CompressionOf(const CatalogTable &t) {
 	return compression;
 }
 
-std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, const PageStore &pages) {
+std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, const PageStore &pages,
+							FuzzinessMemo &memo) {
 	const std::string compression = CompressionOf(t);
 	vector<Value> columns, units;
 	for (const auto &c : t.columns) {
@@ -337,6 +341,11 @@ std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, con
 	row.push_back(Text(t.schema_name));
 	row.push_back(Text(t.name));
 	row.push_back(Value::INTEGER(t.object_id));
+	// sys.objects' type and is_ms_shipped: a user table "U", a system base table "S", an internal one "IT"
+	// with its parent (a queue's messages, an XML index's nodes); every one read alike.
+	row.push_back(Value(t.type));
+	row.push_back(Value::BOOLEAN(t.is_ms_shipped));
+	row.push_back(t.parent_object_id ? Value::INTEGER(t.parent_object_id) : Value(LogicalType::INTEGER));
 	row.push_back(Text(ShapeName(t.shape)));
 	row.push_back(OptionalText(compression));
 	row.push_back(Value::INTEGER(static_cast<int32_t>(t.partitions.size())));
@@ -346,7 +355,7 @@ std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, con
 	row.push_back(Value::BOOLEAN(t.decodable));
 	row.push_back(OptionalText(t.reason));
 	if (tail) {
-		const TableFuzziness fuzzy = FuzzinessOf(*tail, t, pages);	// D11 (task 27)
+		const TableFuzziness fuzzy = memo.Of(*tail, BaseUnitsOf(t), pages);	 // D11 (task 27), kept per unit
 		row.push_back(Text(fuzzy.Status()));
 		row.push_back(Value::INTEGER(static_cast<int32_t>(fuzzy.open_transactions)));
 		row.push_back(Value::INTEGER(static_cast<int32_t>(fuzzy.stale_transactions)));
@@ -760,7 +769,8 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 	while (state.next < total && count < STANDARD_VECTOR_SIZE) {
 		const std::vector<Value> row =
 			data.listing == Listing::Tables
-				? TableRow(model.tables[state.next], Fuzzy(context, data, state), *state.catalog->pages->store)
+				? TableRow(model.tables[state.next], Fuzzy(context, data, state), *state.catalog->pages->store,
+						   state.catalog->opened.backup->Fuzziness())
 			: data.listing == Listing::Views
 				? ViewRow(*state.catalog->pages->store, model, model.views[state.next], state.off_row_bytes)
 				: SchemaRow(model, model.schemas[state.next]);

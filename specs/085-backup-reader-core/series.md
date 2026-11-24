@@ -121,7 +121,7 @@ Each PR merges before the next opens (no stacked PRs).
 
 | spec | functions and columns | what the importer does with them |
 |---|---|---|
-| 085 | `mssql_backup_info` (GUIDs, LSNs, dates, database, family and recovery-fork ids, compression, `consistent`); `mssql_backup_tables` (schemas, tables, columns with DuckDB types, AUs, partition counts, `partitioning` from E7, `fuzzy_status`); `mssql_backup_views`; `mssql_backup_scan` with `_mssql_rid`, `_mssql_page` and, from PR 3, the plain `_mssql_lob`: root bytes and node list (task 20, DQ-05) (and `max_memory`, `max_threads`, 085 D17); `mssql_backup_catalog` (and its no-argument list of the allow-listed base tables) | the DDL of a full import, the proposed partition and sort specs, the provenance tags and snapshot `extra_info`, views as text in `__mssql_backup.views`, the rows of a full import (v1, Parquet first in plain SQL: `COPY` of the scan to Parquet plus `ducklake_add_data_files`; the export of 089 PR 2 later), the LOB maps every lake carries from its first import, refusal of non-consistent tables until 090 |
+| 085 | `mssql_backup_info` (GUIDs, LSNs, dates, database, family and recovery-fork ids, compression, `consistent`); `mssql_backup_tables` (schemas, tables, columns with DuckDB types, AUs, partition counts, `partitioning` from E7, `fuzzy_status`); `mssql_backup_views`; `mssql_backup_scan` with `_mssql_rid`, `_mssql_page` and, from PR 3, the plain `_mssql_lob`: root bytes and node list (task 20, DQ-05) (and `max_memory`, `max_threads`, 085 D17); `mssql_backup_catalog` (the scan of a table of schema sys; `mssql_backup_tables` lists every table) | the DDL of a full import, the proposed partition and sort specs, the provenance tags and snapshot `extra_info`, views as text in `__mssql_backup.views`, the rows of a full import (v1, Parquet first in plain SQL: `COPY` of the scan to Parquet plus `ducklake_add_data_files`; the export of 089 PR 2 later), the LOB maps every lake carries from its first import, refusal of non-consistent tables until 090 |
 | 086 | the same functions on compressed tables and the remaining types | real-world tables; `VARIANT` columns (not inlined); `FLOAT[n]` cast to `FLOAT[]` (DuckLake has no `ARRAY`) |
 | 087 | the `mssql_backup_key` secret; `needs_key`, thumbprints in `mssql_backup_info` | nothing of its own: secrets apply to the file functions; a TDE backup's status is `unknown` until E10, so the importer refuses it until then (no dirt) |
 | 088 | columnstore tables in the scan, a compressed row's rowgroup key in `_mssql_page`; rowgroups in `mssql_backup_tables`; ordered-CCI keys, for information | columnstore tables (no sort is proposed for an ordered CCI, DQ-25); rowgroups deleted by `_mssql_page`, delete-bitmap entries by `_mssql_page` and `_mssql_rid` (after E11) |
@@ -231,7 +231,7 @@ deduplicated list ordered by impact, with the blocking ones marked. This series'
 |---|---|---|---|
 | 1 fuzzy default for browsing | DQ-13 | 8 service-column types (decided: opaque values, `_mssql_page` hex `VARCHAR`) | DQ-02 |
 | 2 minimum SQL Server version | DQ-04 | 9 lake state as Parquet side files | DQ-12 |
-| 3 `mssql_backup_catalog` allow-list | DQ-11 | 10 LOB splice source | DQ-01 |
+| 3 which base tables `mssql_backup_catalog` serves (all, since 2026-11-21) | DQ-11 | 10 LOB splice source | DQ-01 |
 | 4 `backup_<component>.cpp` names | DQ-37 | 11 the export in mssql | DQ-18 |
 | 5 `VARIANT` / `FLOAT[n]` | DQ-19 | 12 `recovery := true` for browsing | DQ-13 |
 | 6 spatial Z / M, CRS | DQ-20 | 13 order of 088 / 090, guard order | DQ-03 |

@@ -107,6 +107,8 @@ struct MSSQLStagedDmlTarget {
 	bool convert_varchar_max = true;
 	//! The catalog's mssql_client_transcode (spec 092), likewise.
 	bool client_transcode = true;
+	//! The catalog's geometry_as (spec 093 T5), likewise.
+	tds::GeometryAs geometry_as = tds::GeometryAs::Geometry;
 };
 
 class MSSQLStagedDml {

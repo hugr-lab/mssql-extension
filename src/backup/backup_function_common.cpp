@@ -97,11 +97,11 @@ std::string FuzzyParameterOf(const named_argument_map_t &named, const char *func
 
 TableFuzziness CheckFuzzyUnits(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
 							   const std::vector<uint64_t> &units, const std::string &name, FuzzyMode mode,
-							   const char *function) {
+							   const char *function, FuzzinessMemo *memo) {
 	if (mode == FuzzyMode::Ignore) {
 		return TableFuzziness();
 	}
-	const TableFuzziness fuzzy = FuzzinessOf(tail, units, pages);
+	const TableFuzziness fuzzy = memo ? memo->Of(tail, units, pages) : FuzzinessOf(tail, units, pages);
 	if (fuzzy.Consistent()) {
 		return fuzzy;
 	}
@@ -141,7 +141,8 @@ void CheckStatementFuzzy(ClientContext &context, const OpenedCatalog &catalog, c
 						   given, e.what());
 	}
 	if (tail) {
-		CheckFuzzyUnits(context, *tail, *catalog.pages->store, units, name, mode, function);
+		CheckFuzzyUnits(context, *tail, *catalog.pages->store, units, name, mode, function,
+						&catalog.opened.backup->Fuzziness());
 	}
 }
 
@@ -517,6 +518,10 @@ std::string RawByType(const CatalogColumn &c, const std::string &type) {
 	case XTYPE_XML:
 		return "xml (stored as binary XML) is converted to text later, with the TDS path's";
 	case XTYPE_CLR:
+		// TODO(spec 093 T8): geometry / geography through T5's kernel (codec/clr/ssclrt_wkb, shared with the
+		// TDS path), with geometry_as registered then -- an ATTACH option of TYPE mssql_backup and a
+		// mssql_backup_scan parameter -- so its default 'geometry' never names these bytes. Until then the
+		// stored bytes, what geometry_as 'native' reads on the TDS path.
 		return type + " (its CLR serialization) is converted later, with the TDS path's";
 	default:
 		break;

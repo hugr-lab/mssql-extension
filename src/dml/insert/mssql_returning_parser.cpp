@@ -1,13 +1,17 @@
 #include "dml/insert/mssql_returning_parser.hpp"
 #include "codec/code_page/code_page_codec.hpp"
 #include "duckdb/common/exception.hpp"
+#include "query/mssql_result_stream.hpp"
 #include "tds/encoding/type_converter.hpp"
 
 namespace duckdb {
 
 MSSQLReturningParser::MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids,
-										   bool client_transcode)
-	: target_(target), returning_column_ids_(returning_column_ids), client_transcode_(client_transcode) {
+										   bool client_transcode, tds::GeometryAs geometry_as)
+	: target_(target),
+	  returning_column_ids_(returning_column_ids),
+	  client_transcode_(client_transcode),
+	  geometry_as_(geometry_as) {
 	// Build result types from returning column indices
 	for (auto col_idx : returning_column_ids_) {
 		if (col_idx < target_.columns.size()) {
@@ -23,6 +27,9 @@ void MSSQLReturningParser::Attach(mssql::DmlBatchOptions &options) {
 		if (client_transcode_) {
 			mssql::codec::code_page::ResolveWireCodePages(columns_);
 		}
+		for (auto &col : columns_) {
+			col.geometry_as = geometry_as_;	 // spec 093 T5: a geometry / geography as the catalog reads it
+		}
 		rows_.clear();
 	};
 	options.on_row = [this](const tds::RowData &row, const std::vector<tds::ColumnMetadata> &) {
@@ -30,7 +37,7 @@ void MSSQLReturningParser::Attach(mssql::DmlBatchOptions &options) {
 	};
 }
 
-unique_ptr<DataChunk> MSSQLReturningParser::TakeResult() {
+unique_ptr<DataChunk> MSSQLReturningParser::TakeResult(ClientContext &context, MSSQLReturningWarned &warned) {
 	if (rows_.empty()) {
 		return nullptr;
 	}
@@ -57,15 +64,29 @@ unique_ptr<DataChunk> MSSQLReturningParser::TakeResult() {
 	}
 	auto chunk = make_uniq<DataChunk>();
 	chunk->Initialize(Allocator::DefaultAllocator(), result_types_);
+	// Spec 093 T1 / T5: what the decoders read as NULL or as bytes, counted per column for the WARNINGs.
+	std::vector<mssql::codec::variant::VariantColumnNotes> variant_notes(columns_.size());
+	std::vector<mssql::codec::spatial::SpatialColumnNotes> spatial_notes(columns_.size());
 	for (idx_t r = 0; r < rows_.size(); r++) {
 		const auto &row = rows_[r];
 		for (idx_t i = 0; i < columns_.size(); i++) {
 			bool is_null = (i < row.null_mask.size()) ? row.null_mask[i] : false;
 			const auto &value = (i < row.values.size()) ? row.values[i] : std::vector<uint8_t>{};
-			tds::encoding::TypeConverter::ConvertValue(value, is_null, columns_[i], chunk->data[i], r);
+			tds::encoding::TypeConverter::ConvertValue(value, is_null, columns_[i], chunk->data[i], r,
+													   &variant_notes[i], &spatial_notes[i]);
 		}
 	}
 	chunk->SetChildCardinality(rows_.size());
+	warned.spatial.resize(columns_.size(), 0);
+	warned.variant.resize(columns_.size(), false);
+	for (idx_t i = 0; i < columns_.size(); i++) {
+		if (columns_[i].IsSpatialUdt()) {
+			warned.spatial[i] = mssql::LogSpatialNotes(context, columns_[i], spatial_notes[i], warned.spatial[i]);
+		}
+		if (!warned.variant[i] && mssql::LogVariantNotes(context, columns_[i], variant_notes[i])) {
+			warned.variant[i] = true;
+		}
+	}
 	rows_.clear();
 	return chunk;
 }

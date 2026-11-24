@@ -27,6 +27,8 @@
 # full and its differential (PR 4c-3: schema_full, schema_diff; not run by default); lob_changes.sql, values stored
 # off row changed in every form, then a shrink (PR 4c-3: lob_changes_full, lob_changes_diff, lob_changes_shrink; not run by default; committed under test/data/backup/lob_changes, made by its generate.sh); switch_in.sql, a
 # partition switched in with no shrink (PR 4c-3: switch_full, switch_diff; not run by default; committed under test/data/backup/switch_in, made by its generate.sh);
+# history_break.sql, a full restored over its database between two fulls (review of #612: break_before, break_after;
+# not run by default; committed under test/data/backup/history_break, made by its generate.sh);
 # bench_changes.sql, a benchmark of 10 million rows and differentials of 10k / 110k / 1.1M changes and an index rebuild
 # (PR 4c-3: bench_full, bench_diff_*, each also compressed as *_x; not run by default). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
@@ -370,6 +372,10 @@ for fixture in ${FIXTURES}; do
 	switch_in)
 		# A partition switched in with no shrink after it (spec 085 PR 4c-3): only the catalog tells.
 		sets+=("switch_full|switch_full.bak" "switch_diff|switch_diff.bak")
+		;;
+	history_break)
+		# A full restored over its database between two fulls (review of #612): a new recovery fork.
+		sets+=("break_before|break_before.bak" "break_after|break_after.bak")
 		;;
 	bench_changes)
 		# A benchmark (spec 085 PR 4c-3): 10 million rows, then differentials of 10k / 110k / 1.1M changes, and

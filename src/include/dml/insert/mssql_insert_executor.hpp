@@ -5,6 +5,7 @@
 #include "dml/insert/mssql_insert_config.hpp"
 #include "dml/insert/mssql_insert_error.hpp"
 #include "dml/insert/mssql_insert_target.hpp"
+#include "dml/insert/mssql_returning_parser.hpp"
 #include "dml/mssql_dml_execute.hpp"
 #include "dml/mssql_statement_connection.hpp"
 #include "duckdb/common/types.hpp"
@@ -119,6 +120,8 @@ private:
 
 	// Returning column IDs (for RETURNING mode)
 	vector<idx_t> returning_column_ids_;
+	//! The RETURNING columns' decode WARNINGs logged so far (spec 093 T1 / T5), once a column a statement.
+	MSSQLReturningWarned returning_warned_;
 
 	// Initialize batch builder if needed
 	void EnsureBatchBuilder(bool with_output);

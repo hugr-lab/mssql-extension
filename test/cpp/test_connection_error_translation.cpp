@@ -141,6 +141,36 @@ void TestNonLoginFailuresStillClassified() {
 	const string refused = MSSQLTranslateConnectionError("connect: connection refused", "s", 1433, "u", "db");
 	CHECK(Contains(refused, "Connection refused"));
 
+	// The socket's own words for a refused port (TdsSocket::Connect, test_tds_socket.cpp). It used to word
+	// a refusal "Connection timed out", which this function then turned into advice about firewalls.
+	const string socket_refused =
+		MSSQLTranslateConnectionError("Connection failed: Connection refused", "s", 1433, "u", "db");
+	CHECK(Contains(socket_refused, "check if SQL Server is running"));
+	CHECK(!Contains(socket_refused, "check network connectivity"));
+
+	// An unreachable server is a network problem, not a name that does not resolve (review of #610: the DNS
+	// arm's bare "host" caught "No route to host"). A name that does not resolve keeps the DNS advice.
+	for (const char *unreachable : {"Connection failed: No route to host", "Connection failed: Host is down",
+									"Connection failed: Network is unreachable"}) {
+		const string out = MSSQLTranslateConnectionError(unreachable, "s", 1433, "u", "db");
+		CHECK(Contains(out, "Cannot reach s:1433"));
+		CHECK(Contains(out, "check network connectivity"));
+		CHECK(!Contains(out, "Cannot resolve hostname"));
+	}
+	// An integrated-auth login whose KDC cannot be reached has reached SQL Server already: the hint's
+	// "unreachable" is the KDC's, not the server's (review of the fix above, job 2574).
+	for (const char *kdc : {"Kerberos authentication failed: Cannot contact any KDC for realm 'EXAMPLE.COM' (Hint: "
+							"KDC unreachable. Check /etc/krb5.conf and network path to the AD domain controllers.)",
+							"SSPI authentication failed: SEC_E_NO_AUTHENTICATING_AUTHORITY (Hint: KDC / domain "
+							"controller unreachable. Verify network connectivity and DNS resolution for the target "
+							"realm.)"}) {
+		const string out = MSSQLTranslateConnectionError(kdc, "s", 1433, "u", "db");
+		CHECK(!Contains(out, "Cannot reach s:1433"));
+	}
+	const string unresolved = MSSQLTranslateConnectionError(
+		"Failed to resolve hostname: nodename nor servname provided, or not known", "s", 1433, "u", "db");
+	CHECK(Contains(unresolved, "Cannot resolve hostname 's'"));
+
 	const string tls = MSSQLTranslateConnectionError("TLS handshake failed: bad record", "s", 1433, "u", "db");
 	// "TLS negotiation failed" is this branch's own wording -- the raw input says
 	// "handshake", so asserting on that would pass from the echo alone even if

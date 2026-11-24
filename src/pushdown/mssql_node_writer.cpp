@@ -218,8 +218,9 @@ MSSQLColumnInfo DerivedColumn(const std::string &name, const LogicalType &type) 
 	default:
 		break;
 	}
-	// No datetime2 is built here (the switch above): its read form does not apply.
-	return MSSQLColumnInfo(name, 0, sql_type, length, precision, scale, true, "", "", MSSQLDatetime2Read::Nanoseconds);
+	// No datetime2 nor spatial column is built here (the switch above): their read forms do not apply.
+	return MSSQLColumnInfo(name, 0, sql_type, length, precision, scale, true, "", "", MSSQLDatetime2Read::Nanoseconds,
+						   tds::GeometryAs::Geometry);
 }
 
 }  // namespace node_writer

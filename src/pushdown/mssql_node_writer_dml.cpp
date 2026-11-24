@@ -378,7 +378,7 @@ bool NodeWriter::WriteDelete(const DeleteQueryNode &node) {
 // Both sides on the server, so no row crosses the wire. The SELECT is the
 // SELECT writer's, with its columns written as themselves (raw_columns_): the
 // value never leaves the server, so the read expression a client needs (a
-// code-page varchar's NVARCHAR cast, geometry's STAsBinary) is not applied.
+// code-page varchar's NVARCHAR cast) is not applied.
 // Each value must reach its column as DuckDB's INSERT would write it -- the
 // SET rule of PR 3c -- and an omitted column gets the server's DEFAULT on
 // both paths (the shipped INSERT names only the named columns, measured).

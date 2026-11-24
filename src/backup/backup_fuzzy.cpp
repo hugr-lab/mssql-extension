@@ -74,6 +74,14 @@ public:
 		return saw_checkpoint_;
 	}
 
+	//! What the summary holds so far, roughly, in bytes: MemoryBytes's measure of what Finish keeps, and
+	//! the builder's index and set beside it.
+	uint64_t Bytes() const {
+		return sizeof(FuzzySummary) + summary_.transactions.size() * (sizeof(FuzzySummary::Transaction) + 48) +
+			   pages_ * 64 + index_.size() * (sizeof(FuzzySummary::Change) + sizeof(ChangeKey) + 32) +
+			   (summary_.formatted.size() + after_checkpoint_.size()) * (sizeof(uint64_t) + 2 * sizeof(void *));
+	}
+
 	//! The last record read before LastLSN (zero for none), and its block's bytes.
 	const Lsn &Reached() const {
 		return reached_;
@@ -162,6 +170,7 @@ private:
 		t.after_checkpoint = t.after_checkpoint || Newer(r.lsn, summary_.checkpoint);
 		const uint64_t page = (static_cast<uint64_t>(r.file) << 32) | r.page;
 		auto &changes = changes_[r.allocation_unit][page];
+		pages_ += changes.empty();
 		// The page's change by this transaction, found by its index (review of #591: a linear search of the
 		// page's changes was quadratic in the short transactions of a hot page).
 		const ChangeKey key{r.allocation_unit, page, r.transaction};
@@ -195,6 +204,7 @@ private:
 	std::unordered_set<uint64_t> after_checkpoint_;
 	//! Where each (unit, page, transaction)'s change is in its page's vector.
 	std::unordered_map<ChangeKey, size_t, ChangeKeyHash> index_;
+	uint64_t pages_ = 0;  // (unit, page)s with a change
 	bool saw_checkpoint_ = false;
 	Lsn reached_;
 	uint16_t reached_block_size_ = 0;
@@ -230,12 +240,12 @@ bool FormattedInTail(const FuzzySummary &tail, uint16_t file, uint32_t page) {
 }
 
 FuzzySummary SummarizeLogTail(const LogTailReader &tail, const Lsn &first, const Lsn &last, const Lsn &checkpoint,
-							  const std::function<void()> &poll) {
+							  const std::function<void(uint64_t bytes)> &poll) {
 	Summarizer summarizer(first, last, checkpoint);
 	uint64_t read = 0;
 	tail.ForEach([&](const LogRecord &r) {
 		if (poll && read++ % SUMMARY_POLL_RECORDS == 0) {
-			poll();
+			poll(summarizer.Bytes());
 		}
 		summarizer.Add(r);
 	});
@@ -320,32 +330,89 @@ bool ChangeShows(bool open, const FuzzySummary::Change &c, PageState state, cons
 										 : true;
 }
 
-TableFuzziness FuzzinessOf(const FuzzySummary &summary, const std::vector<uint64_t> &units, const PageStore &pages) {
-	TableFuzziness result;
-	std::unordered_set<uint64_t> dirty;
-	std::unordered_set<uint64_t> stale;
+namespace {
+
+//! The transactions of one unit whose changes show, each page's copy read once.
+void UnitShowing(const FuzzySummary &summary, const FuzzySummary::Unit &unit, const PageStore &pages,
+				 std::unordered_set<uint64_t> &dirty, std::unordered_set<uint64_t> &stale) {
 	Page copy;
-	for (auto au : units) {
-		auto it = summary.units.find(au);
-		if (it == summary.units.end()) {
-			continue;
-		}
-		for (int open = 0; open < 2; open++) {
-			for (const auto &page : open ? it->second.open : it->second.finished) {
-				const PageState state = CopyOf(pages, page.first, copy);
-				for (const auto &c : page.second) {
-					if (ChangeShows(open != 0, c, state, copy.header.lsn, summary.checkpoint)) {
-						(open ? dirty : stale).insert(c.transaction);
-					}
+	for (int open = 0; open < 2; open++) {
+		for (const auto &page : open ? unit.open : unit.finished) {
+			const PageState state = CopyOf(pages, page.first, copy);
+			for (const auto &c : page.second) {
+				if (ChangeShows(open != 0, c, state, copy.header.lsn, summary.checkpoint)) {
+					(open ? dirty : stale).insert(c.transaction);
 				}
 			}
 		}
 	}
+}
+
+TableFuzziness FuzzinessFrom(const std::unordered_set<uint64_t> &dirty, const std::unordered_set<uint64_t> &stale) {
+	TableFuzziness result;
 	result.dirty = !dirty.empty();
 	result.stale = !stale.empty();
 	result.open_transactions = static_cast<uint32_t>(dirty.size());
 	result.stale_transactions = static_cast<uint32_t>(stale.size());
 	return result;
+}
+
+}  // namespace
+
+TableFuzziness FuzzinessOf(const FuzzySummary &summary, const std::vector<uint64_t> &units, const PageStore &pages) {
+	std::unordered_set<uint64_t> dirty;
+	std::unordered_set<uint64_t> stale;
+	for (auto au : units) {
+		auto it = summary.units.find(au);
+		if (it != summary.units.end()) {
+			UnitShowing(summary, it->second, pages, dirty, stale);
+		}
+	}
+	return FuzzinessFrom(dirty, stale);
+}
+
+TableFuzziness FuzzinessMemo::Of(const FuzzySummary &summary, const std::vector<uint64_t> &units,
+								 const PageStore &pages) {
+	// A table's transactions are counted once over its units: each unit's kept as its own set, joined here.
+	std::unordered_set<uint64_t> dirty;
+	std::unordered_set<uint64_t> stale;
+	for (auto au : units) {
+		auto it = summary.units.find(au);
+		if (it == summary.units.end()) {
+			continue;
+		}
+		std::shared_ptr<const UnitShows> shows;
+		{
+			std::lock_guard<std::mutex> guard(lock_);
+			auto kept = units_.find(au);
+			if (kept != units_.end()) {
+				shows = kept->second;
+			}
+		}
+		if (!shows) {
+			// Read outside the lock: the copies are fetched through the page store, which may wait on I/O.
+			std::unordered_set<uint64_t> unit_dirty;
+			std::unordered_set<uint64_t> unit_stale;
+			UnitShowing(summary, it->second, pages, unit_dirty, unit_stale);
+			auto made = std::make_shared<UnitShows>();
+			made->dirty.assign(unit_dirty.begin(), unit_dirty.end());
+			made->stale.assign(unit_stale.begin(), unit_stale.end());
+			std::lock_guard<std::mutex> guard(lock_);
+			auto put = units_.emplace(au, made);
+			if (put.second) {
+				transactions_ += made->dirty.size() + made->stale.size();
+			}
+			shows = put.first->second;
+		}
+		dirty.insert(shows->dirty.begin(), shows->dirty.end());
+		stale.insert(shows->stale.begin(), shows->stale.end());
+	}
+	return FuzzinessFrom(dirty, stale);
+}
+
+size_t FuzzinessMemo::MemoryBytes() const {
+	std::lock_guard<std::mutex> guard(lock_);
+	return units_.size() * (sizeof(UnitShows) + 64) + transactions_ * sizeof(uint64_t);
 }
 
 std::vector<uint64_t> BaseUnitsOf(const CatalogTable &table) {

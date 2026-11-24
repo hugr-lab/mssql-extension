@@ -12,15 +12,41 @@ require mssql
 query TTITTIITTI
 SELECT schema_name, table_name, object_id > 0, shape, compression, partition_count, row_count, decodable, reason,
        len(columns)
-FROM mssql_backup_tables('test/data/backup/full.bak') ORDER BY table_name;
+FROM mssql_backup_tables('test/data/backup/full.bak') WHERE type = 'U' ORDER BY table_name;
 ----
 dbo	events	1	heap	none	1	3000	true	NULL	4
 dbo	items	1	clustered	none	1	2000	true	NULL	7
 
+# Every table of the database is listed and read, whoever made it (owner, 2026-11-22: no table refused):
+# the user tables (U), the system base tables (S, the catalog's own) and the internal ones (IT: Query
+# Store, the queues' messages, change tracking, ...). The resource database's tables (sys.trace_xe_*,
+# negative ids, their rows not in this database) are not this database's.
+query TTII
+SELECT type, is_ms_shipped, count(*), count(*) FILTER (WHERE decodable)
+FROM mssql_backup_tables('test/data/backup/full.bak') GROUP BY ALL ORDER BY ALL;
+----
+IT	true	43	43
+S	true	72	72
+U	false	2	2
+
+query TTTII
+SELECT schema_name, table_name, shape, row_count, len(columns)
+FROM mssql_backup_tables('test/data/backup/full.bak') WHERE table_name IN ('sysschobjs', 'sysallocunits', 'plan_persist_query_text') ORDER BY 2;
+----
+sys	plan_persist_query_text	clustered	1	6
+sys	sysallocunits	clustered	235	11
+sys	sysschobjs	clustered	2909	12
+
+# An internal table names its parent: a queue's messages, the queue.
+query I
+SELECT count(*) FROM mssql_backup_tables('test/data/backup/full.bak') WHERE table_name LIKE 'queue_messages_%' AND parent_object_id IS NOT NULL;
+----
+3
+
 # Every form of the full lists the same tables.
 query TI
 SELECT table_name, row_count FROM mssql_backup_tables(['test/data/backup/stripe_zstd_1.bak', 'test/data/backup/stripe_zstd_2.bak'])
-ORDER BY table_name;
+WHERE type = 'U' ORDER BY table_name;
 ----
 events	3000
 items	2000
@@ -44,7 +70,7 @@ SELECT * FROM mssql_backup_schemas('test/data/backup/full.bak') WHERE schema_id 
 1	dbo	2	0
 2	guest	0	0
 3	INFORMATION_SCHEMA	0	0
-4	sys	0	0
+4	sys	115	0
 
 query I
 SELECT count(*) FROM mssql_backup_schemas('test/data/backup/full.bak') WHERE schema_name LIKE 'db\_%' ESCAPE '\';
@@ -61,7 +87,7 @@ IN_ROW_DATA	0	true	true	true
 
 # The dates: created before modified or with it, within the day the samples were made.
 query T
-SELECT bool_and(created <= modified AND created >= TIMESTAMP '2026-01-01') FROM mssql_backup_tables('test/data/backup/full.bak');
+SELECT bool_and(created <= modified AND created >= TIMESTAMP '2026-01-01') FROM mssql_backup_tables('test/data/backup/full.bak') WHERE type = 'U';
 ----
 true
 
@@ -76,7 +102,7 @@ true	true	true	true
 
 query TITT
 SELECT table_name, p.partition_number, p.filegroup, p.compression
-FROM (SELECT table_name, unnest(partitions) AS p FROM mssql_backup_tables('test/data/backup/full.bak')) ORDER BY table_name;
+FROM (SELECT table_name, unnest(partitions) AS p FROM mssql_backup_tables('test/data/backup/full.bak') WHERE type = 'U') ORDER BY table_name;
 ----
 events	1	PRIMARY	none
 items	1	PRIMARY	none

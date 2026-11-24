@@ -130,7 +130,7 @@ TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_respon
 # whole space-separated words, so a stray separator or a typo would otherwise build fewer harnesses
 # than asked, green.
 TARGETS="$(printf '%s %s' "${TARGETS}" "${TARGETS_EXTRA:-}" | tr ',\n\r\t' '    ')"
-KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci variant_envelope vector hierarchyid "
+KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci variant_envelope vector hierarchyid ssclrt "
 for t in ${TARGETS}; do
 	if [[ "${KNOWN_TARGETS}" != *" ${t} "* ]]; then
 		echo "ERROR: unknown fuzz target '${t}' in TARGETS / TARGETS_EXTRA (known:${KNOWN_TARGETS})" >&2
@@ -189,13 +189,20 @@ if want variant_envelope; then
 	build_harness fuzz_variant_envelope fuzz_variant_envelope.cc ${VE_OBJS}
 fi
 
-# 5b''. A hierarchyid's bit string as its ToString() text (spec 093 T4, D5): one source, DuckDB-free.
+# 5b''. A geometry / geography value's MS-SSCLRT bytes as ISO WKB (spec 093 T5, D6): one source,
+#       DuckDB-free. Not a default target either; the weekly run fuzzes it through
+#       .clusterfuzzlite/extra_targets.
+if want ssclrt; then
+	SSCLRT_OBJS="$(compile_objs ssclrt "${REPO}/src/codec/clr/ssclrt_wkb.cpp")"
+	build_harness fuzz_ssclrt fuzz_ssclrt.cc ${SSCLRT_OBJS}
+fi
+# 5b'''. A hierarchyid's bit string as its ToString() text (spec 093 T4, D5): one source, DuckDB-free.
 #       Not a default target either; the weekly run fuzzes it through .clusterfuzzlite/extra_targets.
 if want hierarchyid; then
 	HID_OBJS="$(compile_objs hid "${REPO}/src/codec/clr/hierarchyid.cpp")"
 	build_harness fuzz_hierarchyid fuzz_hierarchyid.cc ${HID_OBJS}
 fi
-# 5b'''. A SQL Server vector(n) value (spec 093 T3): its bytes and its JSON text, standalone like
+# 5b''''. A SQL Server vector(n) value (spec 093 T3): its bytes and its JSON text, standalone like
 #       variant_envelope. The text parse is DuckDB's fast_float (namespace duckdb_fast_float), header-only:
 #       the submodule's when it is checked out, else that file fetched at the submodule's commit (the
 #       ClusterFuzzLite checkout has no submodules), as simdutf is fetched. Not a default target.
@@ -243,8 +250,10 @@ BACKUP_SRCS=(
 	"${BACKUP}/backup_record.cpp"
 )
 # The catalog reader (PR 2b): pages, records, IAM chains, the boot page (its collation lookup takes
-# spec 091's generated tables), the system base tables, sql_variant, LOB trees, the model.
+# spec 091's generated tables), the system base tables, sql_variant, LOB trees, the model; and the CD
+# records (spec 086), which the system-table reader takes as the scan does (a compressed system table).
 BACKUP_CATALOG_SRCS=(
+	"${BACKUP}/backup_cd_record.cpp"
 	"${BACKUP}/backup_page.cpp"
 	"${BACKUP}/backup_boot.cpp"
 	"${BACKUP}/backup_collation.cpp"
@@ -257,8 +266,6 @@ BACKUP_CATALOG_SRCS=(
 )
 # Values stored off row (PR 3): the walker above and the `_mssql_lob` map.
 BACKUP_LOB_SRCS=("${BACKUP}/backup_lob_map.cpp")
-# ROW-compressed records (spec 086 PR 1): the CD walk and the values' uncompressed forms.
-BACKUP_CD_SRCS=("${BACKUP}/backup_cd_record.cpp")
 # The log tail (spec 085 PR 5): its blocks and records, and D11's summary of them.
 BACKUP_LOG_SRCS=("${BACKUP}/backup_log_tail.cpp" "${BACKUP}/backup_fuzzy.cpp")
 BACKUP_OBJS=""
@@ -282,10 +289,8 @@ if want backup_lob; then
 	build_harness fuzz_backup_lob fuzz_backup_lob.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS} ${BACKUP_LOB_OBJS}
 fi
 # ROW-compressed records (spec 086 PR 1): ReadCdRecord, CdRow::Read, DecodeCompressedUnicode, DecodeVardecimal.
-if want backup_cd; then
-	BACKUP_CD_OBJS="$(compile_objs backup_cd "${BACKUP_CD_SRCS[@]}")"
-	build_harness fuzz_backup_cd fuzz_backup_cd.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS} ${BACKUP_CD_OBJS}
-fi
+# (backup_cd_record.cpp is among the catalog's sources: the system-table reader takes CD records too.)
+want backup_cd && build_harness fuzz_backup_cd fuzz_backup_cd.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS}
 # The log tail (spec 085 PR 5): ParseLogBlock, RestoreSectorParity, RowLogElements, LogTailCursor,
 # SummarizeLogTail.
 if want backup_log; then
@@ -294,10 +299,7 @@ if want backup_log; then
 fi
 
 # PAGE compression (spec 086 PR 2): ReadPageCompression, and CdRow::Read with a page's compression information.
-if want backup_page_ci; then
-	BACKUP_PAGE_CI_OBJS="$(compile_objs backup_page_ci "${BACKUP_CD_SRCS[@]}")"
-	build_harness fuzz_backup_page_ci fuzz_backup_page_ci.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS} ${BACKUP_PAGE_CI_OBJS}
-fi
+want backup_page_ci && build_harness fuzz_backup_page_ci fuzz_backup_page_ci.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS}
 
 # 6. The STAGED read path (spec 059 D4): parser in raw-row mode feeding
 #    codec::staging::RowStager. Deliberately NOT in the default TARGETS — it is
@@ -414,7 +416,7 @@ fi
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
 for t in browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode \
 	backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci \
-	variant_envelope vector hierarchyid; do
+	variant_envelope vector hierarchyid ssclrt; do
 	# Only the corpora of the targets this build makes: OSS-Fuzz pairs a zip with its binary.
 	want "${t}" || continue
 	if [[ -d "${HERE}/corpus/${t}" ]]; then

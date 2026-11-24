@@ -17,6 +17,7 @@
 
 #include "backup/backup_opened.hpp"
 #include "duckdb.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 using namespace duckdb;
 using namespace duckdb::mssql::backup;
@@ -149,6 +150,62 @@ int main() {
 		OpenBackupPages(context, *headers);
 	});
 	Check(log.find("log backup") != std::string::npos, "a log backup is refused: " + log);
+
+	{
+		// D11's table status kept per unit (FuzzinessMemo, review of #591): the same as FuzzinessOf, asked
+		// twice, for the dirty table of open_tail and the consistent ones beside it.
+		auto catalog = OpenBackupCatalog(context, {DIR + "open_tail/open_tail_full.bak"});
+		BindFiles bound(catalog->Binding());
+		const FuzzySummary &tail = StatementTail(context, catalog->opened);
+		auto &memo = catalog->opened.backup->Fuzziness();
+		bool same = true;
+		bool dirty_seen = false;
+		for (int pass = 0; pass < 2; pass++) {
+			for (const auto &table : catalog->Model().tables) {
+				const auto units = BaseUnitsOf(table);
+				const TableFuzziness kept = memo.Of(tail, units, *catalog->pages->store);
+				const TableFuzziness read = FuzzinessOf(tail, units, *catalog->pages->store);
+				same = same && std::string(kept.Status()) == read.Status() &&
+					   kept.open_transactions == read.open_transactions &&
+					   kept.stale_transactions == read.stale_transactions;
+				dirty_seen = dirty_seen || (table.name == "changed" && kept.dirty && kept.open_transactions == 1);
+			}
+		}
+		Check(same && dirty_seen, "FuzzinessMemo answers as FuzzinessOf, asked twice (dbo.changed dirty, 1 open)");
+		Check(memo.MemoryBytes() > 0, "what it keeps is in the entry's estimate");
+	}
+
+	{
+		// D17 for memory the reader allocates itself: held with DuckDB in steps, given back; past the limit,
+		// refused naming what it is for.
+		auto &buffers = BufferManager::GetBufferManager(context);
+		const idx_t before = buffers.GetUsedMemory();
+		{
+			ReservedBytes held(buffers, "the test's summary");
+			held.Hold(1);
+			Check(held.Held() == ReservedBytes::STEP && buffers.GetUsedMemory() == before + ReservedBytes::STEP,
+				  "one byte holds one step");
+			held.Hold(ReservedBytes::STEP + 1);
+			Check(held.Held() == 2 * ReservedBytes::STEP, "a step and a byte hold two");
+			held.Hold(0);
+			Check(held.Held() == 0 && buffers.GetUsedMemory() == before, "Hold(0) gives every step back");
+			held.Hold(3 * ReservedBytes::STEP);
+		}
+		Check(buffers.GetUsedMemory() == before, "the destructor gives back what is held");
+		con.Query("SET memory_limit = '64MB'");
+		std::string refused = ErrorOf([&]() {
+			ReservedBytes held(buffers, "the test's summary");
+			held.Hold(1ull << 30);
+		});
+		Check(refused.find("the test's summary") != std::string::npos &&
+				  refused.find("memory_limit") != std::string::npos,
+			  "past memory_limit, refused naming what it holds: " + refused);
+		// DuckDB may evict the opened-file cache's entries to make room before it refuses: no more than before.
+		Check(buffers.GetUsedMemory() <= before, "a refused hold gives back the steps it took (" +
+													 std::to_string(buffers.GetUsedMemory()) +
+													 " <= " + std::to_string(before) + ")");
+		con.Query("RESET memory_limit");
+	}
 
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;
 	return failures ? 1 : 0;

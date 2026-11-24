@@ -200,10 +200,60 @@ decode the legacy LOB wire forms natively (issue #197).
 
 ### Spatial Types
 
-`geometry` and `geography` columns map to DuckDB `GEOMETRY`: the scan rewrites
-them to WKB (`.STAsBinary()`), so they compose with the DuckDB `spatial`
-extension. On the write side, a GEOMETRY source column lands in a
-`varbinary`/`binary`/`image` target as standard WKB.
+`geometry` columns map to DuckDB `GEOMETRY`, `geography` columns to `GEOMETRY('OGC:CRS84')` (WGS 84,
+longitude first, built into DuckDB: no extension needed, and Parquet writes it as it is). Both are
+read as the bytes SQL Server stores and decoded on the client into ISO WKB, through an attached
+catalog and a raw `mssql_scan()` alike, so they compose with the DuckDB `spatial` extension:
+
+- **Z and M are kept** (`POINT ZM (1 2 3 4)`); until this release the server's `.STAsBinary()` dropped
+  them.
+- A `geography` value keeps the column's `OGC:CRS84` label whatever SRID it carries (4269, say).
+- **Writing into a `geography` column** takes a `GEOMETRY` with no CRS or with `OGC:CRS84`. One labelled
+  with another CRS (`GEOMETRY('OGC:CRS83')`, say) is refused when the statement is
+  bound -- `Cannot cast GEOMETRY with CRS … to GEOMETRY with different CRS 'OGC:CRS84'` -- because DuckDB
+  casts to the column's type and reprojects nothing. Cast it to a plain `GEOMETRY` first
+  (`g::GEOMETRY`) to write its coordinates as they are, or reproject it with the `spatial` extension.
+  A `geometry` column has no CRS of its own and takes any.
+- **POINT EMPTY** reads as DuckDB's `POINT EMPTY`, also as a member of a `MULTIPOINT` or a collection
+  (`MULTIPOINT (1 2, EMPTY)`), where the server's `STAsBinary()` writes `MULTIPOINT EMPTY` or leaves the
+  member out.
+- **A curve or `FullGlobe`** (`CIRCULARSTRING`, `COMPOUNDCURVE`, `CURVEPOLYGON`, `FULLGLOBE`) is no
+  `GEOMETRY` DuckDB holds: it reads as **NULL**, and the scan logs one `WARNING` per column into
+  `duckdb_logs` naming the column and the way out. The query does not fail. So is a value of
+  collections nested deeper than 15, which DuckDB's `GEOMETRY` does not read.
+- **`geometry_as`**, an ATTACH option, says what the catalog's spatial columns are instead, for the
+  whole catalog (its raw scans too):
+
+  ```sql
+  ATTACH 'Server=...' AS db (TYPE mssql, geometry_as 'wkb');
+  ```
+
+  | `geometry_as` | DuckDB type | the value |
+  |---|---|---|
+  | `'geometry'` (default) | `GEOMETRY` / `GEOMETRY('OGC:CRS84')` | ISO WKB; a curve or FullGlobe NULL with a WARNING |
+  | `'wkb'` | `BLOB` | ISO WKB, the curves included (types 8 - 10) and FullGlobe as type 126, as `AsBinaryZM()` writes them |
+  | `'native'` | `BLOB` | the stored bytes, `CAST(g AS varbinary(max))`; they load back by `CAST(… AS geometry)` |
+
+  Under `'geometry'` and `'wkb'` a stored value whose bytes cannot be read is NULL, with a WARNING of
+  its own naming the column and the first one's fault (not how many: a streaming scan says it as soon
+  as it meets one); the scan goes on. `'native'` reads
+  such a value's bytes as they are.
+
+  Under `'native'` an `INSERT` or `UPDATE` of a spatial column that the extension writes row by row
+  is refused by name (the write path sends WKB, which these bytes are not); write through a catalog
+  attached with `'geometry'`, or with `mssql_exec()`. A statement pushed to the server whole (an
+  `INSERT … SELECT` between two tables of the catalog, say) copies the values there and is not refused.
+
+- A filter, an `ORDER BY` or a key on a spatial column runs in DuckDB, never on the server. `IS NULL` /
+  `IS NOT NULL` and `count(g)` go to the server, which answers by the real values: under `'geometry'` a
+  curve is not NULL there, so `WHERE g IS NULL` (a `DELETE` too) leaves it alone, and `count(g)` counts it.
+- Under `'geometry'` DuckDB holds a curve as NULL, so anything DuckDB computes over the column sees NULL: an
+  `UPDATE … SET g = <an expression over g>`, a condition such as `coalesce(g, …)`, or an `INSERT … SELECT`
+  between two catalogs can write NULL over a curve on the server, or pick its row. A copy into a column of the
+  same declaration that goes to the server whole stays exact. Read the column with `'wkb'` to keep the curves.
+
+On the write side, a GEOMETRY source column lands in a `varbinary`/`binary`/`image` target as
+standard WKB.
 
 **Writing into a `geometry` or `geography` target works, with one assumption.**
 The value goes as `geometry::STGeomFromWKB(0x…, srid)`, the server-side reader
@@ -213,7 +263,7 @@ different encoding — `0xe6100000 01 0c …` against WKB's `0x01 01000000 …` 
 the same point — and fails with
 `24210: Geometry type with an unexpected version of 0 received`.
 
-The assumption is the **SRID**, which `.STAsBinary()` does not carry, so a
+The assumption is the **SRID**, which WKB does not carry, so a
 value that has been read from SQL Server has already lost it. A `geometry`
 target is given **0**, the planar "undefined" SRID. A `geography` target
 refuses 0 outright (error 24204) and is given **4326 / WGS 84**. If your data
@@ -228,9 +278,12 @@ statement round trip per batch. For bulk volumes, land the WKB in a
 `varbinary(max)` column with `COPY` and convert it in one server-side
 statement.
 
+A Z / M value writes back with its Z and M (`STGeomFromWKB` takes ISO WKB). A `POINT EMPTY` does
+not yet: DuckDB holds it as a point of NaN coordinates, which the server refuses.
+
 `INSERT … RETURNING` works against such a table, including when the RETURNING
-list names the spatial column: the generated `OUTPUT` clause reads it through
-`.STAsBinary()`, exactly as a scan does.
+list names the spatial column: the generated `OUTPUT` clause reads it bare,
+exactly as a scan does.
 
 **`COPY` into a table that has a spatial column drops that column**, silently
 if it is nullable and with a misleading NULL error if it is not. Use `INSERT`

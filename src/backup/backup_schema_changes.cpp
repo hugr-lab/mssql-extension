@@ -27,6 +27,9 @@ SchemaChange TableChange(const std::string &type, const CatalogTable *now, const
 	SchemaChange c;
 	c.change_type = type;
 	c.object_type = "table";
+	const CatalogTable *any = now ? now : old;
+	c.type = any->type;
+	c.is_ms_shipped = any->is_ms_shipped;
 	if (now) {
 		c.object_id = now->object_id;
 		c.schema_name = now->schema_name;
@@ -207,6 +210,8 @@ SchemaChange ViewChange(const std::string &type, const CatalogView *now, const C
 	SchemaChange c;
 	c.change_type = type;
 	c.object_type = "view";
+	c.type = "V";
+	c.is_ms_shipped = (now ? now : old)->is_ms_shipped;
 	if (now) {
 		c.object_id = now->object_id;
 		c.schema_name = now->schema_name;

@@ -838,7 +838,10 @@ void RecordStager::FinalizeChunk() {
 	begun_ = false;
 	for (size_t i = 0; i < columns_.size(); i++) {
 		const ColumnStaging &st = arena_.Column(i);
-		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, *targets_[i]);
+		// No notes: the backup reads a sql_variant and a spatial value as their stored bytes until spec 093 T8,
+		// so its kernels are never Variant or Spatial.
+		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, *targets_[i],
+											 nullptr, nullptr);
 		codec::staging::PublishStagedValidity(st, count_, *targets_[i]);
 	}
 	// The values written straight into their vectors, over their placeholders.

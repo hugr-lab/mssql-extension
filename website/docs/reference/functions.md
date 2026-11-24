@@ -96,7 +96,7 @@ FROM mssql_scan_params_unsafe('sqlserver',
 | `datetime2(n)` | any TIMESTAMP variant; the one of its scale keeps full precision (`TIMESTAMP_NS` for `datetime2(7)`) |
 | `datetimeoffset` | `TIMESTAMP WITH TIME ZONE` |
 | `uniqueidentifier` | `UUID` |
-| `geometry` | `GEOMETRY`, sent as WKB: `SELECT shape.STAsBinary() AS shape …` |
+| `geometry` / `geography` | `GEOMETRY` / `GEOMETRY('OGC:CRS84')`, the column bare (decoded on the client); `BLOB` under the catalog's `geometry_as 'wkb'` / `'native'`; or `GEOMETRY` for a varbinary of WKB: `SELECT shape.STAsBinary() AS shape …` |
 | `sql_variant`, `hierarchyid`, other UDTs | not readable as such: cast them in the T-SQL (`CAST(v AS nvarchar(4000))`, `h.ToString()`) |
 
 A type no SQL Server column is read as (`TINYINT`, a LIST, a STRUCT) is refused at bind. Casting each column in the T-SQL to the type you declare keeps the shape from drifting when a table changes. `EXPLAIN` shows `Shape: given (columns :=)`. The remote-pushdown rewriter uses these two for every pushed statement whose column types it knows.
@@ -251,15 +251,15 @@ refused). `reread := true` makes a prepared statement read the file again on eve
 
 ### mssql_backup_tables() / mssql_backup_views()
 
-List the user tables, and the views with their definitions, of the database in a SQL Server full
-backup, read from the file alone. See [Backup Files](../reading/backups.md#tables-and-views) for
+List every table (`type`: `U` user, `S` system base, `IT` internal), and the views with their definitions,
+of the database in a SQL Server full backup, read from the file alone. See [Backup Files](../reading/backups.md#tables-and-views) for
 every column.
 
 **Signature:** `mssql_backup_tables(path VARCHAR | VARCHAR[]) -> TABLE(...)`,
 `mssql_backup_views(path VARCHAR | VARCHAR[]) -> TABLE(...)`
 
 ```sql
-SELECT schema_name, table_name, row_count FROM mssql_backup_tables('/backups/sales_full.bak');
+SELECT schema_name, table_name, row_count FROM mssql_backup_tables('/backups/sales_full.bak') WHERE type = 'U';
 SELECT view_name, definition FROM mssql_backup_views('/backups/sales_full.bak');
 ```
 
@@ -276,7 +276,7 @@ SELECT schema_name, table_count FROM mssql_backup_schemas('/backups/sales_full.b
 
 ### mssql_backup_columns()
 
-Every column of the user tables in a SQL Server full backup, one row each, with its state at a
+Every column of every table in a SQL Server full backup (those of schema `sys` included), one row each, with its state at a
 glance (`converted`, `stored_bytes`, `not_stored`, `storage_format`) and why;
 optionally one schema's or one table's. See [Backup Files](../reading/backups.md#tables-and-views).
 
@@ -288,20 +288,22 @@ SELECT column_name, sql_type, system_type, state FROM mssql_backup_columns('/bac
 
 ### mssql_backup_catalog()
 
-A system base table of the database in a SQL Server full backup, as stored, with the virtual
-`_mssql_page` and `_mssql_rid`; with no table, the base tables it serves. See
-[Backup Files](../reading/backups.md#the-catalogs-base-tables).
+A table of schema `sys` of the database in a SQL Server full backup -- a system base table or an internal
+one -- read as `mssql_backup_scan(path, 'sys', base_table)` reads it, with the same parameters and virtual
+columns. A table of another schema, MS-shipped or not (`cdc.*`), is read with `mssql_backup_scan(path,
+schema, table)`. Attached, the same table is `bk.sys.<table>`. See
+[Backup Files](../reading/backups.md#system-and-internal-tables).
 
-**Signature:** `mssql_backup_catalog(path VARCHAR | VARCHAR[] [, base_table VARCHAR]) -> TABLE(...)`
+**Signature:** `mssql_backup_catalog(path VARCHAR | VARCHAR[], base_table VARCHAR) -> TABLE(...)`
 
 ```sql
-SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak');
 SELECT id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs');
+SELECT query_sql_text FROM mssql_backup_catalog('/backups/sales_full.bak', 'plan_persist_query_text');
 ```
 
 ### mssql_backup_scan()
 
-A user table's rows from a SQL Server full backup, with no SQL Server, typed as `TYPE mssql` reads
+A table's rows from a SQL Server full backup (a user table, or one of schema `sys`), with no SQL Server, typed as `TYPE mssql` reads
 them, values stored off row included; virtual columns `_mssql_page`, `_mssql_rid`, `_mssql_page_lsn`
 and `_mssql_lob`. See
 [Backup Files](../reading/backups.md#rows).

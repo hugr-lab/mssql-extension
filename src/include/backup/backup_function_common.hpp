@@ -47,10 +47,11 @@ std::string FuzzyParameterOf(const named_argument_map_t &named, const char *func
 //! The status, in the backup whose log tail is `tail` and pages `pages`, of the table whose rows are in
 //! `units` (a user table's BaseUnitsOf; a system base table's, which the model does not describe), acted
 //! on as `mode` says: one that is not consistent gets one WARNING in duckdb_logs (warn) or is refused by
-//! name (error). `name` ("dbo.t") is what it is called there, `function` the caller. Returns the status.
+//! name (error). `name` ("dbo.t") is what it is called there, `function` the caller; `memo`, when given,
+//! keeps the units' answers (the backup's FuzzinessMemo, whose tail and pages these are). Returns the status.
 TableFuzziness CheckFuzzyUnits(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
 							   const std::vector<uint64_t> &units, const std::string &name, FuzzyMode mode,
-							   const char *function);
+							   const char *function, FuzzinessMemo *memo = nullptr);
 //! CheckFuzzyUnits with the tail of `catalog`'s backup read for the statement (stage 5), through its files:
 //! what every function that reads a table's pages does before it reads them. A tail that cannot be read
 //! leaves the status unknown: refused under 'error', said under 'warn' (naming `given`, the table as the

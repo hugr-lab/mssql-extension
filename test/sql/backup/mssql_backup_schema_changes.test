@@ -12,7 +12,7 @@ require mssql
 query I
 SELECT count(*) FROM (DESCRIBE SELECT * FROM mssql_backup_schema_changes('test/data/backup/full.bak', diff := 'test/data/backup/diff.bak'));
 ----
-21
+23
 
 query I
 SELECT count(*) FROM mssql_backup_schema_changes('test/data/backup/full.bak', diff := 'test/data/backup/diff.bak');

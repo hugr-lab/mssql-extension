@@ -7,6 +7,7 @@
 #include "codec/binary_codec.hpp"
 #include "codec/boolean_codec.hpp"
 #include "codec/clr/hierarchyid_codec.hpp"
+#include "codec/clr/spatial_codec.hpp"
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
@@ -142,20 +143,20 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 	case TDS_TYPE_IMAGE:
 		return LogicalType::BLOB;
 
-	// A CLR type (spec 093 T4): hierarchyid decoded on the client into its ToString() text, a user CLR
-	// type as its bytes (opaque by design), geometry / geography refused until T5 decodes them (a raw scan;
-	// an attached catalog reads them through .STAsBinary()).
+	// A CLR type: hierarchyid decoded on the client into its ToString() text (spec 093 T4), geometry /
+	// geography into GEOMETRY of the ISO WKB, geography's labelled OGC:CRS84 (DQ-45), or a BLOB under the
+	// catalog's geometry_as 'wkb' / 'native' (T5, D6), and a user CLR type as its bytes (opaque by design).
 	case TDS_TYPE_UDT: {
 		if (column.IsHierarchyIdUdt()) {
 			return LogicalType::VARCHAR;
 		}
-		if (column.IsUserClrUdt()) {
-			return LogicalType::BLOB;
+		if (column.IsSpatialUdt()) {
+			if (column.geometry_as != GeometryAs::Geometry) {
+				return LogicalType::BLOB;
+			}
+			return column.IsGeographyUdt() ? LogicalType::GEOMETRY("OGC:CRS84") : LogicalType::GEOMETRY();
 		}
-		throw InvalidInputException(
-			"MSSQL Error: column '%s' is of the CLR type sys.%s, which a raw mssql_scan does not read yet. Read it "
-			"through an attached catalog, or convert it in the query (.STAsBinary()).",
-			column.name.c_str(), column.udt_type_name.c_str());
+		return LogicalType::BLOB;  // IsUserClrUdt
 	}
 	// sql_variant (spec 093 T1, D3): each value a VARIANT of its base type.
 	case TDS_TYPE_SQL_VARIANT:
@@ -297,7 +298,8 @@ std::string TypeConverter::GetTypeName(uint8_t type_id) {
 
 void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null, const ColumnMetadata &column,
 								 Vector &vector, idx_t row_idx,
-								 mssql::codec::variant::VariantColumnNotes *variant_notes) {
+								 mssql::codec::variant::VariantColumnNotes *variant_notes,
+								 mssql::codec::spatial::SpatialColumnNotes *spatial_notes) {
 	if (is_null) {
 		FlatVector::SetNull(vector, row_idx, true);
 		return;
@@ -364,10 +366,15 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 		mssql::codec::variant::DecodeFromTds(value, column, vector, row_idx, variant_notes);
 		break;
 
-	// A CLR type (spec 093 T4): hierarchyid as its text, a user CLR type as its bytes.
+	// A CLR type: hierarchyid as its text (spec 093 T4); geometry / geography the WKB the client decodes,
+	// or under geometry_as 'native' the stored bytes into a BLOB -- into a GEOMETRY always the WKB (T5); a
+	// user CLR type as its bytes.
 	case TDS_TYPE_UDT:
 		if (column.IsHierarchyIdUdt()) {
 			mssql::codec::hierarchyid::DecodeFromTds(value, column, vector, row_idx);
+		} else if (column.IsSpatialUdt() &&
+				   !(vector.GetType().id() == LogicalTypeId::BLOB && column.geometry_as == GeometryAs::Native)) {
+			mssql::codec::spatial::DecodeFromTds(value, column, vector, row_idx, spatial_notes);
 		} else {
 			mssql::codec::binary::DecodeFromTds(value, column, vector, row_idx);
 		}

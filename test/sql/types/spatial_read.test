@@ -1,0 +1,501 @@
+# name: test/sql/types/spatial_read.test
+# description: Spec 093 T5 (D6) -- geometry / geography read bare and decoded on the client into ISO WKB, against the server's own AsBinaryZM(); geometry_as 'geometry' / 'wkb' / 'native'; the curves NULL with a WARNING; a raw scan
+# group: [sql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The values are experiment G1's (specs/093-type-kernels/measured/G1.md): every OGC type, EMPTY of each,
+# holes, collections, Z / M / ZM, a missing Z, the curves and FullGlobe, an invalid instance, geography in
+# SRIDs 4326, 4269 and 104001, and a LineString of 5000 points (80 KB, past a TDS packet). The kernel
+# gives AsBinaryZM() byte for byte, except where a POINT EMPTY is stored (the value, a MULTIPOINT member, a
+# collection member): DuckDB's POINT EMPTY there, a point of NaN coordinates (owner, 2026-11-20), where the
+# server writes MULTIPOINT EMPTY or leaves the member out. A curve or FullGlobe is NULL under
+# geometry_as 'geometry', with one WARNING per column per scan; 'wkb' reads it as its ISO WKB, 'native' as
+# the stored bytes (CAST(g AS varbinary(max))). The kernel's own check of every value is
+# test/cpp/codec/test_ssclrt.cpp.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS sp (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('sp', 'DROP TABLE IF EXISTS dbo.SpatialReadM; DROP TABLE IF EXISTS dbo.SpatialReadG; DROP TABLE IF EXISTS dbo.SpatialReadW;
+	CREATE TABLE dbo.SpatialReadM (id int NOT NULL PRIMARY KEY, name varchar(40) NOT NULL, g geometry NULL);
+	CREATE TABLE dbo.SpatialReadG (id int NOT NULL PRIMARY KEY, name varchar(40) NOT NULL, g geography NULL);
+	CREATE TABLE dbo.SpatialReadW (id int NOT NULL PRIMARY KEY, g geometry NULL)');
+
+statement ok
+SELECT mssql_exec('sp', 'INSERT INTO dbo.SpatialReadM (id, name, g) VALUES
+	(1, ''point'', geometry::STGeomFromText(''POINT(1 2)'', 0)),
+	(2, ''point_neg'', geometry::STGeomFromText(''POINT(-1.5 2.25)'', 0)),
+	(3, ''point_empty'', geometry::STGeomFromText(''POINT EMPTY'', 0)),
+	(4, ''point_z'', geometry::STGeomFromText(''POINT(1 2 3)'', 0)),
+	(5, ''point_zm'', geometry::STGeomFromText(''POINT(1 2 3 4)'', 0)),
+	(6, ''point_m'', geometry::STGeomFromText(''POINT(1 2 NULL 4)'', 0)),
+	(7, ''point_3857'', geometry::STGeomFromText(''POINT(1000 2000)'', 3857)),
+	(8, ''line'', geometry::STGeomFromText(''LINESTRING(0 0, 1 1, 2 0)'', 0)),
+	(9, ''line_empty'', geometry::STGeomFromText(''LINESTRING EMPTY'', 0)),
+	(10, ''line_z'', geometry::STGeomFromText(''LINESTRING(0 0 1, 1 1 2)'', 0)),
+	(11, ''line_m'', geometry::STGeomFromText(''LINESTRING(0 0 NULL 5, 1 1 NULL 6)'', 0)),
+	(12, ''line_zm'', geometry::STGeomFromText(''LINESTRING(0 0 1 5, 1 1 2 6)'', 0)),
+	(13, ''line_zpartial'', geometry::STGeomFromText(''LINESTRING(0 0 1, 1 1 NULL)'', 0)),
+	(14, ''poly'', geometry::STGeomFromText(''POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))'', 0)),
+	(15, ''poly_hole'', geometry::STGeomFromText(''POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (2 2, 2 4, 4 4, 4 2, 2 2))'', 0)),
+	(16, ''poly_empty'', geometry::STGeomFromText(''POLYGON EMPTY'', 0)),
+	(17, ''poly_cw'', geometry::STGeomFromText(''POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'', 0)),
+	(18, ''mpoint'', geometry::STGeomFromText(''MULTIPOINT((1 2), (3 4))'', 0)),
+	(19, ''mpoint_empty'', geometry::STGeomFromText(''MULTIPOINT EMPTY'', 0)),
+	(20, ''mpoint_with_empty'', geometry::STGeomFromText(''MULTIPOINT((1 2), EMPTY)'', 0)),
+	(21, ''mline'', geometry::STGeomFromText(''MULTILINESTRING((0 0, 1 1), (2 2, 3 3, 4 4))'', 0)),
+	(22, ''mline_empty'', geometry::STGeomFromText(''MULTILINESTRING EMPTY'', 0)),
+	(23, ''mpoly'', geometry::STGeomFromText(''MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)), ((5 5, 9 5, 9 9, 5 9, 5 5), (6 6, 6 7, 7 7, 6 6)))'', 0)),
+	(24, ''mpoly_empty'', geometry::STGeomFromText(''MULTIPOLYGON EMPTY'', 0)),
+	(25, ''gc'', geometry::STGeomFromText(''GEOMETRYCOLLECTION(POINT(1 2), LINESTRING(0 0, 1 1), POLYGON((0 0, 1 0, 1 1, 0 0)))'', 0)),
+	(26, ''gc_nested'', geometry::STGeomFromText(''GEOMETRYCOLLECTION(POINT(1 2), GEOMETRYCOLLECTION(POINT(3 4), LINESTRING(0 0, 5 5)), MULTIPOINT((7 8), (9 10)))'', 0)),
+	(27, ''gc_empty'', geometry::STGeomFromText(''GEOMETRYCOLLECTION EMPTY'', 0)),
+	(28, ''gc_with_empty'', geometry::STGeomFromText(''GEOMETRYCOLLECTION(POINT EMPTY, POINT(1 2))'', 0)),
+	(29, ''gc_z'', geometry::STGeomFromText(''GEOMETRYCOLLECTION(POINT(1 2 3), LINESTRING(0 0 1, 1 1 2))'', 0)),
+	(30, ''circ'', geometry::STGeomFromText(''CIRCULARSTRING(0 0, 1 1, 2 0)'', 0)),
+	(31, ''circ_empty'', geometry::STGeomFromText(''CIRCULARSTRING EMPTY'', 0)),
+	(32, ''compound'', geometry::STGeomFromText(''COMPOUNDCURVE((0 0, 1 1), CIRCULARSTRING(1 1, 2 2, 3 1))'', 0)),
+	(33, ''curvepoly'', geometry::STGeomFromText(''CURVEPOLYGON(CIRCULARSTRING(0 0, 4 0, 4 4, 0 4, 0 0))'', 0)),
+	(34, ''gc_curve'', geometry::STGeomFromText(''GEOMETRYCOLLECTION(CIRCULARSTRING(0 0, 1 1, 2 0), POINT(5 5))'', 0)),
+	(35, ''bowtie_invalid'', geometry::STGeomFromText(''POLYGON((0 0, 2 2, 2 0, 0 2, 0 0))'', 0)),
+	(36, ''mline_with_empty'', geometry::STGeomFromText(''MULTILINESTRING((0 0, 1 1), EMPTY)'', 0)),
+	(37, ''mpoly_with_empty'', geometry::STGeomFromText(''MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)), EMPTY)'', 0)),
+	(38, ''gc_gc_empty'', geometry::STGeomFromText(''GEOMETRYCOLLECTION(GEOMETRYCOLLECTION EMPTY, POINT(1 1))'', 0)),
+	(39, ''gc_curvepoly'', geometry::STGeomFromText(''GEOMETRYCOLLECTION(CURVEPOLYGON(COMPOUNDCURVE(CIRCULARSTRING(0 0, 2 2, 4 0), (4 0, 0 0))), LINESTRING(9 9, 8 8))'', 0)),
+	(40, ''curvepoly_hole'', geometry::STGeomFromText(''CURVEPOLYGON(CIRCULARSTRING(0 0, 8 0, 8 8, 0 8, 0 0), (2 2, 4 2, 4 4, 2 2))'', 0)),
+	(41, ''poly_z_holes'', geometry::STGeomFromText(''POLYGON((0 0 1, 10 0 1, 10 10 1, 0 10 1, 0 0 1), (1 1 2, 2 1 2, 2 2 2, 1 1 2), (5 5 3, 6 5 3, 6 6 3, 5 5 3))'', 0)),
+	(42, ''mpoint_z_empty'', geometry::STGeomFromText(''MULTIPOINT((1 2 3), EMPTY, (4 5 6))'', 0)),
+	(43, ''big_coords'', geometry::STGeomFromText(''POINT(1.7976931348623157E+308 -1.7976931348623157E+308)'', 0)),
+	(44, ''neg_zero'', geometry::STGeomFromText(''POINT(-0 0)'', 0)),
+	(45, ''gc_mpoly_in_gc'', geometry::STGeomFromText(''GEOMETRYCOLLECTION(MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)), ((3 3, 4 3, 4 4, 3 3))), MULTILINESTRING((0 0, 1 1)))'', 0))');
+
+statement ok
+SELECT mssql_exec('sp', 'INSERT INTO dbo.SpatialReadG (id, name, g) VALUES
+	(1, ''g_point'', geography::STGeomFromText(''POINT(10 50)'', 4326)),
+	(2, ''g_point_z'', geography::STGeomFromText(''POINT(10 50 100)'', 4326)),
+	(3, ''g_point_empty'', geography::STGeomFromText(''POINT EMPTY'', 4326)),
+	(4, ''g_line'', geography::STGeomFromText(''LINESTRING(10 50, 11 51)'', 4326)),
+	(5, ''g_poly'', geography::STGeomFromText(''POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))'', 4326)),
+	(6, ''g_poly_big'', geography::STGeomFromText(''POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'', 4326)),
+	(7, ''g_mpoly'', geography::STGeomFromText(''MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)), ((5 5, 9 5, 9 9, 5 9, 5 5)))'', 4326)),
+	(8, ''g_gc'', geography::STGeomFromText(''GEOMETRYCOLLECTION(POINT(10 50), LINESTRING(10 50, 11 51))'', 4326)),
+	(9, ''g_fullglobe'', geography::STGeomFromText(''FULLGLOBE'', 4326)),
+	(10, ''g_circ'', geography::STGeomFromText(''CIRCULARSTRING(0 0, 1 1, 2 0)'', 4326)),
+	(11, ''g_srid4269'', geography::STGeomFromText(''POINT(10 50)'', 4269)),
+	(12, ''g_point_api'', geography::Point(50, 10, 4326)),
+	(13, ''g_poly_hole'', geography::STGeomFromText(''POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (2 2, 2 4, 4 4, 4 2, 2 2))'', 4326)),
+	(14, ''g_point_m'', geography::STGeomFromText(''POINT(10 50 NULL 7)'', 4326)),
+	(15, ''g_line_zm'', geography::STGeomFromText(''LINESTRING(10 50 1 2, 11 51 3 4)'', 4326)),
+	(16, ''g_mpoly_big'', geography::STGeomFromText(''MULTIPOLYGON(((0 0, 0 10, 10 10, 10 0, 0 0)))'', 4326)),
+	(17, ''g_compound'', geography::STGeomFromText(''COMPOUNDCURVE((0 0, 1 1), CIRCULARSTRING(1 1, 2 2, 3 1))'', 4326)),
+	(18, ''g_curvepoly'', geography::STGeomFromText(''CURVEPOLYGON(CIRCULARSTRING(0 0, 4 0, 4 4, 0 4, 0 0))'', 4326)),
+	(19, ''g_unit_sphere'', geography::STGeomFromText(''POINT(10 50)'', 104001))');
+
+# A LineString of 5000 points, and a NULL in each table.
+statement ok
+SELECT mssql_exec('sp', 'INSERT INTO dbo.SpatialReadM (id, name, g) SELECT 100, ''line_5000'', geometry::STGeomFromText(''LINESTRING('' + STRING_AGG(CAST(CONCAT(n, '' '', n % 97, ''.5'') AS varchar(max)), '', '') WITHIN GROUP (ORDER BY n) + '')'', 0) FROM (SELECT TOP (5000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.all_objects a CROSS JOIN sys.all_objects b) s;
+	INSERT INTO dbo.SpatialReadM (id, name, g) VALUES (99, ''null'', NULL);
+	INSERT INTO dbo.SpatialReadG (id, name, g) VALUES (99, ''null'', NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('sp');
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS sp_wkb (TYPE mssql, geometry_as 'wkb');
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS sp_nat (TYPE mssql, geometry_as 'native');
+
+# =============================================================================
+# The types
+# =============================================================================
+
+query TTTTTT
+SELECT typeof(m.g), typeof(g.g), typeof(mw.g), typeof(gw.g), typeof(mn.g), typeof(gn.g)
+FROM sp.dbo.SpatialReadM m, sp.dbo.SpatialReadG g, sp_wkb.dbo.SpatialReadM mw, sp_wkb.dbo.SpatialReadG gw,
+	sp_nat.dbo.SpatialReadM mn, sp_nat.dbo.SpatialReadG gn
+WHERE m.id = 1 AND g.id = 1 AND mw.id = 1 AND gw.id = 1 AND mn.id = 1 AND gn.id = 1;
+----
+GEOMETRY	GEOMETRY('OGC:CRS84')	BLOB	BLOB	BLOB	BLOB
+
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS sp_bad (TYPE mssql, geometry_as 'blob');
+----
+the ATTACH option geometry_as must be 'geometry'
+
+# =============================================================================
+# geometry_as 'wkb': every value is the server's AsBinaryZM(), the curves and FullGlobe included
+# =============================================================================
+
+query II
+SELECT count(*), count(*) FILTER (WHERE t.g IS NOT DISTINCT FROM s.zm)
+FROM sp_wkb.dbo.SpatialReadM t JOIN mssql_scan('sp', 'SELECT id, g.AsBinaryZM() AS zm FROM dbo.SpatialReadM') s USING (id)
+WHERE t.name NOT IN ('point_empty', 'mpoint_with_empty', 'gc_with_empty', 'mpoint_z_empty');
+----
+43	43
+
+query II
+SELECT count(*), count(*) FILTER (WHERE t.g IS NOT DISTINCT FROM s.zm)
+FROM sp_wkb.dbo.SpatialReadG t JOIN mssql_scan('sp', 'SELECT id, g.AsBinaryZM() AS zm FROM dbo.SpatialReadG') s USING (id)
+WHERE t.name <> 'g_point_empty';
+----
+19	19
+
+# POINT EMPTY is DuckDB's: a point of two NaN, kept as a MULTIPOINT's or a collection's member
+query TT
+SELECT name, hex(g) FROM sp_wkb.dbo.SpatialReadM WHERE name IN ('point_empty', 'mpoint_with_empty', 'gc_with_empty') ORDER BY name;
+----
+gc_with_empty	0107000000020000000101000000000000000000F87F000000000000F87F0101000000000000000000F03F0000000000000040
+mpoint_with_empty	0104000000020000000101000000000000000000F03F00000000000000400101000000000000000000F87F000000000000F87F
+point_empty	0101000000000000000000F87F000000000000F87F
+
+# FullGlobe as the server writes it: type 126
+query T
+SELECT hex(g) FROM sp_wkb.dbo.SpatialReadG WHERE name = 'g_fullglobe';
+----
+017E000000
+
+# =============================================================================
+# geometry_as 'native': the stored bytes, CAST(g AS varbinary(max)) (G2)
+# =============================================================================
+
+query II
+SELECT count(*), count(*) FILTER (WHERE t.g IS NOT DISTINCT FROM s.raw)
+FROM sp_nat.dbo.SpatialReadM t JOIN mssql_scan('sp', 'SELECT id, CAST(g AS varbinary(max)) AS raw FROM dbo.SpatialReadM') s USING (id);
+----
+47	47
+
+query II
+SELECT count(*), count(*) FILTER (WHERE t.g IS NOT DISTINCT FROM s.raw)
+FROM sp_nat.dbo.SpatialReadG t JOIN mssql_scan('sp', 'SELECT id, CAST(g AS varbinary(max)) AS raw FROM dbo.SpatialReadG') s USING (id);
+----
+20	20
+
+# =============================================================================
+# geometry_as 'geometry' (the default): a GEOMETRY, a curve or FullGlobe NULL
+# =============================================================================
+
+query II
+SELECT count(*), count(*) FILTER (WHERE t.g::BLOB IS NOT DISTINCT FROM s.zm)
+FROM sp.dbo.SpatialReadM t JOIN mssql_scan('sp', 'SELECT id, g.AsBinaryZM() AS zm FROM dbo.SpatialReadM') s USING (id)
+WHERE t.name NOT IN ('point_empty', 'mpoint_with_empty', 'gc_with_empty', 'mpoint_z_empty', 'circ', 'circ_empty', 'compound', 'curvepoly', 'gc_curve', 'gc_curvepoly', 'curvepoly_hole');
+----
+36	36
+
+query II
+SELECT count(*), count(*) FILTER (WHERE t.g::BLOB IS NOT DISTINCT FROM s.zm)
+FROM sp.dbo.SpatialReadG t JOIN mssql_scan('sp', 'SELECT id, g.AsBinaryZM() AS zm FROM dbo.SpatialReadG') s USING (id)
+WHERE t.name NOT IN ('g_point_empty', 'g_circ', 'g_compound', 'g_curvepoly', 'g_fullglobe');
+----
+15	15
+
+# IS NULL is the server's (owner, 2026-11-20): true NULLs only, the curves, read as NULL here, not matched --
+# so a DELETE ... WHERE g IS NULL leaves them alone.
+query T
+SELECT name FROM sp.dbo.SpatialReadM WHERE g IS NULL ORDER BY name;
+----
+null
+
+query T
+SELECT name FROM sp.dbo.SpatialReadG WHERE g IS NULL ORDER BY name;
+----
+null
+
+# ... and IS NOT NULL / count(g) too: the server counts a curve, which DuckDB read as NULL. Evaluated by DuckDB
+# (an expression over the column, never pushed) the count is of what DuckDB read.
+query II
+SELECT count(*), count(g) FROM sp.dbo.SpatialReadM;
+----
+47	46
+
+query I
+SELECT count(g::BLOB) FROM sp.dbo.SpatialReadM;
+----
+39
+
+# read as BLOB, a curve is a value: IS NULL is pushed and answers as the server does
+query I
+SELECT count(*) FROM sp_wkb.dbo.SpatialReadM WHERE g IS NULL;
+----
+1
+
+# Z and M kept, geography longitude first, POINT EMPTY as DuckDB's, the SRID not checked (DQ-45)
+query TT
+SELECT name, g::VARCHAR FROM sp.dbo.SpatialReadM WHERE name IN ('point_zm', 'point_m', 'line_zm', 'gc_z', 'point_empty', 'mpoint_with_empty', 'gc_with_empty', 'mpoint_z_empty', 'point_3857') ORDER BY name;
+----
+gc_with_empty	GEOMETRYCOLLECTION (POINT EMPTY, POINT (1 2))
+gc_z	GEOMETRYCOLLECTION Z (POINT Z (1 2 3), LINESTRING Z (0 0 1, 1 1 2))
+line_zm	LINESTRING ZM (0 0 1 5, 1 1 2 6)
+mpoint_with_empty	MULTIPOINT (1 2, EMPTY)
+mpoint_z_empty	MULTIPOINT Z (1 2 3, EMPTY, 4 5 6)
+point_3857	POINT (1000 2000)
+point_empty	POINT EMPTY
+point_m	POINT M (1 2 4)
+point_zm	POINT ZM (1 2 3 4)
+
+query TT
+SELECT name, g::VARCHAR FROM sp.dbo.SpatialReadG WHERE name IN ('g_point', 'g_point_api', 'g_point_z', 'g_srid4269', 'g_unit_sphere', 'g_point_empty') ORDER BY name;
+----
+g_point	POINT (10 50)
+g_point_api	POINT (10 50)
+g_point_empty	POINT EMPTY
+g_point_z	POINT Z (10 50 100)
+g_srid4269	POINT (10 50)
+g_unit_sphere	POINT (10 50)
+
+# a filter on a BLOB of WKB runs in DuckDB, over the bytes read (the server would compare the column)
+query T
+SELECT name FROM sp_wkb.dbo.SpatialReadM WHERE g = unhex('0101000000000000000000F03F0000000000000040');
+----
+point
+
+# =============================================================================
+# The WARNING: once per column per scan, as the scan meets a value it reads as NULL
+# =============================================================================
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+SELECT * FROM sp.dbo.SpatialReadM;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "g" (geometry) holds values a GEOMETRY cannot hold%read as NULL; attach with geometry_as ''wkb''%''native''%';
+----
+1
+
+statement ok
+SELECT * FROM sp.dbo.SpatialReadG;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "g" (geography) holds values a GEOMETRY cannot hold%';
+----
+1
+
+# a scan stopped early still says it: the warning is logged as it is met
+statement ok
+SELECT g FROM sp.dbo.SpatialReadM WHERE name = 'circ' LIMIT 1;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "g" (geometry) holds values a GEOMETRY cannot hold%';
+----
+2
+
+# nothing to say under 'wkb' / 'native', nor for a table with no curve
+statement ok
+SELECT * FROM sp_wkb.dbo.SpatialReadM;
+
+statement ok
+SELECT * FROM sp_nat.dbo.SpatialReadG;
+
+statement ok
+SELECT * FROM sp.dbo.SpatialReadM WHERE name = 'point';
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%a GEOMETRY cannot hold%';
+----
+3
+
+statement ok
+SET enable_logging = false;
+
+# =============================================================================
+# A raw scan: the UDT_INFO's type name, the catalog's geometry_as
+# =============================================================================
+
+query TTT
+SELECT typeof(p), typeof(q), q::VARCHAR FROM mssql_scan('sp', 'SELECT geometry::Point(1, 2, 0) AS p, geography::Point(50, 10, 4326) AS q');
+----
+GEOMETRY	GEOMETRY('OGC:CRS84')	POINT (10 50)
+
+query TT
+SELECT typeof(p), typeof(q) FROM mssql_scan('sp_wkb', 'SELECT geometry::Point(1, 2, 0) AS p, geography::Point(50, 10, 4326) AS q');
+----
+BLOB	BLOB
+
+query T
+SELECT hex(q) FROM mssql_scan('sp_nat', 'SELECT geography::Point(50, 10, 4326) AS q');
+----
+E6100000010C00000000000049400000000000002440
+
+# prepared := true, and a batch the server cannot describe (run at bind), type it alike
+query TT
+SELECT typeof(g), g::VARCHAR FROM mssql_scan('sp', 'SELECT g FROM dbo.SpatialReadG WHERE name = ''g_point''', prepared := true);
+----
+GEOMETRY('OGC:CRS84')	POINT (10 50)
+
+query TT
+SELECT typeof(g), g::VARCHAR FROM mssql_scan('sp', 'SELECT g INTO #sp_t FROM dbo.SpatialReadG WHERE name = ''g_point''; SELECT g FROM #sp_t');
+----
+GEOMETRY('OGC:CRS84')	POINT (10 50)
+
+# column_types reads a geography as a plain GEOMETRY (the same WKB)
+query T
+SELECT typeof(g) FROM mssql_scan('sp', 'SELECT g FROM dbo.SpatialReadG WHERE name = ''g_point''', column_types := ['GEOMETRY']);
+----
+GEOMETRY
+
+# a raw scan reads what the catalog reads, the curves NULL alike
+query I
+SELECT count(*) FROM (SELECT id, g::BLOB FROM sp.dbo.SpatialReadM EXCEPT ALL SELECT id, g::BLOB FROM mssql_scan('sp', 'SELECT id, g FROM dbo.SpatialReadM'));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, g FROM mssql_scan('sp_wkb', 'SELECT id, g FROM dbo.SpatialReadG') EXCEPT ALL SELECT id, g FROM sp_wkb.dbo.SpatialReadG);
+----
+0
+
+# =============================================================================
+# Pushed whole (spec 079): the catalog's types, the same values
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS sp_off (TYPE mssql, remote_pushdown false);
+
+statement ok
+CREATE TEMP TABLE sp_via_on AS SELECT id, g FROM sp.dbo.SpatialReadG ORDER BY id LIMIT 100;
+
+query T
+SELECT data_type FROM duckdb_columns() WHERE table_name = 'sp_via_on' AND column_name = 'g';
+----
+GEOMETRY('OGC:CRS84')
+
+query I
+SELECT count(*) FROM (SELECT id, g::BLOB FROM sp_via_on EXCEPT ALL SELECT id, g::BLOB FROM sp_off.dbo.SpatialReadG);
+----
+0
+
+query II
+EXPLAIN SELECT id, g FROM sp.dbo.SpatialReadG ORDER BY id LIMIT 100;
+----
+physical_plan	<!REGEX>:.*STAsBinary.*
+
+# =============================================================================
+# RETURNING, and a value written back (writes are spec 093 T6's: STGeomFromWKB keeps Z / M, G7)
+# =============================================================================
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+INSERT INTO sp.dbo.SpatialReadW (id, g) SELECT 1, g FROM sp.dbo.SpatialReadM WHERE name = 'point_zm';
+
+# Z on some points only (review of #594): the read gives the missing ordinate as NaN, STGeomFromWKB takes it
+# back as the server's NULL -- the value written is the stored one, byte for byte (G7 measured NaN refused in x
+# / y only).
+query T
+SELECT g::VARCHAR FROM sp.dbo.SpatialReadM WHERE name = 'line_zpartial';
+----
+LINESTRING Z (0 0 1, 1 1 nan)
+
+statement ok
+INSERT INTO sp.dbo.SpatialReadW (id, g) SELECT 4, g FROM sp.dbo.SpatialReadM WHERE name = 'line_zpartial';
+
+query TTT
+SELECT * FROM mssql_scan('sp', 'SELECT w.g.AsTextZM() AS t, m.g.AsTextZM() AS o, CASE WHEN CAST(w.g AS varbinary(max)) = CAST(m.g AS varbinary(max)) THEN ''same'' ELSE ''differ'' END AS b FROM dbo.SpatialReadW w CROSS JOIN dbo.SpatialReadM m WHERE w.id = 4 AND m.name = ''line_zpartial''');
+----
+LINESTRING (0 0 1, 1 1)	LINESTRING (0 0 1, 1 1)	same
+
+statement ok
+RESET mssql_dml_pushdown;
+
+query T
+SELECT * FROM mssql_scan('sp', 'SELECT g.AsTextZM() AS t FROM dbo.SpatialReadW WHERE id = 1');
+----
+POINT (1 2 3 4)
+
+query IT
+INSERT INTO sp.dbo.SpatialReadW (id, g) VALUES (2, 'LINESTRING Z (0 0 1, 1 1 2)'::GEOMETRY) RETURNING id, g::VARCHAR;
+----
+2	LINESTRING Z (0 0 1, 1 1 2)
+
+query IT
+DELETE FROM sp.dbo.SpatialReadW WHERE id = 1 RETURNING id, g::VARCHAR;
+----
+1	POINT ZM (1 2 3 4)
+
+# Under geometry_as 'native' the values are the stored bytes, which the write path (STGeomFromWKB) does not
+# take: an INSERT or UPDATE of such a column is refused by name, nothing sent.
+statement error
+INSERT INTO sp_nat.dbo.SpatialReadW (id, g) VALUES (5, unhex('00000000010C000000000000F03F0000000000000040'));
+----
+the catalog is attached with geometry_as 'native'
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement error
+UPDATE sp_nat.dbo.SpatialReadW SET g = NULL WHERE id = 2;
+----
+the catalog is attached with geometry_as 'native'
+
+statement ok
+RESET mssql_dml_pushdown;
+
+# an INSERT ... SELECT pushed whole copies the column on the server, the curve included
+query I
+INSERT INTO sp_nat.dbo.SpatialReadW (id, g) SELECT 3, g FROM sp_nat.dbo.SpatialReadM WHERE name = 'circ';
+----
+1
+
+query T
+SELECT * FROM mssql_scan('sp', 'SELECT g.AsTextZM() AS t FROM dbo.SpatialReadW WHERE id = 3');
+----
+CIRCULARSTRING (0 0, 1 1, 2 0)
+
+# A geography column is GEOMETRY('OGC:CRS84'), so what is written into it is cast to that: a source with no
+# CRS or with OGC:CRS84 is written as before; one labelled with another CRS is refused by DuckDB's binder,
+# which reprojects nothing (review of #594: until T5 the column was a plain GEOMETRY and took it, relabelled).
+# The way through is the cast that drops the label.
+statement ok
+INSERT INTO sp.dbo.SpatialReadG (id, name, g) SELECT 200, 'no crs', 'POINT(10 50)'::GEOMETRY;
+
+statement ok
+INSERT INTO sp.dbo.SpatialReadG (id, name, g) SELECT 201, 'crs84', 'POINT(10 50)'::GEOMETRY('OGC:CRS84');
+
+statement error
+INSERT INTO sp.dbo.SpatialReadG (id, name, g) SELECT 202, 'crs83', 'POINT(10 50)'::GEOMETRY('OGC:CRS83');
+----
+Cannot cast GEOMETRY with CRS 'OGC:CRS83' to GEOMETRY with different CRS 'OGC:CRS84'
+
+statement error
+UPDATE sp.dbo.SpatialReadG SET g = 'POINT(11 51)'::GEOMETRY('OGC:CRS83') WHERE id = 200;
+----
+Cannot cast GEOMETRY with CRS 'OGC:CRS83' to GEOMETRY with different CRS 'OGC:CRS84'
+
+statement ok
+INSERT INTO sp.dbo.SpatialReadG (id, name, g) SELECT 203, 'crs83, label dropped', 'POINT(10 50)'::GEOMETRY('OGC:CRS83')::GEOMETRY;
+
+query IT
+SELECT id, g::VARCHAR FROM sp.dbo.SpatialReadG WHERE id >= 200 ORDER BY id;
+----
+200	POINT (10 50)
+201	POINT (10 50)
+203	POINT (10 50)
+
+# A geometry column has no CRS of its own and takes any.
+statement ok
+INSERT INTO sp.dbo.SpatialReadW (id, g) SELECT 300, 'POINT(10 50)'::GEOMETRY('OGC:CRS83');
+
+statement ok
+SELECT mssql_exec('sp', 'DROP TABLE dbo.SpatialReadM; DROP TABLE dbo.SpatialReadG; DROP TABLE dbo.SpatialReadW');
+
+statement ok
+DETACH sp_off;
+
+statement ok
+DETACH sp_nat;
+
+statement ok
+DETACH sp_wkb;
+
+statement ok
+DETACH sp;

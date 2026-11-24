@@ -4,6 +4,7 @@
 #include "backup/backup_function_common.hpp"
 #include "backup/backup_xpress.hpp"
 #include "backup/backup_zstd.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/date.hpp"
@@ -11,6 +12,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -467,25 +469,45 @@ const FuzzySummary &OpenedBackup::Fuzzy(ClientContext &context, bool *built) con
 	if (fuzzy_) {
 		return *fuzzy_;
 	}
+	if (!fuzzy_error_.empty()) {
+		throw FormatError(fuzzy_error_);
+	}
+	// Made before the build is marked: nothing may throw between the mark and the try that clears it.
+	const auto &family = *headers_->families.front();
+	std::unique_ptr<ReservedBytes> memory(
+		new ReservedBytes(BufferManager::GetBufferManager(context),
+						  "backup file \"" + headers_->Path(family.file) + "\": its log tail's summary"));
+	std::unique_ptr<FuzzySummary> summary;
 	fuzzy_building_ = true;
 	guard.unlock();
-	std::unique_ptr<FuzzySummary> summary;
 	try {
-		const auto &family = *headers_->families.front();
 		const auto &set = headers_->Set();
 		try {
 			LogTailReader tail(family.Stream(), family.layout, LogBlockHeaderBytes(set.software_major));
-			// A log backup's whole log is read here: Ctrl-C ends it (review of #591; it used to be asked only
-			// of a statement waiting for another's read).
-			summary.reset(
-				new FuzzySummary(SummarizeLogTail(tail, set.first_lsn, set.last_lsn, set.checkpoint_lsn, [&context]() {
-					if (context.IsInterrupted()) {
-						throw InterruptException();
-					}
-				})));
+			// The cursor's chunk first, then the summary as it grows (D17; review of #591: built on the heap
+			// before anything charged for it). A log backup's whole log is read here: Ctrl-C ends it.
+			memory->Hold(LOG_CURSOR_BYTES);
+			summary.reset(new FuzzySummary(SummarizeLogTail(tail, set.first_lsn, set.last_lsn, set.checkpoint_lsn,
+															[&context, &memory](uint64_t bytes) {
+																if (context.IsInterrupted()) {
+																	throw InterruptException();
+																}
+																memory->Hold(LOG_CURSOR_BYTES + bytes);
+															})));
+		} catch (FileChangedError &e) {
+			// A short read: the file changed under the statement, which may not hold for the next one. Not kept.
+			throw FileChangedError("backup file \"" + headers_->Path(family.file) +
+								   "\": its log tail: " + WithoutPrefix(e));
 		} catch (FormatError &e) {
-			throw FormatError("backup file \"" + headers_->Path(family.file) + "\": its log tail: " + WithoutPrefix(e));
+			const std::string why =
+				"backup file \"" + headers_->Path(family.file) + "\": its log tail: " + WithoutPrefix(e);
+			// The tail does not change under the entry: the next statement is told the same, not read again.
+			guard.lock();
+			fuzzy_error_ = why;
+			guard.unlock();
+			throw FormatError(why);
 		}
+		memory->Hold(summary->MemoryBytes());  // the cursor gone
 	} catch (...) {
 		guard.lock();
 		fuzzy_building_ = false;
@@ -494,6 +516,7 @@ const FuzzySummary &OpenedBackup::Fuzzy(ClientContext &context, bool *built) con
 	}
 	guard.lock();
 	fuzzy_ = std::move(summary);
+	fuzzy_memory_ = std::move(memory);
 	fuzzy_building_ = false;
 	fuzzy_built_.notify_all();
 	if (built) {
@@ -502,11 +525,64 @@ const FuzzySummary &OpenedBackup::Fuzzy(ClientContext &context, bool *built) con
 	return *fuzzy_;
 }
 
+bool OpenedBackup::HoldsTailReservation() const {
+	std::lock_guard<std::mutex> guard(fuzzy_lock_);
+	return fuzzy_memory_ != nullptr;
+}
+
+void PutInCache(ObjectCache &cache, const std::string &key, const shared_ptr<OpenedBackup> &backup) {
+	// A summary the entry still holds reserved is weighed in first, so the cache's reservation counts it, and
+	// given back after (review: an entry put by a later statement, an attached one with the setting turned
+	// back on, was charged twice).
+	const bool holds = backup->HoldsTailReservation();
+	if (holds) {
+		backup->Reweigh();
+	}
+	cache.Put(key, backup);
+	if (holds) {
+		backup->ReleaseTailReservation();
+	}
+}
+
+void OpenedBackup::ReleaseTailReservation() const {
+	std::unique_ptr<ReservedBytes> memory;
+	{
+		std::lock_guard<std::mutex> guard(fuzzy_lock_);
+		memory = std::move(fuzzy_memory_);
+	}
+	// Given back outside the lock (FreeReservedMemory only adjusts a counter).
+}
+
+ReservedBytes::~ReservedBytes() {
+	if (reserved_) {
+		buffers_.FreeReservedMemory(reserved_);
+	}
+}
+
+void ReservedBytes::Hold(uint64_t bytes) {
+	const uint64_t target = (bytes + STEP - 1) / STEP * STEP;
+	if (target < reserved_) {
+		buffers_.FreeReservedMemory(reserved_ - target);
+		reserved_ = target;
+	}
+	while (reserved_ < target) {
+		try {
+			buffers_.ReserveMemory(STEP);
+		} catch (OutOfMemoryException &e) {
+			throw OutOfMemoryException("%s (%s) passes what DuckDB's memory_limit leaves: %s", what_,
+									   StringUtil::BytesToHumanReadableString(bytes), ErrorData(e).RawMessage());
+		}
+		reserved_ += STEP;
+	}
+}
+
 const FuzzySummary &StatementTail(ClientContext &context, const OpenedForStatement &opened) {
 	bool built = false;
 	const FuzzySummary &tail = opened.backup->Fuzzy(context, &built);
-	if (built && !opened.cache_key.empty() && opened.backup->Reweigh()) {
-		ObjectCache::GetObjectCache(context).Put(opened.cache_key, opened.backup);
+	if (built && !opened.cache_key.empty()) {
+		// The cache's reservation counts the summary from here (PutInCache): not held twice. Not cached, the
+		// entry keeps its own for its life (review of #591: it was charged to nothing).
+		PutInCache(ObjectCache::GetObjectCache(context), opened.cache_key, opened.backup);
 	}
 	return tail;
 }
@@ -525,6 +601,7 @@ const FuzzySummary *TailOrWarn(ClientContext &context, const OpenedForStatement 
 //! allocation map as they measure themselves, a container family's recent blocks (up to 4 MiB) and
 //! its chain, and the bootstrap tables at a few hundred bytes a row.
 bool OpenedBackup::Reweigh() {
+	std::lock_guard<std::mutex> weighing(weigh_lock_);
 	size_t bytes = 64 * 1024 * headers_->families.size();
 	for (const auto &f : headers_->families) {
 		if (f->container) {
@@ -554,6 +631,7 @@ bool OpenedBackup::Reweigh() {
 			bytes += fuzzy_->MemoryBytes();
 		}
 	}
+	bytes += fuzziness_.MemoryBytes();
 	return estimate_.exchange(bytes, std::memory_order_relaxed) != bytes;
 }
 
@@ -886,7 +964,7 @@ static OpenedForStatement OpenOverlay(ClientContext &context, OpenedForStatement
 		full.backup = opened.backup->Base();
 		full.binding = BindingFor(full.backup->Headers(), *full.files);
 		if (!full.cache_key.empty()) {
-			cache.Put(full.cache_key, full.backup);
+			PutInCache(cache, full.cache_key, full.backup);
 		}
 	}
 	if (!opened.backup) {
@@ -895,7 +973,7 @@ static OpenedForStatement OpenOverlay(ClientContext &context, OpenedForStatement
 		opened.backup = make_shared_ptr<OpenedBackup>(std::move(headers), full.backup);
 		if (!opened.cache_key.empty()) {
 			opened.backup->Reweigh();
-			cache.Put(opened.cache_key, opened.backup);
+			PutInCache(cache, opened.cache_key, opened.backup);
 		}
 	}
 	opened.binding = BindingFor(opened.backup->Headers(), *opened.files);
@@ -924,7 +1002,7 @@ static OpenedForStatement OpenBackupFiles(ClientContext &context, const std::vec
 		opened.backup = make_shared_ptr<OpenedBackup>(ReadBackupHeaders(*opened.files));
 		if (!opened.cache_key.empty()) {
 			opened.backup->Reweigh();
-			cache.Put(opened.cache_key, opened.backup);
+			PutInCache(cache, opened.cache_key, opened.backup);
 		}
 	}
 	opened.binding = BindingFor(opened.backup->Headers(), *opened.files);
@@ -940,11 +1018,11 @@ static void TakeStages(ClientContext &context, OpenedCatalog &catalog) {
 	// intervals, the units' page lists): measured at every open, outside the cache's lock, and put
 	// again when it changed, the reservation being taken at a Put.
 	if (!opened.cache_key.empty() && opened.backup->Reweigh()) {
-		ObjectCache::GetObjectCache(context).Put(opened.cache_key, opened.backup);
+		PutInCache(ObjectCache::GetObjectCache(context), opened.cache_key, opened.backup);
 	}
 	// A differential's full: its stages were built through the overlay, and grow as its reads search it.
 	if (opened.base && !opened.base->cache_key.empty() && opened.base->backup->Reweigh()) {
-		ObjectCache::GetObjectCache(context).Put(opened.base->cache_key, opened.base->backup);
+		PutInCache(ObjectCache::GetObjectCache(context), opened.base->cache_key, opened.base->backup);
 	}
 	catalog.headers = &opened.backup->Headers();
 	catalog.pages = &opened.backup->Pages();
@@ -1028,7 +1106,7 @@ std::shared_ptr<AttachedBackup> OpenAttachedBackup(
 	BindFiles bound(opened.binding);
 	opened.backup->EnsureTables(context);
 	if (!opened.cache_key.empty() && opened.backup->Reweigh()) {
-		ObjectCache::GetObjectCache(context).Put(opened.cache_key, opened.backup);
+		PutInCache(ObjectCache::GetObjectCache(context), opened.cache_key, opened.backup);
 	}
 	CatalogScope scope;
 	if (wants_object) {

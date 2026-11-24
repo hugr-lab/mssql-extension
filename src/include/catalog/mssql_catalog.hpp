@@ -78,6 +78,9 @@ struct MSSQLCatalogStartup {
 	//! ATTACH option, a secret, a connection string, a URI -- which wins) as it stood at ATTACH -- the type this
 	//! catalog's datetime2(7) columns are read as for its life (column types, keys, filters, the 079 vehicle's types).
 	MSSQLDatetime2Read datetime2_read = MSSQLDatetime2Read::Nanoseconds;
+	//! Spec 093 T5: the geometry_as ATTACH option -- what this catalog's geometry / geography columns are
+	//! read as for its life (column types, the stream's kernel, a raw scan's types).
+	tds::GeometryAs geometry_as = tds::GeometryAs::Geometry;
 	//! The `native_types` ATTACH option: 1 / 0 over mssql_catalog_native_types
 	//! for this catalog's life, -1 = unset (the setting decides, read where it
 	//! always was). DuckLake's METADATA_PARAMETERS reaches ATTACH options, not
@@ -388,6 +391,10 @@ public:
 	//! How this catalog reads datetime2(7) (spec 093 D8). Fixed at ATTACH.
 	MSSQLDatetime2Read Datetime2Read() const {
 		return startup_.datetime2_read;
+	}
+	//! What this catalog reads geometry / geography as (spec 093 T5). Fixed at ATTACH.
+	tds::GeometryAs GeometryAs() const {
+		return startup_.geometry_as;
 	}
 	//! Records a logged-in connection's answer when none is cached yet -- a
 	//! lazily validated ATTACH learns it from its first connection (#405).

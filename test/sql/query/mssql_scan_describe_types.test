@@ -112,17 +112,17 @@ SELECT typeof(v), variant_typeof(v) FROM mssql_scan('dt75', 'SELECT CAST(1 AS sq
 ----
 VARIANT	INT32
 
-# Spec 093 T4: a hierarchyid is decoded on the client into its ToString() text; geometry and
-# geography are still refused by a raw scan (T5).
+# Spec 093 T4: a hierarchyid is decoded on the client into its ToString() text; T5: geometry and
+# geography too, into GEOMETRY (spatial_read.test has the forms).
 query TT
 SELECT typeof(h), h FROM mssql_scan('dt75', 'SELECT hierarchyid::Parse(''/1.5/-2/'') AS h');
 ----
 VARCHAR	/1.5/-2/
 
-statement error
-SELECT * FROM mssql_scan('dt75', 'SELECT geometry::Point(1, 2, 0) AS g');
+query TT
+SELECT typeof(g), typeof(w) FROM mssql_scan('dt75', 'SELECT geometry::Point(1, 2, 0) AS g, geography::Point(1, 2, 4326) AS w');
 ----
-column 'g' is of the CLR type sys.geometry, which a raw mssql_scan does not read yet
+GEOMETRY	GEOMETRY('OGC:CRS84')
 
 # Spec 093 T0: the COLMETADATA and rows of a UDT / sql_variant column are parsed, so the
 # prepared path refuses with the same message, and a batch that returns one to mssql_exec runs

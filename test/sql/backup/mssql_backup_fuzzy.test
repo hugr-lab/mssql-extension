@@ -30,11 +30,23 @@ SELECT backup_type, consistent, open_transactions, committed_after_checkpoint FR
 ----
 log	NULL	NULL	NULL
 
+# The columns are projected: the tail is read at init, for D11's columns only (review of #591: a header
+# question read it at bind), and each column lands where it was asked for.
+query IT
+SELECT rolled_back_after_checkpoint, backup_type FROM mssql_backup_info('test/data/backup/open_tail/open_tail_full.bak');
+----
+0	full
+
+query TI
+SELECT backup_type, count(*) FROM mssql_backup_info('test/data/backup/open_tail/open_tail_full.bak') GROUP BY ALL;
+----
+full	1
+
 # --- the table level (mssql_backup_tables), a full and a differential over its full ---
 
 query TTII
 SELECT table_name, fuzzy_status, open_transactions, stale_transactions
-FROM mssql_backup_tables('test/data/backup/open_tail/open_tail_full.bak') ORDER BY 1;
+FROM mssql_backup_tables('test/data/backup/open_tail/open_tail_full.bak') WHERE type = 'U' ORDER BY 1;
 ----
 changed	dirty	1	0
 control	consistent	0	0
@@ -43,7 +55,7 @@ static	consistent	0	0
 query TTII
 SELECT table_name, fuzzy_status, open_transactions, stale_transactions
 FROM mssql_backup_tables('test/data/backup/open_tail/open_tail_base.bak', diff := 'test/data/backup/open_tail/open_tail_diff.bak')
-ORDER BY 1;
+WHERE type = 'U' ORDER BY 1;
 ----
 changed	dirty	1	0
 control	consistent	0	0
@@ -66,9 +78,39 @@ SELECT count(*), sum(v) FROM mssql_backup_scan('test/data/backup/open_tail/open_
 100	15503
 
 query I
-SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE '%dbo.changed is dirty in this backup: 1 transaction(s) open%';
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%dbo.changed is dirty in this backup: 1 transaction(s) open%';
 ----
-true
+1
+
+# The check is at init, not bind: a DESCRIBE says nothing, a PREPARE nothing, and each EXECUTE once (review
+# of #591: a PREPARE and two EXECUTEs logged three).
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+DESCRIBE SELECT * FROM mssql_backup_scan('test/data/backup/open_tail/open_tail_full.bak', 'dbo', 'changed');
+
+statement ok
+PREPARE scan_changed AS SELECT count(*) FROM mssql_backup_scan('test/data/backup/open_tail/open_tail_full.bak', 'dbo', 'changed');
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%dbo.changed is dirty in this backup%';
+----
+0
+
+statement ok
+EXECUTE scan_changed;
+
+statement ok
+EXECUTE scan_changed;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'mssql_backup_scan: dbo.changed is dirty in this backup%';
+----
+2
+
+statement ok
+DEALLOCATE scan_changed;
 
 statement ok
 SET enable_logging = false;

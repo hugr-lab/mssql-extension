@@ -23,6 +23,24 @@ class ConnectionPool;
 //! error numbers of the statement, decimal, comma-separated, in the order they came (issue #570).
 static constexpr const char *MSSQL_SERVER_ERROR_NUMBERS = "mssql_server_error_numbers";
 
+namespace mssql {
+
+//! Spec 093 T1 / T5: the WARNINGs a column's decode notes call for, in one wording for every reader of
+//! a result set -- MSSQLResultStream and INSERT ... RETURNING (MSSQLReturningParser). Each is said once
+//! a column a statement; the caller keeps what was said.
+//!
+//! The spatial ones, by kind: `warned` holds the SPATIAL_WARNED_* bits the column has logged; returned,
+//! the whole set after this call (`warned` and what it logged).
+static constexpr uint8_t SPATIAL_WARNED_NOT_GEOMETRY = 1;
+static constexpr uint8_t SPATIAL_WARNED_MALFORMED = 2;
+uint8_t LogSpatialNotes(ClientContext &context, const tds::ColumnMetadata &column,
+						const codec::spatial::SpatialColumnNotes &notes, uint8_t warned);
+//! The sql_variant one: whether it was logged (a column with no value read as its bytes logs nothing).
+bool LogVariantNotes(ClientContext &context, const tds::ColumnMetadata &column,
+					 const codec::variant::VariantColumnNotes &notes);
+
+}  // namespace mssql
+
 //===----------------------------------------------------------------------===//
 // MSSQLResultStream - Streaming result iterator that yields DataChunks
 //===----------------------------------------------------------------------===//
@@ -57,8 +75,10 @@ public:
 	// client_transcode: the catalog's answer (spec 092 D4), fixed at ATTACH. No
 	//                   default: a caller must not keep verbatim bytes by forgetting
 	//                   it, nor transcode a catalog that turned it off.
+	// geometry_as: the catalog's (spec 093 T5), fixed at ATTACH: what a geometry /
+	//              geography column is read as. No default, for the same reason.
 	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const tds::Request &request,
-					  const string &context_name, bool client_transcode,
+					  const string &context_name, bool client_transcode, tds::GeometryAs geometry_as,
 					  weak_ptr<tds::ConnectionPool> pool_handle = weak_ptr<tds::ConnectionPool>(),
 					  bool transaction_pinned = false, int query_timeout_seconds = 30,
 					  bool reset_on_release = tds::DEFAULT_RESET_CONNECTION);
@@ -232,6 +252,8 @@ private:
 	bool reset_on_release_;
 	// The catalog's mssql_client_transcode, fixed at ATTACH (spec 092 D4).
 	bool client_transcode_;
+	// The catalog's geometry_as, fixed at ATTACH (spec 093 T5).
+	tds::GeometryAs geometry_as_;
 
 	// Query
 	string sql_;
@@ -274,6 +296,16 @@ private:
 	std::vector<uint8_t> vector_text_;
 	void NoteVectorText(idx_t c);
 	std::vector<mssql::codec::variant::VariantColumnNotes> row_variant_notes_;
+	//! Spec 093 T5: per column, which of its spatial WARNINGs were logged (mssql::SPATIAL_WARNED_* bits);
+	//! and the per-value path's counts, beside the stager's.
+	std::vector<uint8_t> spatial_warned_;
+	std::vector<mssql::codec::spatial::SpatialColumnNotes> row_spatial_notes_;
+	//! The column's spatial counts, the stager's and the per-value path's together.
+	mssql::codec::spatial::SpatialColumnNotes SpatialNotesOf(idx_t c) const;
+	//! Whether column `c` has spatial NULLs of a kind not yet logged.
+	bool SpatialWarningPending(idx_t c) const;
+	//! Log the spatial WARNINGs not yet logged, one a column for each kind.
+	void SurfaceSpatialWarnings(ClientContext &context);
 	bool is_catalog_scan_ = false;
 
 	// Statistics
