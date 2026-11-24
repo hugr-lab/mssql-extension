@@ -9,7 +9,13 @@
 #   stale_update     100 rows, sum(v) 10        (an UPDATE committed: the copy lacks it)
 #   rollback_insert  100 rows                   (a transaction rolled back, its log hardened: the copy
 #   rollback_delete  100 rows                    holds its 50 inserted rows and lacks its 50 deleted ones)
+#   rollback_loaded  0 rows                     (the same transaction's INSERT ... WITH (TABLOCK) into a heap:
+#                                                the copy holds its 1000 rows; review of #619)
+#   rollback_truncated  100 rows                (the same transaction's TRUNCATE: the copy lacks the rows, its
+#                                                IAM page freed and given back by the rollback; review of #619)
 #   savepoint        110 rows, sum(v) 10        (rows, a savepoint, rows, a rollback to it, a commit)
+#   rollback_grown   0 rows                     (rows inserted into an empty table, on pages taken into use
+#                                                after the copy, rolled back there: consistent, a control)
 #   parallel_open    0 rows                     (a parallel INSERT ... WITH (TABLOCK), DOP 4, left open:
 #                                                logged as page images, under the one transaction id)
 #   loaded           1000 rows                  (an INSERT ... WITH (TABLOCK) into a heap: page images)
@@ -35,7 +41,10 @@ loaded	stale	0	1
 parallel_open	dirty	1	0
 rebuilt	stale	0	1
 rollback_delete	stale	0	1
+rollback_grown	consistent	0	0
 rollback_insert	stale	0	1
+rollback_loaded	stale	0	1
+rollback_truncated	stale	0	1
 savepoint	stale	0	1
 src	consistent	0	0
 stale_update	stale	0	1
@@ -49,13 +58,13 @@ SELECT name, status, list_sort(list_transform(tables, lambda x: x.table_name || 
 FROM mssql_backup_transactions(getvariable('tw')) WHERE name LIKE 'tw%' ORDER BY 1;
 ----
 tw_parallel	open	[parallel_open dirty]
-tw_undo	rolled back	[rollback_delete stale, rollback_insert stale]
+tw_undo	rolled back	[rollback_delete stale, rollback_insert stale, rollback_loaded stale, rollback_truncated stale, sysallocunits stale, sysrowsets stale]
 
 query TIII
 SELECT consistent, open_transactions, committed_after_checkpoint, rolled_back_after_checkpoint
 FROM mssql_backup_info(getvariable('tw'));
 ----
-false	1	9	1
+false	1	11	2
 
 # The rows as the copies hold them (against the RESTORE's in the header).
 statement ok
@@ -65,6 +74,9 @@ query TII
 SELECT 'stale_update', count(*), sum(v) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'stale_update')
 UNION ALL SELECT 'rollback_insert', count(*), sum(v) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rollback_insert')
 UNION ALL SELECT 'rollback_delete', count(*), sum(v) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rollback_delete')
+UNION ALL SELECT 'rollback_loaded', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rollback_loaded')
+UNION ALL SELECT 'rollback_truncated', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rollback_truncated')
+UNION ALL SELECT 'rollback_grown', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rollback_grown')
 UNION ALL SELECT 'savepoint', count(*), sum(v) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'savepoint')
 UNION ALL SELECT 'parallel_open', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'parallel_open')
 UNION ALL SELECT 'loaded', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'loaded')
@@ -75,6 +87,9 @@ UNION ALL SELECT 'widened', count(*), sum(v) FROM mssql_backup_scan(getvariable(
 stale_update	100	0
 rollback_insert	150	50
 rollback_delete	50	0
+rollback_loaded	1000	NULL
+rollback_truncated	0	NULL
+rollback_grown	0	NULL
 savepoint	100	0
 parallel_open	2000	NULL
 loaded	0	NULL

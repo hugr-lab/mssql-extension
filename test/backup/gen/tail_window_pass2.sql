@@ -19,6 +19,13 @@ COMMIT TRANSACTION;
 GO
 INSERT INTO dbo.loaded WITH (TABLOCK) (id, v, pad) SELECT id, v, pad FROM dbo.src WHERE id <= 1000;
 GO
+-- Pages and extents taken into use after the copy, by rows rolled back: nothing a RESTORE keeps. The flush
+-- puts the undo before LastLSN (a ROLLBACK does not harden the log: tail_window_open.sql).
+BEGIN TRANSACTION;
+INSERT INTO dbo.rollback_grown (id, v, pad) SELECT id, v, pad FROM dbo.src;
+ROLLBACK TRANSACTION;
+EXEC sys.sp_flush_log;
+GO
 TRUNCATE TABLE dbo.truncated;
 GO
 ALTER INDEX pk_rebuilt ON dbo.rebuilt REBUILD;

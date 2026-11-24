@@ -1787,7 +1787,14 @@ before the next opens.
       TRUNCATE logs nothing else: it read consistent with the copy's rows gone; an index rebuild frees the
       old unit's extents alike and reads stale with its rows equal -- the price; extents allocated are not
       counted: an allocation may commit on its own -- AllocFirstPage, a transaction of the system's -- while the rows
-      put there stay open). Still not counted: a large table's TRUNCATE (deferred: its extents freed later),
+      put there stay open; review of #619: extents a transaction sets on an IAM page where it freed some
+      widen that change -- a rolled-back TRUNCATE's compensation --, and such a change on an IAM page the
+      backup holds as not live and the tail did not format (one the database had: a TRUNCATE frees its IAM
+      page, which the rollback gives back) shows when given back after CheckpointLSN; extents freed on an IAM
+      page not live in the image show for no committed transaction, rows on it being in neither the image nor
+      a RESTORE; fixture tables rollback_loaded and rollback_truncated, a TABLOCK load and a TRUNCATE rolled
+      back in the second pass, and the control rollback_grown, an insert into an empty table rolled back
+      there, consistent). Still not counted: a large table's TRUNCATE (deferred: its extents freed later),
       a partition switched in the tail, pages freed from a mixed extent. Measured there too:
       a ROLLBACK does not harden the log and a backup copies only the hardened log, so an undo not flushed by
       the backup's end is past LastLSN (the transaction reads open, which the RESTORE undoes alike); a

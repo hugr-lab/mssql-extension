@@ -77,6 +77,8 @@ public:
 			t.end = r.lsn;
 		} else if (IsRowChange(r)) {
 			NoteRowChange(t, r);
+		} else if (IsIamSet(r)) {
+			NoteIamSet(t, r);
 		}
 	}
 
@@ -127,7 +129,12 @@ public:
 		for (auto &unit : changes_) {
 			auto &out = summary_.units[unit.first];
 			for (auto &page : unit.second) {
+				// An IAM page formatted in the tail is one taken into use while the backup ran: extents it freed and
+				// set again were the transaction's own, not a table's it had before (fixture tail_window,
+				// rollback_grown: a rolled-back insert into an empty table).
+				const bool formatted = summary_.formatted.count(page.first) != 0;
 				for (auto &c : page.second) {
+					c.regained = c.regained && !formatted;
 					if (open(c.transaction)) {
 						out.open[page.first].push_back(c);
 					} else {
@@ -184,7 +191,8 @@ private:
 	//!   RESTORE's: the price of not missing a TRUNCATE; so would a ghost cleanup freeing an extent emptied
 	//!   before the copy. Extents allocated (bits set) are not counted: an allocation may commit on its own
 	//!   (AllocFirstPage, a transaction of the system's) while the rows put there stay open, which a RESTORE
-	//!   undoes -- the table equal, read stale.
+	//!   undoes -- the table equal, read stale. Extents set where the same transaction freed some widen that
+	//!   change instead (NoteIamSet: a rolled-back TRUNCATE's compensation, review of #619).
 	//! Still not counted, the table read consistent where a RESTORE differs: a large table's TRUNCATE (a
 	//! deferred drop: the rowset replaced, its extents freed later, maybe past LastLSN), a partition switched
 	//! in the tail, pages freed from a mixed extent (the IAM's single-page slots); a schema change shows on
@@ -225,6 +233,34 @@ private:
 		}
 	}
 
+	//! Extents allocated to a unit (a SET_BITS setting bits of its IAM page), not counted on their own (an
+	//! allocation may commit apart from the rows put there: IsRowChange).
+	static bool IsIamSet(const LogRecord &r) {
+		return r.op == log_op::SET_BITS && r.context == log_context::IAM && r.has_allocation_unit && r.has_page &&
+			   !FreesExtents(r);
+	}
+
+	//! Extents a transaction allocates on an IAM page where it freed extents before widen that change (review of
+	//! #619): a TRUNCATE rolled back sets the bits it cleared again, on the same page, which is its compensation.
+	//! Without it a rolled-back TRUNCATE after the IAM page's copy read consistent with the rows gone (fixture
+	//! tail_window, rollback_truncated: its copy lacks the rows, a RESTORE has them). A set with no free of the
+	//! same transaction before it on the page widens nothing.
+	void NoteIamSet(FuzzySummary::Transaction &t, const LogRecord &r) {
+		const uint64_t page = (static_cast<uint64_t>(r.file) << 32) | r.page;
+		auto at = index_.find(ChangeKey{r.allocation_unit, page, r.transaction});
+		if (at == index_.end()) {
+			return;
+		}
+		auto &change = changes_[r.allocation_unit][page][at->second];
+		Widen(change, r.lsn);
+		change.regained = true;
+		// A compensation after CheckpointLSN, as a row operation's would be (mssql_backup_info's counts).
+		t.after_checkpoint = t.after_checkpoint || Newer(r.lsn, summary_.checkpoint);
+		if (Newer(r.lsn, summary_.checkpoint)) {
+			after_checkpoint_.insert(r.transaction);
+		}
+	}
+
 	void NoteRowChange(FuzzySummary::Transaction &t, const LogRecord &r) {
 		t.row_operations++;
 		t.after_checkpoint = t.after_checkpoint || Newer(r.lsn, summary_.checkpoint);
@@ -242,6 +278,7 @@ private:
 			c.transaction = r.transaction;
 			c.oldest = r.lsn;
 			c.newest = r.lsn;
+			c.iam = r.op == log_op::SET_BITS;
 			index_.emplace(key, changes.size());
 			changes.push_back(c);
 		}
@@ -379,14 +416,24 @@ bool ChangeShows(bool open, const FuzzySummary::Change &c, PageState state, cons
 	}
 	if (c.rolled_back) {
 		// Its changes undone in the tail: the copy differs only when it holds a change and lacks the
-		// compensation, between the two. A page the image does not have, or does not hold, holds none of it.
-		return state == PageState::Present && !Newer(c.oldest, copy_lsn) && Newer(c.newest, copy_lsn);
+		// compensation, between the two. An IAM page the backup holds as not live whose extents the change
+		// freed and the compensation set again, one the database had before (`regained`), was freed by the change
+		// and given back (a TRUNCATE frees its IAM page: fixture tail_window, rollback_truncated, review of #619):
+		// the image lacks it when that came after CheckpointLSN, as (iv) says of a committed one. Any other change
+		// on a page not live -- one taken into use after the image by rows the rollback removed, its IAM page
+		// formatted in the tail (rollback_grown) -- holds nothing a RESTORE keeps, nor does a Pending or
+		// unreadable page.
+		return state == PageState::Present	 ? !Newer(c.oldest, copy_lsn) && Newer(c.newest, copy_lsn)
+			   : state == PageState::NotLive ? c.regained && Newer(c.newest, checkpoint)
+											 : false;
 	}
 	// (iv): a committed change the copy does not hold. A page the backup holds as not live was freed before
 	// the image (its rows gone with it: a delete, a split), unless the change came after CheckpointLSN, on a
-	// page taken into use after the image; a Pending or unreadable one holds none.
+	// page taken into use after the image; a Pending or unreadable one holds none. Extents freed on an IAM page
+	// not live in the image are not rows the image or a RESTORE holds (fixture tail_window, rollback_grown: a
+	// system transaction, DeallocateBulkTempPages, freeing a rolled-back insert's extents; review of #619).
 	return state == PageState::Present	 ? Newer(c.newest, copy_lsn)
-		   : state == PageState::NotLive ? Newer(c.newest, checkpoint)
+		   : state == PageState::NotLive ? !c.iam && Newer(c.newest, checkpoint)
 										 : true;
 }
 

@@ -417,6 +417,7 @@ for fixture in ${FIXTURES}; do
 		}
 		tw_wait "SELECT CASE WHEN (SELECT COUNT(*) FROM bak_tail_window.dbo.rollback_insert WITH (READUNCOMMITTED)) = 150
 			AND (SELECT COUNT(*) FROM bak_tail_window.dbo.rollback_delete WITH (READUNCOMMITTED)) = 50
+			AND (SELECT n FROM tw_control.dbo.opened WITH (READUNCOMMITTED)) = 1
 			AND (SELECT COUNT(*) FROM bak_tail_window.dbo.parallel_open WITH (READUNCOMMITTED)) = 2000 THEN 1 ELSE 0 END" ||
 			tw_failed "open transactions did not make their changes in 60 s"
 		# A trial backup of the same layout: where its second data pass starts is where the real one's does (a

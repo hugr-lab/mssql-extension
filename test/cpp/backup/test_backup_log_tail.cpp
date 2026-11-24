@@ -279,6 +279,14 @@ int main() {
 		Check(ChangeShows(false, c, PageState::Present, lsn(15), checkpoint) &&
 				  !ChangeShows(false, c, PageState::Present, lsn(20), checkpoint),
 			  "committed: stale before its newest change, not at it");
+		// On a page not live in the image: rows taken there after it are missing; extents freed on such an IAM
+		// page are not (review of #619).
+		c.iam = true;
+		Check(!ChangeShows(false, c, PageState::NotLive, lsn(0), checkpoint),
+			  "committed: extents freed on an IAM page not live in the image: as RESTORE");
+		c.iam = false;
+		Check(ChangeShows(false, c, PageState::NotLive, lsn(0), checkpoint),
+			  "committed: rows on a page taken into use after the image: stale");
 		// Rolled back: only a copy between its first change and its compensation holds what was undone.
 		c.rolled_back = true;
 		Check(!ChangeShows(false, c, PageState::Present, lsn(8), checkpoint),
@@ -287,9 +295,18 @@ int main() {
 			  "rolled back, copied between a change and its undo: stale");
 		Check(!ChangeShows(false, c, PageState::Present, lsn(25), checkpoint),
 			  "rolled back, copied after its undo: as RESTORE");
-		Check(!ChangeShows(false, c, PageState::NotLive, lsn(0), checkpoint) &&
-				  !ChangeShows(false, c, PageState::Pending, lsn(0), checkpoint),
+		Check(!ChangeShows(false, c, PageState::Pending, lsn(0), checkpoint),
 			  "rolled back, on a page the backup does not hold: as RESTORE");
+		// A page the backup holds as not live: a change on it -- rows on a page taken into use after the image, which
+		// the rollback removed -- holds nothing a RESTORE keeps; an IAM page whose extents the change freed and the
+		// compensation set again (a TRUNCATE's, review of #619) is stale when that came after CheckpointLSN.
+		Check(!ChangeShows(false, c, PageState::NotLive, lsn(0), checkpoint),
+			  "rolled back, on a page not live in the backup: as RESTORE");
+		c.regained = true;
+		Check(ChangeShows(false, c, PageState::NotLive, lsn(0), checkpoint) &&
+				  !ChangeShows(false, c, PageState::NotLive, lsn(0), lsn(25)),
+			  "rolled back TRUNCATE, its IAM page not live in the backup: stale when given back after CheckpointLSN");
+		c.regained = false;
 		// Open: dirty when the copy holds its oldest change.
 		c.rolled_back = false;
 		Check(ChangeShows(true, c, PageState::Present, lsn(10), checkpoint) &&
@@ -417,6 +434,59 @@ int main() {
 		Check(changed(425) && !changed(426),
 			  "extents freed from a unit's IAM page (a TRUNCATE): counted; allocated: not");
 		Check(summary.transactions.at(5).row_operations == 2, "the transaction counts the two");
+	}
+	std::cout << "a rolled-back TRUNCATE's compensation widens its change (review of #619)" << std::endl;
+	{
+		const uint64_t au = 72057594054377472ULL;
+		auto record = [&](uint32_t block, uint8_t op, uint32_t page, uint8_t value) {
+			static std::vector<std::vector<uint8_t>> keep;
+			std::vector<uint8_t> b(54, 0);
+			b[48] = 0x56;
+			b[50] = 1;
+			b[52] = value;
+			keep.push_back(std::move(b));
+			LogRecord r;
+			r.lsn.vlf = 1;
+			r.lsn.block = block;
+			r.lsn.slot = 1;
+			r.op = op;
+			r.context = op == log_op::SET_BITS ? 0x0a : 0;
+			r.transaction = 7;
+			r.has_page = r.has_allocation_unit = op == log_op::SET_BITS || op == log_op::FORMAT_PAGE;
+			r.file = 1;
+			r.page = page;
+			r.allocation_unit = au;
+			r.bytes = keep.back().data();
+			r.length = 54;
+			r.fixed_length = 54;
+			return r;
+		};
+		Lsn first, last, checkpoint;
+		first.vlf = last.vlf = checkpoint.vlf = 1;
+		first.block = checkpoint.block = 1;
+		last.block = 99;
+		// The TRUNCATE frees extents of IAM page 424; the rollback sets them again. A set on page 431 with no free
+		// before it (a bulk load's allocation) widens nothing and is not a change of its own. IAM page 602, formatted
+		// in the tail, has extents freed and set again: the transaction's own, not regained.
+		const std::vector<LogRecord> records = {
+			record(2, log_op::BEGIN_XACT, 0, 0), record(3, log_op::SET_BITS, 431, 1),
+			record(4, log_op::SET_BITS, 424, 0), record(5, log_op::FORMAT_PAGE, 602, 0),
+			record(6, log_op::SET_BITS, 602, 0), record(7, log_op::SET_BITS, 602, 1),
+			record(8, log_op::SET_BITS, 424, 1), record(9, log_op::ABORT_XACT, 0, 0)};
+		const FuzzySummary summary = SummarizeLogRecords(records, first, last, checkpoint);
+		const auto &unit = summary.units.at(au);
+		auto truncated = unit.finished.find(uint64_t(1) << 32 | 424);
+		Check(truncated != unit.finished.end() && truncated->second.size() == 1 &&
+				  truncated->second[0].oldest.block == 4 && truncated->second[0].newest.block == 8 &&
+				  truncated->second[0].rolled_back && truncated->second[0].regained,
+			  "the free and the set that undoes it: one change, from the free to the set");
+		Check(truncated->second[0].iam, "an IAM page's change is marked so");
+		Check(unit.finished.count(uint64_t(1) << 32 | 431) == 0 && summary.transactions.at(7).row_operations == 2,
+			  "an allocation alone: no change");
+		auto grown = unit.finished.find(uint64_t(1) << 32 | 602);
+		Check(grown != unit.finished.end() && grown->second.size() == 1 && grown->second[0].newest.block == 7 &&
+				  !grown->second[0].regained,
+			  "an IAM page formatted in the tail: widened, but not regained");
 	}
 	std::cout << "each log block follows the one before it, across the streams (review of #591)" << std::endl;
 	{

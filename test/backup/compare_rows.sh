@@ -160,7 +160,7 @@ fi
 FUZZY="${FUZZY-fuzzy_full fuzzy_xpress load_full load_xpress tail_window_full}"
 FUZZY_OVERLAYS="${FUZZY_OVERLAYS-fuzzy_over}"
 FUZZY_FLAGGED_EQUAL="${FUZZY_FLAGGED_EQUAL-tail_window_full=dbo.rebuilt}"
-FUZZY_MUST_DIFFER="${FUZZY_MUST_DIFFER-tail_window_full=dbo.stale_update,dbo.rollback_insert,dbo.rollback_delete,dbo.savepoint,dbo.parallel_open,dbo.loaded,dbo.truncated,dbo.widened}"
+FUZZY_MUST_DIFFER="${FUZZY_MUST_DIFFER-tail_window_full=dbo.stale_update,dbo.rollback_insert,dbo.rollback_delete,dbo.rollback_loaded,dbo.rollback_truncated,dbo.savepoint,dbo.parallel_open,dbo.loaded,dbo.truncated,dbo.widened}"
 of_set() {	# $1 = set, $2 = a list of set=tables entries: the set's tables
 	printf '%s\n' $2 | awk -F= -v n="$1" '$1 == n { print $2 }'
 }

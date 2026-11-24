@@ -171,7 +171,8 @@ def main():
     parser.add_argument("--flagged-equal", default="",
                         help="with --fuzzy: tables (schema.table, comma-separated) that may read 'stale' while equal")
     parser.add_argument("--must-differ", default="",
-                        help="with --fuzzy: tables (schema.table, comma-separated) that must differ from the restored ones")
+                        help="with --fuzzy: tables (schema.table, comma-separated) that must differ from the restored ones; "
+                             "one not compared (absent, not decodable) is a failure")
     args = parser.parse_args()
     try:
         session = Session(args.duckdb, os.environ["MSSQL_ROWS_PORT"], os.environ["MSSQL_ROWS_PASSWORD"],
@@ -201,6 +202,8 @@ def main():
 
     compared, failures, rows_total = 0, [], 0
     statuses = {}
+    must_differ = [n for n in args.must_differ.split(",") if n]
+    checked = set()  # the --must-differ tables compared (review of #619: one absent or skipped passed silently)
     for t in tables:
         schema, table = t["schema_name"], t["table_name"]
         where = f"{schema}.{table}"
@@ -254,7 +257,8 @@ def main():
                 differs = differs or retyped
                 verdict = "ok"
                 allowed = where in [n for n in args.flagged_equal.split(",") if n]
-                if not differs and where in [n for n in args.must_differ.split(",") if n]:
+                checked.add(where)
+                if not differs and where in must_differ:
                     failures.append(f"{where}: equal to the restored table, where its changes were made after its "
                                     "copy: the fixture missed its window")
                 if differs and fuzzy == "consistent":
@@ -410,6 +414,9 @@ def main():
         else:
             print(f"  ok   {where}: equal, _mssql_rid included; each of {len(described)} columns alone too")
 
+    for name in must_differ if args.fuzzy else []:
+        if name not in checked:
+            failures.append(f"{name}: named by --must-differ but not compared (not in the listing, or not decodable)")
     if args.fuzzy:
         print(f"compare_rows: fuzzy_status of the tables compared: "
               f"{', '.join(f'{n} {k}' for k, n in sorted(statuses.items())) or 'none'}")

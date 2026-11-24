@@ -67,6 +67,12 @@ struct FuzzySummary {
 		Lsn newest;
 		//! Its transaction was rolled back (in `finished` only).
 		bool rolled_back = false;
+		//! A change of an IAM page: extents freed (review of #619).
+		bool iam = false;
+		//! Extents it freed on an IAM page that was not formatted in the tail (one the database had before it)
+		//! were set again by the same transaction after (review of #619): a TRUNCATE whose rollback gives them
+		//! back -- and, freeing its IAM page, gives that back too.
+		bool regained = false;
 	};
 	struct Unit {
 		//! By page, (file << 32) | page: the finished transactions' changes (flag (iv)) and the open ones'
