@@ -1,0 +1,67 @@
+# name: test/sql/catalog/filter_pushdown_repeated.test
+# description: a scan's pushed conditions kept when DuckDB pushes filters into it again (issue #623)
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# DuckDB calls a scan's pushdown_complex_filter once per pushdown pass that reaches it: the CTE filter
+# pusher pushes a materialized CTE's consumers' filters (OR-ed) into its body after the main pass. Each
+# call removes from the plan what it encoded, so a second call that replaced the stored WHERE clause left
+# the first call's conditions nowhere: a CTE filtered on year(d) returned every year's rows. 3000 rows,
+# one a day from 2022-01-02, x = id % 5: 2024 holds 73 rows of x = 1 and 73 of x = 2. The remote-pushdown rewriter is off
+# (it would send these statements whole), so the catalog scan is what runs.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS fpr (TYPE mssql, remote_pushdown false);
+
+statement ok
+SELECT mssql_exec('fpr', 'DROP TABLE IF EXISTS dbo.fpr_days; CREATE TABLE dbo.fpr_days (id int PRIMARY KEY, d date NOT NULL, x int NOT NULL); WITH n AS (SELECT TOP (3000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b) INSERT INTO dbo.fpr_days SELECT i, DATEADD(day, i, ''2022-01-01''), i % 5 FROM n');
+
+query I
+SELECT count(*) FROM fpr.dbo.fpr_days WHERE year(d) = 2024 AND x IN (1, 2);
+----
+146
+
+# One consumer: the CTE's own condition, then the consumer's, in two calls.
+query I
+SELECT count(*) FROM (WITH c AS MATERIALIZED (SELECT * FROM fpr.dbo.fpr_days WHERE year(d) = 2024)
+	SELECT * FROM c WHERE x = 1);
+----
+73
+
+# Two consumers: their filters OR-ed by the CTE filter pusher, ANDed onto the stored condition.
+query I
+SELECT count(*) FROM (WITH c AS MATERIALIZED (SELECT * FROM fpr.dbo.fpr_days WHERE year(d) = 2024)
+	SELECT * FROM c WHERE x = 1 UNION ALL SELECT * FROM c WHERE x = 2);
+----
+146
+
+query I
+SELECT count(*) FROM (WITH c AS MATERIALIZED (SELECT * FROM fpr.dbo.fpr_days WHERE d >= DATE '2024-01-01' AND d < DATE '2025-01-01')
+	SELECT * FROM c WHERE x = 1 UNION ALL SELECT * FROM c WHERE x = 2);
+----
+146
+
+# The constants as literals (spec 076's escape hatch): the same clauses, no parameters to renumber.
+statement ok
+SET mssql_scan_parameterize_filters = false;
+
+query I
+SELECT count(*) FROM (WITH c AS MATERIALIZED (SELECT * FROM fpr.dbo.fpr_days WHERE year(d) = 2024)
+	SELECT * FROM c WHERE x = 1 UNION ALL SELECT * FROM c WHERE x = 2);
+----
+146
+
+statement ok
+RESET mssql_scan_parameterize_filters;
+
+statement ok
+SELECT mssql_exec('fpr', 'DROP TABLE IF EXISTS dbo.fpr_days');
+
+statement ok
+DETACH fpr;
