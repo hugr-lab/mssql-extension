@@ -309,8 +309,13 @@ void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData
 	vector<column_t> column_ids;
 	ExpressionEncodeContext ctx = BuildEncodeContext(context, get, bind_data, column_ids);
 	// Spec 076: the constants become parameters, kept on the bind data beside
-	// the clause that refers to them.
-	mssql::SqlParamSet params;
+	// the clause that refers to them. DuckDB calls this more than once on one
+	// scan (a pushdown pass per optimizer that pushes filters again: a
+	// materialized CTE's consumers, filter statistics), each call with the
+	// filters left: what an earlier call stored stays, and this call's
+	// parameters are numbered after those (issue #623: the clause was replaced,
+	// its conditions gone from the plan and the server alike).
+	mssql::SqlParamSet params = bind_data.complex_filter_params;
 	if (LoadScanParameterizeFilters(context)) {
 		ctx.params = &params;
 	}
@@ -342,12 +347,12 @@ void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData
 
 	// Build the WHERE clause from encoded conditions
 	if (!encoded_conditions.empty()) {
-		std::string where_clause;
-		for (idx_t i = 0; i < encoded_conditions.size(); i++) {
-			if (i > 0) {
+		std::string where_clause = bind_data.complex_filter_where_clause;
+		for (const auto &condition : encoded_conditions) {
+			if (!where_clause.empty()) {
 				where_clause += " AND ";
 			}
-			where_clause += encoded_conditions[i];
+			where_clause += condition;
 		}
 		bind_data.complex_filter_where_clause = where_clause;
 		bind_data.complex_filter_params = std::move(params);
