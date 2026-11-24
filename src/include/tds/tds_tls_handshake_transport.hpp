@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -33,8 +34,10 @@ public:
 	bool Flush();
 	//! Up to `len` bytes of the server's TLS data into `buf`, after sending what Buffer kept: what is left
 	//! of the last packet, else the next packet's payload (the rest of it kept for the next call). The
-	//! count, 0 when nothing arrives within `timeout_ms`, -1 on an error: a socket error, the peer closing,
-	//! a packet that is neither a reply nor a PRELOGIN, a declared length shorter than the header.
+	//! count, 0 when no whole packet arrives within `timeout_ms` (one that arrived in part is kept, and the
+	//! next call reads on: a peer that stops inside a packet costs the timeout, not forever), -1 on an
+	//! error: a socket error, the peer closing, a packet that is neither a reply nor a PRELOGIN, a declared
+	//! length shorter than the header.
 	int Receive(uint8_t *buf, size_t len, int timeout_ms);
 
 	//! The bytes kept to send, and those of the last packet not handed out yet (for the tests).
@@ -42,17 +45,20 @@ public:
 		return send_buffer_.size();
 	}
 	size_t PendingReceiveBytes() const {
-		return recv_buffer_.size() - recv_pos_;
+		return in_payload_ ? 0 : recv_buffer_.size() - recv_pos_;
 	}
 
 private:
 	//! What is left of the last packet, up to `len` bytes; the buffer reset once drained.
 	size_t TakeBuffered(uint8_t *buf, size_t len);
-	//! `count` bytes from the socket into `to`; false on an error or the peer closing (`what` and `closed`
-	//! word the debug log).
-	bool ReadFully(uint8_t *to, size_t count, const char *what, const char *closed);
-	//! The next packet's payload into the receive buffer; false as Receive's -1.
-	bool ReadPacket();
+	//! Reads on until `to` holds `count` bytes, `filled_` of them there already: 1 when it does, 0 when the
+	//! time is up first (`timeout_ms` counted from `start`; negative: no limit), -1 on an error or the peer
+	//! closing (`what` and `closed` word the debug log).
+	int ReadSome(uint8_t *to, size_t count, std::chrono::steady_clock::time_point start, int timeout_ms,
+				 const char *what, const char *closed);
+	//! The next packet's payload into the receive buffer, read on from where the last call left it: 1 when
+	//! it is whole, 0 when `timeout_ms` passes first, -1 as Receive's -1.
+	int ReadPacket(int timeout_ms);
 
 	int fd_;
 	uint8_t &packet_id_;
@@ -61,6 +67,12 @@ private:
 	// every call, and OpenSSL's first call of each record asks for five bytes.
 	std::vector<uint8_t> recv_buffer_;
 	size_t recv_pos_ = 0;
+	// The packet being read, kept across calls: its header until that is whole, then its payload straight
+	// into recv_buffer_ (`in_payload_`: sized for it and not whole yet, so nothing of it is handed out);
+	// `filled_` is how much of the part being read has arrived.
+	uint8_t header_[8] = {};
+	bool in_payload_ = false;
+	size_t filled_ = 0;
 };
 
 }  // namespace tds

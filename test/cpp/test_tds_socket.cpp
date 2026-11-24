@@ -27,6 +27,7 @@ int main() {
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <cerrno>
@@ -490,6 +491,7 @@ enum class ServerFault {
 	CloseAfterHello,
 	CloseInsidePayload,
 	Silent,
+	StallInsidePacket,
 	// After a good handshake: TLS closed in order (close_notify), or the socket dropped without it.
 	ShutdownAfterHandshake,
 	DropAfterHandshake
@@ -562,6 +564,14 @@ void ServeTls(int fd, const ServerIdentity &identity, ServerFault fault, size_t 
 			ReadUpTo(fd, 1);  // until the client gives up and closes
 			alive = false;
 			break;
+		case ServerFault::StallInsidePacket: {
+			// Half of its answer, and then nothing: the connection stays open.
+			const Bytes whole = Packet(0x04, 0x01, flight);
+			WriteAll(fd, whole.data(), whole.size() / 2);
+			ReadUpTo(fd, 1);  // until the client gives up and closes
+			alive = false;
+			break;
+		}
 		case ServerFault::ShutdownAfterHandshake:
 		case ServerFault::DropAfterHandshake:
 		case ServerFault::None: {
@@ -710,6 +720,26 @@ void TestEnableTls(const ServerIdentity &identity) {
 		server.join();
 		Check(!enabled && took >= 250 && took < 3000 && error.find("TLS handshake failed: ") == 0,
 			  "a server that never answers fails the handshake at the timeout (" + error + ")");
+	}
+	{
+		// Regression: only the wait for a packet's first byte had the timeout, the rest of it was read with
+		// blocking reads. A server that stopped inside a packet held the login for as long as it kept the
+		// connection open (this case then never returns).
+		Pair pair;
+		ServerSeen seen;
+		std::thread server(ServeTls, pair.peer, std::cref(identity), ServerFault::StallInsidePacket, size_t(1),
+						   TLS1_2_VERSION, std::ref(seen));
+		pair.peer = -1;
+		uint8_t packet_id = 1;
+		const auto start = std::chrono::steady_clock::now();
+		const bool enabled = pair.socket.EnableTls(packet_id, 300, "", trust);
+		const auto took =
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+		const std::string error = pair.socket.GetLastError();
+		pair.socket.Close();
+		server.join();
+		Check(!enabled && took >= 250 && took < 3000 && error.find("TLS handshake failed: Timeout") == 0,
+			  "a server that stops inside a packet fails the handshake at the timeout (" + error + ")");
 	}
 	{
 		// The default verifies: a self-signed certificate is refused, with the two ways out named.
@@ -928,6 +958,32 @@ void TestTransport() {
 		Check(sent.size() == 48 && sent[0] == 0x12 && sent[6] == 1 && Bytes(sent.begin() + 8, sent.end()) == hello,
 			  "as one PRELOGIN packet");
 	}
+	{
+		// Regression: a packet that arrives in pieces slower than the timeout. Each call gives up at its
+		// timeout (it used to block in the read until the rest came), and the packet is not lost for it.
+		SocketPair pair;
+		uint8_t packet_id = 1;
+		TlsHandshakeTransport transport(pair.a, packet_id);
+		const Bytes payload = Pattern(40, 3);
+		const Bytes whole = Packet(0x12, 0x01, payload);
+		uint8_t buffer[64];
+		const auto start = std::chrono::steady_clock::now();
+		WriteAll(pair.b, whole.data(), 3);
+		const int in_header = transport.Receive(buffer, sizeof(buffer), 100);
+		WriteAll(pair.b, whole.data() + 3, 5 + 10);
+		const int in_payload = transport.Receive(buffer, sizeof(buffer), 100);
+		const auto took =
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+		Check(in_header == 0 && in_payload == 0 && took >= 180 && took < 2000,
+			  "a packet that stops inside its header, then inside its payload: 0 at each timeout");
+		Check(transport.PendingReceiveBytes() == 0, "and nothing of the unfinished packet is handed out");
+		WriteAll(pair.b, whole.data() + 18, whole.size() - 18);
+		Check(transport.Receive(buffer, sizeof(buffer), 1000) == 40 && Bytes(buffer, buffer + 40) == payload,
+			  "the rest arriving, the packet is whole: every byte, in order");
+		WriteAll(pair.b, Packet(0x04, 0x01, Pattern(7, 9)));
+		Check(transport.Receive(buffer, sizeof(buffer), 1000) == 7 && Bytes(buffer, buffer + 7) == Pattern(7, 9),
+			  "and the packet after it is read from its own header");
+	}
 	struct Bad {
 		Bytes bytes;
 		bool close;
@@ -965,6 +1021,89 @@ void TestTransport() {
 }
 #endif
 
+//------------------------------------------------------------------------------
+// A signal during a wait
+//------------------------------------------------------------------------------
+void OnSignal(int) {}
+
+//! Runs `wait` on this thread while another sends it SIGUSR1 after 100 ms and, when `bytes` is not empty,
+//! writes them to `peer` 200 ms after that. The handler is installed without SA_RESTART -- poll() is not
+//! restarted either way -- so the wait under way is cut short with EINTR.
+template <class WAIT>
+void WithSignal(int peer, const Bytes &bytes, WAIT wait) {
+	struct sigaction action;
+	std::memset(&action, 0, sizeof(action));
+	action.sa_handler = OnSignal;
+	sigemptyset(&action.sa_mask);
+	struct sigaction before;
+	sigaction(SIGUSR1, &action, &before);
+	const pthread_t waiter = pthread_self();
+	std::thread other([&]() {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		pthread_kill(waiter, SIGUSR1);
+		if (!bytes.empty()) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+			WriteAll(peer, bytes);
+		}
+	});
+	wait();
+	other.join();
+	sigaction(SIGUSR1, &before, nullptr);
+}
+
+long long MillisSince(std::chrono::steady_clock::time_point start) {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+}
+
+//! Regressions: a signal ends poll() with EINTR, and the wait reported that as its own answer -- a timeout
+//! before the time was up (Receive, and through it a query that "timed out" or "lost its connection"), an
+//! error (the handshake's transport).
+void TestSignals() {
+	std::cout << "A signal during a wait" << std::endl;
+	{
+		Pair pair;
+		const Bytes in = Pattern(24, 5);
+		uint8_t buffer[64];
+		ssize_t n = -2;
+		WithSignal(pair.peer, in, [&]() { n = pair.socket.Receive(buffer, sizeof(buffer), 3000); });
+		Check(n == 24 && Bytes(buffer, buffer + 24) == in && pair.socket.IsConnected(),
+			  "Receive waits on through a signal and returns what arrives after it (" + std::to_string(n) + ")");
+	}
+	{
+		Pair pair;
+		uint8_t buffer[64];
+		ssize_t n = -2;
+		const auto start = std::chrono::steady_clock::now();
+		WithSignal(pair.peer, Bytes(), [&]() { n = pair.socket.Receive(buffer, sizeof(buffer), 400); });
+		const auto took = MillisSince(start);
+		Check(n == 0 && pair.socket.IsConnected() && took >= 350 && took < 2500,
+			  "with nothing arriving the timeout is the whole of it, counted once (" + std::to_string(took) + " ms)");
+	}
+	{
+		Pair pair;
+		const Bytes payload = Pattern(30, 2);
+		TdsPacket packet;
+		bool got = false;
+		WithSignal(pair.peer, Packet(0x04, 0x01, payload), [&]() { got = pair.socket.ReceivePacket(packet, 3000); });
+		Check(got && packet.GetPayload() == payload, "ReceivePacket too: the packet that arrives after the signal");
+	}
+#ifndef TDS_SOCKET_TEST_NO_TRANSPORT
+	{
+		using duckdb::tds::TlsHandshakeTransport;
+		SocketPair pair;
+		uint8_t packet_id = 1;
+		TlsHandshakeTransport transport(pair.a, packet_id);
+		const Bytes payload = Pattern(12, 4);
+		uint8_t buffer[64];
+		int n = -2;
+		WithSignal(pair.b, Packet(0x12, 0x01, payload), [&]() { n = transport.Receive(buffer, sizeof(buffer), 3000); });
+		Check(n == 12 && Bytes(buffer, buffer + 12) == payload,
+			  "the handshake's transport waits on through a signal, where it failed the handshake (" +
+				  std::to_string(n) + ")");
+	}
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -978,6 +1117,7 @@ int main() {
 #ifndef TDS_SOCKET_TEST_NO_TRANSPORT
 	TestTransport();
 #endif
+	TestSignals();
 	std::cout << (failures ? "FAILED" : "all passed") << std::endl;
 	return failures ? 1 : 0;
 }
