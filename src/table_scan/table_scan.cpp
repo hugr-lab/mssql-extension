@@ -270,14 +270,16 @@ static void AppendReadColumn(const MSSQLColumnInfo &col_info, const string &col_
 	projection.read_columns.push_back(&col_info);
 }
 
-//! The first position of `name` in `names`; 0 when it is not there, which the callers' names always are.
+//! The first position of `name` in `names`. It is always there -- a key column is a column of the table,
+//! and of the SELECT list once added -- so one that is not is an error, where it used to read as
+//! column 0: another column's read expression, or its values as the key.
 static idx_t IndexOfName(const vector<string> &names, const string &name) {
 	for (idx_t i = 0; i < names.size(); i++) {
 		if (names[i] == name) {
 			return i;
 		}
 	}
-	return 0;
+	throw InternalException("MSSQL scan: rowid key column \"%s\" is not among the table's columns", name);
 }
 
 //! The output chunk's position of table column `name`, UINT64_MAX when the projection has not got it.
@@ -598,10 +600,8 @@ static void ConfigureStreamOutput(const MSSQLCatalogScanBindData &bind_data, con
 		// SQL returns N columns (PK columns), we write them directly to STRUCT children
 		// The STRUCT is at rowid_output_idx in the output chunk
 		idx_t pk_count = bind_data.pk_column_names.size();
-		stream.SetColumnsToFill(pk_count);	// Fill all PK columns
-		// Use special marker (-1) to indicate STRUCT mode - data will be written in PopulateRowIdVector
-		// Actually, we need to skip ProcessRow entirely and handle this in PopulateRowIdVector
-		// Set columns_to_fill to 0 so ProcessRow doesn't write anything
+		// Nothing for now: BindRowIdTargetVectors points the stream at the STRUCT's children and sets
+		// the count, on the chunk the stream then fills.
 		stream.SetColumnsToFill(0);
 		// Store pk_result_indices as SQL column indices (0, 1, 2, ...)
 		result.pk_result_indices.clear();
@@ -707,34 +707,26 @@ static void MaterializeScan(ClientContext &context, const MSSQLCatalogScanBindDa
 	// What Execute's first call does for its own output chunk.
 	BindRowIdTargetVectors(result, chunk);
 	idx_t total = 0;
-	try {
-		for (;;) {
-			chunk.Reset();
-			idx_t rows = result.result_stream->FillChunk(chunk);
-			if (rows == 0) {
-				break;
-			}
-			PopulateRowIdVector(result, chunk, rows);
-			// The filters the encoder did not push run here, as in Execute: the
-			// collection is served as it stands, and DuckDB does not re-check a
-			// filter it handed to the scan (issue #451 -- a materialized scan
-			// returned rows such a filter rejects, so an UPDATE in a transaction
-			// changed them).
-			if (!result.client_filters.empty()) {
-				rows = ApplyClientFilters(context, result, chunk, rows);
-				if (rows == 0) {
-					continue;
-				}
-			}
-			result.materialized->Append(chunk);
-			total += rows;
+	for (;;) {
+		chunk.Reset();
+		idx_t rows = result.result_stream->FillChunk(chunk);
+		if (rows == 0) {
+			break;
 		}
-	} catch (...) {
-		// The stream closed (ATTENTION, then the drain) while the materialize lock is still held:
-		// unwinding would release the lock first, and another scan on the pinned connection could
-		// start while it still answers (review of #560).
-		result.result_stream.reset();
-		throw;
+		PopulateRowIdVector(result, chunk, rows);
+		// The filters the encoder did not push run here, as in Execute: the
+		// collection is served as it stands, and DuckDB does not re-check a
+		// filter it handed to the scan (issue #451 -- a materialized scan
+		// returned rows such a filter rejects, so an UPDATE in a transaction
+		// changed them).
+		if (!result.client_filters.empty()) {
+			rows = ApplyClientFilters(context, result, chunk, rows);
+			if (rows == 0) {
+				continue;
+			}
+		}
+		result.materialized->Append(chunk);
+		total += rows;
 	}
 	result.result_stream->SurfaceWarnings(context);
 	// Closing the stream is what releases the connection back to Idle. Without
@@ -810,16 +802,27 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// EXCEPT when pk_direct_to_rowid is true - then we fill the PK directly to rowid position
 	result->projected_column_count = projection.valid_column_ids.size();
 	if (result->result_stream) {
-		// COLMETADATA is known now, so say what is wrong with the columns before any
-		// rows move. Waiting for the drain-end call loses this entirely on a query
-		// that stops early -- any LIMIT (issue #224).
-		result->result_stream->MarkCatalogScan();
-		RefuseOutOfRangeKeys(input, bind_data, projection.read_columns, *result->result_stream);
-		CheckWireCodePages(context, projection.read_columns, options.client_transcode, *result->result_stream);
-		result->result_stream->SurfaceWarnings(context);
-		ConfigureStreamOutput(bind_data, projection, *result);
-		if (bind_data.requires_materialization) {
-			MaterializeScan(context, bind_data, projection.column_ids, *result);
+		try {
+			// COLMETADATA is known now, so say what is wrong with the columns before any
+			// rows move. Waiting for the drain-end call loses this entirely on a query
+			// that stops early -- any LIMIT (issue #224).
+			result->result_stream->MarkCatalogScan();
+			RefuseOutOfRangeKeys(input, bind_data, projection.read_columns, *result->result_stream);
+			CheckWireCodePages(context, projection.read_columns, options.client_transcode, *result->result_stream);
+			result->result_stream->SurfaceWarnings(context);
+			ConfigureStreamOutput(bind_data, projection, *result);
+			if (bind_data.requires_materialization) {
+				MaterializeScan(context, bind_data, projection.column_ids, *result);
+			}
+		} catch (...) {
+			// The stream is closed here (ATTENTION, then its drain), while the materialize lock is still
+			// held: unwinding releases the lock first -- `result`, which owns the stream, is declared
+			// before it -- and another scan on the pinned connection could start while this one still
+			// answers (review of #560). That review closed it for a failure in the drain; a refusal
+			// before it (a column the wire cannot decode, a warning the logger throws on) left by the
+			// same door.
+			result->result_stream.reset();
+			throw;
 		}
 	}
 
