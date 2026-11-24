@@ -323,7 +323,7 @@ bool MSSQLConnectionInfo::IsSynapseEndpoint() const {
 //===----------------------------------------------------------------------===//
 
 bool MSSQLConnectionInfo::IsUriFormat(const string &str) {
-	return IsUriFormatImpl(str);
+	return MSSQLIsUriFormat(str);
 }
 
 // Check if string is an ADO.NET connection string (contains key=value pairs)
@@ -515,7 +515,7 @@ string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_st
 	}
 
 	// Parse based on format
-	case_insensitive_map_t<string> params = ParseConnectionParameters(connection_string);
+	case_insensitive_map_t<string> params = MSSQLParseConnectionParameters(connection_string);
 
 	// Check required fields
 	if (params.find("server") == params.end()) {
@@ -615,7 +615,7 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 	}
 
 	// Parse based on format
-	const case_insensitive_map_t<string> params = ParseConnectionParameters(connection_string);
+	const case_insensitive_map_t<string> params = MSSQLParseConnectionParameters(connection_string);
 
 	auto result = make_shared_ptr<MSSQLConnectionInfo>();
 	ParseServer(ParamOrEmpty(params, "server"), *result);

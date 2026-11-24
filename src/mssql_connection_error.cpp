@@ -11,20 +11,6 @@ namespace duckdb {
 // Connection Validation
 //===----------------------------------------------------------------------===//
 
-// Translate TDS error message to user-friendly message.
-//
-// `server_error` / `server_state` are the SERVER's own ERROR-token fields, or 0
-// when the failure produced no ERROR token. When a number is present it decides
-// the classification; the string heuristics below only run for failures that
-// never reached a login (socket, TLS, DNS).
-//
-// Issue #262: the string arms must never be allowed to classify a login
-// failure. Every login failure this extension produces begins "Authentication
-// failed (error N, state S): ...", so a `find("authentication")` test matches
-// our OWN wrapper rather than the server's message, and collapsed every cause
-// -- including Azure 40613, a serverless database resuming -- into "check
-// username and password". The server's number and text are always appended now,
-// so no diagnosis is lost on the way to the user.
 //! Whether `text` holds any of `needles`.
 static bool ContainsAny(const string &text, std::initializer_list<const char *> needles) {
 	for (auto needle : needles) {
@@ -68,6 +54,20 @@ static string TranslateServerError(const string &error, const string &host, uint
 	}
 }
 
+// Translate TDS error message to user-friendly message.
+//
+// `server_error` / `server_state` are the SERVER's own ERROR-token fields, or 0
+// when the failure produced no ERROR token. When a number is present it decides
+// the classification; the string heuristics below only run for failures that
+// never reached a login (socket, TLS, DNS).
+//
+// Issue #262: the string arms must never be allowed to classify a login
+// failure. Every login failure this extension produces begins "Authentication
+// failed (error N, state S): ...", so a `find("authentication")` test matches
+// our OWN wrapper rather than the server's message, and collapsed every cause
+// -- including Azure 40613, a serverless database resuming -- into "check
+// username and password". The server's number and text are always appended now,
+// so no diagnosis is lost on the way to the user.
 string MSSQLTranslateConnectionError(const string &error, const string &host, uint16_t port, const string &user,
 									 const string &database, uint32_t server_error, uint8_t server_state) {
 	if (server_error > 0) {

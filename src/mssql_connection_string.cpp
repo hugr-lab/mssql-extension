@@ -8,7 +8,7 @@
 namespace duckdb {
 
 // Check if string is a URI format (mssql://...)
-bool IsUriFormatImpl(const string &str) {
+bool MSSQLIsUriFormat(const string &str) {
 	return StringUtil::StartsWith(StringUtil::Lower(str), "mssql://");
 }
 
@@ -369,8 +369,8 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 }
 
 //! The parameters of either form: a URI's, or an ADO.NET connection string's.
-case_insensitive_map_t<string> ParseConnectionParameters(const string &connection_string) {
-	return IsUriFormatImpl(connection_string) ? ParseUri(connection_string) : ParseConnectionString(connection_string);
+case_insensitive_map_t<string> MSSQLParseConnectionParameters(const string &connection_string) {
+	return MSSQLIsUriFormat(connection_string) ? ParseUri(connection_string) : ParseConnectionString(connection_string);
 }
 
 }  // namespace duckdb

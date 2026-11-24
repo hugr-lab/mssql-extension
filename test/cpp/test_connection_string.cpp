@@ -99,10 +99,10 @@ void TestPort() {
 	}
 	Check(Refusal("mssql://u:p@h:1433x/d").find("Invalid port in Server parameter") == 0, "in a URI too");
 	// An IPv6 literal with no port is split at its last ':' -- "[:" and "1]" -- and used to dial host "[:" on
-	// port 1. Refused now; with a port (mssql://u:p@[::1]:1433/d) it has always been read.
+	// port 1. Refused now. With a port it parses, the brackets left in the host: not a form that is supported.
 	Check(Refusal("mssql://u:p@[::1]/d").find("Invalid port in Server parameter") == 0 &&
-			  Parse("mssql://u:p@[::1]:1433/d")->port == 1433,
-		  "an IPv6 literal needs its port");
+			  Parse("mssql://u:p@[::1]:1433/d")->host == "[::1]",
+		  "a bracketed IPv6 literal with no port is refused; with one, the brackets stay in the host");
 	Check(Refusal("Server=h,0;Database=d;User Id=u;Password=p") == "Port must be between 1 and 65535. Got: 0" &&
 			  Refusal("Server=h,70000;Database=d;User Id=u;Password=p") ==
 				  "Port must be between 1 and 65535. Got: 70000" &&

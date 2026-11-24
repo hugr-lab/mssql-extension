@@ -4,7 +4,6 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_transaction.hpp"
-#include "connection/instance_resolver.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_login_retry.hpp"
 #include "connection/mssql_settings.hpp"
@@ -14,17 +13,12 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
-#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
-#include "mssql_platform.hpp"
 #include "tds/auth/auth_strategy_factory.hpp"
 #include "tds/tds_connection.hpp"
 
-#include <openssl/crypto.h>
-
-#include <cctype>
 #include <cstdlib>
 
 // Debug logging (same pattern as tds_socket.cpp)

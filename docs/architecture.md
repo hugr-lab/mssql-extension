@@ -92,7 +92,10 @@ src/
 ├── mssql_extension.cpp           # Entry point, LoadInternal()
 ├── mssql_functions.cpp           # mssql_scan (table function), mssql_exec (scalar)
 ├── mssql_secret.cpp              # Secret type registration and validation
-├── mssql_storage.cpp             # ATTACH mechanism, context manager
+├── mssql_storage.cpp             # ATTACH mechanism
+├── mssql_connection_info.cpp     # MSSQLConnectionInfo: secrets, validation, app name, named instance
+├── mssql_connection_string.cpp   # Connection-string and URI parsers
+├── mssql_connection_error.cpp    # Connection error translation
 │
 ├── azure/                        # Azure AD authentication infrastructure
 │   ├── azure_token.cpp           # Token acquisition and caching
