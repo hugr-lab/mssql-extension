@@ -11,6 +11,10 @@
 //   'error';
 // - the 2017 form naming another page: a misplaced copy, a plain FormatError, refused as not a page with
 //   the tail never asked (review of #591).
+// - a pad unit: beside the later pass, which copies a page taken into use while the backup ran, a plain
+//   FormatError, the tail never asked. In a one-pass backup (2017 lays the extents taken into use past the
+//   data its one pass copies onto the pass's closing pad groups, the oracle lane's load_full) it is a
+//   ZeroCopyError, which the lane's 2017 backups check, no sample having one pass.
 // A one-pass backup (2017's) makes the same copy a ZeroCopyError, which the scan asks the tail about: the
 // 2017 oracle lane's, as no sample has one pass. What keeps it one through ReadUnitDataPage -- a150a887's
 // check shipped inert without it -- is FormatError::AddContext, rethrowing the error itself: checked here
@@ -160,6 +164,9 @@ int main() {
 	PagePointer other = at;
 	other.page += 1;
 	const std::vector<uint8_t> misplaced = unformatted(other);
+	std::vector<uint8_t> pad(PAGE_SIZE, 0);
+	pad[0] = 1;	   // a page header
+	pad[1] = 101;  // of type 101, a pad
 	const std::string path = (dir / "full_zero_copy.bak").string();
 	con.Query("SET mssql_backup_cache = false");
 	const int64_t rows = [&] {
@@ -169,7 +176,7 @@ int main() {
 	}();
 	const int64_t on_page = static_cast<int64_t>(page.header.slot_count);
 	for (const Form &form : {Form{"all zeros", std::vector<uint8_t>(PAGE_SIZE, 0)}, Form{"7 bytes set", partial},
-							 Form{"7 bytes set naming another page", misplaced}}) {
+							 Form{"7 bytes set naming another page", misplaced}, Form{"a pad unit", pad}}) {
 		auto bytes = file;
 		std::copy(form.unit.begin(), form.unit.end(), bytes.begin() + static_cast<std::ptrdiff_t>(offset));
 		WriteFile(path, bytes);
@@ -177,8 +184,9 @@ int main() {
 		// Beside a later pass a copy of version 0 that is all zeros or names itself is Pending (IsPendingCopy);
 		// one naming another page is a misplaced copy.
 		const bool elsewhere = form.unit == misplaced;
-		const bool zeros = !elsewhere;
-		const std::string kind = elsewhere ? "format" : "pending";
+		const bool padded = form.unit == pad;
+		const bool zeros = !elsewhere && !padded;
+		const std::string kind = elsewhere || padded ? "format" : "pending";
 		Check(t.store == kind, std::string(form.what) + ": the page store throws " + kind + " (" + t.store + ")");
 		Check(t.unit == kind && t.message.find("(reading dbo.events)") != std::string::npos,
 			  std::string(form.what) + ": ReadUnitDataPage keeps the type, naming the table (" + t.unit + ")");
@@ -198,6 +206,10 @@ int main() {
 			Check(why.find("became live while the backup ran") != std::string::npos &&
 					  why.find(at.ToString()) != std::string::npos,
 				  std::string(form.what) + ": fuzzy := 'error' refuses the table, naming the page: " + why);
+		} else if (padded) {
+			Check(error.find("is a pad unit") != std::string::npos &&
+					  error.find("formats no such page") == std::string::npos,
+				  "a pad unit beside a later pass: refused, the tail never asked: " + error);
 		} else {
 			Check(error.find("its copy is not a page") != std::string::npos &&
 					  error.find("formats no such page") == std::string::npos,

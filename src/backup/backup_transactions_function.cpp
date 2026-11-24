@@ -627,7 +627,7 @@ void RecordsExecute(ClientContext &, TableFunctionInput &input, DataChunk &outpu
 			row.push_back(t ? Value(TransactionStateName(t->state)) : Value(LogicalType::VARCHAR));
 			row.push_back(r.has_page ? Value(std::to_string(r.file) + ":" + std::to_string(r.page))
 									 : Value(LogicalType::VARCHAR));
-			row.push_back(r.has_page ? Value::INTEGER(r.slot) : Value(LogicalType::INTEGER));
+			row.push_back(r.has_slot ? Value::INTEGER(r.slot) : Value(LogicalType::INTEGER));
 			row.push_back(r.has_allocation_unit ? Value::BIGINT(static_cast<int64_t>(r.allocation_unit))
 												: Value(LogicalType::BIGINT));
 			row.push_back(o ? Value(o->table->schema_name) : Value(LogicalType::VARCHAR));

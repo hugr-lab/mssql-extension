@@ -126,13 +126,13 @@ public:
 	PendingValueError(const std::string &message, const PageStore *store_) : PendingPageError(message, store_) {}
 };
 
-//! A live page whose copy is no formatted page (header version 0) in a backup of one data pass: SQL Server
-//! 2017 under writes copies the data once, no later pass copies what changed (measured in the oracle
-//! lane), and a page taken into use while it ran is copied as a zero unit, or caught being formatted (7
-//! bytes set, its own id among them, the rest zeros, measured; one naming another page is a misplaced
-//! copy, refused). Pending when the backup's log tail formats the page
-//! (FormattedInTail), which only a reader holding the tail can tell -- the scan asks it; else a
-//! locator's or a short backup's fault, refused.
+//! A live page with no copy of its own in a backup of one data pass: SQL Server 2017 under writes copies
+//! the data once, no later pass copies what changed (measured in the oracle lane), and a page taken into
+//! use while it ran is copied as a zero unit, caught being formatted (7 bytes set, its own id among them,
+//! the rest zeros, measured; one naming another page is a misplaced copy, refused), or -- in an extent
+//! taken into use past the data the pass copies -- found as a pad unit, or not found at all. Pending when
+//! the backup's log tail formats the page (FormattedInTail), which only a reader holding the tail can
+//! tell -- the scan asks it; else a locator's or a short backup's fault, refused.
 class ZeroCopyError : public FormatError {
 public:
 	ZeroCopyError(const std::string &message, const PagePointer &page_, const PageStore *store_)
@@ -151,8 +151,10 @@ public:
 
 	//! Page `page` of file `file` when it is live (E2 R3; an allocation page always is): its latest
 	//! copy, its header read and checked -- version 1, not a pad, and the page's own id. False
-	//! when the page is not live. A live page whose copy the backup lacks, a Pending one (a zero unit in
-	//! its place; a PendingPageError), or a header naming another page is a FormatError naming the page.
+	//! when the page is not live. A live page whose copy the backup lacks, is a pad or no page, a Pending one
+	//! (a zero unit in its place beside a later pass; a PendingPageError), or a header naming another page is
+	//! a FormatError naming the page: a ZeroCopyError when the copy is none of the page's own in a backup of
+	//! one data pass (its class comment).
 	bool Read(uint16_t file, uint32_t page, Page &out) const;
 	//! Read, with a Pending page (live, its copy a zero unit) answered as such instead of refused. `out` is
 	//! written only for Present and Pending: a page that is not live leaves it as it was.
@@ -165,6 +167,11 @@ public:
 	}
 
 private:
+	//! Whether the backup has a data pass after the first (one that ran under changes, 2019 and later).
+	bool HasLaterPass() const;
+	//! A live page `want` the backup has no copy of, or a pad for: a ZeroCopyError in a backup of one data
+	//! pass (the tail decides), else a FormatError -- a later pass copies such a page.
+	[[noreturn]] void ThrowUncopied(const PagePointer &want, const std::string &message) const;
 	//! A version-0 copy of live page `want` that is Pending: the backup has a pass after the first,
 	//! and the copy is all zeros or names `want`.
 	bool IsPendingCopy(const PagePointer &want, const Page &copy) const;

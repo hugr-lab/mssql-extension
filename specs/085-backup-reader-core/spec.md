@@ -867,8 +867,14 @@ offsets above are in its fixed part.
   the log tail only (RESTORE writes the frame whole and redoes the page from the log; DbReader alike).
   The page store answers it `Pending` (the load fixture's full: one page of pass 2 of 45,603 live), and
   a reader that needs it refuses by name until spec 090 replays the tail. Only in a backup with a later
-  pass (one that ran under changes), and only for a copy that is all zeros or names the page; in a one-pass
-  backup, or for a unit naming another page, it is the named error a misplaced copy is.
+  pass (one that ran under changes), and only for a copy that is all zeros or names the page; a unit naming
+  another page is the named error a misplaced copy is. In a backup of one data pass (SQL Server 2017 under
+  writes) such a page has no copy of its own -- a zero unit, a unit caught being formatted, or, in an extent
+  taken into use past the data the pass copies, a pad or nothing (the 2017 lane's load_full: the pass sized
+  at its start, 43,656 pages, then 15 pad groups; the GAM copied a little later marks extents 5457-5461
+  allocated, which the ranked pass map lays onto the pads) -- and it is `Pending` when the log tail formats
+  it, else refused by name (`ZeroCopyError`, the scan asks the tail). Beside a later pass, which copies
+  such a page, a pad or no copy is refused as a locator's fault.
 - A file whose SFIN record carries flag 0x20 was emptied and removed (`ALTER DATABASE … REMOVE FILE`):
   FILELISTONLY leaves it out and so does the reader. The backup carries no page of it (files fixture);
   one that does is refused, so that another meaning of the flag cannot silently hide a file's pages.
@@ -1752,7 +1758,9 @@ before the next opens.
     block header of zeros ending its stream (the stream's unused end: a 64 KiB stream held 12 KiB of log on
     the samples). `ParseLogBlock` puts the sectors back (`RestoreSectorParity`), reads the slot array
     backwards and each record's header (E3§6: previous LSN @4, transaction @16, operation @22, context @23,
-    page @24, slot @30, the unit from @32 / @46), a record running to the next one in the block;
+    page @24 in a fixed part of 30 bytes or more, slot @30 in one of 32 or more -- `LOP_MIGRATE_LOCKS` has a
+    page and no slot, 30 bytes, measured on 2017 --, the unit from @32 / @46), a record running to the next
+    one in the block;
     `RowLogElements` its contents (u16 n, n lengths, the elements from 4-byte boundaries). Checked against
     `fn_dump_dblog` over the same files: log.trn's 1628 records equal on the LSN, operation, context,
     transaction, page and unit (RowLog Contents 0-3 equal too; fn_dump_dblog joins the elements from the
