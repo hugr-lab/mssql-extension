@@ -16,6 +16,9 @@ namespace backup {
 
 namespace {
 
+//! A SET_BITS record's fixed part: up to the value it sets (Summarizer::FreesExtents).
+constexpr uint16_t SET_BITS_FIXED = 54;
+
 bool Newer(const Lsn &a, const Lsn &b) {
 	return !(a <= b);
 }
@@ -60,6 +63,14 @@ public:
 		auto &t = summary_.transactions[r.transaction];
 		t.records++;
 		if (r.op == log_op::BEGIN_XACT) {
+			if (t.records > 1) {
+				// A BEGIN_XACT is its transaction's first record, and SQL Server does not reuse an id within
+				// one log: a second life of the id would file the first's changes under the second's fate
+				// (review of #591: a committed change read as open, the table as consistent).
+				throw FormatError("backup: the log tail begins transaction " + TransactionIdText(r.transaction) +
+								  " at " + r.lsn.ToDecimal() + " after " + std::to_string(t.records - 1) +
+								  " records of it: an id begun twice, the tail is not one log");
+			}
 			Begin(t, r);
 		} else if (r.op == log_op::COMMIT_XACT || r.op == log_op::ABORT_XACT) {
 			t.state = r.op == log_op::COMMIT_XACT ? FuzzySummary::State::Committed : FuzzySummary::State::RolledBack;
@@ -161,8 +172,57 @@ private:
 		}
 	}
 
+	//! A change of the rows a reader sees on the record's page, of the record's unit (fixture tail_window,
+	//! each against a RESTORE, review of #591):
+	//! - a row operation in a row context;
+	//! - a FORMAT_PAGE in a row context that carries the page's image: an INSERT ... WITH (TABLOCK) into a
+	//!   heap logs its pages so, with no INSERT_ROWS (one left open read consistent, its rows in the copy).
+	//!   One that lays out an empty page has no element;
+	//! - extents freed from the unit (a SET_BITS clearing bits of its IAM page): a small table's TRUNCATE
+	//!   logs only its extents freed (PFS, GAM, its IAM), and read consistent with the copy's rows gone. An
+	//!   index rebuild frees the old unit's extents the same way, and reads stale with its rows as the
+	//!   RESTORE's: the price of not missing a TRUNCATE; so would a ghost cleanup freeing an extent emptied
+	//!   before the copy. Extents allocated (bits set) are not counted: an allocation may commit on its own
+	//!   (AllocFirstPage, a transaction of the system's) while the rows put there stay open, which a RESTORE
+	//!   undoes -- the table equal, read stale.
+	//! Still not counted, the table read consistent where a RESTORE differs: a large table's TRUNCATE (a
+	//! deferred drop: the rowset replaced, its extents freed later, maybe past LastLSN), a partition switched
+	//! in the tail, pages freed from a mixed extent (the IAM's single-page slots); a schema change shows on
+	//! the system tables' rows only (sysrowsets, sysallocunits, syscolpars ...), not on the table's.
 	static bool IsRowChange(const LogRecord &r) {
-		return IsRowOperation(r.op) && IsRowContext(r.context) && r.has_allocation_unit && r.has_page;
+		if (!r.has_allocation_unit || !r.has_page) {
+			return false;
+		}
+		if (IsRowOperation(r.op)) {
+			return IsRowContext(r.context);
+		}
+		if (r.op == log_op::FORMAT_PAGE) {
+			return IsRowContext(r.context) && HoldsPageImage(r);
+		}
+		return r.op == log_op::SET_BITS && r.context == log_context::IAM && FreesExtents(r);
+	}
+
+	//! A SET_BITS's fixed part from @48: u16 the first bit (an extent of the IAM page's interval), u16 their
+	//! count, u16 the value set (measured on 2025: 1 for an extent allocated, 0 for one freed). A shorter
+	//! fixed part is counted, so no change is missed.
+	static bool FreesExtents(const LogRecord &r) {
+		if (!r.bytes || r.fixed_length < SET_BITS_FIXED) {
+			return true;
+		}
+		return r.bytes[SET_BITS_FIXED - 2] == 0 && r.bytes[SET_BITS_FIXED - 1] == 0;
+	}
+
+	static bool HoldsPageImage(const LogRecord &r) {
+		try {
+			for (const auto &e : RowLogElements(r, "a FORMAT_PAGE")) {
+				if (e.length != 0) {
+					return true;
+				}
+			}
+			return false;
+		} catch (FormatError &) {
+			return true;  // contents that do not parse: counted, so no change is missed
+		}
 	}
 
 	void NoteRowChange(FuzzySummary::Transaction &t, const LogRecord &r) {

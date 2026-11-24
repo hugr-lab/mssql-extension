@@ -268,6 +268,28 @@ bool LogTailCursor::NextBlock() {
 			chunk_.clear();
 			continue;
 		}
+		// Each block follows the one before it, across the streams too: the next in its VLF (its id plus the
+		// sectors before it), or one of the next VLF (review of #591: a tail with its middle missing was
+		// summarised). Caught: a block missing within a VLF, a VLF skipped, a block twice, an older one. Not
+		// caught: a VLF's blocks cut short where the next stream starts the next VLF -- where a VLF ends is
+		// not in the backup; LastLSN's check catches it at the tail's end only. A stream ends in zeros after
+		// its last block, in a VLF reused too (measured on 2025 with a log wrapped twelve VLF sequences: no
+		// earlier generation's blocks there); tail_window's log is wrapped so the lane reads such a tail on
+		// every version.
+		const uint32_t vlf = U32(head + 12);
+		const uint32_t id = U32(head + 16);
+		if (has_previous_ &&
+			!(vlf == previous_vlf_ ? id == previous_id_ + previous_size_ / SECTOR : vlf == previous_vlf_ + 1u)) {
+			auto name = [](uint32_t v, uint32_t b) {
+				return "VLF " + std::to_string(v) + " block " + std::to_string(b);
+			};
+			throw FormatError(where + ": " + name(vlf, id) + " does not follow " + name(previous_vlf_, previous_id_) +
+							  " of " + std::to_string(previous_size_) + " bytes before it: the tail is not read whole");
+		}
+		has_previous_ = true;
+		previous_vlf_ = vlf;
+		previous_id_ = id;
+		previous_size_ = size;
 		block_.assign(head, head + size);
 		in_ += size;
 		if (size % SECTOR == 0) {

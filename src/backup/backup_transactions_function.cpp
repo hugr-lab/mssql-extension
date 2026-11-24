@@ -70,6 +70,8 @@ const CodeName OPERATION_NAMES[] = {
 	{0x81, "LOP_COMMIT_XACT"},
 	{0x82, "LOP_ABORT_XACT"},
 	{0x83, "LOP_PREP_XACT"},
+	{0x84, "LOP_MARK_SAVEPOINT"},  // met on 2025 (fixture tail_window: a SAVE TRANSACTION)
+	{0x89, "LOP_HOBT_DDL"},		   // met on 2025 (tail_window: an index rebuilt, a column altered)
 	{0x8c, "LOP_HOBT_DELTA"},
 	{0x8d, "LOP_LOCK_XACT"},
 	{0x8f, "LOP_MIGRATE_LOCKS"},
@@ -78,6 +80,7 @@ const CodeName OPERATION_NAMES[] = {
 	{0x99, "LOP_END_CKPT"},
 	{0x9a, "LOP_BUF_WRITE"},  // met on 2019 / 2022 (fn_dump_dblog of the load fixture's log)
 	{0xb0, "LOP_CREATE_ALLOCCHAIN"},
+	{0xdd, "LOP_INVALIDATE_CACHE"},	 // met on 2025 (tail_window: DDL)
 };
 
 const CodeName CONTEXT_NAMES[] = {
@@ -89,8 +92,10 @@ const CodeName CONTEXT_NAMES[] = {
 	{0x05, "LCX_TEXT_MIX"},
 	{0x06, "LCX_TEXT_TREE"},
 	{0x08, "LCX_GAM"},
+	{0x09, "LCX_SGAM"},	 // met on 2022 (fixture tail_window)
 	{0x0a, "LCX_IAM"},
 	{0x0b, "LCX_PFS"},
+	{0x0d, "LCX_OBJECT_ID"},  // met on 2025 (tail_window: an index rebuilt)
 	{0x11, "LCX_FILE_HEADER"},
 	{0x12, "LCX_SCHEMA_VERSION"},
 	{0x13, "LCX_MARK_AS_GHOST"},

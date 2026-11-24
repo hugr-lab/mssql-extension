@@ -154,12 +154,22 @@ fi
 # overlays.txt among them (FUZZY_OVERLAYS), restored -- RESTORE recovers them: the tail redone, its open
 # transactions undone -- and compared with --fuzzy: each table's fuzzy_status against whether it differs.
 # Every one asked for must be there.
-FUZZY="${FUZZY-fuzzy_full fuzzy_xpress load_full load_xpress}"
+# tail_window (changes at known points of the copy, review of #591) among them. Per set (set=schema.table,...):
+# FUZZY_FLAGGED_EQUAL the tables that may read stale while equal (an index rebuilt in the tail),
+# FUZZY_MUST_DIFFER those that must differ (changed after their copy: a run that missed its window fails).
+FUZZY="${FUZZY-fuzzy_full fuzzy_xpress load_full load_xpress tail_window_full}"
 FUZZY_OVERLAYS="${FUZZY_OVERLAYS-fuzzy_over}"
+FUZZY_FLAGGED_EQUAL="${FUZZY_FLAGGED_EQUAL-tail_window_full=dbo.rebuilt}"
+FUZZY_MUST_DIFFER="${FUZZY_MUST_DIFFER-tail_window_full=dbo.stale_update,dbo.rollback_insert,dbo.rollback_delete,dbo.savepoint,dbo.parallel_open,dbo.loaded,dbo.truncated,dbo.widened}"
+of_set() {	# $1 = set, $2 = a list of set=tables entries: the set's tables
+	printf '%s\n' $2 | awk -F= -v n="$1" '$1 == n { print $2 }'
+}
 fuzzy_compare() {	# $1 = what, then compare_rows.py's arguments
 	local what="$1"
 	shift
-	if python3 -I "${HERE}/compare_rows.py" --duckdb "${DUCKDB}" --fuzzy "$@"; then
+	if python3 -I "${HERE}/compare_rows.py" --duckdb "${DUCKDB}" --fuzzy \
+		--flagged-equal "$(of_set "${what}" "${FUZZY_FLAGGED_EQUAL}")" \
+		--must-differ "$(of_set "${what}" "${FUZZY_MUST_DIFFER}")" "$@"; then
 		compared=$((compared + 1))
 	else
 		echo "ERROR: ${what}: a fuzzy_status disagrees with the RESTORE" >&2

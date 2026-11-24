@@ -94,7 +94,7 @@ struct FuzzySummary {
 		Lsn end;		   // its COMMIT / ABORT, zero when none
 		std::string name;  // the BEGIN_XACT's (fn_dblog's Transaction Name)
 		uint32_t records = 0;
-		uint32_t row_operations = 0;	// IsRowOperation in a row context
+		uint32_t row_operations = 0;	// changes of rows a reader sees (backup_fuzzy's IsRowChange)
 		bool after_checkpoint = false;	// a row operation after CheckpointLSN
 	};
 	//! By transaction id; the id 0 (records of no transaction) is not one.

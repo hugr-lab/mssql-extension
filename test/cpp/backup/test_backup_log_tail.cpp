@@ -316,6 +316,152 @@ int main() {
 				  !TailReachesLast(lsn(46, 16, 1), 512, lsn(45, 16, 1)),
 			  "LastLSN in the next VLF: taken; two VLFs on, or an earlier one: not");
 	}
+	std::cout << "a transaction id begun twice (review of #591)" << std::endl;
+	{
+		auto record = [](uint32_t block, uint8_t op, uint64_t transaction) {
+			LogRecord r;
+			r.lsn.vlf = 1;
+			r.lsn.block = block;
+			r.lsn.slot = 1;
+			r.op = op;
+			r.context = 0x02;  // LCX_CLUSTERED
+			r.transaction = transaction;
+			r.has_page = r.has_allocation_unit = true;
+			r.file = 1;
+			r.page = 300;
+			r.allocation_unit = 72057594043170816ULL;
+			return r;
+		};
+		Lsn first, last, checkpoint;
+		first.vlf = last.vlf = checkpoint.vlf = 1;
+		first.block = checkpoint.block = 1;
+		last.block = 99;
+		// Its committed change would be filed under the second life's open state, the table consistent.
+		const std::vector<LogRecord> reused = {record(2, log_op::BEGIN_XACT, 7), record(3, log_op::INSERT_ROWS, 7),
+											   record(4, log_op::COMMIT_XACT, 7), record(5, log_op::BEGIN_XACT, 7)};
+		Check(
+			ErrorOf([&] {
+				SummarizeLogRecords(reused, first, last, checkpoint);
+			}).find("begins transaction 0000:00000007 at 1000000000500001 after 3 records of it") != std::string::npos,
+			"BEGIN, a change, COMMIT, BEGIN of one id: not one log");
+		// One begun before the tail (no BEGIN in it), then begun in it.
+		const std::vector<LogRecord> late = {record(2, log_op::INSERT_ROWS, 8), record(3, log_op::BEGIN_XACT, 8)};
+		Check(ErrorOf([&] { SummarizeLogRecords(late, first, last, checkpoint); }).find("begun twice") !=
+				  std::string::npos,
+			  "a change of an id, then its BEGIN: not one log");
+		const std::vector<LogRecord> once = {record(2, log_op::BEGIN_XACT, 9), record(3, log_op::INSERT_ROWS, 9),
+											 record(4, log_op::COMMIT_XACT, 9), record(5, log_op::BEGIN_XACT, 10)};
+		Check(ErrorOf([&] { SummarizeLogRecords(once, first, last, checkpoint); }).empty(),
+			  "each id begun once: summarised");
+	}
+	std::cout << "changes a reader sees beside row operations (fixture tail_window)" << std::endl;
+	{
+		const uint64_t au = 72057594054311936ULL;
+		std::vector<std::vector<uint8_t>> keep;	 // each record's bytes, alive through the summary
+		auto record = [&](uint32_t block, uint8_t op, uint8_t context, uint32_t page, std::vector<uint8_t> bytes) {
+			keep.push_back(std::move(bytes));
+			LogRecord r;
+			r.lsn.vlf = 1;
+			r.lsn.block = block;
+			r.lsn.slot = 1;
+			r.op = op;
+			r.context = context;
+			r.transaction = 5;
+			r.has_page = r.has_allocation_unit = true;
+			r.file = 1;
+			r.page = page;
+			r.allocation_unit = au;
+			r.bytes = keep.back().data();
+			r.length = static_cast<uint16_t>(keep.back().size());
+			r.fixed_length = op == log_op::SET_BITS ? 54 : 48;
+			return r;
+		};
+		// A FORMAT_PAGE's elements after its fixed part: their count, their lengths, then the data (4-aligned).
+		auto format = [](uint16_t image) {
+			std::vector<uint8_t> b(48, 0);
+			b.push_back(image ? 1 : 0);
+			b.push_back(0);
+			if (image) {
+				b.push_back(static_cast<uint8_t>(image));
+				b.push_back(static_cast<uint8_t>(image >> 8));
+				b.resize(52 + image, 0xAB);
+			}
+			return b;
+		};
+		// A SET_BITS's fixed part: the first bit @48, their count @50, the value @52.
+		auto bits = [](uint8_t value) {
+			std::vector<uint8_t> b(54, 0);
+			b[48] = 0x56;
+			b[50] = 1;
+			b[52] = value;
+			return b;
+		};
+		Lsn first, last, checkpoint;
+		first.vlf = last.vlf = checkpoint.vlf = 1;
+		first.block = checkpoint.block = 1;
+		last.block = 99;
+		std::vector<LogRecord> records = {record(2, log_op::BEGIN_XACT, 0, 0, {}),
+										  record(3, log_op::FORMAT_PAGE, 0x01, 432, format(8096)),
+										  record(4, log_op::FORMAT_PAGE, 0x01, 433, format(0)),
+										  record(5, log_op::SET_BITS, 0x0a, 425, bits(0)),
+										  record(6, log_op::SET_BITS, 0x0a, 426, bits(1)),
+										  record(7, log_op::COMMIT_XACT, 0, 0, {})};
+		records[0].has_page = records[5].has_page = false;
+		const FuzzySummary summary = SummarizeLogRecords(records, first, last, checkpoint);
+		auto changed = [&](uint32_t page) {
+			auto unit = summary.units.find(au);
+			return unit != summary.units.end() && unit->second.finished.count(uint64_t(1) << 32 | page) != 0;
+		};
+		Check(changed(432) && !changed(433),
+			  "a FORMAT_PAGE with its page's image (a bulk load's): counted; an empty one: not");
+		Check(changed(425) && !changed(426),
+			  "extents freed from a unit's IAM page (a TRUNCATE): counted; allocated: not");
+		Check(summary.transactions.at(5).row_operations == 2, "the transaction counts the two");
+	}
+	std::cout << "each log block follows the one before it, across the streams (review of #591)" << std::endl;
+	{
+		// Two MQTL streams (each a 2-byte lead-in, then 512-byte blocks); the first ends in a header of zeros.
+		auto block = [](uint32_t vlf, uint32_t id) {
+			auto b = Block(1, 24);
+			for (int i = 0; i < 4; i++) {
+				b[12 + i] = static_cast<uint8_t>(vlf >> (8 * i));
+				b[16 + i] = static_cast<uint8_t>(id >> (8 * i));
+			}
+			return b;
+		};
+		auto read = [&](const std::vector<std::vector<std::vector<uint8_t>>> &streams, size_t &records) {
+			std::vector<uint8_t> bytes;
+			MtfLayout layout;
+			layout.blocks.emplace_back();
+			for (const auto &blocks : streams) {
+				MtfStream s;
+				s.id = "MQTL";
+				s.data_offset = bytes.size();
+				bytes.insert(bytes.end(), 2, 0);
+				for (const auto &b : blocks) {
+					bytes.insert(bytes.end(), b.begin(), b.end());
+				}
+				s.length = bytes.size() - s.data_offset;
+				layout.blocks[0].streams.push_back(s);
+			}
+			MemoryAccess file("crafted", bytes.data(), bytes.size());
+			LogTailReader tail(file, layout, 72);
+			records = 0;
+			return ErrorOf([&] { tail.ForEach([&](const LogRecord &) { records++; }); });
+		};
+		const std::vector<uint8_t> zeros(512, 0);
+		size_t records = 0;
+		Check(
+			read({{block(1, 10), block(1, 11), zeros}, {block(1, 12), block(2, 400)}}, records).empty() && records == 4,
+			"the next block in its VLF, across a stream's unused end, then the next VLF: 4 records");
+		const std::string gap = read({{block(1, 10), block(1, 11), zeros}, {block(1, 13)}}, records);
+		Check(gap.find("VLF 1 block 13 does not follow VLF 1 block 11 of 512 bytes before it") != std::string::npos,
+			  "a block missing between two streams: not read whole");
+		Check(read({{block(1, 10), block(3, 1)}}, records).find("does not follow") != std::string::npos,
+			  "a VLF skipped: not read whole");
+		Check(read({{block(1, 10), block(1, 10)}}, records).find("does not follow") != std::string::npos,
+			  "a block twice: not read whole");
+	}
 	std::cout << "the pages the tail formats (a zero copy in a one-pass backup: Pending)" << std::endl;
 	{
 		auto record = [](uint32_t block, uint16_t slot, uint8_t op, uint32_t page) {

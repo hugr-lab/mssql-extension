@@ -1778,7 +1778,20 @@ before the next opens.
       LCX_INDEX_LEAF, LCX_TEXT_MIX, LCX_TEXT_TREE, LCX_MARK_AS_GHOST): a PFS update (logged as a
       MODIFY_ROW under the unit allocated), interior index rows and 37 pages formatted after the
       checkpoint named a table's unit on pages that held none of its rows -- a table equal to the RESTORE
-      read stale;
+      read stale. Two more since (review of #591, fixture `tail_window`: changes made at known points of a
+      backup's copy -- the backup written into a FIFO the generator reads, held in its first data pass and
+      inside its second, which copies again only the extents changed during the first -- each table against
+      its RESTORE on 2022 and 2025): a FORMAT_PAGE in a row context that carries the page's image (an
+      `INSERT … WITH (TABLOCK)` into a heap logs no INSERT_ROWS: one left open read consistent with its rows
+      in the copy), and a SET_BITS clearing bits of a unit's IAM page, extents freed (a small table's
+      TRUNCATE logs nothing else: it read consistent with the copy's rows gone; an index rebuild frees the
+      old unit's extents alike and reads stale with its rows equal -- the price; extents allocated are not
+      counted: an allocation may commit on its own -- AllocFirstPage, a transaction of the system's -- while the rows
+      put there stay open). Still not counted: a large table's TRUNCATE (deferred: its extents freed later),
+      a partition switched in the tail, pages freed from a mixed extent. Measured there too:
+      a ROLLBACK does not harden the log and a backup copies only the hardened log, so an undo not flushed by
+      the backup's end is past LastLSN (the transaction reads open, which the RESTORE undoes alike); a
+      parallel INSERT (DOP 4) logs every worker under the one transaction id;
     - (iii) by the page copy: dirty when an open transaction's oldest change on a page is no newer than the
       copy (the copy holds what RESTORE undoes); one written after the copies read dirty while equal;
     - (iv): a committed transaction (or one with no BEGIN in the tail) stale when its newest change on a

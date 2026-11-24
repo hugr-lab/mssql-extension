@@ -1579,8 +1579,8 @@ flowchart BT
   not live in the backup: only after CheckpointLSN), dirty when an open one's oldest is not (the copy
   holds what RESTORE undoes). The listings give NULL when the tail cannot be read (`TailOrWarn`); the
   scan, the change listing and `mssql_backup_catalog` act by `fuzzy :=` (`CheckStatementFuzzy`: a user
-  table by its base units, a base table by its own; the change listing each state against its own
-  tail). `mssql_backup_transaction_records` walks the tail again through a cursor -- the summary read
+  table -- user or system, all in the model -- by its base units; the change listing each state against
+  its own tail). `mssql_backup_transaction_records` walks the tail again through a cursor -- the summary read
   only when `transaction_status` is selected --, a row image laid on a page of its own and staged by `RecordStager` into the
   table's columns, built into a VARIANT.
 
