@@ -64,6 +64,8 @@ void WriteFile(const std::string &path, const std::vector<uint8_t> &bytes) {
 //! or "none", and the last message.
 struct Thrown {
 	std::string store, unit, message;
+	//! Every PendingPageError / ZeroCopyError thrown named the page store that met the page (review of #607).
+	bool own_store = true;
 };
 
 Thrown ReadPage(ClientContext &context, const std::string &path, const PagePointer &at) {
@@ -76,9 +78,11 @@ Thrown ReadPage(ClientContext &context, const std::string &path, const PagePoint
 			f();
 		} catch (PendingPageError &e) {
 			t.message = e.what();
+			t.own_store = t.own_store && e.store == pages->store.get();
 			return "pending";
 		} catch (ZeroCopyError &e) {
 			t.message = e.what();
+			t.own_store = t.own_store && e.store == pages->store.get();
 			return "zero";
 		} catch (FormatError &e) {
 			t.message = e.what();
@@ -178,6 +182,7 @@ int main() {
 		Check(t.store == kind, std::string(form.what) + ": the page store throws " + kind + " (" + t.store + ")");
 		Check(t.unit == kind && t.message.find("(reading dbo.events)") != std::string::npos,
 			  std::string(form.what) + ": ReadUnitDataPage keeps the type, naming the table (" + t.unit + ")");
+		Check(t.own_store, std::string(form.what) + ": the error names the page store that met the page");
 		auto scan = con.Query("SELECT count(*) FROM mssql_backup_scan('" + path + "', 'dbo', 'events')");
 		const std::string error = scan->HasError() ? scan->GetError() : "";
 		if (zeros) {
@@ -209,18 +214,20 @@ int main() {
 				PagePointer p;
 				p.file = 1;
 				p.page = 44592;
-				throw ZeroCopyError("backup: page 1:44592 is live, and its copy is not a page", p);
+				throw ZeroCopyError("backup: page 1:44592 is live, and its copy is not a page", p, pages->store.get());
 			} catch (FormatError &e) {
 				e.AddContext(" (reading dbo.events)");
 				throw;
 			}
 		} catch (ZeroCopyError &e) {
-			kept = std::string(e.what()) + " @" + e.page.ToString();
+			kept = std::string(e.what()) + " @" + e.page.ToString() +
+				   (e.store == pages->store.get() ? " (its store)" : "");
 		} catch (FormatError &) {
 			kept = "a FormatError";
 		}
-		Check(kept == "backup: page 1:44592 is live, and its copy is not a page (reading dbo.events) @1:44592",
-			  "a ZeroCopyError rethrown with its context is still one, its page kept: " + kept);
+		Check(kept ==
+				  "backup: page 1:44592 is live, and its copy is not a page (reading dbo.events) @1:44592 (its store)",
+			  "a ZeroCopyError rethrown with its context is still one, its page and store kept: " + kept);
 	}
 
 	std::cout << "FormattedInTail" << std::endl;

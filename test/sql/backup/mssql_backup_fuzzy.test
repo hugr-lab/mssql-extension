@@ -205,6 +205,36 @@ SELECT count(*) FROM duckdb_logs WHERE message LIKE 'mssql_backup_table_%is dirt
 ----
 1
 
+# As the scan's, the listing's check is at init: a DESCRIBE and a PREPARE say nothing, each EXECUTE once
+# (review of #591: "one WARNING" was asserted as count(*) > 0 while the check was at bind).
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+DESCRIBE SELECT * FROM mssql_backup_table_changes('test/data/backup/open_tail/open_tail_base.bak', 'dbo', 'changed', diff := 'test/data/backup/open_tail/open_tail_diff.bak');
+
+statement ok
+PREPARE changes_changed AS SELECT count(*) FROM mssql_backup_table_changes('test/data/backup/open_tail/open_tail_base.bak', 'dbo', 'changed', diff := 'test/data/backup/open_tail/open_tail_diff.bak');
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'mssql_backup_table_changes: dbo.changed%is dirty in this backup%';
+----
+0
+
+statement ok
+EXECUTE changes_changed;
+
+statement ok
+EXECUTE changes_changed;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'mssql_backup_table_changes: dbo.changed (the newer state) is dirty in this backup%';
+----
+2
+
+statement ok
+DEALLOCATE changes_changed;
+
 statement ok
 SET enable_logging = false;
 

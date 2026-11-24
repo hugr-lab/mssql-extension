@@ -430,7 +430,7 @@ bool RecordStager::UnlessPending(WALK &&walk) {
 		return true;
 	} catch (PendingPageError &e) {
 		if (!pending_as_null_) {
-			throw PendingValueError(e.what());
+			throw PendingValueError(e.what(), e.store);
 		}
 		if (pending_values_++ == 0) {
 			first_pending_ = e.what();

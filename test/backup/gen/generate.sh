@@ -29,6 +29,9 @@
 # partition switched in with no shrink (PR 4c-3: switch_full, switch_diff; not run by default; committed under test/data/backup/switch_in, made by its generate.sh);
 # history_break.sql, a full restored over its database between two fulls (review of #612: break_before, break_after;
 # not run by default; committed under test/data/backup/history_break, made by its generate.sh);
+# clr.sql, CLR columns of every storage form: a Format.Native user type (test/clr's assembly) stored at a fixed
+# offset as binary, a user type past 8000 bytes, hierarchyid and geometry, uncompressed, ROW, PAGE and a heap
+# (clr_full; not run by default; committed under test/data/backup/clr, made by its generate.sh);
 # bench_changes.sql, a benchmark of 10 million rows and differentials of 10k / 110k / 1.1M changes and an index rebuild
 # (PR 4c-3: bench_full, bench_diff_*, each also compressed as *_x; not run by default). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
@@ -170,6 +173,14 @@ for fixture in ${FIXTURES}; do
 		# the databases whose backups are made go first (the backups stay).
 		sql -Q "IF DB_ID('bak_load') IS NOT NULL DROP DATABASE bak_load; IF DB_ID('bak_files') IS NOT NULL DROP DATABASE bak_files" >/dev/null
 		df -h / || true
+	fi
+	if [ "${fixture}" = clr ]; then
+		# The user CLR types' assembly (test/clr/build.sh), trusted by its SHA-512 and created in the database
+		# clr.sql makes: a script of its own, which clr.sql reads with :r (10 KB of hex in no command line),
+		# written straight into the container (no file beside the fixture).
+		hex="$(tr -d ' \n' <"${HERE}/../../data/clr/mssql_test_udt.dll.hex")"
+		printf "DECLARE @b varbinary(max) = 0x%s;\nDECLARE @h varbinary(64) = HASHBYTES('SHA2_512', @b);\nIF NOT EXISTS (SELECT 1 FROM sys.trusted_assemblies WHERE hash = @h) EXEC sys.sp_add_trusted_assembly @h, N'mssql_test_udt';\nCREATE ASSEMBLY MssqlTestUdt FROM @b WITH PERMISSION_SET = SAFE;\n" \
+			"${hex}" | docker exec -i -u 0 "${CONTAINER}" sh -c 'cat >/tmp/gen/clr_assembly.sql && chmod 644 /tmp/gen/clr_assembly.sql'
 	fi
 	echo ">> running ${fixture}.sql"
 	run_sql "${fixture}.sql"
@@ -376,6 +387,10 @@ for fixture in ${FIXTURES}; do
 	history_break)
 		# A full restored over its database between two fulls (review of #612): a new recovery fork.
 		sets+=("break_before|break_before.bak" "break_after|break_after.bak")
+		;;
+	clr)
+		# CLR columns of every storage form (a Format.Native user type at a fixed offset, described as binary).
+		sets+=("clr_full|clr_full.bak")
 		;;
 	bench_changes)
 		# A benchmark (spec 085 PR 4c-3): 10 million rows, then differentials of 10k / 110k / 1.1M changes, and

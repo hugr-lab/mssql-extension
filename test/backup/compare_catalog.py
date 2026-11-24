@@ -26,6 +26,7 @@ difference, or when fewer than --min-fields fields were compared.
 import argparse
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -429,6 +430,14 @@ def main():
                     refused = ("became live while the backup ran" in out and "(reading sysobjvalues)" not in out
                                and "(reading sysseobjvalues)" not in out)
                     c.check(f"{name}: {function} (no golden)", "lists or refuses by name", ok or refused, True)
+                # How often a table that is not the user's reads dirty or stale under a workload (review of
+                # #607: mssql_backup_catalog under fuzzy := 'error' refuses those): said, not checked.
+                ok, out = db.try_query(
+                    "SELECT type, coalesce(fuzzy_status, 'unknown') AS status, count(*)::VARCHAR AS n "
+                    f"FROM mssql_backup_tables({arg}) WHERE type <> 'U' GROUP BY ALL ORDER BY ALL")
+                if ok:
+                    print(f"compare_catalog: {name}: fuzzy status of the tables not the user's: " +
+                          ", ".join(f"{r['type']} {r['status']} {r['n']}" for r in json.loads(out or "[]")))
             continue
         for kind in ("columns", "views", "modules", "partitioning", "boundaries", "partitions"):
             if f"{name}.{kind}.txt" not in texts:
