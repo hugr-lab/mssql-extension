@@ -284,6 +284,8 @@ set(EXTENSION_SOURCES
     src/table_scan/filter_encoder.cpp
     src/table_scan/function_mapping.cpp
     src/table_scan/table_scan.cpp
+    src/table_scan/table_scan_pushdown.cpp
+    src/table_scan/table_scan_serialize.cpp
     src/table_scan/mssql_optimizer.cpp
     src/pushdown/mssql_expression_vocabulary.cpp
     src/pushdown/mssql_node_writer.cpp
