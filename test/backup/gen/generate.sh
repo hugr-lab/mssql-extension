@@ -419,20 +419,34 @@ for fixture in ${FIXTURES}; do
 			AND (SELECT COUNT(*) FROM bak_tail_window.dbo.rollback_delete WITH (READUNCOMMITTED)) = 50
 			AND (SELECT COUNT(*) FROM bak_tail_window.dbo.parallel_open WITH (READUNCOMMITTED)) = 2000 THEN 1 ELSE 0 END" ||
 			tw_failed "open transactions did not make their changes in 60 s"
-		# A trial backup of the same layout: its second data pass starts where the real one's does (a stream
-		# header, so at a multiple of 512 -- an MSDA of the filler's random bytes is not).
+		# A trial backup of the same layout: where its second data pass starts is where the real one's does (a
+		# stream header, so at a multiple of 512 -- an MSDA of the filler's random bytes is not), and where its
+		# log (MQTL) does.
 		tw_with="CHECKSUM, BUFFERCOUNT = 2, MAXTRANSFERSIZE = 65536, NAME = 'tail_window_full'"
 		sql -Q "BACKUP DATABASE bak_tail_window TO DISK = '${DIR}/tail_window_trial.bak' WITH FORMAT, INIT, COPY_ONLY, ${tw_with}" >/dev/null
 		pass2="$(docker exec "${CONTAINER}" sh -c "grep -obUa MSDA '${DIR}/tail_window_trial.bak' | awk -F: '\$1 % 512 == 0 { n++; if (n == 2) print \$1 }'")"
+		log_at="$(docker exec "${CONTAINER}" sh -c "grep -obUa MQTL '${DIR}/tail_window_trial.bak' | awk -F: '\$1 % 4 == 0 { print \$1; exit }'")"
 		docker exec "${CONTAINER}" rm -f "${DIR}/tail_window_trial.bak" "${DIR}/tail_window_chain.bak" "${DIR}/tail_window_chain.trn"
-		[ -n "${pass2}" ] || tw_failed "trial backup has no second data pass"
-		# The reader: 512 KiB (within the first pass), held; then to 256 KiB or more past the second pass's
-		# start, held; then the rest. The server waits on its writes meanwhile (two 64 KiB buffers and the
-		# pipe's: it reads up to about 192 KiB ahead of the reader).
-		hold1=8
-		hold2=$(((pass2 + 65535) / 65536 + 4 - hold1))
-		[ "${hold2}" -gt 0 ] || tw_failed "second data pass at ${pass2}, before the first hold"
-		echo ">> tail_window: the second data pass at ${pass2}; the reader holds at ${hold1} and $((hold1 + hold2)) blocks of 64 KiB"
+		# The reader holds twice. With a second data pass (2019 on): 512 KiB in (within the first pass), then
+		# 256 KiB or more past the second pass's start (tail_window_pass1.sql at the first, pass2.sql at the
+		# second). SQL Server 2017 copies the data once (its pages changed meanwhile are in the log only: the
+		# lane's 2017 backups): one hold, 512 KiB before its log -- inside the filler, the file's last extents,
+		# past the other tables' pages -- for pass2.sql, the first hold's script skipped. The server waits on
+		# its writes meanwhile (two 64 KiB buffers and the pipe's: it reads up to about 192 KiB ahead).
+		if [ -n "${pass2}" ]; then
+			hold1=8
+			hold2=$(((pass2 + 65535) / 65536 + 4 - hold1))
+			first_script=tail_window_pass1.sql
+			[ "${hold2}" -gt 0 ] || tw_failed "second data pass at ${pass2}, before the first hold"
+			echo ">> tail_window: the second data pass at ${pass2}; the reader holds at ${hold1} and $((hold1 + hold2)) blocks of 64 KiB"
+		else
+			[ -n "${log_at}" ] || tw_failed "trial backup has neither a second data pass nor a log stream"
+			hold1=$(((log_at - 524288) / 65536))
+			hold2=0
+			first_script=""
+			[ "${hold1}" -gt 8 ] || tw_failed "log stream at ${log_at}, too close to the data's start"
+			echo ">> tail_window: one data pass, its log at ${log_at}; the reader holds at ${hold1} blocks of 64 KiB"
+		fi
 		docker exec "${CONTAINER}" sh -c "rm -f ${DIR}/tw.fifo ${DIR}/tw.h1 ${DIR}/tw.g1 ${DIR}/tw.h2 ${DIR}/tw.g2 && mkfifo ${DIR}/tw.fifo"
 		docker exec -d "${CONTAINER}" sh -c "{ dd bs=65536 count=${hold1} iflag=fullblock 2>/dev/null; touch ${DIR}/tw.h1;
 			while [ ! -e ${DIR}/tw.g1 ]; do sleep 0.2; done; dd bs=65536 count=${hold2} iflag=fullblock 2>/dev/null;
@@ -451,7 +465,11 @@ for fixture in ${FIXTURES}; do
 			docker exec "${CONTAINER}" test -e "${DIR}/tw.h${hold}" || tw_failed "reader did not reach hold ${hold} in 60 s"
 			[ "$(scalar "${backing_up}" || true)" = 1 ] || tw_failed "backup was not running at hold ${hold}"
 			echo ">> tail_window: held $(scalar "SELECT CAST(percent_complete AS int) FROM sys.dm_exec_requests WHERE command LIKE 'BACKUP%'")% into the backup"
-			run_sql "tail_window_pass${hold}.sql"
+			if [ "${hold}" = 2 ]; then
+				run_sql tail_window_pass2.sql
+			elif [ -n "${first_script}" ]; then
+				run_sql "${first_script}"
+			fi
 			docker exec "${CONTAINER}" touch "${DIR}/tw.g${hold}"
 		done
 		tw_wait "SELECT 1 - (${backing_up#SELECT })" || tw_failed "backup did not end 60 s after the reader went on"
