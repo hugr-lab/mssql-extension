@@ -520,9 +520,11 @@ int main() {
 		refused.columns.back().is_computed = true;
 		refused.columns.push_back(Col(23, "cs", XTYPE_XML, "xml", -1));
 		refused.columns.back().is_column_set = true;
-		Check(ErrorOf([&]() { RecordStager(refused, {22}, TypeForms()); }).find("dbo.synthetic.computed: a computed column") !=
-					  std::string::npos &&
-				  ErrorOf([&]() { RecordStager(refused, {23}, TypeForms()); }).find("a column set is computed") != std::string::npos,
+		Check(ErrorOf([&]() {
+				  RecordStager(refused, {22}, TypeForms());
+			  }).find("dbo.synthetic.computed: a computed column") != std::string::npos &&
+				  ErrorOf([&]() { RecordStager(refused, {23}, TypeForms()); }).find("a column set is computed") !=
+					  std::string::npos,
 			  "a computed column that is not persisted and a column set are not readable, by name");
 		const std::vector<std::pair<CatalogColumn, std::string>> raws = {
 			{Col(31, "doc", XTYPE_XML, "xml", -1), "binary XML"},

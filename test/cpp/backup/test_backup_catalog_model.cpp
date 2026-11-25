@@ -610,7 +610,9 @@ int main() {
 		narrow.columns[4].is_computed = true;
 		narrow.columns[5].is_sparse = true;
 		narrow.columns[6].is_column_set = true;
-		auto state = [](const CatalogTable &t, size_t i) { return std::string(StateOf(t, t.columns[i], TypeForms()).state); };
+		auto state = [](const CatalogTable &t, size_t i) {
+			return std::string(StateOf(t, t.columns[i], TypeForms()).state);
+		};
 		Check(state(narrow, 0) == "converted" && StateOf(narrow, narrow.columns[0], TypeForms()).reason.empty() &&
 				  state(narrow, 1) == "converted" && state(narrow, 2) == "converted" &&
 				  state(narrow, 3) == "converted" && state(narrow, 4) == "not_stored" &&
