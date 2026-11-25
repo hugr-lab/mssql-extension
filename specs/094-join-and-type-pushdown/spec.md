@@ -1,9 +1,20 @@
 # Spec 094: pushdown for joins and the new types
 
-Status: draft, 2026-11-24; DQ-1 and DQ-2 decided by the owner the same day. From #515 (the umbrella): its runtime join filters (level 0),
+Status: draft, 2026-11-24; DQ-1 and DQ-2 decided by the owner the same day for cosine, both revisited
+after X1b (review of #622: euclidean and dot are not exact either; for the owner to confirm), DQ-3 open. From #515 (the umbrella): its runtime join filters (level 0),
 the vector pushdown (#363) and the spatial items, with the owner's direction of 2026-11-20 ("research
 what can be pushed, and filter hints such as a bbox to help spatial joins"). Measured: `measured/X1-X3.md`
-(SQL Server 2025, a throwaway container) and `research/duckdb-side.md` (DuckDB at the pin, `4569c0a1eeb`).
+and `measured/X1b-X3b.md` (SQL Server 2025, a throwaway container) and `research/duckdb-side.md` (DuckDB at
+the pin, `4569c0a1eeb`).
+
+The rule every decision below keeps:
+- **A filter pushed into a scan is DuckDB's answer or a superset of it**, and DuckDB re-checks it. A
+  narrower one loses rows silently, because the rows it drops never reach the re-check.
+- **A value or a condition in a statement pushed whole** (079's writer) has no re-check, so it must be
+  DuckDB's.
+
+The one exception is DQ-1: a vector distance as a result column and as a kNN's ORDER BY key differs from
+DuckDB's in its last bits, recorded.
 
 ## Why
 
@@ -22,7 +33,8 @@ predicates with a constant (`geometry`); P3 a bbox hint for spatial joins; P4 sp
 
 Out: `VECTOR_SEARCH` (a DiskANN index: no DuckDB query shape; an `mssql_vector_search` table function,
 its own task if wanted); more than 50 join keys (`mssql_keyed_scan` via `#keys`, its own spec after P0
-is measured); geography predicates (X3: geodesic on the server, planar in DuckDB); any DuckDB patch.
+is measured); the server's geodesic geography methods (X3b: not DuckDB's answer; geography is pushed in
+DuckDB's planar form, D3); any DuckDB patch.
 
 ## Decisions
 
@@ -43,7 +55,8 @@ scan keeps `INITIALIZE_ON_EXECUTE`).
 - An IN list on any type the encoder takes: it can only widen the result, and the join re-checks every
   match. A `>=` / `<=` bound only where `OrdersLikeDuckDB()` holds.
 - Anything the encoder does not take (bloom, prefix range, a string range, an IN of an unencodable
-  type) is dropped, never armed client-side (DuckDB evaluates the wrapper as all-true).
+  type) is dropped, never armed client-side. Dropping is correct for both wrappers: DuckDB evaluates
+  `optional` as all-true, and `selectivity_optional` it may skip itself.
 - **Open, to test first (research Q1):** the unwrapped min == max comparison a range join (NLJ, IEJoin,
   PWMJ) pushes -- `s < 'b'` from a one-row build -- is rendered today like a user's filter. On a string
   under a non-binary collation the server's `<` is not DuckDB's: a row the join matches can be dropped.
@@ -51,63 +64,138 @@ scan keeps `INITIALIZE_ON_EXECUTE`).
 
 ### D2 (P1): vector distances by VECTOR_DISTANCE (SQL Server 2025)
 
-Measured (X1, 2000 `vector(3)` values exact in float32):
+**Measured** on random float32 vectors (X1b: 2000 of 384 and of 1536 dimensions, three runs). X1's vectors
+were multiples of 1/64, which made every sum exact and so hid the summation order.
 
 | DuckDB | SQL Server | values |
 |---|---|---|
-| `array_distance(v, q)` | `VECTOR_DISTANCE('euclidean', v, q)` | bit-equal, 2000 / 2000 |
-| `array_negative_inner_product(v, q)` | `VECTOR_DISTANCE('dot', v, q)` | bit-equal, 2000 / 2000 |
-| `array_cosine_distance(v, q)` | `VECTOR_DISTANCE('cosine', v, q)` | 1665 bit-equal, the rest within 2.4e-7 (1-2 float32 ulps); the 2000 rows' order the same |
+| `array_distance(v, q)` | `VECTOR_DISTANCE('euclidean', v, q)` | 12-26% bit-equal; max relative error 1.1e-6 (5-9 float32 ulps) |
+| `array_negative_inner_product(v, q)` | `VECTOR_DISTANCE('dot', v, q)` | 3-9% bit-equal; max absolute error 1.1e-5 (384) and 5.7e-5 (1536), about 15-30 ulps at the typical magnitudes, with no relative bound near 0 |
+| `array_cosine_distance(v, q)` | `VECTOR_DISTANCE('cosine', v, q)` | 79-82% bit-equal (values near 1.0, where an ulp is coarse); max absolute error 1.2e-7 |
 
-The server returns `float` (a float32 widened); DuckDB `FLOAT`. A zero vector: cosine NaN in DuckDB
-(ordered last), 1.0 on the server; NULL first on the server, last in DuckDB. `VECTOR_NORM(v, 'norm2')`
-tells a zero vector on the server.
+**Order.** The rows ordered by a distance disagree only between distances that close: 0-32 rank
+disagreements of 2000, the most for euclidean at 1536 dimensions. The top-10 and top-100 sets were the same in
+the two runs that measured them.
 
-- Pushed: a distance of a `vector(n)` column and a constant `FLOAT[n]` (`CAST(@q AS vector(n))`, a
-  parameter), or of two columns of one table, as a result column, an ORDER BY key (with `TOP`) and a
-  condition. `array_inner_product` as `-VECTOR_DISTANCE('dot', …)`.
-- NULL and NaN placement emulated: `ORDER BY CASE WHEN v IS NULL THEN 1 ELSE 0 END, CASE WHEN
-  VECTOR_NORM(v, 'norm2') = 0 THEN 1 ELSE 0 END, VECTOR_DISTANCE(…)` for cosine (the NaN ones after the
-  others, before NULL: DuckDB's order); a constant zero vector not pushed.
-- Where: the catalog-scan TOP N path (`MSSQLOptimizer::TryPushTopN`: a two-argument key over the column
-  and a constant; it is behind `mssql_order_pushdown`, opt-in) and the 079 writer's vocabulary (the
-  default path).
-- **DQ-1 (owner, 2026-11-24): cosine is pushed everywhere**, though it differs in its last bits -- under
-  the floating-point aggregates' rule (recorded, vetoed in a condition / ORDER BY) it would never be
-  pushed in a kNN, the case it is for. The difference is recorded (`docs/type-mapping.md`): a kNN's
-  membership can change only where two distances are within 2 ulps at its boundary; euclidean and dot
-  are exact.
-- **DQ-2 (owner, 2026-11-24): with ORDER BY … LIMIT k pushed, DuckDB's TopN is removed for euclidean /
-  dot** (bit-equal: the server's order, D2's emulation) **and kept for cosine**, over `TOP (k)`: DuckDB
-  orders the k rows the server chose in its own floats.
+**Types and edge cases.**
+- The server returns `float` (a float32 widened); DuckDB returns `FLOAT`.
+- A zero vector: cosine is NaN in DuckDB (the largest value in its order) and 1.0 on the server.
+- NULL sorts first on the server and last in DuckDB, ascending or descending.
+- `VECTOR_NORM(v, 'norm2')` tells a zero vector on the server.
 
-### D3 (P2): spatial predicates with a constant, a superset DuckDB re-checks (geometry only)
+- **What is pushed.** A distance of a `vector(n)` column and a constant `FLOAT[n]` (`CAST(@q AS vector(n))`,
+  a parameter), or of two columns of one table: as a result column, as an ORDER BY key (with `TOP`), and
+  as a condition in the catalog scan only (below). `array_inner_product` is pushed as
+  `-VECTOR_DISTANCE('dot', …)`.
+- **NULL and NaN placement, emulated.**
+  - ASC: `ORDER BY CASE WHEN v IS NULL THEN 1 ELSE 0 END, CASE WHEN VECTOR_NORM(v, 'norm2') = 0 THEN 1
+    ELSE 0 END, VECTOR_DISTANCE(…)` for cosine: the NaN ones after the others, before NULL, which is
+    DuckDB's order.
+  - DESC: the NaN ones first and NULL still last.
+  - A constant zero vector is not pushed.
+- **A condition (`array_distance(v, q) < r`) is a superset in the catalog scan, never consumed.** The
+  threshold is widened by an a-priori float32 rounding bound, doubled for the two implementations, with
+  γ_k = k·2^-24 / (1 - k·2^-24) and n the dimension:
+  - euclidean: relative 2γ_(n+2);
+  - dot: absolute 2γ_(n+1)·‖v‖·‖q‖, where ‖v‖ is `VECTOR_NORM(v, 'norm2')` on the server (Cauchy-Schwarz
+    bounds the sum of |products|);
+  - cosine: absolute 4γ_(n+2).
 
-Measured (X2, 100k points and other shapes, a GEOMETRY_AUTO_GRID index):
+  At 1536 dimensions these are 1.8e-4 relative, 1.8e-4·‖v‖·‖q‖ and 3.7e-4: loose against X1b's errors,
+  and sound. In a statement pushed whole a distance condition is vetoed: there is no re-check.
+- **Where.**
+  - The catalog-scan TOP N path (`MSSQLOptimizer::TryPushTopN`: a two-argument key over the column and a
+    constant). It is behind `mssql_order_pushdown`, which is opt-in.
+  - The catalog scan's filters.
+  - The 079 writer's vocabulary (the default path), for result columns and ORDER BY keys.
+- **DQ-1 (owner, 2026-11-24, for cosine; extended to euclidean and dot after X1b, for the owner to
+  confirm): a distance is pushed as a result column and a kNN's ORDER BY key**, though it differs in its
+  last bits. Under the floating-point aggregates' rule (recorded, vetoed in a condition / ORDER BY) a
+  distance would never be pushed in a kNN, the case it is for.
+  - The difference is recorded in `docs/type-mapping.md`.
+  - A kNN's membership can change only where two distances at its boundary are within the errors above.
+- **DQ-2, revisited after X1b (owner's call; was: TopN removed for euclidean / dot).** With ORDER BY …
+  LIMIT k pushed, DuckDB's TopN is kept for all three, over `TOP (k)`: DuckDB orders the k rows the
+  server chose by its own floats. The server's order is not DuckDB's (X1b: up to 32 rank disagreements
+  in 2000).
 
-- The spatial index is used by `g.STIntersects(@c) = 1` (either operand order), `STWithin`,
-  `STDistance(@c) <= d`, `g.Filter(@c) = 1` (an index-only superset of STIntersects) and
-  `g.STIntersects(@c1.STUnion(@c2)) = 1`; not by an OR of two, nor by `g.STEnvelope().STIntersects(@c)`
-  (DuckDB's `&&`, bbox meets bbox), nor under a `CASE`.
-- An invalid geometry (a bow tie) fails every exact method -- error 6522 / 24144, the statement ended --
-  when it is a candidate; `STIsValid()` does not fail. A row the index drops is never evaluated, so an
-  unguarded pushed predicate fails or not by where the invalid rows lie.
-- `&&` is exactly `g.STEnvelope().STIntersects(@c)` (2004 / 2004 rows); `Filter` is a superset of
-  `STIntersects`, not of `&&` (the index holds a geometry's cells, not its envelope).
-- A curve: the server sees it, DuckDB reads NULL (`geometry_as 'geometry'`).
+### D3 (P2): spatial predicates with a constant, a superset DuckDB re-checks
 
-So:
-- A pushed spatial predicate is a superset; DuckDB keeps its own filter (the complex filter pushdown
-  erases only what it encodes). Never consumed: a curve, an invalid geometry and the index's coarseness
-  are the server's.
-- With the spatial extension's `ST_Intersects` / `ST_Within` / `ST_Contains` / `ST_DWithin` and a
-  constant: `CASE WHEN g.STIsValid() = 1 THEN g.STIntersects(@c) ELSE 1 END = 1` where the column has no
-  spatial index (a full scan on the server, less on the wire); where it has one (the catalog reads
-  `sys.spatial_indexes`), `g.Filter(@c) = 1` with the index forced (`WITH (INDEX(…))`) if X4 shows a
-  forced index never evaluates `Filter` exactly -- else the guarded form.
-- `&&` / `ST_Intersects_Extent` (core) with a constant: the guarded envelope form, no index.
-- The encoder sees through a CRS-only cast (a geography's `CAST(g AS GEOMETRY)`: research Q5) -- but
-  geography is not pushed (X3).
+**Measured** (X2: 100k points and other shapes, a GEOMETRY_AUTO_GRID index; X2b, X3b).
+
+*The spatial index:*
+- Used by `g.STIntersects(@c) = 1` (either operand order), `STWithin`, `STDistance(@c) <= d`,
+  `g.Filter(@c) = 1` (an index-only superset of the server's STIntersects) and
+  `g.STIntersects(@c1.STUnion(@c2)) = 1`.
+- Not used by an OR with anything, nor by `g.STEnvelope().STIntersects(@c)`, nor under a `CASE`.
+
+*An invalid geometry (a bow tie):*
+- It fails every exact method, `STEnvelope` included -- error 6522 / 24144, the statement ended -- when it
+  is a candidate. `STIsValid()` does not fail.
+- A row the index drops is never evaluated.
+
+*`&&` (bbox meets bbox):*
+- It is `g.STEnvelope().STIntersects(@c.STEnvelope())`: 441 / 441 against DuckDB on a diagonal line's box
+  (X2b).
+- Against the constant itself the form is narrower: 21 of 441 rows (the first draft's form, wrong).
+- `Filter` is a superset of the server's `STIntersects`, not of `&&`: the index holds a geometry's cells,
+  not its envelope.
+
+*SRIDs (X2b):*
+- A method over two SRIDs returns NULL, so a constant of SRID 0 drops every row of SRID 4326: 0 of their
+  43 matches.
+- DuckDB reads no SRID (spec 093 DQ-45), so its answer is SRID-blind.
+- A constant rebuilt in each row's SRID (`geometry::STGeomFromWKB(@wkb, g.STSrid)`) is exact (4048 /
+  4048), but it uses no index, and neither does an OR with `g.STSrid <> @s`.
+
+*Not measured:* the server's exact methods (`STIntersects`, `STWithin`, `STContains`) on boundary cases
+against DuckDB's spatial extension. X3 saw the server round a boundary point.
+
+So every spatial predicate with a constant has **one form, the envelopes'**. It is a superset of every
+predicate that implies the two shapes meet, and it does not depend on the server's exact methods or on
+the constant being valid:
+
+```
+CASE WHEN G.STIsValid() = 1
+     THEN G.STEnvelope().STIntersects(geometry::STGeomFromWKB(@env, G.STSrid)) ELSE 1 END = 1
+```
+
+- **`G`** is the row's geometry: `g` for a `geometry` column, and for a `geography` one
+  `geometry::STGeomFromWKB(g.STAsBinary(), g.STSrid)` (below). The guard tests `G`, the value the
+  methods run on.
+- **`@env`** is the constant's extent, computed on the client (`Geometry::GetExtent`) and sent as the WKB
+  of a 2D POLYGON. It is widened on each side by m = 1e-9·max(1, the extent's largest |coordinate|), so:
+  - a rounding at the rectangle's edge never drops a row;
+  - a point's or an axis-parallel line's extent is never degenerate (an invalid zero-area polygon);
+  - the constant's own validity, Z and M do not matter.
+
+  It is rebuilt in each row's SRID: SRID-blind, as DuckDB is.
+- **The predicates:**
+  - `&&` / `ST_Intersects_Extent` (core), and from the spatial extension `ST_Intersects`, `ST_Within`,
+    `ST_Contains`, `ST_Covers`, `ST_CoveredBy`, `ST_Touches`, `ST_Overlaps`, `ST_Crosses` and `ST_Equals`,
+    in either argument order: each implies the envelopes meet.
+  - `ST_DWithin(g, c, d)`: the same form with `@env` grown by `d` (+ m). The distance between two shapes is
+    at least the distance between their envelopes, which is at least the L∞ gap.
+  - Never `ST_Disjoint` or a negation: their superset is everything.
+- **Never consumed.** DuckDB keeps its own filter (the complex filter pushdown erases only what it
+  encodes): the envelope test, an invalid geometry let through and a curve the server sees are the
+  server's.
+- **A scan filter only.** In a statement pushed whole (079) a spatial condition is vetoed: the form is a
+  superset, and there is no re-check.
+- **The index: DQ-3 (open, the owner's call).** The envelope form uses no index (X2). An indexed form
+  would be the server's exact predicate or `Filter` against the constant itself, in the constant's SRID,
+  `UNION ALL` the envelope form for `g.STSrid <> @s`. It is safe only once X4 / X5 show the indexed
+  predicate is a superset of DuckDB's on boundary cases, and that a forced index never evaluates `Filter`
+  exactly (an invalid candidate fails unguarded). Options:
+  - (a) P2 ships the envelope form alone: less on the wire, the server's work a full scan;
+  - (b) the indexed branch, added for `ST_Intersects` / `ST_Within` / `ST_Contains` / `ST_DWithin` after
+    X4 / X5. It never applies to `&&`: `Filter` against an envelope is narrower for a non-point row, e.g.
+    the line (0,0)-(10,10) against the box [8,20] x [0,2], whose boxes meet.
+- **geography (owner, 2026-11-24): DuckDB's answer.** DuckDB reads a geography as `GEOMETRY('OGC:CRS84')`
+  and compares it in the plane, so `G` converts the value to a planar geometry, longitude / latitude as
+  DuckDB's (X3b: the server's planar form answers ids 1, 3, 5 as DuckDB, where its geodesic
+  `STIntersects` answers 2, 3). A geography's spatial index is geodesic, so none is used. The encoder sees
+  through the CRS-only cast DuckDB plans (research Q5).
 
 ### D4 (P3): a bbox hint for a spatial join
 
@@ -115,32 +203,53 @@ A join on `&&` / `ST_Intersects` binds as a LogicalAnyJoin, planned as a blockwi
 DuckDB pushes nothing into the probe scan (research Q2). The extension adds the hint itself, as spec
 080's staged MERGE replaces `LogicalMergeInto` in `PreOptimizeRoot` (research Q3, option B):
 
-- MSSQLOptimizer recognises `X ⋈ Get(mssql catalog table)` on a spatial predicate of a `geometry` column
-  and puts an extension operator on X's side: a pass-through sink that computes X's extent (or up to N
-  boxes, one STUnion: X2 shows one geometry keeps the index) and, at Finalize, pushes into the probe
-  Get's `DynamicTableFilterSet` an optional-wrapped `st_intersects_extent(column, envelope)`;
-  `LogicalGet::dynamic_filters` is copied to the physical scan (`plan_get.cpp`), the schedule orders the
-  build before the probe's init.
-- The scan renders it by D3 (a superset; the join re-checks).
-- Not taken: rewriting the join into range joins on extent columns (option A: one box only, needs
-  virtual extent columns and functions core lacks) and an in-out table function staging the build in
-  `#stage` (option C: the right shape for many boxes or exact matches -- later, as tier 1 of the keys).
+- MSSQLOptimizer recognises `X ⋈ Get(mssql catalog table)` on a spatial predicate of a `geometry` or
+  `geography` column and puts an extension operator on X's side. It is a pass-through sink that computes
+  X's extent and, at Finalize, pushes into the probe Get's `DynamicTableFilterSet` an optional-wrapped
+  `st_intersects_extent(column, envelope)`.
+  - `LogicalGet::dynamic_filters` is copied to the physical scan (`plan_get.cpp`), and the schedule
+    orders the build before the probe's init.
+  - The scan renders it by D3's envelope form (a superset; the join re-checks), so one box. Up to N boxes
+    would be an OR of envelope tests (X7 to measure; no index either way).
+- **The predicates** are the ones whose matches imply the boxes meet (D3's list). For `ST_DWithin` X's
+  extent is grown by `d`. No `ST_Disjoint` and no negation.
+- **The join types** are as DuckDB's own join filters allow: the Get is the probe child of an INNER,
+  SEMI or RIGHT join. Not LEFT, OUTER, ANTI, MARK or SINGLE, where a probe row the hint removes is one
+  the join must return (as unmatched, or for NOT EXISTS).
+  - The check is made on the plan as DuckDB's join-order optimizer leaves it, which may flip a join's
+    sides.
+  - A Get on the non-preserved side of a LEFT or ANTI join could be hinted too: later.
+- **Between the join and the Get** only operators that commute with a filter: projections and filters.
+  No LIMIT / TOP_N, aggregate or window.
+- Not taken:
+  - rewriting the join into range joins on extent columns (option A): one box only, and it needs virtual
+    extent columns and functions core lacks;
+  - an in-out table function staging the build in `#stage` (option C): the right shape for many boxes or
+    exact matches, later, as tier 1 of the keys.
 
 ### D5 (P4): spatial functions in the 079 writer
 
-Mapped only where the server's answer is DuckDB's (X5 to measure each, planar `geometry` only):
-`ST_X` / `ST_Y` (`.STX` / `.STY`), `ST_Area`, `ST_Length`, `ST_NumPoints`, `ST_IsEmpty`, `ST_GeometryType`
-(names differ: mapped), `ST_SRID`; each guarded against an invalid geometry as D3. What never maps is
-listed in `docs/type-mapping.md`.
+A function's value in a statement pushed whole has no re-check, and D3's superset does not carry over.
+So a function maps only where X5 shows the server's value equals DuckDB's on every one of X2's shapes:
+- **Invalid geometries.** The mapped form is guarded on `G.STIsValid()`, and a guard that answers NULL
+  where DuckDB answers a value is a different column: such a function does not map.
+- **Curves and FullGlobe**, which DuckDB reads as NULL under `geometry_as 'geometry'`. The mapped form
+  NULLs them (`CASE WHEN G.STGeometryType() IN ('CircularString', 'CompoundCurve', 'CurvePolygon',
+  'FullGlobe') THEN NULL ELSE … END`), and maps only under that read.
+- **Planar only.** A geography goes through `G` as in D3, and its geodesic methods never map.
+
+The candidates are `ST_X` / `ST_Y` (`.STX` / `.STY`), `ST_Area`, `ST_Length`, `ST_NumPoints`,
+`ST_IsEmpty` and `ST_GeometryType` (whose names differ: mapped). `ST_SRID` never maps: DuckDB reads no
+SRID. What does not map is listed in `docs/type-mapping.md`.
 
 ## Experiments still to run
 
 | # | for | what |
 |---|---|---|
-| X4 | D3 | `WITH (INDEX(six))` and `Filter`: is a candidate ever evaluated exactly (an invalid one fails)? plans and logical reads, indexed vs guarded, 100k / 1M rows |
-| X5 | D5 | each mapped function against DuckDB's (spatial extension) on X2's shapes |
+| X4 | D3 | the envelope form against DuckDB's spatial extension on boundary cases (points on a box's edges and corners, on a diagonal edge, touching shapes) and its cost (plans, logical reads, 100k / 1M rows); for DQ-3 (b): the exact methods and `Filter` on the same cases, whether `WITH (INDEX(six))` ever evaluates `Filter` exactly, whether the `UNION ALL`'s first branch keeps the index, the parameterised `@wkb` form's plan |
+| X5 | D5 | each mapped function against DuckDB's (spatial extension) on X2's shapes, invalid ones and curves included |
 | X6 | D1 | the range-join min == max string filter against a server: rows lost or not |
-| X7 | D4 | DuckDB at the pin: a `LogicalExtensionOperator` pass-through sink before a blockwise NL join; the dynamic filter reaching the catalog scan's `init_global` |
+| X7 | D4 | DuckDB at the pin: a `LogicalExtensionOperator` pass-through sink before a blockwise NL join; the dynamic filter reaching the catalog scan's `init_global`; a LEFT and an ANTI spatial join left without a hint, their answers equal to the unhinted plan's |
 | X8 | D2 | kNN on 100k / 1M `vector(1536)`: wire, server CPU, wall, against today's full read |
 
 ## PRs (each from main)
@@ -149,8 +258,8 @@ listed in `docs/type-mapping.md`.
 |---|---|
 | P0 | D1: FilterEncoder unwraps the optional join filters; IN on any type, ranges where `OrdersLikeDuckDB`; X6 and its fix; tests with a local table ⋈ a server table (1, 3, 40, 100 keys) |
 | P1 | D2: VECTOR_DISTANCE in the 079 vocabulary and the TOP N path; NULL / NaN emulation; X8 |
-| P2 | D3: spatial predicates with a constant; `sys.spatial_indexes` in the catalog; X4 |
-| P3 | D4: the bbox hint operator; X7 |
+| P2 | D3: spatial predicates with a constant, SRID-blind, geography in its planar form; `sys.spatial_indexes` in the catalog; X4, DQ-3 |
+| P3 | D4: the bbox hint operator; X7, with a LEFT and an ANTI spatial join left unhinted |
 | P4 | D5: the writer's spatial functions; X5 |
 
 The spatial extension is needed for P2's `ST_Intersects` forms and P4's tests: installed in CI (a

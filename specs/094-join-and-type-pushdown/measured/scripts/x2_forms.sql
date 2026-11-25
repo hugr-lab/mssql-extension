@@ -92,7 +92,7 @@ GO
 SET NOCOUNT ON; SET QUOTED_IDENTIFIER ON;
 DECLARE @box geometry = geometry::STGeomFromText('POLYGON((100 100, 300 100, 300 300, 100 300, 100 100))', 0);
 DECLARE @far geometry = geometry::STGeomFromText('POLYGON((5 5, 20 5, 20 20, 5 20, 5 5))', 0);
-BEGIN TRY SELECT 'two_boxes_or_on_invalid' AS form, COUNT(*) AS n FROM dbo.geo WHERE id = 200005 AND g.STIntersects(@far) = 1 OR g.STIntersects(@far) = 1; END TRY BEGIN CATCH SELECT 'two_boxes_or_on_invalid' AS form, -ERROR_NUMBER() AS n; END CATCH;
+BEGIN TRY SELECT 'two_boxes_or_on_invalid' AS form, COUNT(*) AS n FROM dbo.geo WHERE id = 200005 AND (g.STIntersects(@box) = 1 OR g.STIntersects(@far) = 1); END TRY BEGIN CATCH SELECT 'two_boxes_or_on_invalid' AS form, -ERROR_NUMBER() AS n; END CATCH;
 GO
 SET NOCOUNT ON; SET QUOTED_IDENTIFIER ON;
 DECLARE @box geometry = geometry::STGeomFromText('POLYGON((100 100, 300 100, 300 300, 100 300, 100 100))', 0);
@@ -104,7 +104,7 @@ GO
 SET NOCOUNT ON; SET QUOTED_IDENTIFIER ON;
 DECLARE @box geometry = geometry::STGeomFromText('POLYGON((100 100, 300 100, 300 300, 100 300, 100 100))', 0);
 DECLARE @far geometry = geometry::STGeomFromText('POLYGON((5 5, 20 5, 20 20, 5 20, 5 5))', 0);
-BEGIN TRY SELECT 'two_boxes_union_on_invalid' AS form, COUNT(*) AS n FROM dbo.geo WHERE id = 200005 AND g.STIntersects(@far.STUnion(@far)) = 1; END TRY BEGIN CATCH SELECT 'two_boxes_union_on_invalid' AS form, -ERROR_NUMBER() AS n; END CATCH;
+BEGIN TRY SELECT 'two_boxes_union_on_invalid' AS form, COUNT(*) AS n FROM dbo.geo WHERE id = 200005 AND g.STIntersects(@box.STUnion(@far)) = 1; END TRY BEGIN CATCH SELECT 'two_boxes_union_on_invalid' AS form, -ERROR_NUMBER() AS n; END CATCH;
 GO
 SET NOCOUNT ON; SET QUOTED_IDENTIFIER ON;
 DECLARE @box geometry = geometry::STGeomFromText('POLYGON((100 100, 300 100, 300 300, 100 300, 100 100))', 0);

@@ -3,7 +3,7 @@
 Sources: `duckdb/` submodule at `4569c0a1eeb27c69f7799d9a40453a4fc7c0299d`, the extension at `main` (`e604c797`).
 Plans come from `build/release/duckdb` (source id `4569c0a1ee`) run on local tables. No extension was loaded,
 so the MSSQL-side behaviour below is read from the source and was not run against a server. The scripts are
-`q*.sql` in this directory.
+`q*.sql` in `plans/`.
 
 Paths: `D/` = `duckdb/src/`, `X/` = the extension's `src/`.
 
@@ -267,7 +267,7 @@ Constraints:
 - Correctness: `bbox(a) ∩ bbox(b) ≠ ∅` holds exactly when the four inequalities hold, so the filter is a
   superset of `&&`. Empty geometries have NULL extents, and a NULL min/max is skipped (`physical_hash_join.cpp:1916-1921`).
 - Geography: DuckDB's `&&` on `GEOMETRY('OGC:CRS84')` is a planar lon/lat box. SQL Server geography has no
-  `STEnvelope`. Open: owner's call.
+  `STEnvelope`. Answered (owner, 2026-11-24; spec D3): converted to a planar geometry on the server.
 
 ### Option B: an extension operator fills the scan's `DynamicTableFilterSet`
 
@@ -395,7 +395,8 @@ Constraints:
   functions over a vector column and a constant, and let the `comparison_differs` gate pass this shape.
   - Without that, the filter runs in DuckDB over every row streamed.
   - A radius filter on the server is exact only up to float differences. A row near the boundary may be dropped
-    where DuckDB would keep it. Open, owner's call (D4 does not cover it).
+    where DuckDB would keep it. Answered in spec D2: the threshold widened by a float32 rounding bound in the
+    catalog scan (never consumed), vetoed in a statement pushed whole.
 
 ---
 
@@ -434,8 +435,8 @@ Constraints:
   - `g.STIntersects(@bbox)` is a **subset** of `g && c`: an L-shaped line whose box meets the constant's box may
     not meet the box itself. Wrong as a pushed filter.
   - `g.STEnvelope().STIntersects(@bbox)` is the exact `&&` for planar geometry, but likely not index-sargable.
-  - Whether `g.Filter(@bbox)` (spatial index) is a guaranteed superset of `&&` is **open**.
-  - Geography has no planar envelope (see Q3).
+  - Whether `g.Filter(@bbox)` (spatial index) is a guaranteed superset of `&&`: it is not for a non-point row (spec D3).
+  - Geography has no planar envelope (see Q3). Spec D3 converts it to a planar geometry.
 - Choosing which server predicate to push is an owner decision for the spec.
 
 ---
