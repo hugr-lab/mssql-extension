@@ -752,7 +752,12 @@ fuzzed by `fuzz_variant_envelope`) splits each envelope and writes the value's V
 spec 093 D3's table -- a string through spec 091's code-page kernels by its own collation, a
 `time(7)` / `datetime2(7)` in nanoseconds where they fit -- and `codec/variant/variant_codec` puts it
 in the vector. The column stays out of pushed comparisons and keys (`comparison_differs`): the server
-compares a `sql_variant` by its base type (#514).
+compares a `sql_variant` by its base type (#514). A backup's column is read by the same kernel (spec 093
+T8b, `DescribeSqlVariant`): its values are in the form a record stores them (`variant_disk_form`,
+`specs/093-type-kernels/measured/S1d.md`), and `SplitDiskVariant` gives what `SplitTdsVariant` gives for
+the same value -- bit's TDS base type, money's halves and datetime's / smalldatetime's parts in the TDS
+order, a string's 5-byte collation from its CollationId -- so `EncodeVariant` reads either alike; a disk
+value that is no `sql_variant` is NULL, counted for a WARNING, its row read.
 
 **`geometry` / `geography` are decoded on the client (spec 093 T5, D6).** The column is read bare: a
 UDT (`0xF0`, PLP) carrying the stored MS-SSCLRT bytes (G2), staged on the PLP binary arm. The
@@ -1701,8 +1706,9 @@ flowchart LR
   (vardecimal) refuses the table by name.
 - **How a column is read** (`ReadingOf`, PR 2d): never refused for its type (owner, 2026-11-11). A type
   the reader converts takes D6's DuckDB type -- every collation, the double-byte code pages included,
-  through spec 091's kernels on the client --; one whose conversion is still to come (`sql_variant`,
-  `xml`, the CLR types, `vector`, `json`, a type the reader does not know) is its stored bytes, a `BLOB`.
+  through spec 091's kernels on the client --, the CLR system types and `sql_variant` the TDS path's
+  kernels (spec 093 T8a / T8b, `backup_type_forms`); one whose conversion is still to come (`xml`, a user
+  CLR type, `vector`, `json`, a type the reader does not know) is its stored bytes, a `BLOB`.
   Not readable, named: a computed column not persisted (no stored value), a sparse column (the sparse
   vector, 086). The scan registers these as virtual columns, so `SELECT *` leaves them out and naming one is refused with its
   reason. `mssql_backup_tables.columns` and the scan take this one answer.

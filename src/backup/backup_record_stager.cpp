@@ -37,6 +37,10 @@ tds::ColumnMetadata MetadataOf(const CatalogColumn &c, const TypeForms &forms) {
 		DescribeClrSystemType(c, forms, m);
 		return m;
 	}
+	if (c.system_type_id == XTYPE_SQL_VARIANT) {
+		DescribeSqlVariant(m);
+		return m;
+	}
 	m.type_id = c.system_type_id;
 	if (c.system_type_id == XTYPE_BIT) {
 		m.type_id = tds::TDS_TYPE_BIT;
@@ -831,11 +835,15 @@ void RecordStager::Append(const RowRecord &row) {
 	count_++;
 }
 
-std::vector<RecordStager::ClrNote> RecordStager::ClrNotes() const {
-	std::vector<ClrNote> notes;
+std::vector<RecordStager::TypeNote> RecordStager::TypeNotes() const {
+	std::vector<TypeNote> notes;
 	for (const auto &col : columns_) {
-		if (col.spatial_notes.not_geometry + col.spatial_notes.malformed + col.hierarchyid_notes.malformed > 0) {
-			notes.push_back(ClrNote{col.name, col.meta.udt_type_name, col.spatial_notes, col.hierarchyid_notes});
+		const auto &v = col.variant_notes;
+		if (col.spatial_notes.not_geometry + col.spatial_notes.malformed + col.hierarchyid_notes.malformed +
+				v.malformed + v.unknown_collation + v.invalid_utf8 >
+			0) {
+			const std::string type = col.meta.variant_disk_form ? "sql_variant" : col.meta.udt_type_name;
+			notes.push_back(TypeNote{col.name, type, col.spatial_notes, col.hierarchyid_notes, v});
 		}
 	}
 	return notes;
@@ -854,11 +862,11 @@ void RecordStager::FinalizeChunk() {
 	begun_ = false;
 	for (size_t i = 0; i < columns_.size(); i++) {
 		const ColumnStaging &st = arena_.Column(i);
-		// A spatial or hierarchyid column's notes kept across chunks (spec 093 T8: a value the kernel cannot
-		// read is NULL, its row read); a sql_variant is still its stored bytes (T8b), so the kernel is never
-		// Variant.
+		// A spatial, hierarchyid or sql_variant column's notes kept across chunks (spec 093 T8: a value the
+		// kernel cannot read is NULL, its row read).
 		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, *targets_[i],
-											 nullptr, &columns_[i].spatial_notes, &columns_[i].hierarchyid_notes);
+											 &columns_[i].variant_notes, &columns_[i].spatial_notes,
+											 &columns_[i].hierarchyid_notes);
 		codec::staging::PublishStagedValidity(st, count_, *targets_[i]);
 	}
 	// The values written straight into their vectors, over their placeholders.

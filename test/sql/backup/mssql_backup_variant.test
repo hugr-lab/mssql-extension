@@ -1,0 +1,181 @@
+# name: test/sql/backup/mssql_backup_variant.test
+# description: Spec 093 T8b -- sql_variant read from a backup as VARIANT, by T1's kernel from the form a record stores it in
+# group: [mssql]
+#
+# test/data/backup/variant (test/backup/gen/variant.sql and variant_changes.sql, SQL Server 2025): every base type
+# at its edges (S1's values, measured/S1d.md for their disk form), a mixed column, a heap, ROW / PAGE compression,
+# values off row, a sql_variant clustered key, and a differential over the full. The oracle lane compares every
+# table with a RESTORE through TYPE mssql on 2017-2025; this pins the committed backup's values. No SQL Server
+# is needed.
+
+require mssql
+
+statement ok
+SET VARIABLE f = 'test/data/backup/variant/variant_full.bak';
+
+statement ok
+SET VARIABLE d = 'test/data/backup/variant/variant_diff.bak';
+
+# Read as VARIANT, as TYPE mssql reads it (T1): converted, no longer its stored bytes.
+query TTTT
+SELECT table_name, duckdb_type, state, reason FROM mssql_backup_columns(getvariable('f'), 'dbo')
+WHERE column_name = 'v' ORDER BY 1;
+----
+v_edges	VARIANT	converted	NULL
+v_heap	VARIANT	converted	NULL
+v_key	VARIANT	converted	NULL
+v_mixed	VARIANT	converted	NULL
+v_ovf	VARIANT	converted	NULL
+v_page	VARIANT	converted	NULL
+v_row	VARIANT	converted	NULL
+
+# Every base type at its edges: the disk form's bit, decimal widths, money, datetime and smalldatetime parts, and a
+# string's collation from its CollationId, read as the TDS path reads them (an instant with an offset as its UTC
+# microseconds).
+query ITT
+SELECT id, variant_typeof(v), CASE WHEN variant_typeof(v) LIKE '%TZ' THEN epoch_us(v::TIMESTAMPTZ)::VARCHAR ELSE v::VARCHAR END
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'v_edges') WHERE id < 55 ORDER BY id;
+----
+1	BOOL_TRUE	true
+2	BOOL_FALSE	false
+3	UINT8	255
+4	INT16	-32768
+5	INT32	-2147483648
+6	INT64	-9223372036854775808
+7	FLOAT	1.5
+8	DOUBLE	-1.25e+300
+9	DECIMAL(1, 1)	.5
+10	DECIMAL(9, 2)	-1234567.89
+11	DECIMAL(18, 0)	123456789012345678
+12	DECIMAL(19, 9)	1234567890.123456789
+13	DECIMAL(28, 8)	-12345678901234567890.12345678
+14	DECIMAL(38, 0)	99999999999999999999999999999999999999
+15	DECIMAL(38, 38)	-.00000000000000000000000000000000000001
+16	DECIMAL(10, 3)	12.500
+17	DECIMAL(19, 4)	-922337203685477.5808
+18	DECIMAL(10, 4)	214748.3647
+19	DATE	0001-01-01
+20	DATE	9999-12-31
+21	TIME_MICROS	23:59:59
+22	TIME_MICROS	10:00:00.123
+23	TIME_MICROS	10:00:00.123456
+24	TIME_NANOS	10:00:00.1234567
+25	TIMESTAMP_SEC	2026-01-01 10:00:00
+26	TIMESTAMP_MILIS	2026-01-01 10:00:00.123
+27	TIMESTAMP_MICROS	2026-01-01 10:00:00.123456
+28	TIMESTAMP_NANOS	2026-01-01 10:00:00.1234567
+29	TIMESTAMP_MICROS	9999-12-31 23:59:59.999999
+30	TIMESTAMP_MICROS	0001-01-01 00:00:00
+31	TIMESTAMP_MICROS	2026-11-13 07:08:09.123333
+32	TIMESTAMP_MICROS	2026-11-13 07:08:00
+33	TIMESTAMP_MICROS_TZ	1767211200000000
+34	TIMESTAMP_MICROS_TZ	1767312000123456
+35	TIMESTAMP_NANOS_TZ	1767241800123457
+36	TIMESTAMP_MICROS_TZ	253402300799999999
+37	UUID	6f9619ff-8b86-d011-b42d-00c04fc964ff
+38	BLOB	\x01\x02\x00\x00
+39	BLOB	\x01\x02\x03
+40	VARCHAR	ab
+41	VARCHAR	café
+42	VARCHAR	дом
+43	VARCHAR	漢字
+44	VARCHAR	😀é
+45	VARCHAR	ab
+46	VARCHAR	😀x
+47	VARCHAR	дом
+48	VARIANT_NULL	NULL
+49	VARCHAR	(empty)
+50	BLOB	(empty)
+51	VARCHAR	ελληνικά
+52	VARCHAR	한국어
+53	VARCHAR	中文
+54	VARCHAR	ąę
+
+# The longest values a sql_variant holds.
+query IIT
+SELECT id, length(v::VARCHAR), variant_typeof(v) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'v_edges') WHERE id >= 55 ORDER BY id;
+----
+55	8000	VARCHAR
+56	4000	VARCHAR
+57	32000	BLOB
+
+# ROW and PAGE compression read the same values (the CD record put back in its uncompressed form).
+query II
+SELECT (SELECT count(*) FROM (SELECT id, v FROM mssql_backup_scan(getvariable('f'), 'dbo', 'v_edges') EXCEPT ALL
+	SELECT id, v FROM mssql_backup_scan(getvariable('f'), 'dbo', 'v_row'))),
+	(SELECT count(*) FROM (SELECT id, v FROM mssql_backup_scan(getvariable('f'), 'dbo', 'v_edges') EXCEPT ALL
+	SELECT id, v FROM mssql_backup_scan(getvariable('f'), 'dbo', 'v_page')));
+----
+0	0
+
+query TI
+SELECT variant_typeof(v) AS t, count(*) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'v_mixed') GROUP BY t ORDER BY t;
+----
+BLOB	230
+DATE	231
+DECIMAL(12, 4)	231
+DECIMAL(19, 4)	231
+DOUBLE	231
+INT64	462
+TIMESTAMP_MICROS	231
+TIMESTAMP_NANOS	231
+UUID	230
+VARCHAR	462
+VARIANT_NULL	230
+
+# Values pushed off row (row-overflow), and the heap's grown rows.
+query IIT
+SELECT id, length(v::VARCHAR), _mssql_lob IS NOT NULL FROM mssql_backup_scan(getvariable('f'), 'dbo', 'v_ovf') ORDER BY id;
+----
+1	7000	true
+2	3900	true
+3	30000	true
+4	1	false
+5	7000	false
+
+query III
+SELECT count(*), count(v), sum(length(v::VARCHAR)) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'v_heap');
+----
+600	600	46651
+
+# A sql_variant clustered key, its uniquifier beside it.
+query ITT
+SELECT n, variant_typeof(v), v::VARCHAR FROM mssql_backup_scan(getvariable('f'), 'dbo', 'v_key') ORDER BY n;
+----
+1	INT32	1
+2	INT32	1
+3	VARCHAR	1
+4	DOUBLE	1.0
+5	DATE	2024-01-01
+6	VARCHAR	z
+7	VARCHAR	z
+
+# The differential over the full: values of another base type, NULL; the change listing.
+query ITT
+SELECT id, variant_typeof(v), v::VARCHAR FROM mssql_backup_scan(getvariable('f'), 'dbo', 'v_edges', diff := getvariable('d'))
+WHERE id IN (3, 5, 13, 48) ORDER BY id;
+----
+3	VARIANT_NULL	NULL
+5	VARCHAR	was 5
+13	VARIANT_NULL	NULL
+48	INT64	48
+
+query TI
+SELECT change_type, count(*) FROM mssql_backup_table_changes(getvariable('f'), 'dbo', 'v_mixed', diff := getvariable('d'))
+GROUP BY ALL ORDER BY ALL;
+----
+delete	61
+insert	200
+update_postimage	64
+update_preimage	64
+
+# An attached backup's table reads the same.
+statement ok
+ATTACH 'test/data/backup/variant/variant_full.bak' AS bv (TYPE mssql_backup);
+
+query TT
+SELECT variant_typeof(v), v::VARCHAR FROM bv.dbo.v_edges WHERE id IN (17, 31, 44) ORDER BY id;
+----
+DECIMAL(19, 4)	-922337203685477.5808
+TIMESTAMP_MICROS	2026-11-13 07:08:09.123333
+VARCHAR	😀é

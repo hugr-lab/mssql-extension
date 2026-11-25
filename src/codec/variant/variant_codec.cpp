@@ -41,19 +41,33 @@ MSSQL_SAME_TAG(TIMESTAMP_NANOS_TZ);
 
 namespace {
 
-//! Emits one root primitive a row: the envelope split and encoded into the builder's row blob.
+//! Emits one root primitive a row: the envelope split and encoded into the builder's row blob. A value a
+//! backup's record stores (col.variant_disk_form, spec 093 T8b) that is not a sql_variant is NULL, counted
+//! in `notes` -- an unreadable value never fails its table's read --; a TDS one fails the stream.
 struct EnvelopeSource {
 	const tds::ColumnMetadata &col;
 	VariantColumnNotes *notes;
+	DiskVariant disk;
 
-	void EmitEnvelope(const uint8_t *data, size_t size, VariantBuilder &builder) {
+	//! False for a disk value that is not a sql_variant, which the caller reads as NULL.
+	bool EmitEnvelope(const uint8_t *data, size_t size, VariantBuilder &builder) {
 		WireVariant wire;
 		std::string why;
 		const uint32_t offset = static_cast<uint32_t>(builder.blob.size());
 		VariantTag tag = VariantTag::VARIANT_NULL;
 		EncodeNote note;
-		if (!SplitTdsVariant(data, size, wire, why) || !EncodeVariant(wire, builder.blob, tag, note, why)) {
-			throw InvalidInputException("MSSQL: column \"%s\" holds %s. The TDS stream is malformed.", col.name, why);
+		const bool split = col.variant_disk_form ? SplitDiskVariant(data, size, wire, disk, why)
+												 : SplitTdsVariant(data, size, wire, why);
+		if (!split || !EncodeVariant(wire, builder.blob, tag, note, why)) {
+			if (col.variant_disk_form && notes) {
+				builder.blob.resize(offset);
+				if (notes->malformed++ == 0) {
+					notes->first_malformed = why;
+				}
+				return false;
+			}
+			throw InvalidInputException("MSSQL: column \"%s\" holds %s. The %s is malformed.", col.name, why,
+										col.variant_disk_form ? "backup's record" : "TDS stream");
 		}
 		builder.type_ids.push_back(static_cast<uint8_t>(tag));
 		builder.byte_offsets.push_back(offset);
@@ -61,29 +75,28 @@ struct EnvelopeSource {
 			notes->unknown_collation += note.unknown_collation;
 			notes->invalid_utf8 += note.invalid_utf8;
 		}
+		return true;
 	}
 };
 
 struct StagedSource : EnvelopeSource {
 	const staging::ColumnStaging &st;
 	StagedSource(const tds::ColumnMetadata &col_p, VariantColumnNotes *notes_p, const staging::ColumnStaging &st_p)
-		: EnvelopeSource{col_p, notes_p}, st(st_p) {}
+		: EnvelopeSource{col_p, notes_p, {}}, st(st_p) {}
 	bool Emit(idx_t row, VariantBuilder &builder) {
 		if (!st.IsValid(row)) {
 			return true;  // SQL NULL
 		}
-		EmitEnvelope(st.buffer.data() + st.offsets[row], st.lengths[row], builder);
-		return false;
+		return !EmitEnvelope(st.buffer.data() + st.offsets[row], st.lengths[row], builder);
 	}
 };
 
 struct OneValueSource : EnvelopeSource {
 	const std::vector<uint8_t> &bytes;
 	OneValueSource(const tds::ColumnMetadata &col_p, VariantColumnNotes *notes_p, const std::vector<uint8_t> &bytes_p)
-		: EnvelopeSource{col_p, notes_p}, bytes(bytes_p) {}
+		: EnvelopeSource{col_p, notes_p, {}}, bytes(bytes_p) {}
 	bool Emit(idx_t, VariantBuilder &builder) {
-		EmitEnvelope(bytes.data(), bytes.size(), builder);
-		return false;
+		return !EmitEnvelope(bytes.data(), bytes.size(), builder);
 	}
 };
 

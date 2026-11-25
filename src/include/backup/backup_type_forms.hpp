@@ -46,6 +46,11 @@ LogicalType ClrSystemTypeOf(const CatalogColumn &c, const TypeForms &forms);
 //! with the HierarchyId or Spatial kernel. IsClrSystemType(c) holds.
 void DescribeClrSystemType(const CatalogColumn &c, const TypeForms &forms, tds::ColumnMetadata &m);
 
+//! `m` made the TDS path's column of a sql_variant read from a record (spec 093 T8b): the Variant kernel's,
+//! its values in the form a record stores them (`variant_disk_form`: SplitDiskVariant), read as VARIANT
+//! as TYPE mssql reads them (T1).
+void DescribeSqlVariant(tds::ColumnMetadata &m);
+
 //! `geometry_as` as kept by a bind or a catalog: "" when neither the call nor the ATTACH gave one (the
 //! default, 'geometry'); `source` names where in a refusal.
 TypeForms TypeFormsOf(const std::string &geometry_as, const char *source);

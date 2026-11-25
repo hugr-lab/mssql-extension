@@ -46,6 +46,12 @@ void DescribeClrSystemType(const CatalogColumn &c, const TypeForms &forms, tds::
 	m.geometry_as = forms.geometry_as;
 }
 
+void DescribeSqlVariant(tds::ColumnMetadata &m) {
+	m.type_id = tds::TDS_TYPE_SQL_VARIANT;
+	m.max_length = tds::SQL_VARIANT_MAX_BYTES;
+	m.variant_disk_form = true;
+}
+
 std::string GeometryAsGiven(const std::string &value, const char *source) {
 	ParseGeometryAs(value, source);
 	return value;

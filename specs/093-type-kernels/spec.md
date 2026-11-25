@@ -747,7 +747,7 @@ it carries DQ-44, decided after the split.
 | **T5** | spatial read (D6): the MS-SSCLRT kernel, bare read, `GEOMETRY('OGC:CRS84')`, curves and malformed values NULL with a WARNING, `geometry_as`; G1, G3, G6, K1; `fuzz_ssclrt` | 5–7 |
 | **T6** | spatial write (D6): SRID from the CRS, the stage, client MS-SSCLRT for geometry if G4 passes, CTAS creates `geometry`; G4, G7 | 4–5 |
 | **T7** | `json` as `JSON` (D7) | 0.5 |
-| **T8** | the backup hookup (D9): `backup_type_forms.cpp`, the vector detection fixed, fixtures per type on 2017–2025; C1. Split (owner, 2026-11-24) into **T8a** the CLR system types (hierarchyid, geometry / geography, `geometry_as` as an ATTACH option and a call parameter; fixture `clr_types`), **T8b** `sql_variant`, **T8c** `datetime2_7_as`, **T8d** `vector` (V4 first). C1 was measured in #616 (fixture `clr`) | 2–3 |
+| **T8** | the backup hookup (D9): `backup_type_forms.cpp`, the vector detection fixed, fixtures per type on 2017–2025; C1. Split (owner, 2026-11-24) into **T8a** the CLR system types (hierarchyid, geometry / geography, `geometry_as` as an ATTACH option and a call parameter; fixture `clr_types`), **T8b** `sql_variant` (its disk form measured, `measured/S1d.md`: `SplitDiskVariant` puts it in the TDS form, T1's `EncodeVariant` reads it; fixture `variant`), **T8c** `datetime2_7_as`, **T8d** `vector` (V4 first). C1 was measured in #616 (fixture `clr`) | 2–3 |
 | **T9** | `datetime2(7)` (D8): the warning, `mssql_datetime2_7_as` and its ATTACH option, the read type through the key / filter / writer checks, the rewritten filters | 3–4 |
 
 **Total ≈ 31–41 days**, docs per PR included (README type table, `docs/type-mapping.md`,

@@ -1,5 +1,6 @@
-// Fuzz harness: a sql_variant value's TDS envelope (spec 093 T1, D3): SplitTdsVariant and EncodeVariant,
-// DuckDB-free. The input is one value's bytes after its u32 length. Checked beyond "no crash": a value
+// Fuzz harness: a sql_variant value's TDS envelope (spec 093 T1, D3) and the form a record stores it in (T8b):
+// SplitTdsVariant, SplitDiskVariant and EncodeVariant, DuckDB-free. The input is one value's bytes (after its u32
+// length over TDS), split by both. Checked beyond "no crash": a value
 // split is encoded or refused with a reason, never both; a payload is well-formed for its tag (a fixed
 // type's width, a DECIMAL's varint width and scale with the integer its width implies, a VARCHAR /
 // BLOB's varint length equal to the bytes that follow it), and a VARCHAR is valid UTF-8. Seeds: S1's
@@ -63,20 +64,16 @@ static size_t FixedWidth(VariantTag tag) {
 	}
 }
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-	WireVariant v;
+//! `v`, split from the input by either splitter, encoded or refused with a reason, never both, and a payload
+//! well-formed for its tag.
+static void Exercise(const WireVariant &v) {
 	std::string why;
-	if (size == 0 || !SplitTdsVariant(data, size, v, why)) {
-		return 0;
-	}
-	Require(v.value >= data && v.value + v.value_bytes == data + size);
 	std::string blob = "prefix";  // a payload is appended, never written over what the blob holds
 	VariantTag tag = VariantTag::VARIANT_NULL;
 	EncodeNote note;
-	why.clear();
 	if (!EncodeVariant(v, blob, tag, note, why)) {
 		Require(!why.empty() && blob == "prefix");
-		return 0;
+		return;
 	}
 	Require(blob.compare(0, 6, "prefix") == 0);
 	const std::string payload = blob.substr(6);
@@ -95,6 +92,33 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 		}
 	} else {
 		Require(FixedWidth(tag) != SIZE_MAX && payload.size() == FixedWidth(tag));
+	}
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+	if (size == 0) {
+		return 0;
+	}
+	WireVariant v;
+	std::string why;
+	if (SplitTdsVariant(data, size, v, why)) {
+		Require(v.value >= data && v.value + v.value_bytes == data + size);
+		Exercise(v);
+	} else {
+		Require(!why.empty());
+	}
+	// The same bytes as a record stores a value (spec 093 T8b): its value in the input, or (money, datetime,
+	// smalldatetime put in the TDS order) in the scratch, and the properties of a string in the scratch.
+	DiskVariant scratch;
+	WireVariant d;
+	why.clear();
+	if (SplitDiskVariant(data, size, d, scratch, why)) {
+		const bool in_input = d.value >= data && d.value + d.value_bytes == data + size;
+		const bool in_scratch = d.value == scratch.value && d.value_bytes <= sizeof(scratch.value);
+		Require(in_input || in_scratch);
+		Exercise(d);
+	} else {
+		Require(!why.empty());
 	}
 	return 0;
 }

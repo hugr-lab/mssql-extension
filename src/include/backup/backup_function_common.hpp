@@ -92,9 +92,9 @@ Value LsnValue(const Lsn &lsn);
 
 //! How the scan reads column `c` (owner, 2026-11-11: no refusal by type). A type the reader converts
 //! takes the DuckDB type TYPE mssql reads it as with native types off (D6: MapSQLServerTypeToDuckDB on
-//! the system type underneath an alias); a type whose conversion is still to come -- sql_variant,
-//! xml, the CLR types (geometry, geography, hierarchyid, a user's), vector, json, a type the reader
-//! does not know, a text whose collation is newer than the code-page tables -- is its stored bytes as
+//! the system type underneath an alias; the CLR system types and sql_variant by the TDS path's kernels,
+//! spec 093 T8); a type whose conversion is still to come -- xml, a user CLR type, vector, json, a type
+//! the reader does not know, a text whose collation is newer than the code-page tables -- is its stored bytes as
 //! they are, a BLOB (`raw`), until its decoder (086, together with the TDS path's). What is not a
 //! type gap is not readable: a computed column that is not persisted (no stored value) and a sparse
 //! column (its value is in the row's sparse vector, a storage format: 086). One answer for

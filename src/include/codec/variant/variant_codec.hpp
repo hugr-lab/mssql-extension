@@ -15,6 +15,7 @@
 #include "duckdb/common/types/vector.hpp"
 #include "tds/tds_column_metadata.hpp"
 
+#include <string>
 #include <vector>
 
 namespace duckdb {
@@ -28,6 +29,10 @@ struct VariantColumnNotes {
 	idx_t unknown_collation = 0;
 	//! char / varchar values under a UTF-8 collation whose bytes are not UTF-8, read as their bytes.
 	idx_t invalid_utf8 = 0;
+	//! Values a record stores that are not a sql_variant (spec 093 T8b, a backup's column only), read as
+	//! NULL; and the first one's reason.
+	idx_t malformed = 0;
+	std::string first_malformed;
 };
 
 //! The staged envelopes of `count` rows (`st`: Var staging, NULL rows invalid) into `out`, a fresh flat

@@ -7,7 +7,7 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types tail_window"): samples.sql, the database of the
+# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types tail_window variant"): samples.sql, the database of the
 # committed samples; catalog.sql, the catalog fixture (spec 085 PR 2b); partition.sql, E7's partitioning
 # database and more boundary types (PR 2c); files.sql, two data files and a second
 # filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
@@ -33,7 +33,11 @@
 # offset as binary, a user type past 8000 bytes, hierarchyid and geometry, uncompressed, ROW, PAGE and a heap
 # (clr_full; not run by default; committed under test/data/backup/clr, made by its generate.sh); clr_types.sql,
 # the CLR system types -- every geometry / geography form T5 reads, hierarchyid's -- in every storage form and
-# off row (spec 093 T8: clr_types_full; 2025's committed under test/data/backup/clr_types);
+# off row (spec 093 T8: clr_types_full, then clr_types_changes.sql's clr_types_diff, paired as clr_types_over;
+# 2025's committed under test/data/backup/clr_types); variant.sql,
+# sql_variant of every base type in every storage form and off row, then variant_changes.sql's changes and a
+# differential (spec 093 T8b: variant_full, variant_diff, paired as variant_over; 2025's committed under
+# test/data/backup/variant);
 # tail_window.sql, changes made at known points of a backup's copy -- the backup written into a FIFO this
 # script reads, held in its first data pass and inside its second (review of #591: tail_window_full, compared
 # with its RESTORE as compare_rows.sh's FUZZY; committed under test/data/backup/tail_window, made by its
@@ -56,7 +60,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types tail_window}"
+FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types tail_window variant}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -392,7 +396,17 @@ for fixture in ${FIXTURES}; do
 		sets+=("switch_full|switch_full.bak" "switch_diff|switch_diff.bak")
 		;;
 	clr_types)
-		sets+=("clr_types_full|clr_types_full.bak")
+		# Then clr_types_changes.sql's changes and differential (review of #621: the change listing on two states).
+		run_sql clr_types_changes.sql
+		sets+=("clr_types_full|clr_types_full.bak" "clr_types_diff|clr_types_diff.bak")
+		overlays+=("clr_types_over|clr_types_full|clr_types_diff")
+		;;
+	variant)
+		# sql_variant (spec 093 T8b), compressed; then variant_changes.sql's changes and differential.
+		golden bak_variant variant_full
+		run_sql variant_changes.sql
+		sets+=("variant_full|variant_full.bak" "variant_diff|variant_diff.bak")
+		overlays+=("variant_over|variant_full|variant_diff")
 		;;
 	tail_window)
 		# Changes at known points of a backup's data copy (spec 085 D11, review of #591; run by default, so the

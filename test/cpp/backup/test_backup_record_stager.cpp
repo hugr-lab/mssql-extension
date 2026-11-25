@@ -527,7 +527,6 @@ int main() {
 				ErrorOf([&]() { RecordStager(refused, {23}, TypeForms()); }).find("sparse vector") != std::string::npos,
 			"a computed column that is not persisted and a sparse column are not readable, by name");
 		const std::vector<std::pair<CatalogColumn, std::string>> raws = {
-			{Col(30, "variant", XTYPE_SQL_VARIANT, "sql_variant", 8016), "sql_variant"},
 			{Col(31, "doc", XTYPE_XML, "xml", -1), "binary XML"},
 			{Col(32, "point", XTYPE_CLR, "", 9), "a user CLR type"},
 			{Col(34, "j", 244, "json", -1), "json"},
@@ -538,7 +537,11 @@ int main() {
 			all_raw = all_raw && reading.readable && reading.raw && reading.type.id() == LogicalTypeId::BLOB &&
 					  reading.note.find(rc.second) != std::string::npos;
 		}
-		Check(all_raw, "sql_variant, xml, a user CLR type, json and an unknown type: their stored bytes, a BLOB");
+		Check(all_raw, "xml, a user CLR type, json and an unknown type: their stored bytes, a BLOB");
+		const ColumnReading sql_variant =
+			ReadingOf(Col(30, "variant", XTYPE_SQL_VARIANT, "sql_variant", 8016), TypeForms());
+		Check(sql_variant.readable && !sql_variant.raw && sql_variant.type.id() == LogicalTypeId::VARIANT,
+			  "a sql_variant: a VARIANT (spec 093 T8b)");
 		// Spec 093 T8: the CLR system types read by the TDS path's kernels; geometry_as as TYPE mssql's.
 		TypeForms wkb;
 		wkb.geometry_as = tds::GeometryAs::Wkb;
@@ -557,23 +560,31 @@ int main() {
 			ReadingOf(odd_collation, TypeForms()).raw &&
 				ReadingOf(odd_collation, TypeForms()).note.find("newer than the code-page tables") != std::string::npos,
 			"a varchar of a collation newer than the tables: its stored bytes");
-		// A raw column through the stager: a sql_variant's bytes as stored, a BLOB.
+		// A sql_variant through the stager (spec 093 T8b): its disk form read by T1's kernel; a value that is no
+		// sql_variant (version 2) NULL, counted in the column's notes, its row read.
 		CatalogTable with_variant = t;
 		with_variant.columns.push_back(Col(37, "variant", XTYPE_SQL_VARIANT, "sql_variant", 8016));
 		RowsetLayout variant_layout = layout;
 		variant_layout.columns.push_back(Phys(37, XTYPE_SQL_VARIANT, -2, 19));
 		const std::vector<uint8_t> variant = {0x38, 0x01, 0x2a, 0x00, 0x00, 0x00};	// an int 42 in a sql_variant
-		const Page variant_page = PageOf({Record(fixed, 19, 0, {note, variant})});
+		const std::vector<uint8_t> broken = {0x38, 0x02, 0x2a, 0x00, 0x00, 0x00};	// version 2: no sql_variant
+		const Page variant_page = PageOf({Record(fixed, 19, 0, {note, variant}), Record(fixed, 19, 0, {note, broken})});
 		RecordStager variant_stager(with_variant, {37}, TypeForms());
 		variant_stager.UseLayout(variant_layout);
 		DataChunk variant_chunk;
 		variant_chunk.Initialize(Allocator::DefaultAllocator(), variant_stager.Types());
 		variant_stager.BeginChunk(variant_chunk);
-		variant_stager.Append(ReadSlot(variant_page.bytes.data(), PAGE_SIZE, 1, 0, "the test"));
+		variant_stager.Append(ReadSlot(variant_page.bytes.data(), PAGE_SIZE, 2, 0, "the test"));
+		variant_stager.Append(ReadSlot(variant_page.bytes.data(), PAGE_SIZE, 2, 1, "the test"));
 		variant_stager.FinalizeChunk(variant_chunk);
-		Check(variant_stager.Types()[0].id() == LogicalTypeId::BLOB &&
-				  variant_chunk.GetValue(0, 0).ToString() == "8\\x01*\\x00\\x00\\x00",
-			  "a sql_variant column reads as its stored bytes: " + variant_chunk.GetValue(0, 0).ToString());
+		const auto variant_notes = variant_stager.TypeNotes();
+		Check(variant_stager.Types()[0].id() == LogicalTypeId::VARIANT &&
+				  variant_chunk.GetValue(0, 0).ToString() == "42" && variant_chunk.GetValue(0, 1).IsNull() &&
+				  variant_notes.size() == 1 && variant_notes[0].type == "sql_variant" &&
+				  variant_notes[0].variant.malformed == 1 &&
+				  variant_notes[0].variant.first_malformed.find("version 2") != std::string::npos,
+			  "a sql_variant column reads as a VARIANT, a value that is none NULL and noted: " +
+				  variant_chunk.GetValue(0, 0).ToString());
 		Check(ErrorOf([&]() { RecordStager(t, {99}, TypeForms()); }).find("has no column 99") != std::string::npos,
 			  "a column the table does not have");
 		RowsetLayout wrong = layout;

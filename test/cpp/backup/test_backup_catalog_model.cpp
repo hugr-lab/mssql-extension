@@ -621,10 +621,9 @@ int main() {
 		variant.decodable = true;
 		variant.columns = {column(1, XTYPE_INT, 4), column(2, XTYPE_SQL_VARIANT, 8016), column(3, XTYPE_VARCHAR, 100)};
 		const ColumnState v = StateOf(variant, variant.columns[1], TypeForms());
-		Check(std::string(v.state) == "stored_bytes" && v.reason.find("sql_variant") != std::string::npos &&
-				  v.reason.find("off row") == std::string::npos && state(variant, 2) == "converted",
-			  "a sql_variant: stored_bytes, its reason the type's alone; a varchar(100) beside it converted, though "
-			  "the row can pass 8,060 bytes: " +
+		Check(std::string(v.state) == "converted" && v.reason.empty() && state(variant, 2) == "converted",
+			  "a sql_variant converted (spec 093 T8b: a VARIANT); a varchar(100) beside it converted, though the row "
+			  "can pass 8,060 bytes: " +
 				  v.reason);
 		CatalogTable wide;
 		wide.decodable = true;

@@ -342,7 +342,7 @@ struct ScanGlobalState : public GlobalTableFunctionState {
 	idx_t lsn_output = DConstants::INVALID_INDEX;
 	idx_t lob_output = DConstants::INVALID_INDEX;
 	std::vector<idx_t> empty_outputs;  // COLUMN_IDENTIFIER_EMPTY (count(*)): a constant NULL
-	ClrWarnings clr_warnings;		   // spec 093 T8
+	TypeWarnings type_warnings;		   // spec 093 T8
 
 	std::mutex claim;
 	std::shared_ptr<const PartitionCursor> cutting;	 // the partition units are being cut from
@@ -1161,7 +1161,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		global.rows_read += count;
 		WarnPendingValues(context, data, global, local);
 		local.stager->FinalizeChunk();
-		global.clr_warnings.Say(context, data.function.c_str(), local.stager->ClrNotes());
+		global.type_warnings.Say(context, data.function.c_str(), local.stager->TypeNotes());
 		WriteVirtual(global, local, output, count);
 		for (idx_t c : global.empty_outputs) {
 			output.data[c].SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -1210,7 +1210,7 @@ TableFunction MakeScanFunction(const LogicalType &path, bool catalog = false) {
 
 }  // namespace
 
-void ClrWarnings::Say(ClientContext &context, const char *function, const std::vector<RecordStager::ClrNote> &notes) {
+void TypeWarnings::Say(ClientContext &context, const char *function, const std::vector<RecordStager::TypeNote> &notes) {
 	for (const auto &n : notes) {
 		std::lock_guard<std::mutex> guard(lock_);
 		if (n.spatial.not_geometry > 0 && said_.insert(n.name + "|curve").second) {
@@ -1235,6 +1235,25 @@ void ClrWarnings::Say(ClientContext &context, const char *function, const std::v
 							   "hierarchyid (the first: %s), read as NULL, their rows read",
 							   function, n.name.c_str(),
 							   codec::hierarchyid::DescribeStatus(n.hierarchyid.first_malformed));
+		}
+		// Spec 093 T8b: a sql_variant's value that is not one, NULL; a string the VARIANT cannot hold as
+		// text (TYPE mssql's rule, LogVariantNotes), its bytes.
+		if (n.variant.malformed > 0 && said_.insert(n.name + "|variant").second) {
+			DUCKDB_LOG_WARNING(context,
+							   "%s: column %s (sql_variant) holds values whose stored bytes cannot be read as a "
+							   "sql_variant (the first: %s), read as NULL, their rows read",
+							   function, n.name.c_str(), n.variant.first_malformed.c_str());
+		}
+		if (n.variant.unknown_collation + n.variant.invalid_utf8 > 0 && said_.insert(n.name + "|variant_text").second) {
+			const char *why = n.variant.unknown_collation && n.variant.invalid_utf8
+								  ? "under a collation this build has no code page for, or under a UTF-8 collation "
+									"with bytes that are not UTF-8"
+							  : n.variant.unknown_collation ? "under a collation this build has no code page for"
+															: "under a UTF-8 collation with bytes that are not UTF-8";
+			DUCKDB_LOG_WARNING(context,
+							   "%s: column %s (sql_variant) holds char / varchar values %s, read as their bytes (a "
+							   "BLOB inside the VARIANT)",
+							   function, n.name.c_str(), why);
 		}
 	}
 }

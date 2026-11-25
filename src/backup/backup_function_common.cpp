@@ -515,8 +515,6 @@ namespace {
 // storage type.
 std::string RawByType(const CatalogColumn &c, const std::string &type) {
 	switch (c.system_type_id) {
-	case XTYPE_SQL_VARIANT:
-		return "sql_variant (its base type, properties and value) is converted later, with the TDS path's";
 	case XTYPE_XML:
 		return "xml (stored as binary XML) is converted to text later, with the TDS path's";
 	case XTYPE_CLR:
@@ -588,6 +586,11 @@ ColumnReading TypeReading(const CatalogColumn &c, const TypeForms &forms) {
 	// Spec 093 T8 (D9): a type the TDS path's kernels read, read by them (backup_type_forms).
 	if (IsClrSystemType(c)) {
 		r.type = ClrSystemTypeOf(c, forms);
+		return r;
+	}
+	// Spec 093 T8b: a sql_variant as TYPE mssql reads it, by T1's kernel (its disk form: DescribeSqlVariant).
+	if (c.system_type_id == XTYPE_SQL_VARIANT) {
+		r.type = LogicalType::VARIANT();
 		return r;
 	}
 	const std::string type = c.system_type_name.empty()

@@ -121,13 +121,13 @@ std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const
 //! mssql_backup_table_changes / _insertions / _deletions, on `paths` (a path or a list of them).
 void RegisterBackupTableChangesFunctions(ExtensionLoader &loader, const vector<LogicalType> &paths);
 
-//! Spec 093 T8: the WARNINGs a statement's stagers' CLR notes call for (RecordStager::ClrNotes), each said
-//! once a column and kind a statement -- a curve under GEOMETRY, bytes that are not MS-SSCLRT, bytes that
-//! are not a hierarchyid's -- whichever task met it first. The values are NULL, their rows read (owner,
-//! 2026-11-20).
-class ClrWarnings {
+//! Spec 093 T8: the WARNINGs a statement's stagers' type notes call for (RecordStager::TypeNotes), each said
+//! once a column and kind a statement -- a curve under GEOMETRY, bytes that are not MS-SSCLRT, a hierarchyid's
+//! or a sql_variant's (those values NULL, their rows read: owner, 2026-11-20), a sql_variant string read as its
+//! bytes (T8b) -- whichever task met it first.
+class TypeWarnings {
 public:
-	void Say(ClientContext &context, const char *function, const std::vector<RecordStager::ClrNote> &notes);
+	void Say(ClientContext &context, const char *function, const std::vector<RecordStager::TypeNote> &notes);
 
 private:
 	std::mutex lock_;
