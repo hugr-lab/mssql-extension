@@ -138,6 +138,12 @@ bool IsTemporalTarget(LogicalTypeId id) {
 	}
 }
 
+//! The sources the datetime kernel reads as ticks: codec::datetime::TicksPerSecondFor's types.
+bool IsTimestampSource(LogicalTypeId id) {
+	return id == LogicalTypeId::TIMESTAMP || id == LogicalTypeId::TIMESTAMP_MS || id == LogicalTypeId::TIMESTAMP_NS ||
+		   id == LogicalTypeId::TIMESTAMP_SEC || id == LogicalTypeId::TIMESTAMP_TZ;
+}
+
 //! Whether the datetime kernel reads this source into this temporal target. The source must be the
 //! matching temporal storage: DATE is int32 days, the TIMESTAMP variants int64 ticks. Anything else is a
 //! conversion and goes the row path, which performs it.
@@ -156,12 +162,6 @@ bool IsTemporalTarget(LogicalTypeId id) {
 //! them (it used to return a constant 8 for every datetime2, so only
 //! datetime2(7) ever matched), which is safe because COLMETADATA for this
 //! token carries the SCALE and no length at all.
-//! The sources the datetime kernel reads as ticks: codec::datetime::TicksPerSecondFor's types.
-bool IsTimestampSource(LogicalTypeId id) {
-	return id == LogicalTypeId::TIMESTAMP || id == LogicalTypeId::TIMESTAMP_MS || id == LogicalTypeId::TIMESTAMP_NS ||
-		   id == LogicalTypeId::TIMESTAMP_SEC || id == LogicalTypeId::TIMESTAMP_TZ;
-}
-
 bool DatetimeKernelFits(const LogicalType &source, const mssql::BCPColumnMetadata &target) {
 	const LogicalTypeId to = target.duckdb_type.id();
 	const PhysicalType src = source.InternalType();
@@ -177,7 +177,8 @@ bool DatetimeKernelFits(const LogicalType &source, const mssql::BCPColumnMetadat
 	}
 	// A datetime2 or datetimeoffset target takes the timestamp types, whose unit the kernel asks the source's
 	// type for. Storing eight bytes is not enough: a BIGINT, a TIME or a DECIMAL(18) does too, and the kernel
-	// answers one of those with an InternalException where the row path converts it or refuses it by name.
+	// answered one of those with an InternalException. Such a pair keeps the row path, whose datetime
+	// encoder refuses it by name (codec::datetime::EncodeToBcp).
 	if (to == LogicalTypeId::TIMESTAMP_TZ) {
 		return IsTimestampSource(source.id()) && target.max_length == dt2_written + 2;
 	}

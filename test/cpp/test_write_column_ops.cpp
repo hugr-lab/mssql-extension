@@ -6,8 +6,9 @@
 //
 // One regression is pinned (found reading the resolver): a datetime2 / datetimeoffset target took the
 // datetime kernel for ANY source stored in eight bytes. The kernel asks the source's type for its tick
-// unit and answers a BIGINT, a TIME or a DECIMAL(18) with an InternalException, where the row path
-// converts the value or refuses it by name. The rest pins what the resolver already answered.
+// unit and answered a BIGINT, a TIME or a DECIMAL(18) with an InternalException -- and so did the row
+// path's encoder (review of #629). The resolver keeps such a pair on the row path, and the row path
+// refuses it by name. The rest pins what the resolver already answered.
 //
 // Part of STANDALONE_TEST_SOURCES (`make test-cpp`), which CI runs.
 
@@ -18,6 +19,7 @@
 #include "codec/write_column_ops.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb.hpp"
+#include "tds/encoding/bcp_row_encoder.hpp"
 
 using namespace duckdb;
 using namespace duckdb::mssql;
@@ -78,6 +80,50 @@ void TestDatetime() {
 	short_datetime2.max_length = 7;
 	Check(Arm(LogicalType::TIMESTAMP, short_datetime2) == ScatterArm::RowFallback,
 		  "a datetime2(7) declared one byte short keeps the row path");
+}
+
+//! `rows` values of `source` encoded for one column `target`; what the encoder threw, empty when it did not.
+std::string EncodeError(const LogicalType &source, const BCPColumnMetadata &target) {
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), {source});
+	const idx_t rows = 3;
+	for (idx_t row = 0; row < rows; row++) {
+		const int64_t micros = 1700000000000000LL + static_cast<int64_t>(row);
+		chunk.SetValue(0, row,
+					   source.id() == LogicalTypeId::BIGINT
+						   ? Value::BIGINT(micros)
+						   : Value::TIMESTAMP(timestamp_t(micros)).DefaultCastAs(source));
+	}
+	chunk.SetChildCardinality(rows);
+	vector<BCPColumnMetadata> columns = {target};
+	vector<uint8_t> bytes;
+	try {
+		tds::encoding::BCPRowEncoder::EncodeChunk(bytes, chunk, columns, nullptr);
+	} catch (std::exception &e) {
+		return ErrorData(e).RawMessage().empty() ? std::string("?") : ErrorData(e).Message();
+	}
+	return bytes.empty() ? std::string("no bytes") : std::string();
+}
+
+//! Regression (review of #629): the row path met the same InternalException as the kernel.
+void TestRowPathRefusesByName() {
+	std::cout << "the row path's refusal" << std::endl;
+	auto datetime2 = Column("datetime2", 8, 27, 7);
+	datetime2.name = "created";
+	auto offset = Column("datetimeoffset", 10, 34, 7);
+	offset.name = "seen";
+	Check(EncodeError(LogicalType::TIMESTAMP, datetime2).empty() &&
+			  EncodeError(LogicalType::TIMESTAMP_TZ, offset).empty(),
+		  "a TIMESTAMP into datetime2 and a TIMESTAMPTZ into datetimeoffset are written");
+	const auto bigint = EncodeError(LogicalType::BIGINT, datetime2);
+	Check(bigint.find("Invalid Input") != std::string::npos && bigint.find("created") != std::string::npos &&
+			  bigint.find("BIGINT") != std::string::npos && bigint.find("datetime2") != std::string::npos &&
+			  bigint.find("INTERNAL") == std::string::npos,
+		  "a BIGINT into datetime2 is refused, naming the column and both types (" + bigint + ")");
+	const auto into_offset = EncodeError(LogicalType::BIGINT, offset);
+	Check(into_offset.find("Invalid Input") != std::string::npos && into_offset.find("seen") != std::string::npos &&
+			  into_offset.find("datetimeoffset") != std::string::npos,
+		  "and into datetimeoffset (" + into_offset + ")");
 }
 
 void TestNumbers() {
@@ -143,6 +189,7 @@ void TestTheRest() {
 
 int main() {
 	TestDatetime();
+	TestRowPathRefusesByName();
 	TestNumbers();
 	TestTheRest();
 	std::cout << (failures ? "FAILED" : "all passed") << std::endl;
