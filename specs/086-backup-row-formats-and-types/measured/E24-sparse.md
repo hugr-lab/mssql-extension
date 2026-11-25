@@ -111,3 +111,27 @@ that is not persisted, and read as one (owner, 2026-11-24: decision A).
   walked as any.
 - **Everything after the value** (the kernels, `_mssql_lob`, the change listing's comparisons) is the
   regular columns' path.
+
+## Against the published descriptions (2026-11-25)
+
+Read after the review of #626: Mark Rasmussen's posts on the sparse vector and on complex columns
+(improve.dk, 2011; the OrcaMDF reader, `SparseVectorParser.cs`, `Records/Record.cs`,
+`Records/Parsers/PrimaryRecordEntityParser.cs`) and Qingsong Yao's post on sparse column storage
+(Microsoft, 2008). They agree with the layout above: tag 5, the count, the ids, the end offsets from the
+vector's start, the values, and no vector when every sparse value is NULL. Where they differ from what was
+measured here:
+
+- **How the vector is found.** OrcaMDF scans every complex variable column for id 5, whatever its place
+  or the null bitmap; the reader here takes the tag too, at the last variable column (before a back
+  pointer), which both posts describe as the vector's place.
+- **A 16-byte vector.** OrcaMDF takes every 16-byte complex column for a text / ntext / image root
+  pointer before it reads an id, and calls this a known bug in its own comments: a vector of one 8-byte
+  value (4 + 2 + 2 + 8 bytes) is lost. The tag decides here (`test_backup_rows`, a bigint entry beside a
+  NULL and beside an empty column).
+- **The ids.** Rasmussen names them `sys.columns` column ids. They are `sysrscols.hbcolid`: after `ALTER
+  COLUMN … ADD SPARSE` the value is under a new hbcolid, and after `DROP SPARSE` the old entry keeps the
+  dropped column's.
+- **An empty value before the vector.** Neither source describes it; Yao says only that trailing NULL
+  columns take no offsets and that the vector does not change that. Measured here (rows 8-11 of
+  `types_sparse`, 2019 / 2022 / 2025): an empty value closing the regular columns is not stored either.
+- **Checks.** OrcaMDF checks the tag alone; the reader checks every part (above).

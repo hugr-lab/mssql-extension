@@ -455,6 +455,27 @@ int main() {
 		Check(ErrorOf([&]() { locate(wide, 0, 3); }).find("sparse entry is 4 bytes, where its type takes 8") !=
 				  std::string::npos,
 			  "a fixed type's entry of another width is refused by name");
+		// A vector of 16 bytes -- one bigint entry: 4 + 2 + 2 + 8 --, the length of a text / ntext / image root
+		// pointer (OrcaMDF takes every 16-byte complex column for one and loses such a vector: the tag decides
+		// here), beside r1 NULL and beside an empty r1 (its null bit clear).
+		const char *SIXTEEN = "300008000300000003003601001f8005000100060010000807060504030201";
+		std::vector<uint8_t> sixteen = Hex(SIXTEEN);
+		std::vector<uint8_t> sixteen_empty_r1 = sixteen;
+		sixteen_empty_r1[10] = 0x34;
+		const Page sixteens = PageOf({sixteen, sixteen_empty_r1});
+		for (uint16_t slot = 0; slot < 2; slot++) {
+			const RecordView r16 = Slot(sixteens, slot);
+			const RowRecord row16 = RowRecord::Fixed(r16, wide);
+			const ValueRef big = row16.Locate(wide, 3);
+			uint64_t value = 0;
+			for (int b = 7; big.size == 8 && b >= 0; b--) {
+				value = value << 8 | big.data[b];
+			}
+			Check(row16.sparse.data && row16.sparse.size == 16 && row16.var_count == 0 && big.size == 8 &&
+					  value == 0x0102030405060708ULL,
+				  slot == 0 ? "a 16-byte vector beside a NULL r1: the vector, its bigint read"
+							: "a 16-byte vector beside an empty r1: the vector, its bigint read");
+		}
 	}
 	// After ALTER (E24): DROP SPARSE moves y into the fixed part (hbcolid 4) and keeps the old entry under the dropped
 	// column's hbcolid 2; ADD SPARSE moves x into the vector under a new hbcolid (5), the old fixed x dropped.
