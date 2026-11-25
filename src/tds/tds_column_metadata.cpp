@@ -235,26 +235,6 @@ bool ReadString(Cursor &in, ColumnMetadata &column) {
 	return in.U16(column.max_length) && ReadCollation(in, column);
 }
 
-// TIME / DATETIME2 / DATETIMEOFFSET.
-//
-// The scale is checked HERE, once per column, because every consumer of it
-// scales by ten to that power: `Pow10(scale)` overflows int64 past 18, which
-// is undefined behaviour, and the fuzz harness reached it (spec 059 D4).
-// Checking at each use would put the test on the per-value path to catch
-// something the metadata already knows. MS-TDS caps these at 7.
-bool ReadScale(Cursor &in, ColumnMetadata &column) {
-	if (!in.U8(column.scale)) {
-		return false;
-	}
-	if (column.scale > 7) {
-		throw std::runtime_error("Column '" + column.name + "' declares fractional-second scale " +
-								 std::to_string(column.scale) +
-								 "; TIME, DATETIME2 and DATETIMEOFFSET allow 0..7. "
-								 "The TDS stream is malformed.");
-	}
-	return true;
-}
-
 //! XML: the SCHEMA_PRESENT flag and, when set, the schema collection's database and owning schema
 //! (B_VARCHAR) and its name (US_VARCHAR), none of which the extension keeps.
 bool ReadXml(Cursor &in, ColumnMetadata &column) {
@@ -287,25 +267,9 @@ bool ReadVariant(Cursor &in, ColumnMetadata &column) {
 }
 
 //! VECTORTYPE (spec 093 D4, measured V1): a u16 max length -- 8 + dimensions x element size -- and the
-//! element type. Checked once here, as the temporal scale is: the read divides by the element size
-//! and sizes the output's arrays by the dimensions.
+//! element type.
 bool ReadVector(Cursor &in, ColumnMetadata &column) {
-	if (!in.Has(3)) {
-		return false;
-	}
-	in.U16(column.max_length);
-	in.U8(column.vector_element_type);
-	if (column.vector_element_type != VECTOR_ELEMENT_FLOAT32 && column.vector_element_type != VECTOR_ELEMENT_FLOAT16) {
-		throw std::runtime_error("a vector column declares element type " + std::to_string(column.vector_element_type) +
-								 " (0 float32, 1 float16). The TDS stream is malformed.");
-	}
-	const uint16_t element = VectorElementBytes(column.vector_element_type);
-	if (column.max_length <= VECTOR_HEADER_BYTES || (column.max_length - VECTOR_HEADER_BYTES) % element != 0 ||
-		(column.max_length - VECTOR_HEADER_BYTES) / element > VECTOR_MAX_DIMENSIONS) {
-		throw std::runtime_error("a vector column declares a maximum length of " + std::to_string(column.max_length) +
-								 " bytes, which no vector(1..1998) has. The TDS stream is malformed.");
-	}
-	return true;
+	return in.U16(column.max_length) && in.U8(column.vector_element_type);
 }
 
 //! Legacy LOBs (issue #197). Their TYPE_INFO is unlike anything else: a 4-byte LONGLEN, a collation
@@ -363,7 +327,7 @@ bool ReadTypeInfo(Cursor &in, ColumnMetadata &column) {
 	case TypeInfoForm::BINARY:
 		return in.U16(column.max_length);
 	case TypeInfoForm::SCALE:
-		return ReadScale(in, column);
+		return in.U8(column.scale);
 	case TypeInfoForm::XML:
 		return ReadXml(in, column);
 	case TypeInfoForm::UDT:
@@ -378,10 +342,65 @@ bool ReadTypeInfo(Cursor &in, ColumnMetadata &column) {
 	return true;
 }
 
+[[noreturn]] void Malformed(const ColumnMetadata &column, const std::string &declares) {
+	throw std::runtime_error("Column '" + column.name + "' declares " + declares + " The TDS stream is malformed.");
+}
+
+//! A vector's element type and maximum length: the read divides by the element size and sizes the
+//! output's arrays by the dimensions.
+void CheckVector(const ColumnMetadata &column) {
+	if (column.vector_element_type != VECTOR_ELEMENT_FLOAT32 && column.vector_element_type != VECTOR_ELEMENT_FLOAT16) {
+		Malformed(column,
+				  "vector element type " + std::to_string(column.vector_element_type) + " (0 float32, 1 float16).");
+	}
+	const uint16_t element = VectorElementBytes(column.vector_element_type);
+	if (column.max_length <= VECTOR_HEADER_BYTES || (column.max_length - VECTOR_HEADER_BYTES) % element != 0 ||
+		(column.max_length - VECTOR_HEADER_BYTES) / element > VECTOR_MAX_DIMENSIONS) {
+		Malformed(column, "a vector's maximum length as " + std::to_string(column.max_length) +
+							  " bytes, which no vector(1..1998) has.");
+	}
+}
+
+// What a declaration may say, checked HERE, once per column, because the consumers trust it on the
+// per-value path, where a test would catch only what the metadata already knows:
+//   - a fractional-second scale: everything downstream scales by ten to that power, and `Pow10(scale)`
+//     overflows int64 past 18, which is undefined behaviour; the fuzz harness reached it (spec 059 D4).
+//     MS-TDS caps TIME / DATETIME2 / DATETIMEOFFSET at 7.
+//   - a DECIMAL / NUMERIC precision and scale: they become DuckDB's DECIMAL(p, s), and a precision past
+//     38 is an InternalException there (measured), where a malformed stream is an error of the stream.
+//   - a vector's element type and length.
+// After the name, so the error can say which column.
+void CheckDeclaration(const TypeEntry &type, const ColumnMetadata &column) {
+	switch (type.form) {
+	case TypeInfoForm::SCALE:
+		if (column.scale > 7) {
+			Malformed(column, "fractional-second scale " + std::to_string(column.scale) +
+								  "; TIME, DATETIME2 and DATETIMEOFFSET allow 0..7.");
+		}
+		break;
+	case TypeInfoForm::DECIMAL:
+		if (column.precision < 1 || column.precision > 38 || column.scale > column.precision) {
+			Malformed(column, "precision " + std::to_string(column.precision) + " and scale " +
+								  std::to_string(column.scale) +
+								  "; DECIMAL and NUMERIC allow a precision of 1..38 and a scale up to it.");
+		}
+		break;
+	case TypeInfoForm::VECTOR:
+		CheckVector(column);
+		break;
+	default:
+		break;
+	}
+}
+
 //! One column: UserType (255 marks a vector column in every form it streams, spec 093 T3), flags,
 //! TYPE_INFO and the name (B_VARCHAR).
 bool ReadColumn(Cursor &in, ColumnMetadata &column) {
-	return in.U32(column.user_type) && in.U16(column.flags) && ReadTypeInfo(in, column) && in.BVarchar(column.name);
+	if (!in.U32(column.user_type) || !in.U16(column.flags) || !ReadTypeInfo(in, column) || !in.BVarchar(column.name)) {
+		return false;
+	}
+	CheckDeclaration(*FindType(column.type_id), column);
+	return true;
 }
 
 }  // namespace
