@@ -7,7 +7,7 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types"): samples.sql, the database of the
+# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types tail_window"): samples.sql, the database of the
 # committed samples; catalog.sql, the catalog fixture (spec 085 PR 2b); partition.sql, E7's partitioning
 # database and more boundary types (PR 2c); files.sql, two data files and a second
 # filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
@@ -34,6 +34,10 @@
 # (clr_full; not run by default; committed under test/data/backup/clr, made by its generate.sh); clr_types.sql,
 # the CLR system types -- every geometry / geography form T5 reads, hierarchyid's -- in every storage form and
 # off row (spec 093 T8: clr_types_full; 2025's committed under test/data/backup/clr_types);
+# tail_window.sql, changes made at known points of a backup's copy -- the backup written into a FIFO this
+# script reads, held in its first data pass and inside its second (review of #591: tail_window_full, compared
+# with its RESTORE as compare_rows.sh's FUZZY; committed under test/data/backup/tail_window, made by its
+# generate.sh);
 # bench_changes.sql, a benchmark of 10 million rows and differentials of 10k / 110k / 1.1M changes and an index rebuild
 # (PR 4c-3: bench_full, bench_diff_*, each also compressed as *_x; not run by default). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
@@ -51,7 +55,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types}"
+FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types tail_window}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -388,6 +392,98 @@ for fixture in ${FIXTURES}; do
 		;;
 	clr_types)
 		sets+=("clr_types_full|clr_types_full.bak")
+		;;
+	tail_window)
+		# Changes at known points of a backup's data copy (spec 085 D11, review of #591; run by default, so the
+		# lane checks it on every version; 2025's committed under test/data/backup/tail_window by its
+		# generate.sh). The two open transactions first, in the background; their output to logs in /tmp,
+		# which the server's user can write.
+		for s in open parallel; do
+			docker exec -d -e SQLCMDPASSWORD "${CONTAINER}" sh -c '"$@" >/tmp/tail_window_'"${s}"'.log 2>&1' sh \
+				"${SQLCMD[@]}" -S localhost -U sa -b -i "/tmp/gen/tail_window_${s}.sql"
+		done
+		tw_failed() {	# $1 = what went wrong
+			echo "ERROR: the tail_window fixture $1; its logs:" >&2
+			docker exec "${CONTAINER}" sh -c 'cat /tmp/tail_window_*.log 2>/dev/null' >&2 || true
+			exit 1
+		}
+		tw_wait() {	# $1 = a query answering 1 when what is waited for holds
+			local _
+			for _ in $(seq 1 300); do
+				[ "$(scalar "$1" || true)" = 1 ] && return 0
+				sleep 0.2
+			done
+			return 1
+		}
+		tw_wait "SELECT CASE WHEN (SELECT COUNT(*) FROM bak_tail_window.dbo.rollback_insert WITH (READUNCOMMITTED)) = 150
+			AND (SELECT COUNT(*) FROM bak_tail_window.dbo.rollback_delete WITH (READUNCOMMITTED)) = 50
+			AND (SELECT n FROM tw_control.dbo.opened WITH (READUNCOMMITTED)) = 1
+			AND (SELECT COUNT(*) FROM bak_tail_window.dbo.parallel_open WITH (READUNCOMMITTED)) = 2000 THEN 1 ELSE 0 END" ||
+			tw_failed "open transactions did not make their changes in 60 s"
+		# A trial backup of the same layout: where its second data pass starts is where the real one's does (a
+		# stream header, so at a multiple of 512 -- an MSDA of the filler's random bytes is not), and where its
+		# log (MQTL) does.
+		tw_with="CHECKSUM, BUFFERCOUNT = 2, MAXTRANSFERSIZE = 65536, NAME = 'tail_window_full'"
+		sql -Q "BACKUP DATABASE bak_tail_window TO DISK = '${DIR}/tail_window_trial.bak' WITH FORMAT, INIT, COPY_ONLY, ${tw_with}" >/dev/null
+		pass2="$(docker exec "${CONTAINER}" sh -c "grep -obUa MSDA '${DIR}/tail_window_trial.bak' | awk -F: '\$1 % 512 == 0 { n++; if (n == 2) print \$1 }'")"
+		log_at="$(docker exec "${CONTAINER}" sh -c "grep -obUa MQTL '${DIR}/tail_window_trial.bak' | awk -F: '\$1 % 4 == 0 { print \$1; exit }'")"
+		docker exec "${CONTAINER}" rm -f "${DIR}/tail_window_trial.bak" "${DIR}/tail_window_chain.bak" "${DIR}/tail_window_chain.trn"
+		# The reader holds twice. With a second data pass (2019 on): 512 KiB in (within the first pass), then
+		# 256 KiB or more past the second pass's start (tail_window_pass1.sql at the first, pass2.sql at the
+		# second). SQL Server 2017 copies the data once (its pages changed meanwhile are in the log only: the
+		# lane's 2017 backups): one hold, 512 KiB before its log -- inside the filler, the file's last extents,
+		# past the other tables' pages -- for pass2.sql, the first hold's script skipped. The server waits on
+		# its writes meanwhile (two 64 KiB buffers and the pipe's: it reads up to about 192 KiB ahead).
+		if [ -n "${pass2}" ]; then
+			hold1=8
+			hold2=$(((pass2 + 65535) / 65536 + 4 - hold1))
+			first_script=tail_window_pass1.sql
+			[ "${hold2}" -gt 0 ] || tw_failed "second data pass at ${pass2}, before the first hold"
+			echo ">> tail_window: the second data pass at ${pass2}; the reader holds at ${hold1} and $((hold1 + hold2)) blocks of 64 KiB"
+		else
+			[ -n "${log_at}" ] || tw_failed "trial backup has neither a second data pass nor a log stream"
+			hold1=$(((log_at - 524288) / 65536))
+			hold2=0
+			first_script=""
+			[ "${hold1}" -gt 8 ] || tw_failed "log stream at ${log_at}, too close to the data's start"
+			echo ">> tail_window: one data pass, its log at ${log_at}; the reader holds at ${hold1} blocks of 64 KiB"
+		fi
+		docker exec "${CONTAINER}" sh -c "rm -f ${DIR}/tw.fifo ${DIR}/tw.h1 ${DIR}/tw.g1 ${DIR}/tw.h2 ${DIR}/tw.g2 && mkfifo ${DIR}/tw.fifo"
+		docker exec -d "${CONTAINER}" sh -c "{ dd bs=65536 count=${hold1} iflag=fullblock 2>/dev/null; touch ${DIR}/tw.h1;
+			while [ ! -e ${DIR}/tw.g1 ]; do sleep 0.2; done; dd bs=65536 count=${hold2} iflag=fullblock 2>/dev/null;
+			touch ${DIR}/tw.h2; while [ ! -e ${DIR}/tw.g2 ]; do sleep 0.2; done; cat; } <${DIR}/tw.fifo >${DIR}/tail_window_full.bak"
+		# The backup through the FIFO. It writes every block, then fails to set the file's size (error 31 in
+		# DiskChangeFileSize, 3013; measured on 2022 and 2025): a FIFO has none. The file is whole -- RESTORE
+		# VERIFYONLY below. A version that sets no size ends it with its success line, also taken.
+		docker exec -d -e SQLCMDPASSWORD "${CONTAINER}" sh -c '"$@" >/tmp/tail_window_backup.log 2>&1' sh \
+			"${SQLCMD[@]}" -S localhost -U sa -Q "BACKUP DATABASE bak_tail_window TO DISK = '${DIR}/tw.fifo' WITH FORMAT, INIT, ${tw_with}"
+		backing_up="SELECT CASE WHEN EXISTS (SELECT 1 FROM sys.dm_exec_requests WHERE command LIKE 'BACKUP%') THEN 1 ELSE 0 END"
+		for hold in 1 2; do
+			for _ in $(seq 1 300); do
+				docker exec "${CONTAINER}" test -e "${DIR}/tw.h${hold}" && break
+				sleep 0.2
+			done
+			docker exec "${CONTAINER}" test -e "${DIR}/tw.h${hold}" || tw_failed "reader did not reach hold ${hold} in 60 s"
+			[ "$(scalar "${backing_up}" || true)" = 1 ] || tw_failed "backup was not running at hold ${hold}"
+			echo ">> tail_window: held $(scalar "SELECT CAST(percent_complete AS int) FROM sys.dm_exec_requests WHERE command LIKE 'BACKUP%'")% into the backup"
+			if [ "${hold}" = 2 ]; then
+				run_sql tail_window_pass2.sql
+			elif [ -n "${first_script}" ]; then
+				run_sql "${first_script}"
+			fi
+			docker exec "${CONTAINER}" touch "${DIR}/tw.g${hold}"
+		done
+		tw_wait "SELECT 1 - (${backing_up#SELECT })" || tw_failed "backup did not end 60 s after the reader went on"
+		if docker exec "${CONTAINER}" grep -v -e DiskChangeFileSize -e '^Processed ' -e '^Msg 3634' -e '^Msg 3013' -e 'successfully processed' -e 'terminating abnormally' -e '^ *$' /tmp/tail_window_backup.log; then
+			tw_failed "backup said more than its FIFO's size error"
+		fi
+		sql -Q "RESTORE VERIFYONLY FROM DISK = '${DIR}/tail_window_full.bak'" >/dev/null || tw_failed "backup does not verify"
+		sql -Q "UPDATE tw_control.dbo.phase SET n = 3" >/dev/null
+		tw_wait "SELECT CASE WHEN (SELECT COUNT(*) FROM bak_tail_window.dbo.parallel_open WITH (READUNCOMMITTED)) = 0 THEN 1 ELSE 0 END" ||
+			tw_failed "open transaction did not end 60 s after it was asked to"
+		docker exec "${CONTAINER}" rm -f "${DIR}/tw.fifo" "${DIR}/tw.h1" "${DIR}/tw.g1" "${DIR}/tw.h2" "${DIR}/tw.g2"
+		run_sql tail_window_report.sql
+		sets+=("tail_window_full|tail_window_full.bak")
 		;;
 	history_break)
 		# A full restored over its database between two fulls (review of #612): a new recovery fork.

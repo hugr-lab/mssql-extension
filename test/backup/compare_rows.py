@@ -24,7 +24,12 @@ does not) a table may differ, and its fuzzy_status (mssql_backup_tables) is chec
 a table that differs from the restored one must not be 'consistent', and one that does not differ must be
 (acceptance 6: every differing table flagged, no consistent table flagged). Only the rows are compared
 there: a fuzzy backup may hold a row twice (a split torn by the backup, E3§3), so _mssql_rid and
-_mssql_lob are not.
+_mssql_lob are not. A table differs too when a column's system type is not the restored one's (an ALTER
+COLUMN in the tail: the values may compare equal across the two types). --flagged-equal names the tables
+(schema.table, comma-separated) that may read 'stale' while equal: the status's known price (an index
+rebuilt in the tail frees its old extents as a TRUNCATE does, backup_fuzzy). --must-differ names the tables
+that must differ from the restored ones: a fixture whose changes are made at known points of the copy
+(tail_window), so a run that missed its window fails rather than passing on equal tables.
 """
 import argparse
 import json
@@ -163,6 +168,11 @@ def main():
                         help="compare the backup's log with fn_dump_dblog over these server paths (comma-separated)")
     parser.add_argument("--fuzzy", action="store_true",
                         help="a backup taken under load: check each table's fuzzy_status against whether it differs")
+    parser.add_argument("--flagged-equal", default="",
+                        help="with --fuzzy: tables (schema.table, comma-separated) that may read 'stale' while equal")
+    parser.add_argument("--must-differ", default="",
+                        help="with --fuzzy: tables (schema.table, comma-separated) that must differ from the restored ones; "
+                             "one not compared (absent, not decodable) is a failure")
     args = parser.parse_args()
     try:
         session = Session(args.duckdb, os.environ["MSSQL_ROWS_PORT"], os.environ["MSSQL_ROWS_PASSWORD"],
@@ -182,7 +192,8 @@ def main():
 
     ok, tables = session.query(
         f"SELECT schema_name, table_name, shape, decodable, reason, fuzzy_status, open_transactions, stale_transactions, "
-        f"to_json([{{'name': c.name, 'decodable': c.decodable, 'reason': c.reason}} FOR c IN columns]) AS columns "
+        f"to_json([{{'name': c.name, 'decodable': c.decodable, 'reason': c.reason, 'system_type_id': c.system_type_id}} "
+        f"FOR c IN columns]) AS columns "
         # The user tables, which the RESTOREd database gives through TYPE mssql (a system or internal table is
         # read through the DAC only); compare_catalog.py reads every other table whole.
         f"FROM mssql_backup_tables({paths}{opts}) WHERE type = 'U' AND NOT is_ms_shipped ORDER BY schema_name, table_name")
@@ -191,6 +202,8 @@ def main():
 
     compared, failures, rows_total = 0, [], 0
     statuses = {}
+    must_differ = [n for n in args.must_differ.split(",") if n]
+    checked = set()  # the --must-differ tables compared (review of #619: one absent or skipped passed silently)
     for t in tables:
         schema, table = t["schema_name"], t["table_name"]
         where = f"{schema}.{table}"
@@ -230,17 +243,37 @@ def main():
             if args.fuzzy:
                 fuzzy = t["fuzzy_status"]
                 statuses[fuzzy] = statuses.get(fuzzy, 0) + 1
+                # The columns' system types against the restored table's.
+                object_name = (tsql_ident(schema) + "." + tsql_ident(table)).replace("'", "''")
+                types_sql = ("SELECT name, CAST(system_type_id AS int) AS system_type_id FROM sys.columns "
+                             f"WHERE object_id = OBJECT_ID(N'{object_name}')")
+                ok, server_types = session.query(f"SELECT * FROM mssql_scan('srv', {sql_string(types_sql)})")
+                if not ok:
+                    failures.append(f"{where}: its columns on the server: {server_types.splitlines()[0] if server_types else 'failed'}")
+                    break
+                backup_typed = sorted((c["name"], int(c["system_type_id"])) for c in columns)
+                server_typed = sorted((c["name"], int(c["system_type_id"])) for c in server_types)
+                retyped = backup_typed != server_typed
+                differs = differs or retyped
                 verdict = "ok"
+                allowed = where in [n for n in args.flagged_equal.split(",") if n]
+                checked.add(where)
+                if not differs and where in must_differ:
+                    failures.append(f"{where}: equal to the restored table, where its changes were made after its "
+                                    "copy: the fixture missed its window")
                 if differs and fuzzy == "consistent":
                     verdict = "MISSED"
                     failures.append(f"{where}: differs from the restored table ({only_backup} rows only in the backup, "
                                     f"{only_server} only on the server) but its fuzzy_status is 'consistent'")
+                elif not differs and fuzzy == "stale" and allowed:
+                    verdict = "known"
                 elif not differs and fuzzy != "consistent":
                     verdict = "FLAGGED"
                     failures.append(f"{where}: equal to the restored table but its fuzzy_status is '{fuzzy}' "
                                     f"({t['open_transactions']} open, {t['stale_transactions']} stale transactions)")
                 print(f"  {verdict:7} {where}: {fuzzy} ({t['open_transactions']} open, {t['stale_transactions']} stale), "
-                      f"{'differs' if differs else 'equal'}: {only_backup} rows only in the backup, {only_server} only "
+                      f"{'differs' if differs else 'equal'}{' (its columns retyped)' if retyped else ''}: "
+                      f"{only_backup} rows only in the backup, {only_server} only "
                       f"on the server, {backup_rows} against {server_rows} rows")
                 compared += 1
                 rows_total += backup_rows
@@ -381,6 +414,9 @@ def main():
         else:
             print(f"  ok   {where}: equal, _mssql_rid included; each of {len(described)} columns alone too")
 
+    for name in must_differ if args.fuzzy else []:
+        if name not in checked:
+            failures.append(f"{name}: named by --must-differ but not compared (not in the listing, or not decodable)")
     if args.fuzzy:
         print(f"compare_rows: fuzzy_status of the tables compared: "
               f"{', '.join(f'{n} {k}' for k, n in sorted(statuses.items())) or 'none'}")

@@ -1,0 +1,153 @@
+# name: test/sql/backup/mssql_backup_tail_window.test
+# description: D11's status of changes made at known points of a backup's copy, against its RESTORE (review of #591)
+# group: [mssql]
+#
+# test/data/backup/tail_window (test/backup/gen/tail_window.sql, SQL Server 2025): the backup written into a
+# FIFO that generate.sh reads, held in its first data pass and inside its second, which copies again only
+# the extents changed during the first. The changes made while it is held in the second pass are in the
+# tail and not in the copies. What a RESTORE of it holds (tail_window_report.sql), table by table:
+#   stale_update     100 rows, sum(v) 10        (an UPDATE committed: the copy lacks it)
+#   rollback_insert  100 rows                   (a transaction rolled back, its log hardened: the copy
+#   rollback_delete  100 rows                    holds its 50 inserted rows and lacks its 50 deleted ones)
+#   rollback_loaded  0 rows                     (the same transaction's INSERT ... WITH (TABLOCK) into a heap:
+#                                                the copy holds its 1000 rows; review of #619)
+#   rollback_truncated  100 rows                (the same transaction's TRUNCATE: the copy lacks the rows, its
+#                                                IAM page freed and given back by the rollback; review of #619)
+#   savepoint        110 rows, sum(v) 10        (rows, a savepoint, rows, a rollback to it, a commit)
+#   rollback_grown   0 rows                     (rows inserted into an empty table, on pages taken into use
+#                                                after the copy, rolled back there: consistent, a control)
+#   parallel_open    0 rows                     (a parallel INSERT ... WITH (TABLOCK), DOP 4, left open:
+#                                                logged as page images, under the one transaction id)
+#   open_truncated   100 rows                   (that open transaction's TRUNCATE, before the backup: the copy
+#                                                lacks the rows, its IAM page freed; review of #619)
+#   open_grown       100 rows                   (the same, on a table first filled inside the tail by a
+#                                                transaction committed there: its IAM page formatted in the tail)
+#   loaded           1000 rows                  (an INSERT ... WITH (TABLOCK) into a heap: page images)
+#   truncated        0 rows                     (a TRUNCATE: only its extents freed)
+#   rebuilt          100 rows                   (an index rebuilt: the old extents freed, the rows equal)
+#   widened          100 rows, bigint           (ALTER COLUMN int -> bigint: every row rewritten)
+#   static, src, filler                         (no change in the tail)
+# Every table that differs is flagged, and rebuilt, equal, is too: the price of not missing a TRUNCATE.
+# The oracle lane checks the same against a RESTORE on every version (compare_rows.sh FUZZY). No SQL
+# Server is needed.
+
+require mssql
+
+statement ok
+SET VARIABLE tw = 'test/data/backup/tail_window/tail_window_full.bak';
+
+query TTII
+SELECT table_name, fuzzy_status, open_transactions, stale_transactions FROM mssql_backup_tables(getvariable('tw'))
+WHERE type = 'U' ORDER BY 1;
+----
+filler	consistent	0	0
+loaded	stale	0	1
+open_grown	dirty	1	0
+open_truncated	dirty	1	0
+parallel_open	dirty	1	0
+rebuilt	stale	0	1
+rollback_delete	stale	0	1
+rollback_grown	consistent	0	0
+rollback_insert	stale	0	1
+rollback_loaded	stale	0	1
+rollback_truncated	stale	0	1
+savepoint	stale	0	1
+src	consistent	0	0
+stale_update	stale	0	1
+static	consistent	0	0
+truncated	stale	0	1
+widened	stale	0	1
+
+# The two transactions the generator held open: one rolled back inside the window, one open past LastLSN.
+query TTT
+SELECT name, status, list_sort(list_transform(tables, lambda x: x.table_name || ' ' || coalesce(x.effect, '-')))
+FROM mssql_backup_transactions(getvariable('tw')) WHERE name LIKE 'tw%' ORDER BY 1;
+----
+tw_parallel	open	[open_grown dirty, open_truncated dirty, parallel_open dirty, sysallocunits dirty, sysrowsets dirty]
+tw_undo	rolled back	[rollback_delete stale, rollback_insert stale, rollback_loaded stale, rollback_truncated stale, sysallocunits stale, sysrowsets stale]
+
+query TIII
+SELECT consistent, open_transactions, committed_after_checkpoint, rolled_back_after_checkpoint
+FROM mssql_backup_info(getvariable('tw'));
+----
+false	1	11	2
+
+# The rows as the copies hold them (against the RESTORE's in the header).
+statement ok
+SET mssql_backup_fuzzy = 'ignore';
+
+query TII
+SELECT 'stale_update', count(*), sum(v) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'stale_update')
+UNION ALL SELECT 'rollback_insert', count(*), sum(v) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rollback_insert')
+UNION ALL SELECT 'rollback_delete', count(*), sum(v) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rollback_delete')
+UNION ALL SELECT 'rollback_loaded', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rollback_loaded')
+UNION ALL SELECT 'rollback_truncated', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rollback_truncated')
+UNION ALL SELECT 'rollback_grown', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rollback_grown')
+UNION ALL SELECT 'savepoint', count(*), sum(v) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'savepoint')
+UNION ALL SELECT 'parallel_open', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'parallel_open')
+UNION ALL SELECT 'open_truncated', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'open_truncated')
+UNION ALL SELECT 'open_grown', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'open_grown')
+UNION ALL SELECT 'loaded', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'loaded')
+UNION ALL SELECT 'truncated', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'truncated')
+UNION ALL SELECT 'rebuilt', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rebuilt')
+UNION ALL SELECT 'widened', count(*), sum(v) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'widened');
+----
+stale_update	100	0
+rollback_insert	150	50
+rollback_delete	50	0
+rollback_loaded	1000	NULL
+rollback_truncated	0	NULL
+rollback_grown	0	NULL
+savepoint	100	0
+parallel_open	2000	NULL
+open_truncated	0	NULL
+open_grown	0	NULL
+loaded	0	NULL
+truncated	100	NULL
+rebuilt	100	NULL
+widened	100	5050
+
+# The copy's column is the one before the ALTER COLUMN.
+query TT
+SELECT column_name, sql_type FROM mssql_backup_columns(getvariable('tw'), 'dbo', 'widened') ORDER BY column_id;
+----
+id	int
+v	int
+
+# One WARNING for each flagged table a statement reads, through the attached catalog too.
+statement ok
+SET mssql_backup_fuzzy = 'warn';
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+ATTACH 'test/data/backup/tail_window/tail_window_full.bak' AS tw (TYPE mssql_backup);
+
+query I
+SELECT (SELECT count(*) FROM tw.dbo.truncated) + (SELECT count(*) FROM tw.dbo.loaded) + (SELECT count(*) FROM tw.dbo.static);
+----
+200
+
+query T
+SELECT string_agg(regexp_extract(message, 'dbo\.(\w+ is \w+) in this backup', 1), ', ' ORDER BY message)
+FROM duckdb_logs WHERE message LIKE 'mssql_backup_scan: dbo.% in this backup%';
+----
+loaded is stale, truncated is stale
+
+statement ok
+SET enable_logging = false;
+
+# Refused by name where an importer asks for consistent tables only.
+statement error
+SELECT count(*) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'truncated', fuzzy := 'error');
+----
+dbo.truncated is stale in this backup
+
+query I
+SELECT count(*) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'static', fuzzy := 'error');
+----
+100

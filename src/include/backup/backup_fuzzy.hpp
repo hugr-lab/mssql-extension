@@ -67,6 +67,15 @@ struct FuzzySummary {
 		Lsn newest;
 		//! Its transaction was rolled back (in `finished` only).
 		bool rolled_back = false;
+		//! A change of an IAM page: extents freed (review of #619).
+		bool iam = false;
+		//! Extents it freed on an IAM page holding rows its transaction did not put there (`foreign_page`) were
+		//! set again by the same transaction after (review of #619): a TRUNCATE whose rollback gives them back --
+		//! and, freeing its IAM page, gives that back too.
+		bool regained = false;
+		//! Its page holds rows its transaction did not put there: one the database had before the tail (not
+		//! formatted in it), or one of a unit another transaction committed rows on in the tail (review of #619).
+		bool foreign_page = false;
 	};
 	struct Unit {
 		//! By page, (file << 32) | page: the finished transactions' changes (flag (iv)) and the open ones'
@@ -94,7 +103,7 @@ struct FuzzySummary {
 		Lsn end;		   // its COMMIT / ABORT, zero when none
 		std::string name;  // the BEGIN_XACT's (fn_dblog's Transaction Name)
 		uint32_t records = 0;
-		uint32_t row_operations = 0;	// IsRowOperation in a row context
+		uint32_t row_operations = 0;	// changes of rows a reader sees (backup_fuzzy's IsRowChange)
 		bool after_checkpoint = false;	// a row operation after CheckpointLSN
 	};
 	//! By transaction id; the id 0 (records of no transaction) is not one.

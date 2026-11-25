@@ -32,6 +32,7 @@ constexpr uint8_t INSERT_ROWS = 0x02;
 constexpr uint8_t DELETE_ROWS = 0x03;
 constexpr uint8_t MODIFY_ROW = 0x04;
 constexpr uint8_t MODIFY_COLUMNS = 0x06;
+constexpr uint8_t SET_BITS = 0x07;
 constexpr uint8_t DELETE_SPLIT = 0x0b;
 constexpr uint8_t EXPUNGE_ROWS = 0x0d;
 constexpr uint8_t BEGIN_XACT = 0x80;
@@ -39,11 +40,17 @@ constexpr uint8_t COMMIT_XACT = 0x81;
 constexpr uint8_t ABORT_XACT = 0x82;
 }  // namespace log_op
 
+//! The contexts the fuzzy status reads beside the row contexts (fn_dump_dblog's LCX_ codes).
+namespace log_context {
+constexpr uint8_t IAM = 0x0a;
+}  // namespace log_context
+
 //! An operation that changes a row a reader sees (D11: what flags (iii) and (iv) count): INSERT_ROWS,
 //! DELETE_ROWS, MODIFY_ROW, MODIFY_COLUMNS, DELETE_SPLIT. Not FORMAT_PAGE, which lays out an empty page,
 //! nor EXPUNGE_ROWS, which removes a ghost (a row already deleted): measured on the load fixture, 37 pages
 //! formatted after CheckpointLSN, none in the image, held no row of the restored table (E3's redo needs
-//! both, spec 090; the status does not).
+//! both, spec 090; the status does not). A FORMAT_PAGE that carries the page's image (a bulk load's) and
+//! extents freed from a unit's IAM page are the status's too (backup_fuzzy, fixture tail_window).
 bool IsRowOperation(uint8_t op);
 
 //! A context in which a row operation changes the rows of a data or LOB page (E3§6, fn_dump_dblog's names):
@@ -125,6 +132,11 @@ private:
 	std::vector<uint8_t> chunk_;
 	size_t in_ = 0;	 // within the chunk: the next block
 	bool span_ended_ = false;
+	//! The block before the next one: each must follow it (NextBlock).
+	bool has_previous_ = false;
+	uint32_t previous_vlf_ = 0;
+	uint32_t previous_id_ = 0;
+	uint16_t previous_size_ = 0;
 	std::vector<uint8_t> block_;
 	std::vector<LogRecord> records_;
 	size_t next_ = 0;

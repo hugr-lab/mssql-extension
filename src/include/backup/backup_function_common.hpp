@@ -46,7 +46,7 @@ FuzzyMode FuzzyModeOf(ClientContext &context, const std::string &given, const ch
 void AddFuzzyParameter(TableFunction &function);
 std::string FuzzyParameterOf(const named_argument_map_t &named, const char *function);
 //! The status, in the backup whose log tail is `tail` and pages `pages`, of the table whose rows are in
-//! `units` (a user table's BaseUnitsOf; a system base table's, which the model does not describe), acted
+//! `units` (BaseUnitsOf the table: a user table's or a system one's, all described by the model), acted
 //! on as `mode` says: one that is not consistent gets one WARNING in duckdb_logs (warn) or is refused by
 //! name (error). `name` ("dbo.t") is what it is called there, `function` the caller; `memo`, when given,
 //! keeps the units' answers (the backup's FuzzinessMemo, whose tail and pages these are). Returns the status.

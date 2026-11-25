@@ -28,5 +28,7 @@ OUT="${HERE}/history_break" VERSION="${VERSION}" FIXTURES=history_break "${HERE}
 OUT="${HERE}/clr" VERSION="${VERSION}" FIXTURES=clr "${HERE}/../../backup/gen/generate.sh"
 # The CLR system types in every storage form, read by the TDS path's kernels (spec 093 T8).
 OUT="${HERE}/clr_types" VERSION="${VERSION}" FIXTURES=clr_types "${HERE}/../../backup/gen/generate.sh"
+# Changes at known points of a backup's copy, the backup written into a FIFO (review of #591: D11's status).
+OUT="${HERE}/tail_window" VERSION="${VERSION}" FIXTURES=tail_window "${HERE}/../../backup/gen/generate.sh"
 # Values stored off row changed every way, then a shrink (spec 085 PR 4c-3, the LOB tail).
 OUT="${HERE}/lob_changes" VERSION="${VERSION}" FIXTURES=lob_changes exec "${HERE}/../../backup/gen/generate.sh"

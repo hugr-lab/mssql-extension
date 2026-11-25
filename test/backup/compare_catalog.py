@@ -433,11 +433,17 @@ def main():
                 # How often a table that is not the user's reads dirty or stale under a workload (review of
                 # #607: mssql_backup_catalog under fuzzy := 'error' refuses those): said, not checked.
                 ok, out = db.try_query(
-                    "SELECT type, coalesce(fuzzy_status, 'unknown') AS status, count(*)::VARCHAR AS n "
+                    "SELECT type, coalesce(fuzzy_status, 'unknown') AS status, count(*)::VARCHAR AS n, "
+                    "string_agg(CASE WHEN fuzzy_status IS DISTINCT FROM 'consistent' THEN table_name END, ', ' "
+                    "ORDER BY table_name) AS tables "
                     f"FROM mssql_backup_tables({arg}) WHERE type <> 'U' GROUP BY ALL ORDER BY ALL")
                 if ok:
                     print(f"compare_catalog: {name}: fuzzy status of the tables not the user's: " +
-                          ", ".join(f"{r['type']} {r['status']} {r['n']}" for r in json.loads(out or "[]")))
+                          ", ".join(f"{r['type']} {r['status']} {r['n']}" + (f" ({r['tables']})" if r['tables'] else "")
+                                    for r in json.loads(out or "[]")))
+                else:
+                    print(f"compare_catalog: {name}: fuzzy status of the tables not the user's not read: "
+                          f"{(out or 'failed').splitlines()[0]}")
             continue
         for kind in ("columns", "views", "modules", "partitioning", "boundaries", "partitions"):
             if f"{name}.{kind}.txt" not in texts:

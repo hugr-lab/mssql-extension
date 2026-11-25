@@ -1778,7 +1778,32 @@ before the next opens.
       LCX_INDEX_LEAF, LCX_TEXT_MIX, LCX_TEXT_TREE, LCX_MARK_AS_GHOST): a PFS update (logged as a
       MODIFY_ROW under the unit allocated), interior index rows and 37 pages formatted after the
       checkpoint named a table's unit on pages that held none of its rows -- a table equal to the RESTORE
-      read stale;
+      read stale. Two more since (review of #591, fixture `tail_window`: changes made at known points of a
+      backup's copy -- the backup written into a FIFO the generator reads, held in its first data pass and
+      inside its second, which copies again only the extents changed during the first -- each table against
+      its RESTORE on 2022 and 2025): a FORMAT_PAGE in a row context that carries the page's image (an
+      `INSERT … WITH (TABLOCK)` into a heap logs no INSERT_ROWS: one left open read consistent with its rows
+      in the copy), and a SET_BITS clearing bits of a unit's IAM page, extents freed (a small table's
+      TRUNCATE logs nothing else: it read consistent with the copy's rows gone; an index rebuild frees the
+      old unit's extents alike and reads stale with its rows equal -- the price; extents allocated are not
+      counted: an allocation may commit on its own -- AllocFirstPage, a transaction of the system's -- while the rows
+      put there stay open; review of #619: extents a transaction sets on an IAM page where it freed some
+      widen that change -- a rolled-back TRUNCATE's compensation --, and such a change on an IAM page the
+      backup holds as not live that holds rows the transaction did not put there -- the tail did not format
+      it (one the database had), or another transaction committed rows on its unit in the tail (a TRUNCATE
+      frees its IAM page, which the rollback gives back) -- shows when given back after CheckpointLSN, and a
+      change of an open transaction on such a page always (a TRUNCATE still open: the image lacks the rows a
+      RESTORE gives back, fixture tables open_truncated and open_grown, the latter first filled inside the
+      tail; an open transaction's own rows on a page the database had, then truncated, read dirty though
+      equal: the price); extents freed on an IAM
+      page not live in the image show for no committed transaction, rows on it being in neither the image nor
+      a RESTORE; fixture tables rollback_loaded and rollback_truncated, a TABLOCK load and a TRUNCATE rolled
+      back in the second pass, and the control rollback_grown, an insert into an empty table rolled back
+      there, consistent). Still not counted: a large table's TRUNCATE (deferred: its extents freed later),
+      a partition switched in the tail, pages freed from a mixed extent. Measured there too:
+      a ROLLBACK does not harden the log and a backup copies only the hardened log, so an undo not flushed by
+      the backup's end is past LastLSN (the transaction reads open, which the RESTORE undoes alike); a
+      parallel INSERT (DOP 4) logs every worker under the one transaction id;
     - (iii) by the page copy: dirty when an open transaction's oldest change on a page is no newer than the
       copy (the copy holds what RESTORE undoes); one written after the copies read dirty while equal;
     - (iv): a committed transaction (or one with no BEGIN in the tail) stale when its newest change on a
