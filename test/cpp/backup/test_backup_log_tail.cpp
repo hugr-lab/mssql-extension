@@ -312,6 +312,19 @@ int main() {
 		Check(ChangeShows(true, c, PageState::Present, lsn(10), checkpoint) &&
 				  !ChangeShows(true, c, PageState::Present, lsn(9), checkpoint),
 			  "open: dirty from its oldest change on");
+		// Open, on a page the backup holds as not live: extents freed on an IAM page the database had before the
+		// tail are a TRUNCATE still open, whose rows the image lacks (review of #619); rows, or an IAM page the
+		// tail formatted, hold nothing a RESTORE keeps.
+		Check(!ChangeShows(true, c, PageState::NotLive, lsn(0), checkpoint),
+			  "open: rows on a page not live: as RESTORE");
+		c.iam = true;
+		Check(!ChangeShows(true, c, PageState::NotLive, lsn(0), checkpoint),
+			  "open: extents freed on an IAM page the tail formatted: as RESTORE");
+		c.foreign_page = true;
+		Check(ChangeShows(true, c, PageState::NotLive, lsn(0), checkpoint),
+			  "open TRUNCATE, its IAM page not live in the backup: dirty");
+		Check(ChangeShows(true, c, PageState::Pending, lsn(0), checkpoint),
+			  "open, on a page the backup may hold: dirty");
 	}
 	std::cout << "a tail read to its LastLSN (TailReachesLast)" << std::endl;
 	{

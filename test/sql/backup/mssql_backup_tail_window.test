@@ -18,6 +18,10 @@
 #                                                after the copy, rolled back there: consistent, a control)
 #   parallel_open    0 rows                     (a parallel INSERT ... WITH (TABLOCK), DOP 4, left open:
 #                                                logged as page images, under the one transaction id)
+#   open_truncated   100 rows                   (that open transaction's TRUNCATE, before the backup: the copy
+#                                                lacks the rows, its IAM page freed; review of #619)
+#   open_grown       100 rows                   (the same, on a table first filled inside the tail by a
+#                                                transaction committed there: its IAM page formatted in the tail)
 #   loaded           1000 rows                  (an INSERT ... WITH (TABLOCK) into a heap: page images)
 #   truncated        0 rows                     (a TRUNCATE: only its extents freed)
 #   rebuilt          100 rows                   (an index rebuilt: the old extents freed, the rows equal)
@@ -38,6 +42,8 @@ WHERE type = 'U' ORDER BY 1;
 ----
 filler	consistent	0	0
 loaded	stale	0	1
+open_grown	dirty	1	0
+open_truncated	dirty	1	0
 parallel_open	dirty	1	0
 rebuilt	stale	0	1
 rollback_delete	stale	0	1
@@ -57,7 +63,7 @@ query TTT
 SELECT name, status, list_sort(list_transform(tables, lambda x: x.table_name || ' ' || coalesce(x.effect, '-')))
 FROM mssql_backup_transactions(getvariable('tw')) WHERE name LIKE 'tw%' ORDER BY 1;
 ----
-tw_parallel	open	[parallel_open dirty]
+tw_parallel	open	[open_grown dirty, open_truncated dirty, parallel_open dirty, sysallocunits dirty, sysrowsets dirty]
 tw_undo	rolled back	[rollback_delete stale, rollback_insert stale, rollback_loaded stale, rollback_truncated stale, sysallocunits stale, sysrowsets stale]
 
 query TIII
@@ -79,6 +85,8 @@ UNION ALL SELECT 'rollback_truncated', count(*), NULL FROM mssql_backup_scan(get
 UNION ALL SELECT 'rollback_grown', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rollback_grown')
 UNION ALL SELECT 'savepoint', count(*), sum(v) FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'savepoint')
 UNION ALL SELECT 'parallel_open', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'parallel_open')
+UNION ALL SELECT 'open_truncated', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'open_truncated')
+UNION ALL SELECT 'open_grown', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'open_grown')
 UNION ALL SELECT 'loaded', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'loaded')
 UNION ALL SELECT 'truncated', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'truncated')
 UNION ALL SELECT 'rebuilt', count(*), NULL FROM mssql_backup_scan(getvariable('tw'), 'dbo', 'rebuilt')
@@ -92,6 +100,8 @@ rollback_truncated	0	NULL
 rollback_grown	0	NULL
 savepoint	100	0
 parallel_open	2000	NULL
+open_truncated	0	NULL
+open_grown	0	NULL
 loaded	0	NULL
 truncated	100	NULL
 rebuilt	100	NULL

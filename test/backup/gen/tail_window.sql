@@ -17,6 +17,10 @@
 --                    rolled back there: the copy and a RESTORE both empty (consistent; review of #619)
 --   parallel_open    rows inserted by a parallel plan (MAXDOP 4) in a transaction open past LastLSN: the
 --                    copy holds them, a RESTORE undoes them (dirty)
+--   open_truncated   a TRUNCATE TABLE by that open transaction, before the backup: the copy lacks the
+--                    rows, its IAM page freed; a RESTORE has them again (dirty; review of #619)
+--   open_grown       empty until rows committed inside the tail (its IAM page formatted there), then
+--                    truncated by that open transaction: the same (dirty; review of #619)
 --   loaded           an INSERT ... SELECT WITH (TABLOCK) into an empty heap in the second pass
 --   truncated        a TRUNCATE TABLE in the second pass
 --   rebuilt          an ALTER INDEX REBUILD in the second pass (the rows unchanged)
@@ -85,6 +89,8 @@ CREATE TABLE dbo.rebuilt (id int NOT NULL, v int NOT NULL, CONSTRAINT pk_rebuilt
 CREATE TABLE dbo.widened (id int PRIMARY KEY, v int NOT NULL);
 CREATE TABLE dbo.static (id int PRIMARY KEY, v int NOT NULL);
 CREATE TABLE dbo.parallel_open (id int NOT NULL, v int NOT NULL, pad char(100) NOT NULL);
+CREATE TABLE dbo.open_truncated (id int PRIMARY KEY, v int NOT NULL);
+CREATE TABLE dbo.open_grown (id int PRIMARY KEY, v int NOT NULL);
 CREATE TABLE dbo.loaded (id int NOT NULL, v int NOT NULL, pad char(100) NOT NULL);
 INSERT INTO dbo.stale_update SELECT id, 0 FROM dbo.src WHERE id <= 100;
 INSERT INTO dbo.rollback_insert SELECT id, 0 FROM dbo.src WHERE id <= 100;
@@ -92,6 +98,7 @@ INSERT INTO dbo.rollback_delete SELECT id, 0 FROM dbo.src WHERE id <= 100;
 INSERT INTO dbo.rollback_truncated SELECT id, 0 FROM dbo.src WHERE id <= 100;
 INSERT INTO dbo.savepoint SELECT id, 0 FROM dbo.src WHERE id <= 100;
 INSERT INTO dbo.truncated SELECT id, 0 FROM dbo.src WHERE id <= 100;
+INSERT INTO dbo.open_truncated SELECT id, 0 FROM dbo.src WHERE id <= 100;
 INSERT INTO dbo.rebuilt SELECT id, 0 FROM dbo.src WHERE id <= 100;
 INSERT INTO dbo.widened SELECT id, id FROM dbo.src WHERE id <= 100;
 INSERT INTO dbo.static SELECT id, 0 FROM dbo.src WHERE id <= 100;

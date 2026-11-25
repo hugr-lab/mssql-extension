@@ -80,7 +80,8 @@ const CodeName OPERATION_NAMES[] = {
 	{0x99, "LOP_END_CKPT"},
 	{0x9a, "LOP_BUF_WRITE"},  // met on 2019 / 2022 (fn_dump_dblog of the load fixture's log)
 	{0xb0, "LOP_CREATE_ALLOCCHAIN"},
-	{0xdd, "LOP_INVALIDATE_CACHE"},	 // met on 2025 (tail_window: DDL)
+	{0xd6, "LOP_BULK_EXT_ALLOCATION"},	// met on 2017, 2022, 2025 (tail_window: rollback_grown)
+	{0xdd, "LOP_INVALIDATE_CACHE"},		// met on 2025 (tail_window: DDL)
 };
 
 const CodeName CONTEXT_NAMES[] = {
@@ -101,6 +102,7 @@ const CodeName CONTEXT_NAMES[] = {
 	{0x13, "LCX_MARK_AS_GHOST"},
 	{0x17, "LCX_BOOT_PAGE_CKPT"},
 	{0x18, "LCX_DIFF_MAP"},
+	{0x1d, "LCX_BULK_OPERATION_PAGE"},	// met on 2017, 2022, 2025 (tail_window: rollback_grown)
 };
 
 //! `code`'s name among `names`, or `prefix` and the code in hex (LOP_0x9B) for one not met.

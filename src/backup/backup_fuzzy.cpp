@@ -128,13 +128,26 @@ public:
 		std::unordered_map<ChangeKey, size_t, ChangeKeyHash>().swap(index_);
 		for (auto &unit : changes_) {
 			auto &out = summary_.units[unit.first];
+			// The committed transactions with rows on the unit: a page of it formatted in the tail holds their rows
+			// too, not only the change's own transaction's (review of #619).
+			std::unordered_set<uint64_t> committed_rows;
+			for (const auto &page : unit.second) {
+				for (const auto &c : page.second) {
+					if (!c.iam && !open(c.transaction) && !rolled_back(c.transaction)) {
+						committed_rows.insert(c.transaction);
+					}
+				}
+			}
 			for (auto &page : unit.second) {
 				// An IAM page formatted in the tail is one taken into use while the backup ran: extents it freed and
 				// set again were the transaction's own, not a table's it had before (fixture tail_window,
-				// rollback_grown: a rolled-back insert into an empty table).
+				// rollback_grown: a rolled-back insert into an empty table) -- unless another transaction committed
+				// rows on the unit.
 				const bool formatted = summary_.formatted.count(page.first) != 0;
 				for (auto &c : page.second) {
-					c.regained = c.regained && !formatted;
+					const bool others = committed_rows.size() > (committed_rows.count(c.transaction) ? 1u : 0u);
+					c.foreign_page = !formatted || others;
+					c.regained = c.regained && c.foreign_page;
 					if (open(c.transaction)) {
 						out.open[page.first].push_back(c);
 					} else {
@@ -411,18 +424,25 @@ bool ChangeShows(bool open, const FuzzySummary::Change &c, PageState state, cons
 	if (open) {
 		// (iii): its oldest row operation on the page no newer than the copy: the copy holds what a RESTORE
 		// undoes. One made after the copy (or on a page the image does not have) is not in it; a Pending or
-		// unreadable page may hold it.
-		return state == PageState::Present ? !Newer(c.oldest, copy_lsn) : state != PageState::NotLive;
+		// unreadable page may hold it. Extents freed on an IAM page the backup holds as not live, one holding
+		// rows the change's transaction did not put there (`foreign_page`), were freed by the open change with
+		// the page itself: a TRUNCATE still open, whose rows the image lacks and a RESTORE gives back (fixture
+		// tail_window, open_truncated; review of #619). One the tail formatted with only that transaction's rows
+		// on its unit was taken into use by it, and a RESTORE undoes both. Its own rows on a page the database had
+		// read dirty though a RESTORE is as empty: the price.
+		return state == PageState::Present	 ? !Newer(c.oldest, copy_lsn)
+			   : state == PageState::NotLive ? c.iam && c.foreign_page
+											 : true;
 	}
 	if (c.rolled_back) {
 		// Its changes undone in the tail: the copy differs only when it holds a change and lacks the
 		// compensation, between the two. An IAM page the backup holds as not live whose extents the change
-		// freed and the compensation set again, one the database had before (`regained`), was freed by the change
-		// and given back (a TRUNCATE frees its IAM page: fixture tail_window, rollback_truncated, review of #619):
-		// the image lacks it when that came after CheckpointLSN, as (iv) says of a committed one. Any other change
-		// on a page not live -- one taken into use after the image by rows the rollback removed, its IAM page
-		// formatted in the tail (rollback_grown) -- holds nothing a RESTORE keeps, nor does a Pending or
-		// unreadable page.
+		// freed and the compensation set again, one holding rows the change's transaction did not put there
+		// (`regained`), was freed by the change and given back (a TRUNCATE frees its IAM page: fixture tail_window,
+		// rollback_truncated, review of #619): the image lacks it when that came after CheckpointLSN, as (iv) says of a
+		// committed one. Any other change on a page not live -- one taken into use after the image by rows the rollback
+		// removed, its IAM page formatted in the tail (rollback_grown) -- holds nothing a RESTORE keeps, nor does a
+		// Pending or unreadable page.
 		return state == PageState::Present	 ? !Newer(c.oldest, copy_lsn) && Newer(c.newest, copy_lsn)
 			   : state == PageState::NotLive ? c.regained && Newer(c.newest, checkpoint)
 											 : false;

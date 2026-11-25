@@ -1789,8 +1789,13 @@ before the next opens.
       counted: an allocation may commit on its own -- AllocFirstPage, a transaction of the system's -- while the rows
       put there stay open; review of #619: extents a transaction sets on an IAM page where it freed some
       widen that change -- a rolled-back TRUNCATE's compensation --, and such a change on an IAM page the
-      backup holds as not live and the tail did not format (one the database had: a TRUNCATE frees its IAM
-      page, which the rollback gives back) shows when given back after CheckpointLSN; extents freed on an IAM
+      backup holds as not live that holds rows the transaction did not put there -- the tail did not format
+      it (one the database had), or another transaction committed rows on its unit in the tail (a TRUNCATE
+      frees its IAM page, which the rollback gives back) -- shows when given back after CheckpointLSN, and a
+      change of an open transaction on such a page always (a TRUNCATE still open: the image lacks the rows a
+      RESTORE gives back, fixture tables open_truncated and open_grown, the latter first filled inside the
+      tail; an open transaction's own rows on a page the database had, then truncated, read dirty though
+      equal: the price); extents freed on an IAM
       page not live in the image show for no committed transaction, rows on it being in neither the image nor
       a RESTORE; fixture tables rollback_loaded and rollback_truncated, a TABLOCK load and a TRUNCATE rolled
       back in the second pass, and the control rollback_grown, an insert into an empty table rolled back

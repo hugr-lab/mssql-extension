@@ -322,7 +322,8 @@ changed. (The query above keeps a NULL status: the tail could not be read, so no
 The status counts the log's row changes -- inserts, deletes and updates of rows, a rollback's undo
 included --, a bulk load logged as page images (`INSERT … WITH (TABLOCK)` into a heap) and extents freed
 from a table (a small table's `TRUNCATE TABLE`), each also when a transaction rolled back after the copy
-undid it (a bulk load's pages freed, a `TRUNCATE`'s extents given back). An index rebuilt while the backup ran frees its old
+undid it (a bulk load's pages freed, a `TRUNCATE`'s extents given back), or is still open (a `TRUNCATE` the
+`RESTORE` undoes: the table reads `dirty`). An index rebuilt while the backup ran frees its old
 extents the same way, so its table reads `stale` though its rows are the ones `RESTORE` gives. What the
 log records otherwise is not counted yet: a large table's `TRUNCATE` (its extents freed later, in the
 background), a partition switch and other DDL leave the tables they touched `consistent` (for now),
