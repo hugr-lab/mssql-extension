@@ -16,7 +16,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR="$(cd "${1:?usage: compare_rows.sh DIR}" && pwd)"
 : "${VERSION:?set VERSION (2017, 2019, 2022 or 2025)}"
 DUCKDB="${DUCKDB:-build/release/duckdb}"
-QUIET="${QUIET:-full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full lob_full lob_xpress cd_full cd_xpress page_full page_xpress names_full diffs_full}"
+QUIET="${QUIET:-full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full lob_full lob_xpress cd_full cd_xpress page_full page_xpress names_full diffs_full clr_types_full}"
 # Spec 085 PR 4c: the full + differential pairs of overlays.txt (name|full set|differential set) compared
 # too: the full restored WITH NORECOVERY, the differential WITH RECOVERY, against
 # mssql_backup_scan(full, diff := differential).

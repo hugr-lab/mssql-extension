@@ -59,6 +59,7 @@ struct TableChangesBindData : public TableFunctionData {
 	std::string schema, table;
 	Value start, end;
 	std::string fuzzy;	// D11: fuzzy := as given, else the ATTACH's option; "" = the setting
+	TypeForms forms;	// spec 093 T8: geometry_as := as given, else the ATTACH's option
 	ChangeListing listing = ChangeListing::All;
 	const char *function = CHANGES_FUNCTION;  // ChangesFunction(listing)
 	TwoStates states;
@@ -78,6 +79,7 @@ struct TableChangesBindData : public TableFunctionData {
 		copy->start = start;
 		copy->end = end;
 		copy->fuzzy = fuzzy;
+		copy->forms = forms;
 		copy->listing = listing;
 		copy->function = function;
 		copy->states = states;
@@ -95,7 +97,8 @@ struct TableChangesBindData : public TableFunctionData {
 			return a.IsNull() == b.IsNull() && (a.IsNull() || (a.type() == b.type() && a == b));
 		};
 		return paths == other.paths && diff == other.diff && schema == other.schema && table == other.table &&
-			   same(start, other.start) && same(end, other.end) && fuzzy == other.fuzzy && listing == other.listing;
+			   same(start, other.start) && same(end, other.end) && fuzzy == other.fuzzy && forms == other.forms &&
+			   listing == other.listing;
 	}
 	//! Every EXECUTE binds again: the files are read at bind.
 	bool SupportStatementCache() const override {

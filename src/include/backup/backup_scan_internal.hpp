@@ -13,10 +13,13 @@
 #include "backup/backup_cd_record.hpp"
 #include "backup/backup_lob.hpp"
 #include "backup/backup_opened.hpp"
+#include "backup/backup_record_stager.hpp"
 #include "backup/backup_scan_function.hpp"
 #include "duckdb/function/table_function.hpp"
 
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -46,6 +49,11 @@ struct ScanBindData : public TableFunctionData {
 	idx_t max_memory = 0;
 	//! D11's `fuzzy` as the call (or the attached catalog) gave it; "" = the setting mssql_backup_fuzzy.
 	std::string fuzzy;
+	//! Spec 093 T8: `geometry_as` as the call (or the attached catalog) gave it; "" = 'geometry'.
+	std::string geometry_as;
+	TypeForms Forms() const {
+		return TypeFormsOf(geometry_as, (function + ": geometry_as").c_str());
+	}
 	//! An attached backup's table entry the scan reads (task 23), for the binder, and that backup, read
 	//! through its catalog, never found again by name; none for a file's (and for a plan deserialized,
 	//! which resolves `paths` and checks the columns).
@@ -63,6 +71,7 @@ struct ScanBindData : public TableFunctionData {
 		copy->max_threads = max_threads;
 		copy->max_memory = max_memory;
 		copy->fuzzy = fuzzy;
+		copy->geometry_as = geometry_as;
 		copy->catalog = catalog;
 		copy->entry = entry;
 		copy->column_ids = column_ids;
@@ -77,7 +86,7 @@ struct ScanBindData : public TableFunctionData {
 		const auto &other = other_p.Cast<ScanBindData>();
 		return paths == other.paths && diff == other.diff && at.Same(other.at) && schema == other.schema &&
 			   table == other.table && max_threads == other.max_threads && max_memory == other.max_memory &&
-			   fuzzy == other.fuzzy;
+			   fuzzy == other.fuzzy && Forms() == other.Forms();
 	}
 	//! Every EXECUTE binds again: the file is read at bind.
 	bool SupportStatementCache() const override {
@@ -111,6 +120,19 @@ std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const
 
 //! mssql_backup_table_changes / _insertions / _deletions, on `paths` (a path or a list of them).
 void RegisterBackupTableChangesFunctions(ExtensionLoader &loader, const vector<LogicalType> &paths);
+
+//! Spec 093 T8: the WARNINGs a statement's stagers' CLR notes call for (RecordStager::ClrNotes), each said
+//! once a column and kind a statement -- a curve under GEOMETRY, bytes that are not MS-SSCLRT, bytes that
+//! are not a hierarchyid's -- whichever task met it first. The values are NULL, their rows read (owner,
+//! 2026-11-20).
+class ClrWarnings {
+public:
+	void Say(ClientContext &context, const char *function, const std::vector<RecordStager::ClrNote> &notes);
+
+private:
+	std::mutex lock_;
+	std::set<std::string> said_;
+};
 
 }  // namespace backup
 }  // namespace mssql

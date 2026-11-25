@@ -52,7 +52,9 @@ class Session:
         self.password = password
         dsn = (f"Server=localhost,{port};Database={database};User Id=sa;Password={password};"
                "Encrypt=yes;TrustServerCertificate=yes")
+        # No log on the console: a WARNING (a curve read as NULL, spec 093 T8) would be printed into the JSON.
         self.preamble = (".output /dev/null\n"
+                         "SET enable_logging = false;\n"
                          f"ATTACH {sql_string(dsn)} AS srv (TYPE mssql, native_types false);\n"
                          ".output\n")
 

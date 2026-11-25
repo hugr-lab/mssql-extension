@@ -8,7 +8,8 @@
 # TestPoint as binary(9), stored at a fixed offset (8 and 17) where the rowset is uncompressed; the
 # reader refused such a table ("stored as xtype 173 ..., which its declaration does not say"), and read a
 # nullable one's trailing zero bytes as ANSI_PADDING OFF padding. The bytes below are the server's own
-# (CAST(... AS varbinary), printed by clr.sql). No SQL Server is needed.
+# (CAST(... AS varbinary), printed by clr.sql). A user type stays its bytes; hierarchyid and geometry are
+# read by the TDS path's kernels since spec 093 T8 (mssql_backup_clr_types.test). No SQL Server is needed.
 
 require mssql
 
@@ -32,18 +33,26 @@ id	int	INTEGER	converted
 p	TestPoint	BLOB	stored_bytes
 pn	TestPoint	BLOB	stored_bytes
 l	TestLabel	BLOB	stored_bytes
-h	hierarchyid	BLOB	stored_bytes
-g	geometry	BLOB	stored_bytes
+h	hierarchyid	VARCHAR	converted
+g	geometry	GEOMETRY	converted
 c	char(3)	VARCHAR	converted
 
 # The uncompressed table: TestPoint at its fixed offset; row 3's ends in zero bytes, which are its value's.
 query ITTITTT
-SELECT id, hex(p), hex(pn), octet_length(l), hex(h), hex(g), c FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_plain')
+SELECT id, hex(p), hex(pn), octet_length(l), h, ST_AsText(g), c FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_plain')
 ORDER BY id;
 ----
-1	008000000180000002	008000000380000004	4	58	00000000010C000000000000F03F0000000000000040	abc
-2	NULL	007FFFFFF9FFFFFFFF	9002	5B40	NULL	NULL
-3	008000000080000000	000000000080000000	NULL	NULL	00000000011400000000000000000000000000000000000000000000F03F000000000000F03F	z
+1	008000000180000002	008000000380000004	4	/1/	POINT (1 2)	abc
+2	NULL	007FFFFFF9FFFFFFFF	9002	/1/2/	NULL	NULL
+3	008000000080000000	000000000080000000	NULL	NULL	LINESTRING (0 0, 1 1)	z
+
+# The stored bytes of h and g, as clr.sql printed them: geometry_as 'native' for g; h's are its text's.
+query IT
+SELECT id, hex(g) FROM mssql_backup_scan(getvariable('clr'), 'dbo', 'clr_plain', geometry_as := 'native') ORDER BY id;
+----
+1	00000000010C000000000000F03F0000000000000040
+2	NULL
+3	00000000011400000000000000000000000000000000000000000000F03F000000000000F03F
 
 # Every other form reads the same rows, TestLabel's included: the same multiset both ways.
 query TII

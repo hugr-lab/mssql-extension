@@ -26,5 +26,7 @@ OUT="${HERE}/open_tail" VERSION="${VERSION}" FIXTURES=open_tail "${HERE}/../../b
 OUT="${HERE}/history_break" VERSION="${VERSION}" FIXTURES=history_break "${HERE}/../../backup/gen/generate.sh"
 # CLR columns of every storage form: a Format.Native user type stored at a fixed offset as binary (spec 093).
 OUT="${HERE}/clr" VERSION="${VERSION}" FIXTURES=clr "${HERE}/../../backup/gen/generate.sh"
+# The CLR system types in every storage form, read by the TDS path's kernels (spec 093 T8).
+OUT="${HERE}/clr_types" VERSION="${VERSION}" FIXTURES=clr_types "${HERE}/../../backup/gen/generate.sh"
 # Values stored off row changed every way, then a shrink (spec 085 PR 4c-3, the LOB tail).
 OUT="${HERE}/lob_changes" VERSION="${VERSION}" FIXTURES=lob_changes exec "${HERE}/../../backup/gen/generate.sh"

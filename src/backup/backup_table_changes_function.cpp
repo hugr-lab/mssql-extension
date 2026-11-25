@@ -82,6 +82,7 @@ struct TableChangesState : public GlobalTableFunctionState {
 	std::unique_ptr<ChangeCollector> collector;
 	std::atomic<size_t> next_unit{0};
 	idx_t max_threads = 1;
+	ClrWarnings clr_warnings;  // spec 093 T8
 	//! D17, as the scan's: a chunk's staging reserved for the call that stages it, by side (the newer, the
 	//! older -- whose values are staged and then cast: twice), against half of memory_limit.
 	std::unique_ptr<ReservationGate> gate;
@@ -112,7 +113,7 @@ struct TableChangesLocal : public LocalTableFunctionState {
 };
 
 //! The call's arguments: the files, the table, the two versions.
-void ReadChangesArguments(TableChangesBindData &data, TableFunctionBindInput &input) {
+void ReadChangesArguments(ClientContext &context, TableChangesBindData &data, TableFunctionBindInput &input) {
 	data.paths = PathsOf(input.inputs[0], data.function);
 	data.diff = DiffPathsOf(input.named_parameters, data.function);
 	if (input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
@@ -121,6 +122,19 @@ void ReadChangesArguments(TableChangesBindData &data, TableFunctionBindInput &in
 	data.schema = input.inputs[1].ToString();
 	data.table = input.inputs[2].ToString();
 	data.fuzzy = FuzzyParameterOf(input.named_parameters, data.function);
+	// Spec 093 T8: the call's geometry_as, else the ATTACH's.
+	std::string geometry_as;
+	bool given = false;
+	for (const auto &kv : input.named_parameters) {
+		if (kv.first == "geometry_as" && !kv.second.IsNull()) {
+			geometry_as = GeometryAsGiven(kv.second.ToString(), (std::string(data.function) + ": geometry_as").c_str());
+			given = true;
+		}
+	}
+	if (!given && data.paths.size() == 1) {
+		geometry_as = AttachedGeometryAs(context, data.paths.front());
+	}
+	data.forms = TypeFormsOf(geometry_as, (std::string(data.function) + ": geometry_as").c_str());
 	for (const auto &kv : input.named_parameters) {
 		if (kv.first == "start_version") {
 			data.start = kv.second;
@@ -281,7 +295,7 @@ void PairOldColumns(TableChangesBindData &data) {
 	if (!data.old_table || data.all_inserts) {
 		return;
 	}
-	const ScanColumns old_columns = ScanColumnsOf(*data.old_table);
+	const ScanColumns old_columns = ScanColumnsOf(*data.old_table, data.forms);
 	std::set<int32_t> readable(old_columns.column_ids.begin(), old_columns.column_ids.end());
 	for (idx_t i = 0; i < data.columns.column_ids.size(); i++) {
 		if (readable.count(data.columns.column_ids[i])) {
@@ -297,9 +311,9 @@ unique_ptr<FunctionData> TableChangesBind(ClientContext &context, TableFunctionB
 	auto data = make_uniq<TableChangesBindData>();
 	data->listing = listing;
 	data->function = ChangesFunction(listing);
-	ReadChangesArguments(*data, input);
+	ReadChangesArguments(context, *data, input);
 	OpenChangesStates(context, *data);
-	data->columns = ScanColumnsOf(*data->new_table);
+	data->columns = ScanColumnsOf(*data->new_table, data->forms);
 	PairOldColumns(*data);
 	names.emplace_back("change_type");
 	return_types.push_back(LogicalType::VARCHAR);
@@ -365,7 +379,7 @@ unique_ptr<GlobalTableFunctionState> TableChangesInit(ClientContext &context, Ta
 	const uint64_t budget = buffers.GetMaxMemory() / 2;
 	state->virtual_row = sizeof(std::string) + 1 + 1700 + 4;
 	auto size_side = [&](int side, const CatalogTable &table, const std::vector<int32_t> &staged, uint64_t copies) {
-		RecordStager probe(table, staged);
+		RecordStager probe(table, staged, data.forms);
 		const uint64_t fixed = probe.FixedStagingBytes();
 		const uint64_t row = 2 * probe.VarRowBytes() + state->virtual_row;
 		const uint64_t vector = fixed + STANDARD_VECTOR_SIZE * row;
@@ -489,11 +503,11 @@ unique_ptr<LocalTableFunctionState> TableChangesInitLocal(ExecutionContext &exec
 	};
 	const auto &global = global_state->Cast<TableChangesState>();
 	local->task = global.collector->NewTask();
-	local->new_stager = make_uniq<RecordStager>(*data.new_table, data.columns.column_ids);
+	local->new_stager = make_uniq<RecordStager>(*data.new_table, data.columns.column_ids, data.forms);
 	local->new_stager->LimitBytes(global.chunk_allowance[0], global.virtual_row);
 	local->new_fetch = fetch_for(*data.states.new_catalog);
 	if (data.old_table && !data.all_inserts) {
-		local->old_stager = make_uniq<RecordStager>(*data.old_table, data.old_staged);
+		local->old_stager = make_uniq<RecordStager>(*data.old_table, data.old_staged, data.forms);
 		local->old_stager->LimitBytes(global.chunk_allowance[1], global.virtual_row);
 		local->old_fetch = fetch_for(*data.states.old_catalog);
 		local->old_values.Initialize(Allocator::DefaultAllocator(), local->old_stager->Types());
@@ -733,6 +747,7 @@ void StageChanges(ClientContext &context, const TableChangesBindData &data, Tabl
 	local.pos = i;
 	const idx_t count = stager.Count();
 	stager.FinalizeChunk();
+	global.clr_warnings.Say(context, data.function, stager.ClrNotes());
 	if (old_side) {
 		CastOldValues(context, data, local, output, count);
 	}
@@ -785,6 +800,8 @@ TableFunction MakeTableChangesFunction(const char *name, const LogicalType &path
 	f.GetSignature().AddKeywordOnly("end_version", LogicalType::ANY, Value());
 	AddDiffParameter(f);
 	AddFuzzyParameter(f);
+	// Spec 093 T8: as mssql_backup_scan's.
+	f.GetSignature().AddKeywordOnly("geometry_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	return f;
 }
 

@@ -21,6 +21,9 @@
 #include "backup/backup_lob.hpp"
 #include "backup/backup_record.hpp"
 #include "backup/backup_system_tables.hpp"
+#include "backup/backup_type_forms.hpp"
+#include "codec/clr/hierarchyid_codec.hpp"
+#include "codec/clr/spatial_codec.hpp"
 #include "codec/staging/column_ops.hpp"
 #include "codec/staging/column_staging.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -66,8 +69,9 @@ public:
 	//! The columns `column_ids` of `table`, in that order, read as ReadingOf says: converted to D6's
 	//! type, or a type still to be converted as its stored bytes (BLOB). A column that is not readable
 	//! (no stored value, a sparse column), one not in the table, or one the codec would stage another
-	//! way than its type says is an InvalidInputException naming it.
-	RecordStager(const CatalogTable &table, const std::vector<int32_t> &column_ids);
+	//! way than its type says is an InvalidInputException naming it. `forms`: how a column of a kernel's
+	//! type is read (backup_type_forms), as the caller typed its output.
+	RecordStager(const CatalogTable &table, const std::vector<int32_t> &column_ids, const TypeForms &forms);
 
 	//! The output types, in `column_ids` order.
 	const vector<LogicalType> &Types() const {
@@ -174,6 +178,17 @@ public:
 	//! cardinality (Count()). The DataChunk form sets it.
 	void FinalizeChunk();
 	void FinalizeChunk(DataChunk &out);
+	//! A geometry / geography / hierarchyid column's decode notes since the stager was made (spec 093 T8:
+	//! values read as NULL -- a curve under GEOMETRY, bytes that are not MS-SSCLRT or not a hierarchyid's),
+	//! with its `table.column` name; the caller words the WARNING (ClrWarnings, backup_scan_internal) once a
+	//! column a statement.
+	struct ClrNote {
+		std::string name;
+		std::string type;  // geometry / geography / hierarchyid
+		codec::spatial::SpatialColumnNotes spatial;
+		codec::hierarchyid::HierarchyIdColumnNotes hierarchyid;
+	};
+	std::vector<ClrNote> ClrNotes() const;
 
 private:
 	struct Column {
@@ -189,11 +204,14 @@ private:
 		bool binary_kernel = false;		// published as its bytes (a BLOB, a UTF-8 text): written direct when long
 		bool utf16_kernel = false;		// decoded from UTF-16 (nvarchar, ntext): streamed when long
 		bool code_page_kernel = false;	// decoded from its code page (varchar, text): streamed when long
+		codec::spatial::SpatialColumnNotes spatial_notes;			   // the Spatial kernel's, across chunks
+		codec::hierarchyid::HierarchyIdColumnNotes hierarchyid_notes;  // the HierarchyId kernel's, across chunks
 	};
 
 	//! The constructor's steps: a projected column resolved to its staging (its arm chosen by ArmOf and
 	//! checked by CheckArm), the arena configured, the staging's bound measured.
-	static Column ResolveColumn(const std::string &table, const CatalogColumn &c, LogicalType &type);
+	static Column ResolveColumn(const std::string &table, const CatalogColumn &c, const TypeForms &forms,
+								LogicalType &type);
 	static StageArm ArmOf(const CatalogColumn &c, const codec::staging::ColumnOps &ops);
 	static void CheckArm(const Column &col, const CatalogColumn &c);
 	void ConfigureArena();

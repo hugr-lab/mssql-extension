@@ -278,7 +278,7 @@ int main() {
 			t.columns.push_back(c);
 		}
 		AssignDuckDBNames(t.columns);
-		const auto columns = ScanColumnsOf(t);
+		const auto columns = ScanColumnsOf(t, TypeForms());
 		const std::vector<std::string> want = {"Id", "ID_2", "id_3", "my col", "Other \"Col\"", "ID_1"};
 		Check(std::vector<std::string>(columns.names.begin(), columns.names.end()) == want,
 			  "columns that differ only in case read as Id, ID_2, id_3: a real column ID_1 keeps its name");

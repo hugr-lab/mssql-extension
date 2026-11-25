@@ -520,11 +520,9 @@ std::string RawByType(const CatalogColumn &c, const std::string &type) {
 	case XTYPE_XML:
 		return "xml (stored as binary XML) is converted to text later, with the TDS path's";
 	case XTYPE_CLR:
-		// TODO(spec 093 T8): geometry / geography through T5's kernel (codec/clr/ssclrt_wkb, shared with the
-		// TDS path), with geometry_as registered then -- an ATTACH option of TYPE mssql_backup and a
-		// mssql_backup_scan parameter -- so its default 'geometry' never names these bytes. Until then the
-		// stored bytes, what geometry_as 'native' reads on the TDS path.
-		return type + " (its CLR serialization) is converted later, with the TDS path's";
+		// A CLR system type is read by its kernel (TypeReading, before this); a user CLR type is opaque by
+		// design (spec 093 § Scope), its bytes on every path.
+		return type + " is a user CLR type, read as its serialized bytes";
 	default:
 		break;
 	}
@@ -585,8 +583,13 @@ std::string RawByDeclaration(const CatalogColumn &c, const std::string &type) {
 }
 
 // The type column `c` is read as, its readability aside: converted, or its stored bytes (`raw`).
-ColumnReading TypeReading(const CatalogColumn &c) {
+ColumnReading TypeReading(const CatalogColumn &c, const TypeForms &forms) {
 	ColumnReading r;
+	// Spec 093 T8 (D9): a type the TDS path's kernels read, read by them (backup_type_forms).
+	if (IsClrSystemType(c)) {
+		r.type = ClrSystemTypeOf(c, forms);
+		return r;
+	}
 	const std::string type = c.system_type_name.empty()
 								 ? (c.type_name.empty() ? "type " + std::to_string(c.user_type_id) : c.type_name)
 								 : c.system_type_name;
@@ -618,9 +621,9 @@ ColumnReading TypeReading(const CatalogColumn &c) {
 
 }  // namespace
 
-ColumnReading ReadingOf(const CatalogColumn &c) {
+ColumnReading ReadingOf(const CatalogColumn &c, const TypeForms &forms) {
 	// What is not readable still says the type it is declared as (raw included).
-	ColumnReading r = TypeReading(c);
+	ColumnReading r = TypeReading(c, forms);
 	auto not_readable = [&](const std::string &why) {
 		r.readable = false;
 		r.note = why;
@@ -635,8 +638,8 @@ ColumnReading ReadingOf(const CatalogColumn &c) {
 	return r;
 }
 
-ColumnState StateOf(const CatalogTable &t, const CatalogColumn &c) {
-	const ColumnReading r = ReadingOf(c);
+ColumnState StateOf(const CatalogTable &t, const CatalogColumn &c, const TypeForms &forms) {
+	const ColumnReading r = ReadingOf(c, forms);
 	ColumnState s;
 	auto join = [](const std::string &a, const std::string &b) { return a.empty() ? b : b.empty() ? a : a + "; " + b; };
 	// A value stored off row is read like one in row since spec 085 PR 3 (row-overflow, LOB trees,

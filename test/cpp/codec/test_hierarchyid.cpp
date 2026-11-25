@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "codec/clr/hierarchyid.hpp"
+#include "codec/clr/hierarchyid_codec.hpp"
 #include "codec/staging/row_stager.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -534,6 +535,53 @@ void TestReadPath() {
 		  "a user type's value: its bytes, " + c3.data[0].GetValue(0).ToString());
 }
 
+// Spec 093 T8 (review of #621): the staged kernel with notes, as the backup reader calls it -- a value
+// that is not a hierarchyid's bytes (a damaged page, or one the server took unchecked) is NULL and counted,
+// its row read; with none, as on the wire, it is refused naming the column.
+void TestUnreadableAsNull() {
+	std::cout << "An unreadable value: NULL and counted with notes, refused without" << std::endl;
+	const ColumnMetadata column = HierarchyIdColumn("node");
+	const std::vector<std::vector<uint8_t>> values = {
+		FromHex("6467D0"), FromHex("5800"), {}, FromHex("08"), FromHex("58")};
+	duckdb::mssql::codec::staging::ColumnStaging st;
+	st.kind = duckdb::mssql::codec::staging::StagingKind::Var;
+	st.offsets.resize(values.size());
+	st.lengths.resize(values.size());
+	st.validity_words.assign(1, ~uint64_t(0));
+	for (idx_t r = 0; r < values.size(); r++) {
+		st.offsets[r] = static_cast<uint32_t>(st.payload_used);
+		st.lengths[r] = static_cast<uint32_t>(values[r].size());
+		st.buffer.insert(st.buffer.end(), values[r].begin(), values[r].end());
+		st.payload_used += values[r].size();
+	}
+	st.count = values.size();
+	duckdb::Vector out(LogicalType::VARCHAR, values.size());
+	duckdb::mssql::codec::hierarchyid::HierarchyIdColumnNotes notes;
+	duckdb::mssql::codec::hierarchyid::DecodeChunkFromStaging(st, values.size(), column, out, &notes);
+	const std::vector<std::string> want = {"/1.5/-2/", "NULL", "/", "NULL", "/1/"};
+	bool all = true;
+	for (idx_t r = 0; r < values.size(); r++) {
+		const auto v = out.GetValue(r);
+		const std::string got = v.IsNull() ? "NULL" : v.ToString();
+		if (got != want[r]) {
+			all = false;
+			std::cout << "    row " << r << ": " << got << ", want " << want[r] << std::endl;
+		}
+	}
+	Check(all, "with notes: the readable values read, the two that are not NULL");
+	Check(notes.malformed == 2 && notes.first_malformed == HierarchyIdStatus::BadPadding,
+		  "with notes: two counted, the first's status kept (bad padding)");
+	std::string error;
+	try {
+		duckdb::Vector refused(LogicalType::VARCHAR, values.size());
+		duckdb::mssql::codec::hierarchyid::DecodeChunkFromStaging(st, values.size(), column, refused, nullptr);
+	} catch (std::exception &e) {
+		error = e.what();
+	}
+	Check(error.find("'node'") != std::string::npos && error.find("cannot be read") != std::string::npos,
+		  "without notes: refused, naming the column: " + error);
+}
+
 }  // namespace
 
 int main() {
@@ -543,6 +591,7 @@ int main() {
 	TestRoundTrips();
 	TestMalformed();
 	TestReadPath();
+	TestUnreadableAsNull();
 	if (failures) {
 		std::cout << failures << " FAILED" << std::endl;
 		return 1;

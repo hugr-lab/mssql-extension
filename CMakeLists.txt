@@ -183,6 +183,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_collation.cpp
     src/backup/backup_container.cpp
     src/backup/backup_function_common.cpp
+    src/backup/backup_type_forms.cpp
     src/backup/backup_history.cpp
     src/backup/backup_iam.cpp
     src/backup/backup_lob.cpp

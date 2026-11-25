@@ -139,7 +139,7 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 | `created`, `modified` | `TIMESTAMP` | `sys.tables.create_date` / `modify_date` |
 | `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether `mssql_backup_scan` reads the table, and why not (a clustered columnstore, for now; ROW and PAGE compression are read) |
 | `fuzzy_status`, `open_transactions`, `stale_transactions` | `VARCHAR`, `INTEGER`, `INTEGER` | `consistent`, `stale`, `dirty` or `stale+dirty` (see [A backup taken under writes](#a-backup-taken-under-writes)); the transactions whose open changes the table's page copies hold, and those whose finished changes they lack |
-| `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `type_schema` (the schema of the column's type: `sys` for a system type, the one an alias or CLR type was created in), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type the scan returns: the one `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off -- a plain `VARCHAR` for a string --, or for now `BLOB`, its stored bytes, for `sql_variant`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector` and `json`, which a later release converts), `decodable` (false only for a column the scan cannot read: a computed one not persisted, a sparse one), `reason` (why a column is not converted or not readable) |
+| `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `type_schema` (the schema of the column's type: `sys` for a system type, the one an alias or CLR type was created in), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type the scan returns: the one `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off -- a plain `VARCHAR` for a string --, or for now `BLOB`, its stored bytes, for `sql_variant`, `xml`, `vector` and `json`, which a later release converts, and for a user CLR type), `decodable` (false only for a column the scan cannot read: a computed one not persisted, a sparse one), `reason` (why a column is not converted or not readable) |
 | `allocation_units` | `LIST(STRUCT(…))` | the table's allocation units: `au_id`, `type` (`IN_ROW_DATA`, `LOB_DATA`, `ROW_OVERFLOW_DATA`), `rowset_id`, `index_id`, `partition_number`, `compression`, `filegroup_id`, `first_page`, `root_page`, `first_iam_page`, `live_pages` (NULL for now) |
 | `partitioning` | `STRUCT(…)` | for a partitioned table (NULL on a filegroup): `function_name`, `scheme_name`, `column_name`, `column_id`, `parameter_type`, `range_right`, `boundaries` (a list of `VARIANT`s in the parameter's type, in boundary order; a NULL boundary is a NULL element), `destinations` (the filegroup of each partition), `next_used`, and `reason` when the reader cannot give it exactly (the boundaries are then NULL, never a partial list; the destinations and `next_used` are still given when only a boundary's value could not be read). The table's rows are read either way |
 | `partitions` | `LIST(STRUCT(…))` | every partition: `partition_number`, `rows`, `compression`, `filegroup` |
@@ -159,7 +159,7 @@ The states:
 | state | meaning |
 |---|---|
 | `converted` | read as `duckdb_type` |
-| `stored_bytes` | read as its stored bytes (`BLOB`) until its type's conversion comes: `sql_variant`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector`, `json` |
+| `stored_bytes` | read as its stored bytes (`BLOB`): a type whose conversion comes later (`sql_variant`, `xml`, `vector`, `json`), and a user CLR type, opaque by design |
 | `not_stored` | a computed column that is not persisted: it has no stored value |
 | `storage_format` | a sparse column or a column set: its value is in the row's sparse vector, read in a later release |
 
@@ -228,9 +228,16 @@ resource database's tables (`sys.trace_xe_event_map`, ...) are listed by the dat
 schema `sys` included --, typed as
 `TYPE mssql` reads them over a connection (`mssql_catalog_native_types` off: a plain `VARCHAR` for a
 string). Every collation is converted, the double-byte code pages (Japanese, Chinese, Korean)
-included. A type whose conversion comes in a later release -- `sql_variant`, `xml`, `geometry` /
-`geography`, `hierarchyid`, `vector`, `json` -- is returned as its stored bytes, a `BLOB`; no column
-is refused for its type. A column the scan cannot read -- a computed column that is not persisted (no
+included. `geometry`, `geography` and `hierarchyid` are decoded by the same code `TYPE mssql` uses:
+`geometry` as `GEOMETRY`, `geography` as `GEOMETRY('OGC:CRS84')` (longitude first), Z / M kept,
+`hierarchyid` as its `ToString()` text (`/1/2/`). A curve or FullGlobe, which a `GEOMETRY` cannot hold,
+is NULL with one WARNING per column; `geometry_as := 'wkb'` (ISO WKB, the curves included) or
+`'native'` (the stored bytes), on the call or as an ATTACH option, reads them, as `TYPE mssql`'s ATTACH
+option does. A value whose stored bytes cannot be read as its type (a damaged page) is NULL with one
+WARNING per column too, its row read; `mssql_backup_transaction_records` keeps such a row image as its
+bytes. A type whose conversion comes in a later release -- `sql_variant`, `xml`, `vector`,
+`json` -- and a user CLR type are returned as their stored bytes, a `BLOB`; no column is refused for
+its type. A column the scan cannot read -- a computed column that is not persisted (no
 stored value) or a sparse column -- is left out of `SELECT *`; a query that names it is refused,
 with the reason (`mssql_backup_tables.columns`).
 
@@ -384,7 +391,7 @@ record before it), `operation` and `context` (`fn_dblog`'s names, `LOP_INSERT_RO
 
 | operation | `contents` |
 |---|---|
-| `LOP_INSERT_ROWS` | `{rows: [...]}`: the rows inserted (a page split moves many in one record), each a struct of the table's columns as `mssql_backup_scan` reads them |
+| `LOP_INSERT_ROWS` | `{rows: [...]}`: the rows inserted (a page split moves many in one record), each a struct of the table's columns as `mssql_backup_scan` reads them -- but a `geometry` / `geography` value as its ISO WKB (a `BLOB`, the curves included: the records have no WARNING to say a NULL) |
 | `LOP_DELETE_ROWS` | `{row: {...}}`: the row deleted, as it was (NULL when the record logs none) |
 | `LOP_MODIFY_ROW` | `{offset, size, before, after}`: the bytes changed in the row |
 | `LOP_MODIFY_COLUMNS` | `{ranges: [{offset, before, after}, ...]}` |
@@ -460,6 +467,7 @@ It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, 
 | `diff` | A differential backup to read over the attached full ([above](#a-differential-over-its-full)) |
 | `history`, `snapshot_version`, `snapshot_time` | A history of backups ([below](#a-history-of-backups)) |
 | `fuzzy` | What a scan of its tables -- and the change listing or `mssql_backup_catalog` over its name -- does with one that is not consistent: `'warn'`, `'error'` or `'ignore'` ([above](#a-backup-taken-under-writes)); unset, the `mssql_backup_fuzzy` setting |
+| `geometry_as` | What its `geometry` / `geography` columns are read as: `'geometry'` (the default), `'wkb'` or `'native'`, as `TYPE mssql`'s option ([above](#rows)); a call's `geometry_as :=` wins over it |
 
 The filters work as `TYPE mssql`'s. An object is kept when it passes the filter -- it matches it, or
 no filter is given -- and does not match the exclusion, so an exclusion alone keeps everything else:

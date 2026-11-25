@@ -29,8 +29,8 @@ void DecodeOrRefuse(const uint8_t *data, size_t size, const tds::ColumnMetadata 
 
 }  // namespace
 
-void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
-							Vector &out) {
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta, Vector &out,
+							HierarchyIdColumnNotes *notes) {
 	// The texts back to back in one buffer, then one allocation for the column, as the binary kernel does.
 	std::string text;
 	text.reserve(st.payload_used * 3 + count * 2);
@@ -38,19 +38,31 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	const uint8_t *payload = st.buffer.data();
 	for (idx_t row = 0; row < count; row++) {
 		if (st.IsValid(row)) {
-			DecodeOrRefuse(payload + st.offsets[row], st.lengths[row], meta, text);
+			if (!notes) {
+				DecodeOrRefuse(payload + st.offsets[row], st.lengths[row], meta, text);
+			} else {
+				const size_t begin = text.size();
+				const auto status = Decode(payload + st.offsets[row], st.lengths[row], text);
+				if (status != HierarchyIdStatus::Ok) {
+					text.resize(begin);	 // what Decode appended before it stopped
+					FlatVector::SetNull(out, row, true);
+					if (notes->malformed++ == 0) {
+						notes->first_malformed = status;
+					}
+				}
+			}
 		}
 		ends[row] = static_cast<uint32_t>(text.size());
 	}
 	string_t *result = FlatVector::GetDataMutable<string_t>(out);
-	// The buffer is at least the root's "/" for every valid row, so never empty when a row is valid; a
-	// text of at most 12 bytes is inlined by string_t, so the blob below may be inline too.
+	// The buffer may be empty (every value NULL, or read as NULL); a text of at most 12 bytes is inlined by
+	// string_t, so the blob below may be inline too.
 	string_t blob_slot = StringVector::EmptyString(out, text.size());
 	char *const blob = blob_slot.GetDataWriteable();
 	std::memcpy(blob, text.data(), text.size());
 	uint32_t begin = 0;
 	for (idx_t row = 0; row < count; row++) {
-		if (st.IsValid(row)) {
+		if (st.IsValid(row)) {	// a value read as NULL is an empty text under its NULL
 			result[row] = string_t(blob + begin, ends[row] - begin);
 		}
 		begin = ends[row];

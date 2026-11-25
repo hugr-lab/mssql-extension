@@ -222,10 +222,10 @@ Value PointerValue(const PagePointer &p) {
 	return p.IsNull() ? Value(LogicalType::VARCHAR) : Value(p.ToString());
 }
 
-Value ColumnValue(const CatalogColumn &c) {
+Value ColumnValue(const CatalogColumn &c, const TypeForms &forms) {
 	const CollationRow *collation = c.collation_id ? CollationById(static_cast<int32_t>(c.collation_id)) : nullptr;
 	const uint32_t code_page = collation ? collation->code_page : 0;
-	const ColumnReading reading = ReadingOf(c);
+	const ColumnReading reading = ReadingOf(c, forms);
 	child_list_t<Value> f;
 	f.emplace_back("column_id", Value::INTEGER(c.column_id));
 	f.emplace_back("name", Text(c.name));
@@ -328,11 +328,11 @@ std::string CompressionOf(const CatalogTable &t) {
 }
 
 std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, const PageStore &pages,
-							FuzzinessMemo &memo) {
+							FuzzinessMemo &memo, const TypeForms &forms) {
 	const std::string compression = CompressionOf(t);
 	vector<Value> columns, units;
 	for (const auto &c : t.columns) {
-		columns.push_back(ColumnValue(c));
+		columns.push_back(ColumnValue(c, forms));
 	}
 	for (const auto &u : t.units) {
 		units.push_back(UnitValue(u));
@@ -444,9 +444,9 @@ std::vector<Value> ViewRow(const PageStore &store, const CatalogModel &model, co
 }
 
 // mssql_backup_columns (task 16d): one row per column of a user table, its state at a glance (StateOf).
-std::vector<Value> ColumnRow(const CatalogTable &t, const CatalogColumn &c) {
-	const ColumnReading reading = ReadingOf(c);
-	const ColumnState state = StateOf(t, c);
+std::vector<Value> ColumnRow(const CatalogTable &t, const CatalogColumn &c, const TypeForms &forms) {
+	const ColumnReading reading = ReadingOf(c, forms);
+	const ColumnState state = StateOf(t, c, forms);
 	return {Text(t.schema_name), Text(t.name), Value::INTEGER(c.column_id), Text(c.name), Text(c.DuckDBName()),
 			Text(SqlTypeText(c.type_name, c.system_type_name, c.system_type_id, c.max_length, c.precision, c.scale)),
 			OptionalText(c.type_schema),
@@ -472,9 +472,12 @@ struct CatalogListBindData : public TableFunctionData {
 	//! The objects the model is built for (task 16e): the listing's kind, the arguments, and the
 	//! names the query's filters ask for (PushdownNames).
 	CatalogScope scope;
+	//! Spec 093 T8: how a kernel's type is listed as read -- an attached name's geometry_as, else the default.
+	TypeForms forms;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<CatalogListBindData>();
+		copy->forms = forms;
 		copy->paths = paths;
 		copy->diff = diff;
 		copy->at = at;
@@ -496,7 +499,7 @@ struct CatalogListBindData : public TableFunctionData {
 		const auto &other = other_p.Cast<CatalogListBindData>();
 		return paths == other.paths && diff == other.diff && at.Same(other.at) && listing == other.listing &&
 			   by_schema == other.by_schema && by_table == other.by_table && schema == other.schema &&
-			   table == other.table && scope == other.scope;
+			   table == other.table && scope == other.scope && forms == other.forms;
 	}
 	bool Wants(const CatalogTable &t) const {
 		return (!by_schema || t.schema_name == schema) && (!by_table || t.name == table);
@@ -538,6 +541,8 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	if (data->paths.size() == 1) {
 		// Over an attached backup, the version pinned now by its files (task 24b, owner 2026-11-19).
 		PinAttachedVersion(context, data->paths.front(), data->at);
+		data->forms =
+			TypeFormsOf(AttachedGeometryAs(context, data->paths.front()), "the attached backup's geometry_as");
 	}
 	if (L == Listing::Columns && input.inputs.size() > 1) {
 		data->by_schema = true;
@@ -752,7 +757,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 				state.next_column = 0;
 				continue;
 			}
-			const std::vector<Value> row = ColumnRow(t, t.columns[state.next_column]);
+			const std::vector<Value> row = ColumnRow(t, t.columns[state.next_column], data.forms);
 			for (idx_t c = 0; c < row.size(); c++) {
 				output.data[c].SetValue(count, row[c]);
 			}
@@ -770,7 +775,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		const std::vector<Value> row =
 			data.listing == Listing::Tables
 				? TableRow(model.tables[state.next], Fuzzy(context, data, state), *state.catalog->pages->store,
-						   state.catalog->opened.backup->Fuzziness())
+						   state.catalog->opened.backup->Fuzziness(), data.forms)
 			: data.listing == Listing::Views
 				? ViewRow(*state.catalog->pages->store, model, model.views[state.next], state.off_row_bytes)
 				: SchemaRow(model, model.schemas[state.next]);

@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include "codec/clr/hierarchyid_codec.hpp"
 #include "codec/clr/spatial_codec.hpp"
 #include "codec/staging/column_ops.hpp"
 #include "codec/staging/column_staging.hpp"
@@ -91,12 +92,15 @@ struct StagingCounters {
 //! straight into the vector). Validity is not touched: PublishStagedValidity. Shared by RowStager and
 //! the backup reader's RecordStager (spec 085 PR 2d), so a column decodes the one way.
 //! `variant_notes`, for a Variant column: what its values needed beyond their decode (spec 093 T1);
-//! `spatial_notes`, for a Spatial one: the values read as NULL (T5). No defaults: a caller says where its
-//! notes go, or passes nullptr when its kernels are never Variant or Spatial (a WARNING is not lost by
-//! omission).
+//! `spatial_notes`, for a Spatial one: the values read as NULL (T5). `hierarchyid_notes`, for a HierarchyId
+//! one: where the values it cannot read as NULL go (T8, a backup's pages); nullptr refuses such a value
+//! (the server's own values). No defaults: a caller says where its notes go, or passes nullptr when its
+//! kernels are never Variant or Spatial (a WARNING is not lost by omission) -- for `hierarchyid_notes`,
+//! nullptr is the refusal.
 void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
 						  Vector &out, variant::VariantColumnNotes *variant_notes,
-						  spatial::SpatialColumnNotes *spatial_notes);
+						  spatial::SpatialColumnNotes *spatial_notes,
+						  hierarchyid::HierarchyIdColumnNotes *hierarchyid_notes);
 
 //! AND the staged NULLs of `count` rows into `out`'s mask (a kernel may have set NULLs of its own,
 //! which must stay); nothing when the column staged none.

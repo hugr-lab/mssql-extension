@@ -28,9 +28,15 @@ namespace {
 // A column's TDS form as the codec resolves it: the system type (its xtype is the TDS type id but
 // for bit, whose bare TDS type is 0x32, and timestamp, which travels as binary(8)), the declared
 // length (MAX as the PLP marker), precision, scale and, for a single-byte text, its code page.
-tds::ColumnMetadata MetadataOf(const CatalogColumn &c) {
+tds::ColumnMetadata MetadataOf(const CatalogColumn &c, const TypeForms &forms) {
 	tds::ColumnMetadata m{};
 	m.name = c.name;
+	m.flags = tds::COL_FLAG_NULLABLE;
+	// Spec 093 T8 (D9): a type the TDS path's kernels read, described as that path's column of it.
+	if (IsClrSystemType(c)) {
+		DescribeClrSystemType(c, forms, m);
+		return m;
+	}
 	m.type_id = c.system_type_id;
 	if (c.system_type_id == XTYPE_BIT) {
 		m.type_id = tds::TDS_TYPE_BIT;
@@ -40,7 +46,6 @@ tds::ColumnMetadata MetadataOf(const CatalogColumn &c) {
 	m.max_length = c.max_length < 0 ? 0xFFFF : static_cast<uint16_t>(c.max_length);
 	m.precision = c.precision;
 	m.scale = c.scale;
-	m.flags = tds::COL_FLAG_NULLABLE;
 	if (c.system_type_id == XTYPE_VARCHAR || c.system_type_id == XTYPE_CHAR || c.system_type_id == XTYPE_TEXT) {
 		// A UTF-8 collation's bytes are UTF-8 already (no table); every other page has one, double-byte
 		// ones included (spec 091), which the code-page kernel decodes on the client: a backup has no
@@ -260,7 +265,8 @@ void RecordStager::CheckArm(const Column &col, const CatalogColumn &c) {
 
 //! Column `c` of `table` resolved to its staging, the type it is read as into `type`: an
 //! InvalidInputException naming it when the reader has no way to read it.
-RecordStager::Column RecordStager::ResolveColumn(const std::string &table, const CatalogColumn &c, LogicalType &type) {
+RecordStager::Column RecordStager::ResolveColumn(const std::string &table, const CatalogColumn &c,
+												 const TypeForms &forms, LogicalType &type) {
 	Column col;
 	col.column_id = c.column_id;
 	col.name = table + "." + c.name;
@@ -268,12 +274,12 @@ RecordStager::Column RecordStager::ResolveColumn(const std::string &table, const
 	const bool legacy_lob =
 		c.system_type_id == XTYPE_TEXT || c.system_type_id == XTYPE_NTEXT || c.system_type_id == XTYPE_IMAGE;
 	col.declared_bytes = c.max_length < 0 || legacy_lob ? IN_ROW_BYTES : static_cast<uint32_t>(c.max_length);
-	const ColumnReading reading = ReadingOf(c);
+	const ColumnReading reading = ReadingOf(c, forms);
 	if (!reading.readable) {
 		throw InvalidInputException("backup: %s: %s", col.name, reading.note);
 	}
 	type = reading.type;
-	col.meta = reading.raw ? RawMetadataOf(c) : MetadataOf(c);
+	col.meta = reading.raw ? RawMetadataOf(c) : MetadataOf(c, forms);
 	col.ops = codec::staging::ResolveColumnOps(col.meta, type);
 	col.binary_kernel = col.ops.kernel == FinalizeKernel::Binary && col.meta.type_id != tds::TDS_TYPE_BIGCHAR;
 	col.utf16_kernel = col.ops.kernel == FinalizeKernel::String && col.meta.type_id != tds::TDS_TYPE_NCHAR;
@@ -324,7 +330,7 @@ void RecordStager::MeasureStaging() {
 	var_row_ = std::min<uint64_t>(declared, IN_ROW_BYTES) + delimiters;
 }
 
-RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t> &column_ids)
+RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t> &column_ids, const TypeForms &forms)
 	: table_(table.schema_name + "." + table.name) {
 	for (int32_t id : column_ids) {
 		const CatalogColumn *found = nullptr;
@@ -337,7 +343,7 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 			throw InvalidInputException("backup: %s has no column %d", table_, id);
 		}
 		LogicalType type;
-		columns_.push_back(ResolveColumn(table_, *found, type));
+		columns_.push_back(ResolveColumn(table_, *found, forms, type));
 		types_.push_back(type);
 	}
 	prepared_.assign(columns_.size(), PreparedValue());
@@ -825,6 +831,16 @@ void RecordStager::Append(const RowRecord &row) {
 	count_++;
 }
 
+std::vector<RecordStager::ClrNote> RecordStager::ClrNotes() const {
+	std::vector<ClrNote> notes;
+	for (const auto &col : columns_) {
+		if (col.spatial_notes.not_geometry + col.spatial_notes.malformed + col.hierarchyid_notes.malformed > 0) {
+			notes.push_back(ClrNote{col.name, col.meta.udt_type_name, col.spatial_notes, col.hierarchyid_notes});
+		}
+	}
+	return notes;
+}
+
 void RecordStager::FinalizeChunk(DataChunk &out) {
 	FinalizeChunk();
 	out.SetChildCardinality(count_);
@@ -838,10 +854,11 @@ void RecordStager::FinalizeChunk() {
 	begun_ = false;
 	for (size_t i = 0; i < columns_.size(); i++) {
 		const ColumnStaging &st = arena_.Column(i);
-		// No notes: the backup reads a sql_variant and a spatial value as their stored bytes until spec 093 T8,
-		// so its kernels are never Variant or Spatial.
+		// A spatial or hierarchyid column's notes kept across chunks (spec 093 T8: a value the kernel cannot
+		// read is NULL, its row read); a sql_variant is still its stored bytes (T8b), so the kernel is never
+		// Variant.
 		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, *targets_[i],
-											 nullptr, nullptr);
+											 nullptr, &columns_[i].spatial_notes, &columns_[i].hierarchyid_notes);
 		codec::staging::PublishStagedValidity(st, count_, *targets_[i]);
 	}
 	// The values written straight into their vectors, over their placeholders.

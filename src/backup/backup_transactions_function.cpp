@@ -165,9 +165,14 @@ std::unordered_map<uint64_t, UnitOwner> OwnersOf(const CatalogModel &model) {
 class RowImageDecoder {
 public:
 	explicit RowImageDecoder(const CatalogTable &table) : table_(table) {
-		const ScanColumns columns = ScanColumnsOf(table);
+		// Spec 093 T8: a geometry / geography value as its ISO WKB (a BLOB in the VARIANT), whatever an
+		// ATTACH's geometry_as says: no value is lost -- a curve or FullGlobe, which a GEOMETRY cannot hold,
+		// would be NULL with nothing to say it, the records having no WARNING of their own.
+		TypeForms forms;
+		forms.geometry_as = tds::GeometryAs::Wkb;
+		const ScanColumns columns = ScanColumnsOf(table, forms);
 		names_ = columns.names;
-		stager_.reset(new RecordStager(table, columns.column_ids));
+		stager_.reset(new RecordStager(table, columns.column_ids, forms));
 		chunk_.Initialize(Allocator::DefaultAllocator(), stager_->Types());
 		page_.assign(PAGE_SIZE, 0);
 	}
@@ -211,7 +216,15 @@ public:
 			const RowRecord row = RowRecord::Fixed(view, RowVarCount(view, layout.table));
 			stager_->PrepareRow(row);
 			stager_->Append(row);
+			const idx_t unread = Unreadable();
 			stager_->FinalizeChunk(chunk_);
+			// A CLR value its kernel read as NULL (bytes that are not MS-SSCLRT or a hierarchyid's): the scan
+			// says it in a WARNING, the records have none, so the image keeps its bytes and says why (review of
+			// #621).
+			if (Unreadable() != unread) {
+				reason = "a geometry, geography or hierarchyid value whose stored bytes cannot be read as its type";
+				return false;
+			}
 			child_list_t<Value> values;
 			for (idx_t c = 0; c < names_.size(); c++) {
 				values.emplace_back(names_[c], chunk_.GetValue(c, 0));
@@ -227,6 +240,15 @@ public:
 	}
 
 private:
+	//! The values the stager's CLR kernels read as NULL so far (RecordStager::ClrNotes).
+	idx_t Unreadable() const {
+		idx_t n = 0;
+		for (const auto &note : stager_->ClrNotes()) {
+			n += note.spatial.malformed + note.hierarchyid.malformed;
+		}
+		return n;
+	}
+
 	const CatalogTable &table_;
 	std::vector<std::string> names_;
 	std::unique_ptr<RecordStager> stager_;
