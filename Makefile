@@ -693,6 +693,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_insert_bulk_sql.cpp \
     test/cpp/test_bcp_column_metadata.cpp \
     test/cpp/test_vector_encodings.cpp \
+    test/cpp/test_write_column_ops.cpp \
     test/cpp/test_collation_metadata.cpp \
     test/cpp/test_tls_verification.cpp \
     test/cpp/test_tds_socket.cpp \

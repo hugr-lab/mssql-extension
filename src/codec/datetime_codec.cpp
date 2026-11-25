@@ -943,6 +943,25 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 // EncodeToBcp — Vector overload
 //===----------------------------------------------------------------------===//
 
+//! A datetime2 / datetimeoffset column takes a timestamp (whose type says its unit) and nothing else stored
+//! in eight bytes: a BIGINT, a TIME or a DECIMAL(18) reached TicksPerSecondFor, which answered with an
+//! InternalException (review of #629). Refused by name -- the caller adds the column's.
+static void RequireTimestampSource(LogicalTypeId source_id, const mssql::BCPColumnMetadata &col) {
+	switch (source_id) {
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return;
+	default:
+		throw InvalidInputException(
+			"MSSQL: a %s value cannot be written to a %s column: it takes a timestamp",
+			LogicalType(source_id).ToString(),
+			col.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ ? "datetimeoffset" : "datetime2");
+	}
+}
+
 static void EncodeToBcpUnnamed(Vector &in, const UnifiedVectorFormat &fmt, idx_t row,
 							   const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
 	// The raw int64 in the vector is counted in the SOURCE type's unit; the wire
@@ -977,6 +996,7 @@ static void EncodeToBcpUnnamed(Vector &in, const UnifiedVectorFormat &fmt, idx_t
 			tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);
 			return;
 		}
+		RequireTimestampSource(source_id, col);
 		ComputeDatetime2Components(FormatValue<timestamp_t>(fmt, row).value, source_id, col.scale, time_value,
 								   date_value);
 		tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);
@@ -986,6 +1006,7 @@ static void EncodeToBcpUnnamed(Vector &in, const UnifiedVectorFormat &fmt, idx_t
 		// DuckDB stores TIMESTAMP_TZ as UTC µs; offset 0 on the wire.
 		uint64_t time_value;
 		uint32_t date_value;
+		RequireTimestampSource(source_id, col);
 		ComputeDatetime2Components(FormatValue<timestamp_t>(fmt, row).value, source_id, col.scale, time_value,
 								   date_value);
 		tds::encoding::BCPRowEncoder::EncodeDatetimeOffsetRaw(buf, time_value, date_value, 0, col.scale);
