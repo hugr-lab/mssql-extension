@@ -74,7 +74,7 @@ struct ColumnMetadata {
 	bool IsVectorText() const {
 		return user_type == VECTOR_USER_TYPE && (type_id == TDS_TYPE_BIGVARCHAR || type_id == TDS_TYPE_NVARCHAR);
 	}
-	//! The dimensions of a VECTORTYPE column (ParseTypeInfo checked them).
+	//! The dimensions of a VECTORTYPE column (the COLMETADATA parse checked them: CheckVector).
 	uint16_t VectorDimensions() const {
 		return static_cast<uint16_t>((max_length - VECTOR_HEADER_BYTES) / VectorElementBytes(vector_element_type));
 	}
