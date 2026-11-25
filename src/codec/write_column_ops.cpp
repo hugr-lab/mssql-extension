@@ -156,6 +156,12 @@ bool IsTemporalTarget(LogicalTypeId id) {
 //! them (it used to return a constant 8 for every datetime2, so only
 //! datetime2(7) ever matched), which is safe because COLMETADATA for this
 //! token carries the SCALE and no length at all.
+//! The sources the datetime kernel reads as ticks: codec::datetime::TicksPerSecondFor's types.
+bool IsTimestampSource(LogicalTypeId id) {
+	return id == LogicalTypeId::TIMESTAMP || id == LogicalTypeId::TIMESTAMP_MS || id == LogicalTypeId::TIMESTAMP_NS ||
+		   id == LogicalTypeId::TIMESTAMP_SEC || id == LogicalTypeId::TIMESTAMP_TZ;
+}
+
 bool DatetimeKernelFits(const LogicalType &source, const mssql::BCPColumnMetadata &target) {
 	const LogicalTypeId to = target.duckdb_type.id();
 	const PhysicalType src = source.InternalType();
@@ -169,8 +175,11 @@ bool DatetimeKernelFits(const LogicalType &source, const mssql::BCPColumnMetadat
 	if (to == LogicalTypeId::TIME) {
 		return src == PhysicalType::INT64 && source.id() == LogicalTypeId::TIME && target.max_length == time_written;
 	}
+	// A datetime2 or datetimeoffset target takes the timestamp types, whose unit the kernel asks the source's
+	// type for. Storing eight bytes is not enough: a BIGINT, a TIME or a DECIMAL(18) does too, and the kernel
+	// answers one of those with an InternalException where the row path converts it or refuses it by name.
 	if (to == LogicalTypeId::TIMESTAMP_TZ) {
-		return src == PhysicalType::INT64 && target.max_length == dt2_written + 2;
+		return IsTimestampSource(source.id()) && target.max_length == dt2_written + 2;
 	}
 	if (target.max_length != dt2_written) {
 		return false;
@@ -180,7 +189,7 @@ bool DatetimeKernelFits(const LogicalType &source, const mssql::BCPColumnMetadat
 	// scale, so only the day number is computed.
 	const bool date_into_timestamp =
 		to == LogicalTypeId::TIMESTAMP && src == PhysicalType::INT32 && source.id() == LogicalTypeId::DATE;
-	return date_into_timestamp || src == PhysicalType::INT64;
+	return date_into_timestamp || IsTimestampSource(source.id());
 }
 
 WriteColumnOps ResolveTemporal(const LogicalType &source, const mssql::BCPColumnMetadata &target, WriteColumnOps ops) {
