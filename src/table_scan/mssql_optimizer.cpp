@@ -10,6 +10,7 @@
 // We must look through these projections to find the underlying scan.
 
 #include "table_scan/mssql_optimizer.hpp"
+#include <algorithm>
 #include <map>
 #include <set>
 #include <unordered_set>
@@ -308,6 +309,7 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const L
 								 string &out_order_clause) {
 	string order_clause;
 	idx_t pushed_count = 0;
+	vector<string> pushed_fragments;
 
 	for (idx_t i = 0; i < orders.size(); i++) {
 		auto &order = orders[i];
@@ -322,6 +324,17 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const L
 			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: cannot push (unsupported expression)", (unsigned long long)i);
 			break;	// Stop at first non-pushable column (prefix only)
 		}
+
+		// Issue #637: a key already pushed cannot reorder anything -- its first
+		// occurrence decides, whatever the direction or NULL order of this one --
+		// and the server refuses a repeated ORDER BY item (169) where DuckDB
+		// takes it. Left out, it counts as pushed, so the sort can still go.
+		if (std::find(pushed_fragments.begin(), pushed_fragments.end(), fragment) != pushed_fragments.end()) {
+			pushed_count++;
+			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: %s already pushed", (unsigned long long)i, fragment.c_str());
+			continue;
+		}
+		pushed_fragments.push_back(fragment);
 
 		// Issue #362: the server's order must be DuckDB's. A key the server
 		// orders otherwise would come back in the server's order with DuckDB's
@@ -341,9 +354,13 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const L
 		}
 		const bool is_nullable = column.is_nullable;
 
+		// The NULL test is on the key itself, as the remote-pushdown writer's:
+		// over the bare column two keys of one column (`year(d), month(d)`)
+		// each sent `CASE WHEN [d] IS NULL ...`, and the server refuses the
+		// repeated item (169, #637). For a column key it is the column.
 		string term;
-		if (!mssql::OrderTerm(fragment, mssql::QuoteIdentifier(source_column), order.type, order.null_order,
-							  is_nullable, limited, term)) {
+		if (!mssql::OrderTerm(fragment, pushed_fragments.back(), order.type, order.null_order, is_nullable, limited,
+							  term)) {
 			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: NULL placement of %s cannot be pushed here", (unsigned long long)i,
 							source_column.c_str());
 			break;

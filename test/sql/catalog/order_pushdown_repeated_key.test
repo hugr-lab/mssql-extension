@@ -1,0 +1,138 @@
+# name: test/sql/catalog/order_pushdown_repeated_key.test
+# description: An ORDER BY naming one key twice is pushed with the key once (#637)
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# DuckDB takes a repeated ORDER BY key; SQL Server refuses it (169: "A column has
+# been specified more than once in the order by list"). A key already pushed
+# cannot reorder anything -- its first occurrence decides, whatever the direction
+# or NULL order of the repeat -- so the scan path sends it once and still removes
+# DuckDB's sort. Found by #633's property tests.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# `mssql_remote_pushdown` is read once per catalog, at ATTACH: off here, so the
+# scan path (MSSQLOptimizer) is the one exercised.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS oprk (TYPE mssql, remote_pushdown false, order_pushdown true);
+
+statement ok
+SELECT mssql_exec('oprk', 'DROP TABLE IF EXISTS dbo.op_repeat;
+	CREATE TABLE dbo.op_repeat (k int NOT NULL PRIMARY KEY, n int NULL, d date NOT NULL);
+	INSERT INTO dbo.op_repeat VALUES (3, NULL, ''2021-05-01''), (1, 10, ''2023-01-01''), (2, 20, ''2022-07-01''), (4, 10, ''2020-02-01'')');
+
+query I
+SELECT k FROM oprk.dbo.op_repeat ORDER BY k, k;
+----
+1
+2
+3
+4
+
+# The repeat goes, the sort goes with it.
+query II
+EXPLAIN SELECT k FROM oprk.dbo.op_repeat ORDER BY k, k;
+----
+physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
+
+# The repeat's own direction is ignored: the first occurrence decides.
+query II
+SELECT k AS c0, k AS c1 FROM oprk.dbo.op_repeat ORDER BY 1 DESC, 2 ASC LIMIT 2;
+----
+4	4
+3	3
+
+# A nullable key under a LIMIT (its NULL placement emulated), repeated with
+# another NULL order, and a second key after the repeat.
+query II
+SELECT n, k FROM oprk.dbo.op_repeat ORDER BY n NULLS LAST, n NULLS FIRST, k DESC LIMIT 3;
+----
+10	4
+10	1
+20	2
+
+query II
+EXPLAIN SELECT n, k FROM oprk.dbo.op_repeat ORDER BY n NULLS LAST, n NULLS FIRST, k DESC LIMIT 3;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N|ORDER_BY|Order By).*
+
+# A function key, repeated.
+query I
+SELECT k FROM oprk.dbo.op_repeat ORDER BY year(d) DESC, year(d), k;
+----
+1
+2
+3
+4
+
+query II
+EXPLAIN SELECT k AS c0, k AS c1 FROM oprk.dbo.op_repeat ORDER BY 1 DESC, 2 ASC LIMIT 2;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N|ORDER_BY|Order By).*
+
+# Two different keys over one nullable column, both with their NULL placement
+# emulated under a LIMIT (DuckDB's NULLS LAST against the server's NULLs first
+# for ASC). The NULL test is on each key, not on the bare column: two
+# `CASE WHEN [dd] IS NULL ...` items were refused the same way (169).
+statement ok
+SELECT mssql_exec('oprk', 'DROP TABLE IF EXISTS dbo.op_repeat_dd;
+	CREATE TABLE dbo.op_repeat_dd (k int NOT NULL PRIMARY KEY, dd date NULL);
+	INSERT INTO dbo.op_repeat_dd VALUES (1, ''2021-05-01''), (2, NULL), (3, ''2021-03-01''), (4, ''2020-02-01'')');
+
+query I
+SELECT k FROM oprk.dbo.op_repeat_dd ORDER BY year(dd), month(dd) LIMIT 3;
+----
+4
+3
+1
+
+query II
+EXPLAIN SELECT k FROM oprk.dbo.op_repeat_dd ORDER BY year(dd), month(dd) LIMIT 3;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N|ORDER_BY|Order By).*
+
+query I
+SELECT k FROM oprk.dbo.op_repeat_dd ORDER BY dd, year(dd) LIMIT 3;
+----
+4
+3
+1
+
+# The same answers with no pushdown at all.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS oprkplain (TYPE mssql, remote_pushdown false);
+
+query II
+SELECT n, k FROM oprkplain.dbo.op_repeat ORDER BY n NULLS LAST, n NULLS FIRST, k DESC LIMIT 3;
+----
+10	4
+10	1
+20	2
+
+query I
+SELECT k FROM oprkplain.dbo.op_repeat ORDER BY year(d) DESC, year(d), k;
+----
+1
+2
+3
+4
+
+query I
+SELECT k FROM oprkplain.dbo.op_repeat_dd ORDER BY year(dd), month(dd) LIMIT 3;
+----
+4
+3
+1
+
+statement ok
+DETACH oprkplain;
+
+statement ok
+SELECT mssql_exec('oprk', 'DROP TABLE dbo.op_repeat; DROP TABLE dbo.op_repeat_dd');
+
+statement ok
+DETACH oprk;
