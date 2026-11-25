@@ -41,10 +41,12 @@ DuckDB's planar form, D3); any DuckDB patch.
 ### D1 (P0): DuckDB's join filters rendered, never a narrower answer
 
 What a hash join pushes into the probe scan at the pin (`JoinFilterPushdownInfo::FinalizeFilters`,
-research Q1): min == max as a plain comparison; an IN list (1 < build rows ≤ `dynamic_or_filter_threshold`,
-50) wrapped `__internal_tablefilter_optional`; a prefix-range filter (small-span keys: then nothing else
-for the key); min/max (only with no IN and no prefix range) wrapped `optional` (equality joins) or
-`selectivity_optional`; a bloom filter, deferred, `selectivity_optional`. The build side always finishes
+research Q1, `physical_hash_join.cpp`): min == max as a plain comparison; an IN list (an equality, 1 < build
+rows ≤ `dynamic_or_filter_threshold`, 50, and the values neither holding a NULL nor a dense integer range:
+`PushInFilter`, `FilterCombiner::IsDenseRange`) wrapped `__internal_tablefilter_optional`; a prefix-range
+filter when the key's span is small (then no min/max for the key); min/max (only with no IN and no prefix
+range) wrapped `optional` (equality joins) or `selectivity_optional`; a bloom filter, deferred,
+`selectivity_optional`. The build side always finishes
 before the probe Get's `init_global`, where the catalog scan sends its SQL (the pipeline schedule; the
 scan keeps `INITIALIZE_ON_EXECUTE`).
 
@@ -57,6 +59,15 @@ scan keeps `INITIALIZE_ON_EXECUTE`).
 - Anything the encoder does not take (bloom, prefix range, a string range, an IN of an unencodable
   type) is dropped, never armed client-side. Dropping is correct for both wrappers: DuckDB evaluates
   `optional` as all-true, and `selectivity_optional` it may skip itself.
+- **Dense keys.** A build of consecutive integers (3 or 40 ids, a `range(n)`), or one holding a NULL (a
+  RIGHT join keeps them), gets no IN list; when the span is small it gets a prefix-range filter and no
+  min/max, so nothing the encoder takes, and the probe scan streams the whole table. `PrefixRangeFilter`
+  has no accessor for its bounds, but `LookupRange(lo, hi)` answers `FILTER_ALWAYS_FALSE` when no key can
+  lie in `[lo, hi]`: a binary search over the key type's range (about 64 calls a bound) gives a lower and
+  an upper bound, a `>=` / `<=` superset, rendered where `OrdersLikeDuckDB()` holds. Taken once X6 shows
+  `LookupRange` never answers false for a range holding a key; else the gap is documented.
+- An IN list stays literal (spec 076: IN lists are not parameters), so each key set compiles a plan of
+  its own.
 - **Open, to test first (research Q1):** the unwrapped min == max comparison a range join (NLJ, IEJoin,
   PWMJ) pushes -- `s < 'b'` from a one-row build -- is rendered today like a user's filter. On a string
   under a non-binary collation the server's `<` is not DuckDB's: a row the join matches can be dropped.
@@ -78,8 +89,10 @@ disagreements of 2000, the most for euclidean at 1536 dimensions. The top-10 and
 the two runs that measured them.
 
 **Types and edge cases.**
-- The server returns `float` (a float32 widened); DuckDB returns `FLOAT`.
-- A zero vector: cosine is NaN in DuckDB (the largest value in its order) and 1.0 on the server.
+- The server returns `float`, a float32 widened in every row (X1b); DuckDB returns `FLOAT`. The 079
+  vehicle's `column_types` reads it as `FLOAT`, which is exact.
+- Cosine distance lies in [0, 2] (2 for opposite vectors). A zero vector: NaN in DuckDB (the largest
+  value in its order, `NaN > 2` is true) and 1.0 on the server.
 - NULL sorts first on the server and last in DuckDB, ascending or descending.
 - `VECTOR_NORM(v, 'norm2')` tells a zero vector on the server.
 
@@ -92,7 +105,16 @@ the two runs that measured them.
     ELSE 0 END, VECTOR_DISTANCE(…)` for cosine: the NaN ones after the others, before NULL, which is
     DuckDB's order.
   - DESC: the NaN ones first and NULL still last.
-  - A constant zero vector is not pushed.
+  - An explicit NULLS FIRST / LAST moves the NULL term; each direction keeps NaN as the largest value.
+  - A constant zero vector is not pushed. For two columns the zero test is on either norm.
+- **A zero vector outside ORDER BY (cosine).**
+  - A condition `>` / `>=` adds `OR VECTOR_NORM(v, 'norm2') = 0`: DuckDB keeps the row for any threshold,
+    the server's 1.0 drops it for one of 1 or more. `<` / `<=` need nothing: the server keeps a row DuckDB
+    drops, and DuckDB re-checks.
+  - A result column in the 079 writer: T-SQL `float` holds no NaN, so the distance is sent as `CASE WHEN
+    <zero> THEN NULL ELSE VECTOR_DISTANCE(…) END` with a hidden bit column for `<zero>`, and a projection
+    over the vehicle restores `'nan'::FLOAT` (as the HUGEINT `sum` is cast back over it).
+  - Measured by X1c before P1.
 - **A condition (`array_distance(v, q) < r`) is a superset in the catalog scan, never consumed.** The
   threshold is widened by an a-priori float32 rounding bound, doubled for the two implementations, with
   γ_k = k·2^-24 / (1 - k·2^-24) and n the dimension:
@@ -118,6 +140,10 @@ the two runs that measured them.
   LIMIT k pushed, DuckDB's TopN is kept for all three, over `TOP (k)`: DuckDB orders the k rows the
   server chose by its own floats. The server's order is not DuckDB's (X1b: up to 32 rank disagreements
   in 2000).
+  - That is the catalog scan's TOP N path. In the 079 writer (a statement pushed whole) there is no
+    TopN: the rows come in the server's order with the server's distances, so the result is ordered by
+    the values it returns (owner, 2026-11-25). The writer's veto of an approximate ORDER BY key is lifted
+    for a distance by DQ-1.
 
 ### D3 (P2): spatial predicates with a constant, a superset DuckDB re-checks
 
@@ -200,8 +226,10 @@ CASE WHEN G.STIsValid() = 1
 ### D4 (P3): a bbox hint for a spatial join
 
 A join on `&&` / `ST_Intersects` binds as a LogicalAnyJoin, planned as a blockwise nested loop, and
-DuckDB pushes nothing into the probe scan (research Q2). The extension adds the hint itself, as spec
-080's staged MERGE replaces `LogicalMergeInto` in `PreOptimizeRoot` (research Q3, option B):
+DuckDB pushes nothing into the probe scan (research Q2). The extension adds the hint itself in
+MSSQLOptimizer's post-optimize pass, which runs after DuckDB's join-order optimizer has fixed each join's
+sides (research Q3, option B). Not in `PreOptimizeRoot`, where spec 080's staged MERGE goes: the sides are
+not fixed there.
 
 - MSSQLOptimizer recognises `X ⋈ Get(mssql catalog table)` on a spatial predicate of a `geometry` or
   `geography` column and puts an extension operator on X's side. It is a pass-through sink that computes
@@ -210,7 +238,8 @@ DuckDB pushes nothing into the probe scan (research Q2). The extension adds the 
   - `LogicalGet::dynamic_filters` is copied to the physical scan (`plan_get.cpp`), and the schedule
     orders the build before the probe's init.
   - The scan renders it by D3's envelope form (a superset; the join re-checks), so one box. Up to N boxes
-    would be an OR of envelope tests (X7 to measure; no index either way).
+    would travel as one `ExpressionFilter`, an OR of N `st_intersects_extent` calls, rendered as an OR of
+    envelope tests (X7 to measure; no index either way).
 - **The predicates** are the ones whose matches imply the boxes meet (D3's list). For `ST_DWithin` X's
   extent is grown by `d`. No `ST_Disjoint` and no negation.
 - **The join types** are as DuckDB's own join filters allow: the Get is the probe child of an INNER,
@@ -218,6 +247,7 @@ DuckDB pushes nothing into the probe scan (research Q2). The extension adds the 
   the join must return (as unmatched, or for NOT EXISTS).
   - The check is made on the plan as DuckDB's join-order optimizer leaves it, which may flip a join's
     sides.
+  - A Get on the build side gets no hint: its scan initialises before X's extent is known.
   - A Get on the non-preserved side of a LEFT or ANTI join could be hinted too: later.
 - **Between the join and the Get** only operators that commute with a filter: projections and filters.
   No LIMIT / TOP_N, aggregate or window.
@@ -248,16 +278,17 @@ SRID. What does not map is listed in `docs/type-mapping.md`.
 |---|---|---|
 | X4 | D3 | the envelope form against DuckDB's spatial extension on boundary cases (points on a box's edges and corners, on a diagonal edge, touching shapes) and its cost (plans, logical reads, 100k / 1M rows); for DQ-3 (b): the exact methods and `Filter` on the same cases, whether `WITH (INDEX(six))` ever evaluates `Filter` exactly, whether the `UNION ALL`'s first branch keeps the index, the parameterised `@wkb` form's plan |
 | X5 | D5 | each mapped function against DuckDB's (spatial extension) on X2's shapes, invalid ones and curves included |
-| X6 | D1 | the range-join min == max string filter against a server: rows lost or not |
+| X1c | D2 | cosine with zero-vector rows (the column, the constant, two columns) under `<`, `>`, ASC, DESC and NULLS FIRST, against DuckDB |
+| X6 | D1 | the range-join min == max string filter against a server: rows lost or not; the dense-key build's prefix-range filter, its bounds by `LookupRange`, never false for a range holding a key |
 | X7 | D4 | DuckDB at the pin: a `LogicalExtensionOperator` pass-through sink before a blockwise NL join; the dynamic filter reaching the catalog scan's `init_global`; a LEFT and an ANTI spatial join left without a hint, their answers equal to the unhinted plan's |
 | X8 | D2 | kNN on 100k / 1M `vector(1536)`: wire, server CPU, wall, against today's full read |
 
-## PRs (each from main)
+## PRs (each from main; P3 after P2, whose encoder arm for `st_intersects_extent` it renders through)
 
 | PR | content |
 |---|---|
-| P0 | D1: FilterEncoder unwraps the optional join filters; IN on any type, ranges where `OrdersLikeDuckDB`; X6 and its fix; tests with a local table ⋈ a server table (1, 3, 40, 100 keys) |
-| P1 | D2: VECTOR_DISTANCE in the 079 vocabulary and the TOP N path; NULL / NaN emulation; X8 |
+| P0 | D1: FilterEncoder unwraps the optional join filters; IN on any type, ranges where `OrdersLikeDuckDB`; the dense keys' bounds; X6 and its fix; tests with a local table ⋈ a server table (sparse keys: 1, 3, 40, 100; and consecutive ids, the dense case) |
+| P1 | D2: VECTOR_DISTANCE in the 079 vocabulary and the TOP N path; NULL / NaN emulation, the zero vector in conditions and result columns; X1c, X8 |
 | P2 | D3: spatial predicates with a constant, SRID-blind, geography in its planar form; `sys.spatial_indexes` in the catalog; X4, DQ-3 |
 | P3 | D4: the bbox hint operator; X7, with a LEFT and an ANTI spatial join left unhinted |
 | P4 | D5: the writer's spatial functions; X5 |
