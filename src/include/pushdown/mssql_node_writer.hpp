@@ -383,11 +383,30 @@ private:
 	bool WriteStringAgg(const AggregateCall &call, const Operand &arg, const std::string &filter, Operand &out);
 	//! A window function (spec 079 PR E2): mssql_node_writer_windows.cpp.
 	bool WriteWindow(const WindowExpression &window, Operand &out);
+	//! WriteWindow's steps. Where a window may stand, and the forms the server has none of.
+	bool CheckWindow(const WindowExpression &window);
+	bool WritePartitionBy(const WindowExpression &window, std::string &partition);
+	//! A window's OVER clause as written (" OVER (...)"), and whether it has an ORDER BY and a frame.
+	struct WindowOver {
+		std::string sql;
+		bool ordered = false;
+		bool framed = false;
+	};
+	bool WriteOver(const WindowExpression &window, WindowOver &over);
+	//! By the function's kind: an aggregate OVER; ROW_NUMBER / RANK / DENSE_RANK / NTILE; LAG / LEAD /
+	//! FIRST_VALUE / LAST_VALUE.
+	bool WriteWindowAggregate(const WindowExpression &window, const WindowOver &over, Operand &out);
+	bool WriteRankingWindow(const WindowExpression &window, const WindowOver &over, Operand &out);
+	bool WriteValueWindow(const WindowExpression &window, const WindowOver &over, Operand &out);
 	bool WriteWindowFrame(const WindowExpression &window, std::string &sql);
+	bool WriteFrameBound(const WindowExpression &window, WindowBoundary boundary,
+						 const unique_ptr<ParsedExpression> &expr, bool &rows, std::string &text);
 	//! A node with QUALIFY (PR E2): `SELECT * FROM (<the node, its QUALIFY a
 	//! hidden bit column>) WHERE <it>` with the node's DISTINCT / ORDER BY /
 	//! LIMIT, which DuckDB applies after QUALIFY.
 	bool WriteQualified(const SelectNode &node);
+	//! Under QUALIFY the wrapper's ORDER BY takes a result column's name or position only.
+	bool CheckQualifyOrder(const SelectNode &node);
 	bool WriteQualifyColumn(const SelectNode &node);
 	bool WriteSelectList(const SelectNode &node);
 	//! One select-list item appended to `list`: a *, a column, an integer constant or a computed value.
