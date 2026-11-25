@@ -62,8 +62,11 @@ struct LogRecord {
 	//! The transaction id as fn_dblog prints it high:low, here (u16 high) << 32 | (u32 low); 0 for
 	//! records of no transaction (checkpoints, system work).
 	uint64_t transaction = 0;
-	//! The page the record changes; a record whose fixed part is shorter than 32 bytes has none.
+	//! The page the record changes (@24, its file @28); a record whose fixed part is shorter than 30 bytes has
+	//! none. Its slot (@30) only in a fixed part of 32 bytes or more: LOP_MIGRATE_LOCKS has a page and no
+	//! slot (30 bytes, measured on 2017; fn_dump_dblog gives the page).
 	bool has_page = false;
+	bool has_slot = false;
 	uint16_t file = 0;
 	uint32_t page = 0;
 	uint16_t slot = 0;

@@ -77,7 +77,7 @@ struct FuzzySummary {
 	//! By allocation unit (PageHeader::AllocationUnit's form).
 	std::unordered_map<uint64_t, Unit> units;
 	//! The pages a FORMAT_PAGE of the tail lays out, (file << 32) | page: taken into use while the backup ran
-	//! (a zero copy of one in a one-pass backup is Pending: ZeroCopyError).
+	//! (one with no copy of its own in a one-pass backup is Pending: ZeroCopyError).
 	std::unordered_set<uint64_t> formatted;
 
 	//! A transaction the tail holds a record of.

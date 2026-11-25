@@ -71,6 +71,12 @@ public:
 	// Receive data over TLS
 	ssize_t Receive(uint8_t *buffer, size_t max_length, int timeout_ms = 0);
 
+private:
+	//! One SSL_read under a receive timeout of `timeout_ms`: Receive's answer, or `interrupted` when a
+	//! signal cut the read short before anything arrived.
+	ssize_t ReceiveOnce(uint8_t *buffer, size_t max_length, int timeout_ms, bool &interrupted);
+
+public:
 	// Close TLS connection gracefully
 	void Close();
 

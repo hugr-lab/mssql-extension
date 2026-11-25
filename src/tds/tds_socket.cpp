@@ -3,6 +3,7 @@
 #include "tds/tds_tls_handshake_transport.hpp"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -164,7 +165,9 @@ static std::string SocketErrorText(int error) {
 				 {WSAEHOSTDOWN, "Host is down"},
 				 {WSAEADDRNOTAVAIL, "Cannot assign requested address"},
 				 {WSAEAFNOSUPPORT, "Address family not supported by protocol"},
-				 {WSAECONNRESET, "Connection reset by peer"}};
+				 {WSAECONNRESET, "Connection reset by peer"},
+				 {WSAECONNABORTED, "Software caused connection abort"},
+				 {WSAEINTR, "Interrupted system call"}};
 	for (const auto &name : NAMES) {
 		if (name.code == error) {
 			return name.text;
@@ -174,6 +177,52 @@ static std::string SocketErrorText(int error) {
 #else
 	return strerror(error);
 #endif
+}
+
+//! The error of the socket call that just failed is read through SOCKET_ERROR_CODE, never errno: Winsock
+//! does not set errno, so on Windows errno is whatever an earlier C call left -- a real socket error worded
+//! by it, and one left at EINTR / EAGAIN retried forever.
+//!
+//! A signal cut the call short: no answer of the socket's, the call is made again.
+static bool IsInterruptedCall(int error) {
+#ifdef _WIN32
+	return error == WSAEINTR;
+#else
+	return error == EINTR;
+#endif
+}
+
+//! A non-blocking socket has nothing to give or take right now.
+static bool WouldBlock(int error) {
+#ifdef _WIN32
+	return error == WSAEWOULDBLOCK;
+#else
+	return error == EAGAIN || error == EWOULDBLOCK;
+#endif
+}
+
+//! poll() on one descriptor for up to `timeout_ms` (negative: no limit); poll()'s own answer. A signal ends
+//! poll() early (EINTR, whatever SA_RESTART says); that is not the wait's answer -- it read as a timeout,
+//! or as an error, before the time was up -- so the wait goes on for what is left of it.
+static int PollOne(struct pollfd &pfd, int timeout_ms) {
+	const auto start = std::chrono::steady_clock::now();
+	int wait_ms = timeout_ms;
+	while (true) {
+		pfd.revents = 0;
+		const int ret = poll(&pfd, 1, wait_ms);
+		if (ret >= 0 || !IsInterruptedCall(SOCKET_ERROR_CODE)) {
+			return ret;
+		}
+		if (timeout_ms < 0) {
+			continue;
+		}
+		const auto elapsed =
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+		if (elapsed >= timeout_ms) {
+			return 0;
+		}
+		wait_ms = static_cast<int>(timeout_ms - elapsed);
+	}
 }
 
 //! A dial that failed before reaching the network: this host has no route or address of that family
@@ -207,7 +256,14 @@ bool TdsSocket::AwaitConnect(int addr_index, int timeout_seconds) {
 	// whether it timed out is asked of the socket, not of the wait: SO_ERROR is 0 when nothing came back in
 	// time. (Every failed wait used to be worded "Connection timed out", and a refusal reached the user as
 	// advice about firewalls.)
+	//
+	// WaitForReady words its own outcome into last_error_ ("Socket error during poll"). That is not a dial's
+	// reason, and left there it passed for one: NoteDialError keeps an earlier address's reason over a local
+	// failure, found the wait's words, and kept those -- neither the earlier reason nor this one. So the
+	// reason from before the wait is put back before this address's is decided.
+	const std::string earlier = last_error_;
 	const bool ready = WaitForReady(true, timeout_seconds * 1000);
+	last_error_ = earlier;
 	int error = 0;
 	socklen_t len = sizeof(error);
 	const bool known = getsockopt(fd_, SOL_SOCKET, SO_ERROR, SOCK_OPT_CAST(&error), &len) == 0;
@@ -432,10 +488,11 @@ bool TlsHandshakeTransport::Flush() {
 		ssize_t sent = send(fd_, SOCK_BUF_CONST_CAST(tds_packet.data() + total_sent), tds_packet.size() - total_sent,
 							MSG_NOSIGNAL);
 		if (sent < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+			const int error = SOCKET_ERROR_CODE;
+			if (WouldBlock(error) || IsInterruptedCall(error)) {
 				continue;
 			}
-			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Flush: socket error %d (%s)", errno, strerror(errno));
+			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Flush: socket error %d (%s)", error, SocketErrorText(error).c_str());
 			return false;
 		}
 		total_sent += sent;
@@ -458,71 +515,104 @@ size_t TlsHandshakeTransport::TakeBuffered(uint8_t *buf, size_t len) {
 	return to_copy;
 }
 
-bool TlsHandshakeTransport::ReadFully(uint8_t *to, size_t count, const char *what, const char *closed) {
-	size_t read = 0;
-	while (read < count) {
-		ssize_t n = recv(fd_, SOCK_BUF_CAST(to + read), count - read, 0);
+int TlsHandshakeTransport::ReadSome(uint8_t *to, size_t count, std::chrono::steady_clock::time_point start,
+									int timeout_ms, const char *what, const char *closed) {
+	while (filled_ < count) {
+		// Every read waits first, for what is left of the call's time. The reads used to be plain blocking
+		// recv() calls behind ONE wait for the packet's first byte: a server that sent part of a packet and
+		// then nothing held the login for as long as it liked, whatever the connection timeout said -- and
+		// this is before its certificate is looked at.
+		int wait_ms = timeout_ms;
+		if (timeout_ms >= 0) {
+			const auto elapsed =
+				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+			wait_ms = elapsed >= timeout_ms ? 0 : static_cast<int>(timeout_ms - elapsed);
+		}
+		struct pollfd pfd;
+		pfd.fd = fd_;
+		pfd.events = POLLIN;
+		const int ready = PollOne(pfd, wait_ms);
+		if (ready < 0) {
+			const int error = SOCKET_ERROR_CODE;
+			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: poll error %d (%s)", error, SocketErrorText(error).c_str());
+			return -1;
+		}
+		if (ready == 0) {
+			return 0;
+		}
+		ssize_t n = recv(fd_, SOCK_BUF_CAST(to + filled_), count - filled_, 0);
 		if (n < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+			const int error = SOCKET_ERROR_CODE;
+			if (WouldBlock(error) || IsInterruptedCall(error)) {
 				continue;
 			}
-			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: %s read error %d (%s)", what, errno, strerror(errno));
-			return false;
+			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: %s read error %d (%s)", what, error,
+								   SocketErrorText(error).c_str());
+			return -1;
 		}
 		if (n == 0) {
 			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: %s", closed);
-			return false;
+			return -1;
 		}
-		read += n;
+		filled_ += static_cast<size_t>(n);
 	}
-	return true;
+	return 1;
 }
 
-bool TlsHandshakeTransport::ReadPacket() {
-	// Read TDS header first (8 bytes)
-	uint8_t header[8];
-	if (!ReadFully(header, 8, "header", "connection closed by server")) {
-		return false;
+int TlsHandshakeTransport::ReadPacket(int timeout_ms) {
+	const auto start = std::chrono::steady_clock::now();
+	if (!in_payload_) {
+		// Read TDS header first (8 bytes)
+		const int got = ReadSome(header_, TDS_HEADER_SIZE, start, timeout_ms, "header", "connection closed by server");
+		if (got != 1) {
+			return got;
+		}
+
+		uint8_t pkt_type = header_[0];
+		uint16_t pkt_len = (static_cast<uint16_t>(header_[2]) << 8) | header_[3];
+
+		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: got TDS packet type=0x%02x, total_len=%d", pkt_type, pkt_len);
+
+		if (pkt_type != 0x04 && pkt_type != 0x12) {	 // REPLY or PRELOGIN
+			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: unexpected packet type 0x%02x", pkt_type);
+			return -1;
+		}
+
+		// Read the payload straight into the buffer that will hold the remainder.
+		// This used to allocate a fresh vector per TDS packet — one malloc, one
+		// value-initialisation and one free for every 16 KB frame of the result
+		// set, all of it discarded a few lines later.
+		if (pkt_len < TDS_HEADER_SIZE) {
+			// Before the subtraction, because it is unsigned: a declared length of
+			// 3 makes payload_len SIZE_MAX-4, and the resize() below then throws
+			// std::length_error from inside a std::function that OpenSSL invokes
+			// through a C function pointer. This runs during the handshake, before
+			// the peer's certificate is validated.
+			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: packet length %u is shorter than the header", pkt_len);
+			return -1;
+		}
+		recv_buffer_.clear();
+		recv_pos_ = 0;
+		recv_buffer_.resize(pkt_len - TDS_HEADER_SIZE);
+		in_payload_ = true;
+		filled_ = 0;
 	}
 
-	uint8_t pkt_type = header[0];
-	uint16_t pkt_len = (static_cast<uint16_t>(header[2]) << 8) | header[3];
-
-	MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: got TDS packet type=0x%02x, total_len=%d", pkt_type, pkt_len);
-
-	if (pkt_type != 0x04 && pkt_type != 0x12) {	 // REPLY or PRELOGIN
-		MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: unexpected packet type 0x%02x", pkt_type);
-		return false;
+	const int got = ReadSome(recv_buffer_.data(), recv_buffer_.size(), start, timeout_ms, "payload",
+							 "connection closed during payload");
+	if (got != 1) {
+		return got;
 	}
+	in_payload_ = false;
+	filled_ = 0;
 
-	// Read the payload straight into the buffer that will hold the remainder.
-	// This used to allocate a fresh vector per TDS packet — one malloc, one
-	// value-initialisation and one free for every 16 KB frame of the result
-	// set, all of it discarded a few lines later.
-	if (pkt_len < TDS_HEADER_SIZE) {
-		// Before the subtraction, because it is unsigned: a declared length of
-		// 3 makes payload_len SIZE_MAX-4, and the resize() below then throws
-		// std::length_error from inside a std::function that OpenSSL invokes
-		// through a C function pointer. This runs during the handshake, before
-		// the peer's certificate is validated.
-		MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: packet length %u is shorter than the header", pkt_len);
-		return false;
-	}
-	size_t payload_len = pkt_len - 8;
-	recv_buffer_.clear();
-	recv_pos_ = 0;
-	recv_buffer_.resize(payload_len);
-	if (!ReadFully(recv_buffer_.data(), payload_len, "payload", "connection closed during payload")) {
-		return false;
-	}
-
-	MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: read TDS payload of %zu bytes", payload_len);
-	return true;
+	MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: read TDS payload of %zu bytes", recv_buffer_.size());
+	return 1;
 }
 
 int TlsHandshakeTransport::Receive(uint8_t *buf, size_t len, int timeout_ms) {
 	MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: request %zu bytes (recv_buffer=%zu, send_buffer=%zu, timeout=%d)", len,
-						   recv_buffer_.size() - recv_pos_, send_buffer_.size(), timeout_ms);
+						   PendingReceiveBytes(), send_buffer_.size(), timeout_ms);
 
 	// Like FreeTDS: flush send buffer before trying to receive
 	// This ensures all pending TLS data is sent as a single TDS packet
@@ -532,31 +622,36 @@ int TlsHandshakeTransport::Receive(uint8_t *buf, size_t len, int timeout_ms) {
 	}
 
 	// First, return data from buffer if we have any
-	if (recv_buffer_.size() > recv_pos_) {
+	if (PendingReceiveBytes() > 0) {
 		const size_t taken = TakeBuffered(buf, len);
 		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: returned %zu bytes from buffer (%zu remaining)", taken,
-							   recv_buffer_.size() - recv_pos_);
+							   PendingReceiveBytes());
 		return static_cast<int>(taken);
 	}
 
-	// Wait for data with timeout
-	struct pollfd pfd;
-	pfd.fd = fd_;
-	pfd.events = POLLIN;
-	pfd.revents = 0;
+	// The call's timeout, cut to what is left of the handshake's (SetDeadline): the caller hands every call
+	// the whole timeout, and a peer that sent something just inside each one was never late.
+	if (has_deadline_) {
+		const auto left =
+			std::chrono::duration_cast<std::chrono::milliseconds>(deadline_ - std::chrono::steady_clock::now()).count();
+		if (left <= 0) {
+			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: the handshake's deadline has passed");
+			return 0;
+		}
+		if (timeout_ms < 0 || left < timeout_ms) {
+			timeout_ms = static_cast<int>(left);
+		}
+	}
 
-	int poll_result = poll(&pfd, 1, timeout_ms);
-	if (poll_result < 0) {
-		MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: poll error %d (%s)", errno, strerror(errno));
+	// The next packet, whole, within the timeout. One that is not whole by then is kept as far as it came:
+	// 0 like any timeout, and the next call reads on from there.
+	const int got = ReadPacket(timeout_ms);
+	if (got < 0) {
 		return -1;
 	}
-	if (poll_result == 0) {
+	if (got == 0) {
 		MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: timeout");
 		return 0;  // Timeout
-	}
-
-	if (!ReadPacket()) {
-		return -1;
 	}
 
 	// Hand out what was asked for; the rest stays where it already is, behind
@@ -637,6 +732,10 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 	// The TLS data must be sent inside TDS PRELOGIN packets (type 0x12)
 	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: setting up TDS-wrapped TLS I/O...");
 	auto transport = std::make_shared<TlsHandshakeTransport>(fd_, packet_id);
+	if (timeout_ms >= 0) {
+		// One deadline for the whole handshake, not a timeout per read (review of #617).
+		transport->SetDeadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
+	}
 	TlsSendCallback send_cb = [transport](const uint8_t *data, size_t len) -> int {
 		return transport->Buffer(data, len);
 	};
@@ -725,7 +824,13 @@ bool TdsSocket::Send(const uint8_t *data, size_t length) {
 	while (total_sent < length) {
 		ssize_t sent = send(fd_, SOCK_BUF_CONST_CAST(data + total_sent), length - total_sent, MSG_NOSIGNAL);
 		if (sent <= 0) {
-			if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			const int error = sent < 0 ? SOCKET_ERROR_CODE : 0;
+			if (sent < 0 && IsInterruptedCall(error)) {
+				// A signal before any byte was taken: the connection is as it was. Reported, this ended a
+				// healthy connection in the middle of a message.
+				continue;
+			}
+			if (sent < 0 && WouldBlock(error)) {
 				// Would block, wait and retry
 				if (!WaitForReady(true, 30000)) {
 					last_error_ = "Send timeout";
@@ -733,7 +838,7 @@ bool TdsSocket::Send(const uint8_t *data, size_t length) {
 				}
 				continue;
 			}
-			last_error_ = "Send failed: " + std::string(strerror(errno));
+			last_error_ = "Send failed: " + (sent < 0 ? SocketErrorText(error) : std::string("no bytes were taken"));
 			connected_ = false;
 			return false;
 		}
@@ -794,12 +899,19 @@ ssize_t TdsSocket::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 		return 0;  // Timeout
 	}
 
-	ssize_t received = recv(fd_, SOCK_BUF_CAST(buffer), max_length, 0);
+	ssize_t received;
+	int error = 0;
+	do {
+		// poll() said there is something to read, so a signal that cuts the read short is no answer:
+		// read again.
+		received = recv(fd_, SOCK_BUF_CAST(buffer), max_length, 0);
+		error = received < 0 ? SOCKET_ERROR_CODE : 0;
+	} while (received < 0 && IsInterruptedCall(error));
 	if (received < 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+		if (WouldBlock(error)) {
 			return 0;  // No data available
 		}
-		last_error_ = "Receive failed: " + std::string(strerror(errno));
+		last_error_ = "Receive failed: " + SocketErrorText(error);
 		connected_ = false;
 		return -1;
 	}
@@ -1004,11 +1116,15 @@ bool TdsSocket::WaitForReady(bool for_write, int timeout_ms) {
 	struct pollfd pfd;
 	pfd.fd = fd_;
 	pfd.events = for_write ? POLLOUT : POLLIN;
-	pfd.revents = 0;
 
-	int ret = poll(&pfd, 1, timeout_ms);
+	int ret = PollOne(pfd, timeout_ms);
 	if (ret < 0) {
-		last_error_ = "Poll failed: " + std::string(strerror(errno));
+		// A signal is waited through (PollOne), so what gets here is poll() itself failing (ENOMEM,
+		// EINVAL): the connection is done. Left "connected", Receive answered 0 -- a timeout -- and a caller
+		// that waits in slices with no deadline came straight back, forever (review of #617; the same
+		// rule as issue #456).
+		last_error_ = "Poll failed: " + SocketErrorText(SOCKET_ERROR_CODE);
+		connected_ = false;
 		return false;
 	}
 	if (ret == 0) {

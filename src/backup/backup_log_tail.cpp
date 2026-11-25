@@ -19,8 +19,10 @@ namespace {
 constexpr size_t LONGEST_BLOCK_HEADER = 72;
 constexpr size_t SHORTEST_BLOCK_HEADER = 48;
 constexpr size_t SECTOR = 512;
-//! A record's header up to its page and slot (@24 .. @31), and up to its allocation unit's high part (@46).
-constexpr size_t RECORD_WITH_PAGE = 32;
+//! A record's header up to its page and file (@24 .. @29), its slot (@30 .. @31), and its allocation unit's
+//! high part (@46).
+constexpr size_t RECORD_WITH_PAGE = 30;
+constexpr size_t RECORD_WITH_SLOT = 32;
 constexpr size_t RECORD_WITH_UNIT = 48;
 //! The tail is read in chunks of this many bytes, a block never cut across two.
 constexpr size_t CHUNK = 4u << 20;
@@ -158,7 +160,8 @@ void ParseLogBlock(const uint8_t *block, size_t size, size_t header_bytes, const
 		record.has_page = fixed >= RECORD_WITH_PAGE;
 		record.page = record.has_page ? U32(r + 24) : 0;
 		record.file = record.has_page ? U16(r + 28) : 0;
-		record.slot = record.has_page ? U16(r + 30) : 0;
+		record.has_slot = fixed >= RECORD_WITH_SLOT;
+		record.slot = record.has_slot ? U16(r + 30) : 0;
 		record.has_allocation_unit = fixed >= RECORD_WITH_UNIT;
 		record.allocation_unit = record.has_allocation_unit ? (static_cast<uint64_t>(U16(r + 46)) << 48) |
 																  (static_cast<uint64_t>(U32(r + 32)) << 16)
