@@ -673,6 +673,29 @@ ssize_t TlsImpl::Send(const uint8_t *data, size_t length) {
 }
 
 ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
+	// A signal cuts the read short with EINTR (a socket with a receive timeout is not restarted, whatever
+	// SA_RESTART says), which OpenSSL reports as "read again". That is not the timeout: reported as 0, a
+	// read gave up before its time, as the plain-TCP path did (review of #617). Read on for what is left.
+	const auto start = std::chrono::steady_clock::now();
+	int wait_ms = timeout_ms;
+	for (;;) {
+		bool interrupted = false;
+		const ssize_t received = ReceiveOnce(buffer, max_length, wait_ms, interrupted);
+		if (!interrupted) {
+			return received;
+		}
+		if (timeout_ms > 0) {
+			const auto elapsed =
+				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+			if (elapsed >= timeout_ms) {
+				return 0;
+			}
+			wait_ms = static_cast<int>(timeout_ms - elapsed);
+		}
+	}
+}
+
+ssize_t TlsImpl::ReceiveOnce(uint8_t *buffer, size_t max_length, int timeout_ms, bool &interrupted) {
 	// The code is how a caller tells a closed peer (0, PEER_CLOSED) from a
 	// timeout (0, no code): a code left over from an earlier call must not make
 	// a timeout read as a close (issue #456).
@@ -730,6 +753,10 @@ ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 		ctx_->last_error = "Connection closed by peer";
 		return 0;
 	} else if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+#ifndef _WIN32
+		// errno was cleared before the read: EINTR here is this read's, set by the BIO's recv().
+		interrupted = errno == EINTR;
+#endif
 		return 0;
 	} else if (ssl_error == SSL_ERROR_SYSCALL) {
 		// System call error - get the actual error
