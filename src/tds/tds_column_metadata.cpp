@@ -6,96 +6,98 @@
 namespace duckdb {
 namespace tds {
 
+namespace {
+
+//! How a type's TYPE_INFO is laid out after the type byte (MS-TDS 2.2.5.4): what the parser reads for it.
+enum class TypeInfoForm : uint8_t {
+	NONE,		  // nothing: the fixed-length types and DATE
+	BYTE_LENGTH,  // 1 byte length: the nullable fixed-length types and UNIQUEIDENTIFIER
+	DECIMAL,	  // 1 byte length, precision, scale
+	STRING,		  // 2 bytes length, 5 bytes collation
+	BINARY,		  // 2 bytes length
+	SCALE,		  // 1 byte fractional-second scale
+	XML,		  // SCHEMA_PRESENT and, when set, the schema collection's names
+	UDT,		  // MAX_BYTE_SIZE and the type's names
+	VARIANT,	  // a LONGLEN maximum
+	VECTOR,		  // 2 bytes length, the element type
+	LOB			  // a LONGLEN, a collation for the text forms, the source table's name
+};
+
+//! One wire type: its name in messages, its TYPE_INFO, and a value's size where the type alone fixes it.
+struct TypeEntry {
+	uint8_t type_id;
+	const char *name;
+	TypeInfoForm form;
+	uint8_t fixed_size;
+};
+
+constexpr TypeEntry TYPES[] = {
+	{TDS_TYPE_NULL, "NULL", TypeInfoForm::NONE, 0},
+	{TDS_TYPE_TINYINT, "TINYINT", TypeInfoForm::NONE, 1},
+	{TDS_TYPE_BIT, "BIT", TypeInfoForm::NONE, 1},
+	{TDS_TYPE_SMALLINT, "SMALLINT", TypeInfoForm::NONE, 2},
+	{TDS_TYPE_INT, "INT", TypeInfoForm::NONE, 4},
+	{TDS_TYPE_BIGINT, "BIGINT", TypeInfoForm::NONE, 8},
+	{TDS_TYPE_REAL, "REAL", TypeInfoForm::NONE, 4},
+	{TDS_TYPE_FLOAT, "FLOAT", TypeInfoForm::NONE, 8},
+	{TDS_TYPE_MONEY, "MONEY", TypeInfoForm::NONE, 8},
+	{TDS_TYPE_SMALLMONEY, "SMALLMONEY", TypeInfoForm::NONE, 4},
+	{TDS_TYPE_DATETIME, "DATETIME", TypeInfoForm::NONE, 8},
+	{TDS_TYPE_SMALLDATETIME, "SMALLDATETIME", TypeInfoForm::NONE, 4},
+	{TDS_TYPE_DATE, "DATE", TypeInfoForm::NONE, 3},
+	{TDS_TYPE_INTN, "INTN", TypeInfoForm::BYTE_LENGTH, 0},
+	{TDS_TYPE_BITN, "BITN", TypeInfoForm::BYTE_LENGTH, 0},
+	{TDS_TYPE_FLOATN, "FLOATN", TypeInfoForm::BYTE_LENGTH, 0},
+	{TDS_TYPE_MONEYN, "MONEYN", TypeInfoForm::BYTE_LENGTH, 0},
+	{TDS_TYPE_DATETIMEN, "DATETIMEN", TypeInfoForm::BYTE_LENGTH, 0},
+	{TDS_TYPE_UNIQUEIDENTIFIER, "UNIQUEIDENTIFIER", TypeInfoForm::BYTE_LENGTH, 0},
+	{TDS_TYPE_DECIMAL, "DECIMAL", TypeInfoForm::DECIMAL, 0},
+	{TDS_TYPE_NUMERIC, "NUMERIC", TypeInfoForm::DECIMAL, 0},
+	{TDS_TYPE_BIGCHAR, "CHAR", TypeInfoForm::STRING, 0},
+	{TDS_TYPE_BIGVARCHAR, "VARCHAR", TypeInfoForm::STRING, 0},
+	{TDS_TYPE_NCHAR, "NCHAR", TypeInfoForm::STRING, 0},
+	{TDS_TYPE_NVARCHAR, "NVARCHAR", TypeInfoForm::STRING, 0},
+	{TDS_TYPE_BIGBINARY, "BINARY", TypeInfoForm::BINARY, 0},
+	{TDS_TYPE_BIGVARBINARY, "VARBINARY", TypeInfoForm::BINARY, 0},
+	{TDS_TYPE_TIME, "TIME", TypeInfoForm::SCALE, 0},
+	{TDS_TYPE_DATETIME2, "DATETIME2", TypeInfoForm::SCALE, 0},
+	{TDS_TYPE_DATETIMEOFFSET, "DATETIMEOFFSET", TypeInfoForm::SCALE, 0},
+	{TDS_TYPE_XML, "XML", TypeInfoForm::XML, 0},
+	{TDS_TYPE_UDT, "UDT", TypeInfoForm::UDT, 0},
+	{TDS_TYPE_SQL_VARIANT, "SQL_VARIANT", TypeInfoForm::VARIANT, 0},
+	{TDS_TYPE_VECTOR, "VECTOR", TypeInfoForm::VECTOR, 0},
+	{TDS_TYPE_IMAGE, "IMAGE", TypeInfoForm::LOB, 0},
+	{TDS_TYPE_TEXT, "TEXT", TypeInfoForm::LOB, 0},
+	{TDS_TYPE_NTEXT, "NTEXT", TypeInfoForm::LOB, 0},
+};
+
+//! The entry of a type byte, or null for one the extension does not read.
+const TypeEntry *FindType(uint8_t type_id) {
+	for (auto &entry : TYPES) {
+		if (entry.type_id == type_id) {
+			return &entry;
+		}
+	}
+	return nullptr;
+}
+
+}  // namespace
+
 //===----------------------------------------------------------------------===//
 // ColumnMetadata Implementation
 //===----------------------------------------------------------------------===//
 
 std::string ColumnMetadata::GetTypeName() const {
-	switch (type_id) {
-	case TDS_TYPE_NULL:
-		return "NULL";
-	case TDS_TYPE_TINYINT:
-		return "TINYINT";
-	case TDS_TYPE_BIT:
-		return "BIT";
-	case TDS_TYPE_SMALLINT:
-		return "SMALLINT";
-	case TDS_TYPE_INT:
-		return "INT";
-	case TDS_TYPE_BIGINT:
-		return "BIGINT";
-	case TDS_TYPE_REAL:
-		return "REAL";
-	case TDS_TYPE_FLOAT:
-		return "FLOAT";
-	case TDS_TYPE_MONEY:
-		return "MONEY";
-	case TDS_TYPE_SMALLMONEY:
-		return "SMALLMONEY";
-	case TDS_TYPE_DATETIME:
-		return "DATETIME";
-	case TDS_TYPE_SMALLDATETIME:
-		return "SMALLDATETIME";
-	case TDS_TYPE_INTN:
-		return "INTN";
-	case TDS_TYPE_BITN:
-		return "BITN";
-	case TDS_TYPE_FLOATN:
-		return "FLOATN";
-	case TDS_TYPE_MONEYN:
-		return "MONEYN";
-	case TDS_TYPE_DATETIMEN:
-		return "DATETIMEN";
-	case TDS_TYPE_DECIMAL:
-		return "DECIMAL";
-	case TDS_TYPE_NUMERIC:
-		return "NUMERIC";
-	case TDS_TYPE_UNIQUEIDENTIFIER:
-		return "UNIQUEIDENTIFIER";
-	case TDS_TYPE_BIGCHAR:
-		return "CHAR";
-	case TDS_TYPE_BIGVARCHAR:
-		return "VARCHAR";
-	case TDS_TYPE_NCHAR:
-		return "NCHAR";
-	case TDS_TYPE_NVARCHAR:
-		return "NVARCHAR";
-	case TDS_TYPE_BIGBINARY:
-		return "BINARY";
-	case TDS_TYPE_BIGVARBINARY:
-		return "VARBINARY";
-	case TDS_TYPE_DATE:
-		return "DATE";
-	case TDS_TYPE_TIME:
-		return "TIME";
-	case TDS_TYPE_DATETIME2:
-		return "DATETIME2";
-	case TDS_TYPE_DATETIMEOFFSET:
-		return "DATETIMEOFFSET";
-	case TDS_TYPE_XML:
-		return "XML";
-	case TDS_TYPE_UDT:
-		return "UDT";
-	case TDS_TYPE_SQL_VARIANT:
-		return "SQL_VARIANT";
-	case TDS_TYPE_VECTOR:
-		return "VECTOR";
-	case TDS_TYPE_IMAGE:
-		return "IMAGE";
-	case TDS_TYPE_TEXT:
-		return "TEXT";
-	case TDS_TYPE_NTEXT:
-		return "NTEXT";
-	default: {
-		// Hex prefix, hex digits: 0xAF, not 0x175. The parser's unknown-token
-		// message had the same defect (spec 072 W5); this is the type-byte twin,
-		// and it reaches users through "Unsupported SQL Server type" and
-		// "Unsupported type in RowReader" -- the lines the next #323 gets pasted from.
-		char buf[16];
-		std::snprintf(buf, sizeof(buf), "UNKNOWN(0x%02X)", static_cast<unsigned>(type_id));
-		return buf;
+	if (const TypeEntry *entry = FindType(type_id)) {
+		return entry->name;
 	}
-	}
+	// Hex prefix, hex digits: 0xAF, not 0x175. The parser's unknown-token
+	// message had the same defect (spec 072 W5); this is the type-byte twin,
+	// and it reaches users through "Unsupported SQL Server type" and
+	// "Unsupported type in RowReader" -- the lines the next #323 gets pasted from.
+	char buf[16];
+	std::snprintf(buf, sizeof(buf), "UNKNOWN(0x%02X)", static_cast<unsigned>(type_id));
+	return buf;
 }
 
 bool ColumnMetadata::IsVariableLength() const {
@@ -131,403 +133,280 @@ bool ColumnMetadata::IsPLPType() const {
 	if (type_id == TDS_TYPE_XML || type_id == TDS_TYPE_UDT) {
 		return true;
 	}
-	// PLP (Partially Length-Prefixed) encoding is used for MAX types
-	// where max_length == 0xFFFF (65535)
-	if (max_length != 0xFFFF) {
-		return false;
-	}
-	switch (type_id) {
-	case TDS_TYPE_BIGCHAR:		 // CHAR(MAX) - rare but possible
-	case TDS_TYPE_BIGVARCHAR:	 // VARCHAR(MAX)
-	case TDS_TYPE_NCHAR:		 // NCHAR(MAX) - rare but possible
-	case TDS_TYPE_NVARCHAR:		 // NVARCHAR(MAX)
-	case TDS_TYPE_BIGBINARY:	 // BINARY(MAX) - rare but possible
-	case TDS_TYPE_BIGVARBINARY:	 // VARBINARY(MAX)
-		return true;
-	default:
-		return false;
-	}
+	// PLP (Partially Length-Prefixed) encoding is used for MAX types, where max_length == 0xFFFF (65535):
+	// VARCHAR / NVARCHAR / VARBINARY(MAX), and CHAR / NCHAR / BINARY should a server ever declare one so.
+	return max_length == 0xFFFF && IsVariableLength();
 }
 
 size_t ColumnMetadata::GetFixedSize() const {
-	switch (type_id) {
-	case TDS_TYPE_TINYINT:
-		return 1;
-	case TDS_TYPE_BIT:
-		return 1;
-	case TDS_TYPE_SMALLINT:
-		return 2;
-	case TDS_TYPE_INT:
-		return 4;
-	case TDS_TYPE_BIGINT:
-		return 8;
-	case TDS_TYPE_REAL:
-		return 4;
-	case TDS_TYPE_FLOAT:
-		return 8;
-	case TDS_TYPE_MONEY:
-		return 8;
-	case TDS_TYPE_SMALLMONEY:
-		return 4;
-	case TDS_TYPE_DATETIME:
-		return 8;
-	case TDS_TYPE_SMALLDATETIME:
-		return 4;
-	case TDS_TYPE_DATE:
-		return 3;
-	default:
-		return 0;  // Variable length or has length prefix
-	}
+	const TypeEntry *entry = FindType(type_id);
+	return entry ? entry->fixed_size : 0;  // 0: variable length, or behind a length prefix
 }
 
 //===----------------------------------------------------------------------===//
 // ColumnMetadataParser Implementation
 //===----------------------------------------------------------------------===//
 
-bool ColumnMetadataParser::Parse(const uint8_t *data, size_t length, size_t &bytes_consumed,
-								 std::vector<ColumnMetadata> &columns) {
-	columns.clear();
-	size_t offset = 0;
+namespace {
 
-	// Need at least 2 bytes for column count
-	if (length < 2) {
-		return false;
+//! The token's bytes and how far the parse has read. Every read answers false, taking nothing, when
+//! the bytes it needs have not arrived: the caller then asks again with more of the token.
+struct Cursor {
+	const uint8_t *data;
+	size_t length;
+	size_t offset;
+
+	bool Has(size_t bytes) const {
+		return bytes <= length - offset;
 	}
-
-	// Read column count (uint16_t LE)
-	uint16_t count = static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
-	offset = 2;
-
-	// Special case: 0xFFFF means no metadata (no result set)
-	if (count == 0xFFFF) {
-		bytes_consumed = offset;
+	bool U8(uint8_t &value) {
+		if (!Has(1)) {
+			return false;
+		}
+		value = data[offset++];
 		return true;
 	}
-
-	columns.reserve(count);
-
-	// Parse each column
-	for (uint16_t i = 0; i < count; i++) {
-		ColumnMetadata column;
-		if (!ParseColumn(data + offset, length - offset, offset, column)) {
-			return false;  // Need more data
+	bool U16(uint16_t &value) {
+		if (!Has(2)) {
+			return false;
 		}
-		columns.push_back(std::move(column));
+		value = static_cast<uint16_t>(data[offset] | (data[offset + 1] << 8));
+		offset += 2;
+		return true;
 	}
+	bool U32(uint32_t &value) {
+		if (!Has(4)) {
+			return false;
+		}
+		value = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
+				(static_cast<uint32_t>(data[offset + 2]) << 16) | (static_cast<uint32_t>(data[offset + 3]) << 24);
+		offset += 4;
+		return true;
+	}
+	bool Skip(size_t bytes) {
+		if (!Has(bytes)) {
+			return false;
+		}
+		offset += bytes;
+		return true;
+	}
+	//! B_VARCHAR: a 1-byte character count, then UTF-16LE.
+	bool BVarchar(std::string &text) {
+		uint8_t chars;
+		if (!U8(chars) || !Has(static_cast<size_t>(chars) * 2)) {
+			return false;
+		}
+		text = encoding::Utf16LEDecode(data + offset, static_cast<size_t>(chars) * 2);
+		offset += static_cast<size_t>(chars) * 2;
+		return true;
+	}
+	bool SkipBVarchar() {
+		uint8_t chars;
+		return U8(chars) && Skip(static_cast<size_t>(chars) * 2);
+	}
+	//! US_VARCHAR: a 2-byte character count, then UTF-16LE.
+	bool SkipUsVarchar() {
+		uint16_t chars;
+		return U16(chars) && Skip(static_cast<size_t>(chars) * 2);
+	}
+};
 
-	bytes_consumed = offset;
+bool ReadByteLength(Cursor &in, ColumnMetadata &column) {
+	uint8_t bytes;
+	if (!in.U8(bytes)) {
+		return false;
+	}
+	column.max_length = bytes;
 	return true;
 }
 
-bool ColumnMetadataParser::ParseColumn(const uint8_t *data, size_t length, size_t &offset, ColumnMetadata &column) {
-	size_t local_offset = 0;
+bool ReadDecimal(Cursor &in, ColumnMetadata &column) {
+	return ReadByteLength(in, column) && in.U8(column.precision) && in.U8(column.scale);
+}
 
-	// Need at least 4 bytes for UserType
-	if (length < 4) {
+//! The 5 collation bytes. The 5th is the SortId, which is what names the code page for a SQL_*
+//! collation: discarding it meant a message about such a column could not say which collation it had
+//! met (issue #224).
+bool ReadCollation(Cursor &in, ColumnMetadata &column) {
+	return in.U32(column.collation) && in.U8(column.collation_sort_id);
+}
+
+bool ReadString(Cursor &in, ColumnMetadata &column) {
+	return in.U16(column.max_length) && ReadCollation(in, column);
+}
+
+// TIME / DATETIME2 / DATETIMEOFFSET.
+//
+// The scale is checked HERE, once per column, because every consumer of it
+// scales by ten to that power: `Pow10(scale)` overflows int64 past 18, which
+// is undefined behaviour, and the fuzz harness reached it (spec 059 D4).
+// Checking at each use would put the test on the per-value path to catch
+// something the metadata already knows. MS-TDS caps these at 7.
+bool ReadScale(Cursor &in, ColumnMetadata &column) {
+	if (!in.U8(column.scale)) {
 		return false;
 	}
-
-	// UserType (4 bytes): 255 marks a vector column in every form it streams (spec 093 T3).
-	column.user_type = static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
-					   (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
-	local_offset += 4;
-
-	// Need 2 more bytes for flags
-	if (length < local_offset + 2) {
-		return false;
+	if (column.scale > 7) {
+		throw std::runtime_error("Column '" + column.name + "' declares fractional-second scale " +
+								 std::to_string(column.scale) +
+								 "; TIME, DATETIME2 and DATETIMEOFFSET allow 0..7. "
+								 "The TDS stream is malformed.");
 	}
-
-	// Read flags (uint16_t LE)
-	column.flags = static_cast<uint16_t>(data[local_offset]) | (static_cast<uint16_t>(data[local_offset + 1]) << 8);
-	local_offset += 2;
-
-	// Parse type info
-	size_t type_offset = local_offset;
-	if (!ParseTypeInfo(data, length, type_offset, column)) {
-		return false;
-	}
-	local_offset = type_offset;
-
-	// Parse column name (B_VARCHAR format)
-	std::string name;
-	if (!ParseColumnName(data, length, local_offset, name)) {
-		return false;
-	}
-	column.name = std::move(name);
-
-	offset += local_offset;
 	return true;
 }
 
-bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, size_t &offset, ColumnMetadata &column) {
-	if (offset >= length) {
+//! XML: the SCHEMA_PRESENT flag and, when set, the schema collection's database and owning schema
+//! (B_VARCHAR) and its name (US_VARCHAR), none of which the extension keeps.
+bool ReadXml(Cursor &in, ColumnMetadata &column) {
+	column.max_length = 0xFFFF;	 // PLP indicator (XML is always PLP)
+	uint8_t schema_present;
+	if (!in.U8(schema_present)) {
 		return false;
 	}
+	return !schema_present || (in.SkipBVarchar() && in.SkipBVarchar() && in.SkipUsVarchar());
+}
 
-	column.type_id = data[offset++];
+//! UDT (CLR types: geometry, geography, hierarchyid, user types), MS-TDS 2.2.5.5.2, measured on 2022
+//! (spec 093 G2): u16 MAX_BYTE_SIZE, DB_NAME / SCHEMA_NAME / TYPE_NAME as B_VARCHAR, then the
+//! ASSEMBLY_QUALIFIED_NAME as US_VARCHAR. Values are PLP.
+bool ReadUdt(Cursor &in, ColumnMetadata &column) {
+	std::string database;
+	return in.U16(column.max_length) && in.BVarchar(database) && in.BVarchar(column.udt_schema) &&
+		   in.BVarchar(column.udt_type_name) && in.SkipUsVarchar();
+}
+
+//! SSVARIANT, MS-TDS 2.2.5.5.4: a LONGLEN maximum (8009, spec 093 G2). Values are a u32 length, 0 for
+//! NULL, then the base type, its property bytes, the properties and the value.
+bool ReadVariant(Cursor &in, ColumnMetadata &column) {
+	uint32_t declared;
+	if (!in.U32(declared)) {
+		return false;
+	}
+	column.max_length = static_cast<uint16_t>(declared < SQL_VARIANT_MAX_BYTES ? declared : SQL_VARIANT_MAX_BYTES);
+	return true;
+}
+
+//! VECTORTYPE (spec 093 D4, measured V1): a u16 max length -- 8 + dimensions x element size -- and the
+//! element type. Checked once here, as the temporal scale is: the read divides by the element size
+//! and sizes the output's arrays by the dimensions.
+bool ReadVector(Cursor &in, ColumnMetadata &column) {
+	if (!in.Has(3)) {
+		return false;
+	}
+	in.U16(column.max_length);
+	in.U8(column.vector_element_type);
+	if (column.vector_element_type != VECTOR_ELEMENT_FLOAT32 && column.vector_element_type != VECTOR_ELEMENT_FLOAT16) {
+		throw std::runtime_error("a vector column declares element type " + std::to_string(column.vector_element_type) +
+								 " (0 float32, 1 float16). The TDS stream is malformed.");
+	}
+	const uint16_t element = VectorElementBytes(column.vector_element_type);
+	if (column.max_length <= VECTOR_HEADER_BYTES || (column.max_length - VECTOR_HEADER_BYTES) % element != 0 ||
+		(column.max_length - VECTOR_HEADER_BYTES) / element > VECTOR_MAX_DIMENSIONS) {
+		throw std::runtime_error("a vector column declares a maximum length of " + std::to_string(column.max_length) +
+								 " bytes, which no vector(1..1998) has. The TDS stream is malformed.");
+	}
+	return true;
+}
+
+//! Legacy LOBs (issue #197). Their TYPE_INFO is unlike anything else: a 4-byte LONGLEN, a collation
+//! for the two text forms, and then the source TABLE NAME in parts -- a field no other type carries.
+//! Without parsing all of it the COLMETADATA stream desynchronises, which is why these columns used
+//! to kill the connection before a single row arrived rather than fail on decode.
+bool ReadLob(Cursor &in, ColumnMetadata &column) {
+	// LONGLEN runs to 2^31-1. max_length is the 16-bit declared width elsewhere, so flag these as
+	// PLP-like instead of truncating it.
+	if (!in.Skip(4)) {
+		return false;
+	}
+	column.max_length = 0xFFFF;
+	if (column.type_id != TDS_TYPE_IMAGE && !ReadCollation(in, column)) {
+		return false;
+	}
+	// TableName: 1 byte part count, then each part as US_VARCHAR.
+	uint8_t parts;
+	if (!in.U8(parts)) {
+		return false;
+	}
+	for (uint8_t part = 0; part < parts; part++) {
+		if (!in.SkipUsVarchar()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! TYPE_INFO: the type byte and what its form puts after it. Throws for a type the extension does
+//! not read: nothing after it could be framed.
+bool ReadTypeInfo(Cursor &in, ColumnMetadata &column) {
+	if (!in.U8(column.type_id)) {
+		return false;
+	}
 	column.max_length = 0;
 	column.precision = 0;
 	column.scale = 0;
 	column.collation = 0;
 	column.collation_sort_id = 0;
 
-	switch (column.type_id) {
-	// Fixed-length types (no additional metadata)
-	case TDS_TYPE_NULL:
-	case TDS_TYPE_TINYINT:
-	case TDS_TYPE_BIT:
-	case TDS_TYPE_SMALLINT:
-	case TDS_TYPE_INT:
-	case TDS_TYPE_BIGINT:
-	case TDS_TYPE_REAL:
-	case TDS_TYPE_FLOAT:
-	case TDS_TYPE_MONEY:
-	case TDS_TYPE_SMALLMONEY:
-	case TDS_TYPE_DATETIME:
-	case TDS_TYPE_SMALLDATETIME:
-		break;
-
-	// Nullable fixed-length types (1 byte length)
-	case TDS_TYPE_INTN:
-	case TDS_TYPE_BITN:
-	case TDS_TYPE_FLOATN:
-	case TDS_TYPE_MONEYN:
-	case TDS_TYPE_DATETIMEN:
-		if (offset >= length)
-			return false;
-		column.max_length = data[offset++];
-		break;
-
-	// DECIMAL/NUMERIC (1 byte length, 1 byte precision, 1 byte scale)
-	case TDS_TYPE_DECIMAL:
-	case TDS_TYPE_NUMERIC:
-		if (offset + 3 > length)
-			return false;
-		column.max_length = data[offset++];
-		column.precision = data[offset++];
-		column.scale = data[offset++];
-		break;
-
-	// UNIQUEIDENTIFIER (1 byte length, always 16)
-	case TDS_TYPE_UNIQUEIDENTIFIER:
-		if (offset >= length)
-			return false;
-		column.max_length = data[offset++];
-		break;
-
-	// Variable-length string types (2 bytes length + 5 bytes collation)
-	case TDS_TYPE_BIGCHAR:
-	case TDS_TYPE_BIGVARCHAR:
-	case TDS_TYPE_NCHAR:
-	case TDS_TYPE_NVARCHAR:
-		if (offset + 7 > length)
-			return false;
-		column.max_length = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
-		offset += 2;
-		// Collation (5 bytes)
-		column.collation = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
-						   (static_cast<uint32_t>(data[offset + 2]) << 16) |
-						   (static_cast<uint32_t>(data[offset + 3]) << 24);
-		// The 5th byte is the SortId, which is what names the code page for a
-		// SQL_* collation. Discarding it meant a message about such a column could
-		// not say which collation it had met (issue #224).
-		column.collation_sort_id = data[offset + 4];
-		offset += 5;
-		break;
-
-	// Variable-length binary types (2 bytes length)
-	case TDS_TYPE_BIGBINARY:
-	case TDS_TYPE_BIGVARBINARY:
-		if (offset + 2 > length)
-			return false;
-		column.max_length = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
-		offset += 2;
-		break;
-
-	// DATE (no additional metadata)
-	case TDS_TYPE_DATE:
-		break;
-
-	// TIME / DATETIME2 / DATETIMEOFFSET (1 byte scale)
-	//
-	// The scale is checked HERE, once per column, because every consumer of it
-	// scales by ten to that power: `Pow10(scale)` overflows int64 past 18, which
-	// is undefined behaviour, and the fuzz harness reached it (spec 059 D4).
-	// Checking at each use would put the test on the per-value path to catch
-	// something the metadata already knows. MS-TDS caps these at 7.
-	case TDS_TYPE_TIME:
-	case TDS_TYPE_DATETIME2:
-	case TDS_TYPE_DATETIMEOFFSET:
-		if (offset >= length)
-			return false;
-		column.scale = data[offset++];
-		if (column.scale > 7) {
-			throw std::runtime_error("Column '" + column.name + "' declares fractional-second scale " +
-									 std::to_string(column.scale) +
-									 "; TIME, DATETIME2 and DATETIMEOFFSET allow 0..7. "
-									 "The TDS stream is malformed.");
-		}
-		break;
-
-	// XML type: 1 byte SCHEMA_PRESENT flag, optional schema info
-	case TDS_TYPE_XML: {
-		column.max_length = 0xFFFF;	 // PLP indicator (XML is always PLP)
-		if (offset >= length)
-			return false;
-		uint8_t schema_present = data[offset++];
-		if (schema_present) {
-			// Skip XML schema info: dbname (B_VARCHAR) + owning_schema (B_VARCHAR) + collection (US_VARCHAR)
-			// B_VARCHAR: 1 byte char count + UTF-16LE chars
-			for (int i = 0; i < 2; i++) {
-				if (offset >= length)
-					return false;
-				uint8_t char_count = data[offset++];
-				size_t byte_len = char_count * 2;
-				if (offset + byte_len > length)
-					return false;
-				offset += byte_len;
-			}
-			// US_VARCHAR: 2 byte char count + UTF-16LE chars
-			if (offset + 2 > length)
-				return false;
-			uint16_t char_count = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
-			offset += 2;
-			size_t byte_len = char_count * 2;
-			if (offset + byte_len > length)
-				return false;
-			offset += byte_len;
-		}
-		break;
-	}
-
-	// UDT (CLR types: geometry, geography, hierarchyid, user types), MS-TDS 2.2.5.5.2, measured on
-	// 2022 (spec 093 G2): u16 MAX_BYTE_SIZE, DB_NAME / SCHEMA_NAME / TYPE_NAME as B_VARCHAR, then the
-	// ASSEMBLY_QUALIFIED_NAME as US_VARCHAR. Values are PLP.
-	case TDS_TYPE_UDT: {
-		if (offset + 2 > length)
-			return false;
-		column.max_length = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
-		offset += 2;
-		std::string database;
-		if (!ParseColumnName(data, length, offset, database) ||
-			!ParseColumnName(data, length, offset, column.udt_schema) ||
-			!ParseColumnName(data, length, offset, column.udt_type_name)) {
-			return false;
-		}
-		if (offset + 2 > length)
-			return false;
-		const uint16_t char_count =
-			static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
-		offset += 2;
-		const size_t byte_len = static_cast<size_t>(char_count) * 2;
-		if (offset + byte_len > length)
-			return false;
-		offset += byte_len;
-		break;
-	}
-
-	// SSVARIANT, MS-TDS 2.2.5.5.4: a LONGLEN maximum (8009, spec 093 G2). Values are a u32 length,
-	// 0 for NULL, then the base type, its property bytes, the properties and the value.
-	case TDS_TYPE_SQL_VARIANT: {
-		if (offset + 4 > length)
-			return false;
-		const uint32_t declared = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
-								  (static_cast<uint32_t>(data[offset + 2]) << 16) |
-								  (static_cast<uint32_t>(data[offset + 3]) << 24);
-		offset += 4;
-		column.max_length = static_cast<uint16_t>(declared < SQL_VARIANT_MAX_BYTES ? declared : SQL_VARIANT_MAX_BYTES);
-		break;
-	}
-
-	// VECTORTYPE (spec 093 D4, measured V1): a u16 max length -- 8 + dimensions x element size -- and the
-	// element type. Checked once here, as the temporal scale is: the read divides by the element size
-	// and sizes the output's arrays by the dimensions.
-	case TDS_TYPE_VECTOR: {
-		if (offset + 3 > length)
-			return false;
-		column.max_length = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
-		column.vector_element_type = data[offset + 2];
-		offset += 3;
-		if (column.vector_element_type != VECTOR_ELEMENT_FLOAT32 &&
-			column.vector_element_type != VECTOR_ELEMENT_FLOAT16) {
-			throw std::runtime_error("a vector column declares element type " +
-									 std::to_string(column.vector_element_type) +
-									 " (0 float32, 1 float16). The TDS stream is malformed.");
-		}
-		const uint16_t element = VectorElementBytes(column.vector_element_type);
-		if (column.max_length <= VECTOR_HEADER_BYTES || (column.max_length - VECTOR_HEADER_BYTES) % element != 0 ||
-			(column.max_length - VECTOR_HEADER_BYTES) / element > VECTOR_MAX_DIMENSIONS) {
-			throw std::runtime_error("a vector column declares a maximum length of " +
-									 std::to_string(column.max_length) +
-									 " bytes, which no vector(1..1998) has. The TDS stream is malformed.");
-		}
-		break;
-	}
-
-	// Legacy LOBs (issue #197). Their TYPE_INFO is unlike anything else: a 4-byte
-	// LONGLEN, a collation for the two text forms, and then the source TABLE NAME
-	// in parts — a field no other type carries. Without parsing all of it the
-	// COLMETADATA stream desynchronises, which is why these columns used to kill
-	// the connection before a single row arrived rather than fail on decode.
-	case TDS_TYPE_TEXT:
-	case TDS_TYPE_NTEXT:
-	case TDS_TYPE_IMAGE: {
-		if (offset + 4 > length)
-			return false;
-		// LONGLEN runs to 2^31-1. max_length is the 16-bit declared width
-		// elsewhere, so flag these as PLP-like instead of truncating it.
-		offset += 4;
-		column.max_length = 0xFFFF;
-		if (column.type_id != TDS_TYPE_IMAGE) {
-			if (offset + 5 > length)
-				return false;
-			column.collation = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
-							   (static_cast<uint32_t>(data[offset + 2]) << 16) |
-							   (static_cast<uint32_t>(data[offset + 3]) << 24);
-			column.collation_sort_id = data[offset + 4];
-			offset += 5;
-		}
-		// TableName: 1 byte part count, then each part as US_VARCHAR.
-		if (offset >= length)
-			return false;
-		uint8_t num_parts = data[offset++];
-		for (uint8_t part = 0; part < num_parts; part++) {
-			if (offset + 2 > length)
-				return false;
-			uint16_t char_count = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
-			offset += 2;
-			const size_t byte_len = static_cast<size_t>(char_count) * 2;
-			if (offset + byte_len > length)
-				return false;
-			offset += byte_len;
-		}
-		break;
-	}
-
-	default:
+	const TypeEntry *entry = FindType(column.type_id);
+	if (!entry) {
 		throw std::runtime_error("Unsupported SQL Server type: " + column.GetTypeName());
 	}
-
+	switch (entry->form) {
+	case TypeInfoForm::NONE:
+		return true;
+	case TypeInfoForm::BYTE_LENGTH:
+		return ReadByteLength(in, column);
+	case TypeInfoForm::DECIMAL:
+		return ReadDecimal(in, column);
+	case TypeInfoForm::STRING:
+		return ReadString(in, column);
+	case TypeInfoForm::BINARY:
+		return in.U16(column.max_length);
+	case TypeInfoForm::SCALE:
+		return ReadScale(in, column);
+	case TypeInfoForm::XML:
+		return ReadXml(in, column);
+	case TypeInfoForm::UDT:
+		return ReadUdt(in, column);
+	case TypeInfoForm::VARIANT:
+		return ReadVariant(in, column);
+	case TypeInfoForm::VECTOR:
+		return ReadVector(in, column);
+	case TypeInfoForm::LOB:
+		return ReadLob(in, column);
+	}
 	return true;
 }
 
-bool ColumnMetadataParser::ParseColumnName(const uint8_t *data, size_t length, size_t &offset, std::string &name) {
-	if (offset >= length) {
+//! One column: UserType (255 marks a vector column in every form it streams, spec 093 T3), flags,
+//! TYPE_INFO and the name (B_VARCHAR).
+bool ReadColumn(Cursor &in, ColumnMetadata &column) {
+	return in.U32(column.user_type) && in.U16(column.flags) && ReadTypeInfo(in, column) && in.BVarchar(column.name);
+}
+
+}  // namespace
+
+bool ColumnMetadataParser::Parse(const uint8_t *data, size_t length, size_t &bytes_consumed,
+								 std::vector<ColumnMetadata> &columns) {
+	columns.clear();
+	Cursor in{data, length, 0};
+
+	uint16_t count;
+	if (!in.U16(count)) {
 		return false;
 	}
-
-	// B_VARCHAR: 1 byte character count + UTF-16LE data
-	uint8_t char_count = data[offset++];
-	size_t byte_length = char_count * 2;
-
-	if (offset + byte_length > length) {
-		return false;
+	// 0xFFFF: no metadata (no result set).
+	if (count != 0xFFFF) {
+		columns.reserve(count);
+		for (uint16_t i = 0; i < count; i++) {
+			ColumnMetadata column;
+			if (!ReadColumn(in, column)) {
+				return false;  // Need more data
+			}
+			columns.push_back(std::move(column));
+		}
 	}
-
-	// Decode UTF-16LE to UTF-8
-	name = encoding::Utf16LEDecode(data + offset, byte_length);
-	offset += byte_length;
-
+	bytes_consumed = in.offset;
 	return true;
 }
 
