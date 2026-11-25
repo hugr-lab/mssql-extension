@@ -1,0 +1,35 @@
+# name: test/ephyra/repro/order_pushdown_duplicate_key.test
+# description: with mssql_order_pushdown on, an ORDER BY naming one column twice fails with SQL Server error 169 (found with ephyra, property qdiff)
+# group: [catalog]
+
+# Expected: ORDER BY k, k is valid in DuckDB and returns the rows ordered by k; a key the
+# pushdown cannot send keeps DuckDB's sort (CLAUDE.md, ORDER BY / TOP pushdown).
+# Actual (4128e1ac): "SQL Server error [169, severity 15]: A column has been specified more
+# than once in the order by list. Columns in the order by list must be unique."
+# mssql_order_pushdown is opt-in (experimental).
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS epho (TYPE mssql, remote_pushdown false, order_pushdown true);
+
+statement ok
+SELECT mssql_exec('epho', 'DROP TABLE IF EXISTS dbo.eph_o; CREATE TABLE dbo.eph_o (k int NOT NULL PRIMARY KEY); INSERT INTO dbo.eph_o VALUES (3), (1), (2)');
+
+query I
+SELECT k FROM epho.dbo.eph_o ORDER BY k, k;
+----
+1
+2
+3
+
+query II
+SELECT k AS c0, k AS c1 FROM epho.dbo.eph_o ORDER BY 1 DESC, 2 ASC LIMIT 2;
+----
+3	3
+2	2
+
+statement ok
+SELECT mssql_exec('epho', 'DROP TABLE dbo.eph_o');

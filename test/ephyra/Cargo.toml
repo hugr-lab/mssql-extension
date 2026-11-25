@@ -1,0 +1,18 @@
+[package]
+name = "mssql-ephyra"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ephyra = { git = "https://github.com/datadog-labs/ephyra" }
+serde_json = "1"
+
+[workspace]
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+debug-assertions = true
+overflow-checks = true
