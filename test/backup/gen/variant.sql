@@ -1,5 +1,5 @@
 -- Spec 093 T8b: sql_variant in a backup, read by T1's kernel from the form a record stores it in (measured/S1d.md):
--- every base type at its edges (S1's values), strings under code-page, double-byte, UTF-8 and SC collations, a
+-- every base type at its edges (S1's values), strings under code-page, double-byte, UTF-8 (2019 on) and SC collations, a
 -- mixed column of generated values; in every storage form -- a clustered table, a heap whose rows grow and are
 -- forwarded, ROW- and PAGE-compressed tables, values pushed off row (row-overflow), a sql_variant clustered key
 -- (the uniquifier beside it) -- then variant_changes.sql's changes and a differential (variant_over). Run by
@@ -51,7 +51,6 @@ INSERT INTO dbo.v_edges VALUES
 	(41, CAST(CAST(N'café' COLLATE SQL_Latin1_General_CP1_CI_AS AS varchar(10)) AS sql_variant)),
 	(42, CAST(CAST(N'дом' COLLATE Cyrillic_General_CI_AS AS varchar(10)) AS sql_variant)),
 	(43, CAST(CAST(N'漢字' COLLATE Japanese_CI_AS AS varchar(10)) AS sql_variant)),
-	(44, CAST(CAST(N'😀é' COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS varchar(20)) AS sql_variant)),
 	(45, CAST(CAST(N'ab' COLLATE SQL_Latin1_General_CP1_CI_AS AS nchar(10)) AS sql_variant)),
 	(46, CAST(CAST(N'😀x' COLLATE Latin1_General_100_CI_AS_SC AS nvarchar(20)) AS sql_variant)),
 	(47, CAST(CAST(N'дом' COLLATE Cyrillic_General_CI_AS AS char(6)) AS sql_variant)), (48, NULL),
@@ -64,6 +63,9 @@ INSERT INTO dbo.v_edges VALUES
 	(55, CAST(CAST(REPLICATE('w', 8000) AS varchar(8000)) AS sql_variant)),
 	(56, CAST(CAST(REPLICATE(N'ж', 4000) AS nvarchar(4000)) AS sql_variant)),
 	(57, CAST(CAST(REPLICATE(0xAB, 8000) AS varbinary(8000)) AS sql_variant));
+-- A UTF-8 collation exists from 2019 (major 15): before it, no row 44.
+IF CAST(SERVERPROPERTY('ProductMajorVersion') AS int) >= 15
+	EXEC (N'INSERT INTO dbo.v_edges VALUES (44, CAST(CAST(N''😀é'' COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS varchar(20)) AS sql_variant))');
 GO
 -- 2. A mixed column: 3000 rows of generated values, a base type each by its id, and NULLs.
 CREATE TABLE dbo.v_mixed (id int PRIMARY KEY, tag varchar(10) NOT NULL, v sql_variant NULL);
