@@ -1711,8 +1711,8 @@ flowchart LR
   CLR type, `vector`, `json`, a type the reader does not know) is its stored bytes, a `BLOB`.
   Not readable, named: a computed column not persisted (no stored value), a column set (computed from
   the sparse columns, not stored). A sparse column is read from the record's sparse vector (spec 086 PR 3,
-  E24: the last variable column, after the regular ones holding a value -- or before a forwarded record's
-  back pointer -- tagged `0x0005`, its entries by `sysrscols.hbcolid`; `FindSparseVector` once per record,
+  E24: the last variable column, after the regular ones stored (trailing NULL and empty ones are not) -- or
+  before a forwarded record's back pointer -- tagged `0x0005` (the tag decides, not the null bitmap), its entries by `sysrscols.hbcolid`; `FindSparseVector` once per record,
   in `RowRecord::Fixed`, `LocateValue` the entry; an off-row entry under bit 15 walked as any). The scan registers these as virtual columns, so `SELECT *` leaves them out and naming one is refused with its
   reason. `mssql_backup_tables.columns` and the scan take this one answer.
 - **Rows** (PR 2d). A record (`RecordView`, allocation-free) is split by its header alone; types 2-7

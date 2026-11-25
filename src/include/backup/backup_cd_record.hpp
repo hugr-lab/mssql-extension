@@ -196,7 +196,7 @@ struct RowRecord {
 	const uint8_t *data = nullptr;	// the record's first byte, in its page (which record it is)
 	const RecordView *fixed = nullptr;
 	//! The table's variable columns of a FixedVar record (RowVarCount), its sparse vector not counted: a
-	//! regular column at the vector's index is not stored (NULL, or a uniquifier of 0).
+	//! regular column at the vector's index is not stored (NULL, empty, or a uniquifier of 0).
 	size_t var_count = 0;
 	SparseVector sparse;  // a FixedVar record's sparse vector (FindSparseVector; spec 086 PR 3)
 	const CdRow *cd = nullptr;

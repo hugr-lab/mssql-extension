@@ -84,6 +84,10 @@ that is not persisted, and read as one (owner, 2026-11-24: decision A).
 - **The uniquifier.** A non-unique clustered index's uniquifier is a variable column, not stored when it is 0
   (its null bit says nothing of that). The vector then takes its index. A real uniquifier is 4 bytes and not
   complex, so the vector's tag tells them apart.
+- **An empty value** (review of #626). An empty regular variable column (`''`, `N''`, `0x`, its null bit
+  clear) closing the regular ones is not stored, as a trailing NULL is not, and the vector takes its index
+  (rows 8-11 of `types_sparse`, the empty pads of `heap_sparse` -- forwarded ones too -- and the empty `v` of
+  `uniq_sparse`; measured on 2019, 2022 and 2025). So the null bitmap cannot say where the vector is: its tag does.
 - **No DEFAULT.** A sparse column takes no DEFAULT constraint (1791). One added after rows were written is
   NULL in them, as an absent entry is.
 - **ANSI_PADDING OFF, sparse or not.** A nullable char / binary holding `''` / `0x` is one pad byte: the server
@@ -93,9 +97,13 @@ that is not persisted, and read as one (owner, 2026-11-24: decision A).
 
 - **The vector:** taken from the last variable column (before a forwarded record's back pointer) when
   the layout has a sparse column (live or dropped) and that column is complex and starts with `0x0005`.
-  No regular variable column at that index or after it may hold a value by the null bitmap; the uniquifier
-  never counts. Past every regular column, the last one must be the vector. Every part is checked: n, the
-  ids ascending, the ends ascending and within the vector. The vector is then not counted among the
+  Whatever the null bitmap says (an empty regular column and a uniquifier of 0 are not stored): a regular
+  column's complex form starts with kind 2 or 4, and a text / ntext / image root pointer with its blob id,
+  whose low 16 bits were 0 in every value (E21). Past every regular column, the last one must be the vector.
+  Every part is checked: n, the ids ascending, the ends ascending and within the vector. Where the bitmap says
+  the regular column at that index holds a value, the vector must also have every id a sparse column's of the
+  layout (live or dropped) and its last value end at its end; a tagged column that fails is that column, not
+  an error. The vector is then not counted among the
   record's regular variable columns, so a regular one at its index is not stored.
 - **The change listing:** a sparse table's rows are compared by their values, not their bytes. `ALTER`
   rewrites every row with its values the same, and a vector keeps a dropped column's entries.

@@ -396,6 +396,33 @@ int main() {
 		Check(row.sparse.data && row.var_count == 0 && row.Locate(uniq, 1).size == 0 && I32(row.Locate(uniq, 3)) == 7,
 			  "a uniquifier of 0 beside the vector: not stored, and the vector at its index read");
 
+		// An empty r1 ('', its null bit clear) closing the regular columns is not stored: the vector takes its index,
+		// and r1 reads empty (review of #626, fixture sparse.sql). Where a tagged column there is no whole vector,
+		// it is r1's value, not an error.
+		std::vector<uint8_t> empty_r1 = Hex(ONE);
+		empty_r1[10] = 0x34;  // r1's null bit cleared
+		std::vector<uint8_t> broken_r1 = empty_r1;
+		broken_r1[21] = 0x40;  // the vector's one value ends past it
+		const Page empties = PageOf({empty_r1, broken_r1});
+		const RecordView e0 = Slot(empties, 0), e1 = Slot(empties, 1);
+		const RowRecord erow = RowRecord::Fixed(e0, types);
+		const ValueRef r1 = erow.Locate(types, 1);
+		Check(erow.sparse.data && erow.sparse.count == 1 && erow.var_count == 0 && r1.state == ValueState::Inline &&
+				  r1.size == 0 && I32(erow.Locate(types, 3)) == 7,
+			  "an empty regular column before the vector: not stored, the vector at its index, the column empty");
+		Check(FindSparseVector(e1, RowVarCount(e1, "t"), types).data == nullptr,
+			  "a tagged column that is no whole vector where the bitmap says a regular value: that value");
+		// There, an id that is no sparse column's: that value too; with r1 NULL the same vector is read.
+		std::vector<uint8_t> foreign_id = empty_r1;
+		foreign_id[19] = 0x2a;	// the entry's id, 6 -> 42
+		std::vector<uint8_t> foreign_null = Hex(ONE);
+		foreign_null[19] = 0x2a;
+		const Page foreigns = PageOf({foreign_id, foreign_null});
+		const RecordView f0 = Slot(foreigns, 0), f1 = Slot(foreigns, 1);
+		Check(FindSparseVector(f0, RowVarCount(f0, "t"), types).data == nullptr &&
+				  FindSparseVector(f1, RowVarCount(f1, "t"), types).data != nullptr,
+			  "an id of no sparse column beside a regular value: that value; beside its NULL, the vector");
+
 		// No regular variable column: the last one must be the vector. With its tag changed it is refused by
 		// name; beside a regular column's NULL it is that column, kept (no vector).
 		RowsetLayout bare = types;

@@ -416,18 +416,23 @@ RowLocation ForwardedFrom(const RecordView &record, const std::string &table) {
 void IndexSparse(RowsetLayout &layout) {
 	layout.sparse = false;
 	layout.var_null_bits.clear();
+	layout.sparse_hbcolids.clear();
 	for (const auto &c : layout.columns) {
 		layout.sparse = layout.sparse || c.Sparse();
+		if (c.Sparse()) {
+			layout.sparse_hbcolids.push_back(c.hbcolid);
+		}
 		if (c.offset < 0) {
 			const size_t i = static_cast<size_t>(-static_cast<int32_t>(c.offset)) - 1;
 			if (layout.var_null_bits.size() <= i) {
 				layout.var_null_bits.resize(i + 1, 0);
 			}
-			// The uniquifier is not stored when it is 0, whatever its null bit says: it never keeps the vector from
-			// its index (a uniquifier is 4 bytes, not complex: the vector's tag tells them apart).
+			// The uniquifier is not stored when it is 0, whatever its null bit says (a uniquifier is 4 bytes, not
+			// complex: the vector's tag tells them apart).
 			layout.var_null_bits[i] = c.Uniquifier() ? 0 : c.null_bit;
 		}
 	}
+	std::sort(layout.sparse_hbcolids.begin(), layout.sparse_hbcolids.end());
 }
 
 namespace {
@@ -459,47 +464,65 @@ SparseVector FindSparseVector(const RecordView &record, size_t var_count, const 
 	if (!layout.sparse || var_count == 0) {
 		return s;
 	}
-	// The vector follows every regular variable column that holds a value (E24: with r1 and r2 NULL it is
-	// variable column 0, with both set column 2), so it can only be the last one.
+	// The vector follows every regular variable column stored (E24: with r1 and r2 NULL it is variable column 0,
+	// with both set column 2), so it can only be the last one.
 	const size_t last = var_count - 1;
-	for (size_t i = last; i < layout.var_null_bits.size(); i++) {
-		if (VarHoldsValue(record, layout, i)) {
-			return s;
-		}
-	}
 	const uint16_t start = record.VarStart(last);
 	const uint16_t size = static_cast<uint16_t>(record.VarEnd(last) - start);
 	const uint8_t *data = record.data + start;
 	const bool tagged =
 		record.VarComplex(last) && size >= SPARSE_VECTOR_HEADER && SparseU16(data, 0) == SPARSE_VECTOR_TAG;
-	auto fail = [&](const std::string &why) -> SparseVector {
-		throw FormatError("backup: the record of " + layout.table + " at offset " + std::to_string(record.offset) +
-						  " has a sparse vector " + why);
-	};
 	if (!tagged) {
 		if (last < layout.var_null_bits.size()) {
-			return s;  // a regular column's NULL, kept: no vector
+			return s;  // a regular column's value or NULL, kept: no vector
 		}
 		throw FormatError("backup: the record of " + layout.table + " at offset " + std::to_string(record.offset) +
 						  " has a variable column past its table's that is not a sparse vector");
 	}
+	// Tagged, it is the vector whatever the null bitmap says of the regular column at its index: an empty value
+	// ('', N'', 0x) closing the regular ones is not stored, as a NULL is not, and the vector takes its index
+	// (review of #626, fixture sparse.sql; so does a uniquifier of 0). A regular column's complex form starts with
+	// kind 2 or 4 (E24); a text / ntext / image root pointer with its blob id, whose low 16 bits were 0 in every
+	// value (E21). Where the bitmap says that column holds a value, the vector must also be whole by stricter
+	// checks -- every id a sparse column's of the layout, its last value ending at its end --, else it is that
+	// column, not an error.
+	const bool regular_here = last < layout.var_null_bits.size() && VarHoldsValue(record, layout, last);
 	const uint16_t count = SparseU16(data, 2);
 	const size_t values = SPARSE_VECTOR_HEADER + 4 * static_cast<size_t>(count);
+	std::string why;
 	if (count == 0 || values > size) {
-		return fail("of " + std::to_string(count) + " columns in " + std::to_string(size) + " bytes");
+		why = "of " + std::to_string(count) + " columns in " + std::to_string(size) + " bytes";
 	}
 	size_t previous_end = values;
-	for (size_t i = 0; i < count; i++) {
+	for (size_t i = 0; why.empty() && i < count; i++) {
 		if (i > 0 &&
 			SparseU16(data, SPARSE_VECTOR_HEADER + 2 * i) <= SparseU16(data, SPARSE_VECTOR_HEADER + 2 * (i - 1))) {
-			return fail("whose column ids do not ascend");
+			why = "whose column ids do not ascend";
+			break;
 		}
 		const size_t end = SparseU16(data, SPARSE_VECTOR_HEADER + 2 * (count + i)) & 0x7FFF;
 		if (end < previous_end || end > size) {
-			return fail("whose value " + std::to_string(i) + " ends at " + std::to_string(end) + ", outside " +
-						std::to_string(previous_end) + " to " + std::to_string(size));
+			why = "whose value " + std::to_string(i) + " ends at " + std::to_string(end) + ", outside " +
+				  std::to_string(previous_end) + " to " + std::to_string(size);
+			break;
+		}
+		if (regular_here && !std::binary_search(layout.sparse_hbcolids.begin(), layout.sparse_hbcolids.end(),
+												static_cast<int32_t>(SparseU16(data, SPARSE_VECTOR_HEADER + 2 * i)))) {
+			why = "whose column id " + std::to_string(SparseU16(data, SPARSE_VECTOR_HEADER + 2 * i)) +
+				  " is no sparse column's";
+			break;
 		}
 		previous_end = end;
+	}
+	if (why.empty() && regular_here && previous_end != size) {
+		why = "whose values end at " + std::to_string(previous_end) + ", not at its end " + std::to_string(size);
+	}
+	if (!why.empty()) {
+		if (regular_here) {
+			return s;
+		}
+		throw FormatError("backup: the record of " + layout.table + " at offset " + std::to_string(record.offset) +
+						  " has a sparse vector " + why);
 	}
 	s.data = data;
 	s.size = size;

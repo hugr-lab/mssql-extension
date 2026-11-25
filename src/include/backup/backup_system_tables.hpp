@@ -153,9 +153,11 @@ struct RowsetLayout {
 	std::vector<PhysicalColumn> columns;
 	//! Spec 086 PR 3 (E24), set by IndexSparse: a column of the layout is sparse, live or dropped, so a
 	//! record may end in a sparse vector; and the null bit of the column at each variable index (0 for the uniquifier,
-	//! none), which tells a regular variable column holding a value from the vector after it.
+	//! none), which says whether a tagged column there could still be a regular column (FindSparseVector).
 	bool sparse = false;
 	std::vector<uint16_t> var_null_bits;
+	//! The hbcolids of its sparse columns, live or dropped, ascending.
+	std::vector<int32_t> sparse_hbcolids;
 
 	//! The column named `name`, or null.
 	const PhysicalColumn *Find(const std::string &name) const;
@@ -163,8 +165,8 @@ struct RowsetLayout {
 	size_t IndexOf(const std::string &name) const;
 };
 
-//! Sets `layout.sparse` and `layout.var_null_bits` from its columns (LayoutOf's last step; a layout
-//! built by hand calls it when it has a sparse column).
+//! Sets `layout.sparse`, `layout.var_null_bits` and `layout.sparse_hbcolids` from its columns (LayoutOf's last step; a
+//! layout built by hand calls it when it has a sparse column).
 void IndexSparse(RowsetLayout &layout);
 
 //! One column's value in a decoded record.
@@ -219,10 +221,12 @@ struct SparseVector {
 };
 
 //! The sparse vector of `record`, whose table variable columns are `var_count` (RowVarCount): its last
-//! one, when `layout` has a sparse column and no regular variable column at that index or after it holds a
-//! value (the vector follows them; their NULL trailing ones are left out before it). There it is the vector
-//! when complex and starting with 0x0005; past every regular column it must be one. Every part checked: a
-//! FormatError naming the table and the record's offset. None (data null) otherwise.
+//! one, when `layout` has a sparse column and that column is complex and starts with 0x0005 (the vector follows
+//! the regular variable columns stored; trailing NULL and empty ones are left out before it), whatever the null
+//! bitmap says (review of #626). Past every regular column it must be one. Every part checked: a FormatError
+//! naming the table and the record's offset -- except where the bitmap says the regular column at that index
+//! holds a value: the vector must then also pass stricter checks (every id a sparse column's, the last value
+//! ending at its end), else it is that column. None (data null) otherwise.
 SparseVector FindSparseVector(const RecordView &record, size_t var_count, const RowsetLayout &layout);
 
 //! Column `k` of `layout` in `record`, whose table variable columns are `var_count`

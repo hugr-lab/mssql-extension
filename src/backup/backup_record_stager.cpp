@@ -404,11 +404,12 @@ void RecordStager::UseLayout(const RowsetLayout &layout) {
 		columns_[i].bit_position = places[i].second;
 	}
 	// The map's columns: every variable column of the rowset, projected or not (DQ-46), by catalog id; a
-	// sparse one of a variable type too, whose entry can be off row (E24).
+	// sparse one of any type not fixed too, whose entry can be off row (E24), as LocateValue reads it (review of
+	// #626: a type of neither list was left out).
 	map_columns_.clear();
 	for (size_t k = 0; k < layout.columns.size(); k++) {
 		const PhysicalColumn &p = layout.columns[k];
-		const bool variable = p.offset < 0 || (p.Sparse() && KnownVariableXtype(p.xtype));
+		const bool variable = p.offset < 0 || (p.Sparse() && !KnownFixedXtype(p.xtype));
 		if (variable && !p.Dropped() && !p.Uniquifier()) {
 			map_columns_.push_back(MapColumn{k, p.rscolid, table_ + "." + p.name});
 		}

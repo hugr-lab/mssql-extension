@@ -50,6 +50,11 @@ INSERT dbo.types_sparse (id, s_vcmax, rmax) VALUES (5, REPLICATE(CAST('x' AS var
 INSERT dbo.types_sparse (id, s_vbmax, s_nvcmax) VALUES (6, CAST(REPLICATE(CAST('y' AS varchar(max)), 90000) AS varbinary(max)),
 	REPLICATE(CAST(N'я' AS nvarchar(max)), 5000));
 INSERT dbo.types_sparse (id, r1, rmax) VALUES (7, 'rmax only', REPLICATE(CAST('q' AS varchar(max)), 9000));
+-- An empty value, not NULL, in the last regular variable column before the vector (review of #626).
+INSERT dbo.types_sparse (id, rmax, s_int) VALUES (8, '', 8);
+INSERT dbo.types_sparse (id, r2, s_int, s_vc) VALUES (9, N'', 9, 'nine');
+INSERT dbo.types_sparse (id, r1, s_big) VALUES (10, '', 10);
+INSERT dbo.types_sparse (id, r1, r2, rmax, s_bit) VALUES (11, '', N'', '', 1);
 WITH n AS (SELECT TOP (3000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
 INSERT dbo.types_sparse (id, r1, s_bit, s_int, s_big, s_dec, s_float, s_date, s_dt2, s_guid, s_char, s_vc, s_nvc, s_vbin,
 	s_vcmax, s_var, r2)
@@ -109,6 +114,10 @@ CREATE TABLE dbo.heap_sparse (id int NOT NULL, pad varchar(100) NULL, s varchar(
 WITH n AS (SELECT TOP (400) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
 INSERT dbo.heap_sparse SELECT i, REPLICATE('p', 100), NULL, CASE WHEN i % 2 = 0 THEN i END FROM n;
 UPDATE dbo.heap_sparse SET s = REPLICATE('s', 3000) WHERE id % 40 = 3;
+-- An empty pad before the vector, and those rows forwarded too (review of #626).
+WITH n AS (SELECT TOP (40) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
+INSERT dbo.heap_sparse SELECT 1000 + i, '', NULL, 1000 + i FROM n;
+UPDATE dbo.heap_sparse SET s = REPLICATE('e', 4000) WHERE id > 1000 AND id % 4 = 1;
 GO
 -- 6. A non-unique clustered index: the uniquifier beside the vector.
 CREATE TABLE dbo.uniq_sparse (k int NOT NULL, s1 int SPARSE NULL, s2 nvarchar(20) SPARSE NULL, v varchar(10) NULL);
@@ -116,6 +125,7 @@ CREATE CLUSTERED INDEX cx_uniq_sparse ON dbo.uniq_sparse (k);
 WITH n AS (SELECT TOP (600) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
 INSERT dbo.uniq_sparse SELECT i % 20, CASE WHEN i % 3 = 0 THEN i END, CASE WHEN i % 5 = 0 THEN CONCAT(N'ю', i) END,
 	CASE WHEN i % 2 = 0 THEN 'v' END FROM n;
+INSERT dbo.uniq_sparse VALUES (5, 55, N'empty v', ''), (5, 56, NULL, '');	-- an empty v before the vector (review of #626)
 GO
 -- 7. A vector past the row: row-overflow and LOB roots inside it.
 CREATE TABLE dbo.ovf_sparse (id int NOT NULL PRIMARY KEY, a varchar(4000) SPARSE NULL, b varchar(4000) SPARSE NULL,

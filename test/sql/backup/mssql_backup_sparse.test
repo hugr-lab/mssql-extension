@@ -87,7 +87,18 @@ SELECT count(*), count(s_bit), sum(s_bit::INT), count(s_int), sum(s_int), count(
 	count(s_vcmax), sum(length(s_vcmax)), count(s_guid), count(r1)
 FROM mssql_backup_scan(getvariable('f'), 'dbo', 'types_sparse');
 ----
-3007	1002	501	602	901499	430	642643927925	1503	106	61456	178	2254
+3011	1003	502	604	901516	431	642643927935	1504	106	61456	178	2256
+
+# An empty value, not NULL, closing the regular variable columns: not stored, the vector at its index (review
+# of #626).
+query IIIIIIII
+SELECT id, r1, r2, rmax, s_bit, s_int, s_big, s_vc FROM mssql_backup_scan(getvariable('f'), 'dbo', 'types_sparse')
+WHERE id BETWEEN 8 AND 11 ORDER BY id;
+----
+8	NULL	NULL	(empty)	NULL	8	NULL	NULL
+9	NULL	(empty)	NULL	NULL	9	NULL	nine
+10	(empty)	NULL	NULL	NULL	NULL	10	NULL
+11	(empty)	(empty)	(empty)	true	NULL	NULL	NULL
 
 # 1000 sparse columns: hbcolids past 255.
 query IIIIII
@@ -126,15 +137,18 @@ SELECT * FROM mssql_backup_scan(getvariable('f'), 'dbo', 'alter_sparse') WHERE i
 1001	1	2	after	k	3
 
 # A heap's forwarded rows (the vector before the back pointer); a non-unique clustered index (the uniquifier).
-query IIII
-SELECT count(*), count(s), sum(length(s)), count(n) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'heap_sparse');
+# Rows 1001-1040 hold an empty pad before the vector, ten of them forwarded (review of #626).
+query IIIII
+SELECT count(*), count(s), sum(length(s)), count(n), count(*) FILTER (WHERE pad = '' AND n = id)
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'heap_sparse');
 ----
-400	10	30000	200
+440	20	70000	240	40
 
-query IIII
-SELECT count(*), count(DISTINCT _mssql_rid), count(s1), count(s2) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'uniq_sparse');
+query IIIII
+SELECT count(*), count(DISTINCT _mssql_rid), count(s1), count(s2), count(*) FILTER (WHERE v = '' AND s1 IN (55, 56))
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'uniq_sparse');
 ----
-600	600	200	120
+602	602	202	121	2
 
 # A vector past the row: row-overflow pointers and an in-row LOB root inside it.
 query IIIIII
@@ -184,7 +198,7 @@ SELECT count(*) FROM mssql_backup_table_changes(getvariable('f'), 'dbo', 'alter_
 query III
 SELECT count(*), count(s_int), sum(s_int) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'types_sparse', diff := getvariable('d'));
 ----
-3266	652	805706
+3270	654	805723
 
 # The attached backup reads them the same.
 statement ok
@@ -193,4 +207,4 @@ ATTACH 'test/data/backup/sparse/sparse_full.bak' AS sp (TYPE mssql_backup);
 query II
 SELECT count(*), count(s_nvc) FROM sp.dbo.types_sparse;
 ----
-3007	133
+3011	133

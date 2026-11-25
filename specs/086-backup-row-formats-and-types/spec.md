@@ -382,9 +382,10 @@ text. What it found:
 *PR 3 as built (2026-11-24).* E24 first (`measured/E24-sparse.md`): nine tables on SQL Server 2019 and 2025,
 DBCC PAGE, D1's clean room; every sparse value of every record placed where the server says. What it found
 beyond X§4:
-- **Where:** the last variable column, after the regular ones that hold a value (their NULL trailing ones are
+- **Where:** the last variable column, after the regular ones stored (their NULL and empty trailing ones are
   left out first, so it can be variable column 0), or before a forwarded record's back pointer; a uniquifier of
-  0 is not stored either, so the vector can take its index.
+  0 is not stored either, so the vector can take its index. Its tag decides, not the null bitmap (review of
+  #626: an empty value's null bit is clear).
 - **The ids** are `sysrscols.hbcolid`: after `ALTER COLUMN … ADD SPARSE` a column's value is under a new one,
   and after `DROP SPARSE` or a dropped column the old entries stay under the dropped column's.
 - **Bit 15** of an entry's end marks an off-row value: an in-row LOB root, a row-overflow pointer.
