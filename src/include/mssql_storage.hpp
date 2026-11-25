@@ -250,7 +250,7 @@ struct MSSQLConnectionInfo {
 	// User-declared destructor OPENSSL_cleanse's `password` and `access_token`
 	// (and any other bearer-token storage added later) so secrets are not
 	// left behind in heap-recycled memory after this struct is freed. The
-	// implementation lives in mssql_storage.cpp to keep OpenSSL out of this
+	// implementation lives in mssql_connection_info.cpp to keep OpenSSL out of this
 	// header. shared_ptr<MSSQLConnectionInfo> is the canonical owner shape,
 	// so the wipe runs exactly when the last reference drops.
 	//

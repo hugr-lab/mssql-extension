@@ -200,7 +200,7 @@ PLUMBING_CALL = re.compile(
 TYPE_NAME = re.compile(r"^(?:[A-Z][a-z0-9]+)+$")
 
 # A credential read BY KEY. `kv_secret.TryGetValue("password")` is how
-# mssql_storage.cpp:207 actually reads the password, and the first cut could not
+# mssql_connection_info.cpp (ReadSecretEndpoint) actually reads the password, and the first cut could not
 # see it: the literal was stripped, the UPPER_SNAKE form was excused as a
 # constant, and `kv_secret` itself was allowlisted. The literal only counts in a
 # LOOKUP position -- otherwise every `throw ...("Secret '%s' not found", ...)`

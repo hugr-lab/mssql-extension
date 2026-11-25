@@ -201,7 +201,7 @@ def quote_dsn_value(value):
     """A connection-string value in braces, as the extension's parser reads them.
 
     Issue #509 item 2. `Password={cfg['password']}` was unquoted, and the parser
-    (`src/mssql_storage.cpp`) splits an unquoted value at `;` -- so
+    (`src/mssql_connection_string.cpp`) splits an unquoted value at `;` -- so
     `MSSQL_BENCH_PASSWORD='pw;Database=master'` built a SECOND `Database` key
     and silently retargeted the connection, after which `load` created its
     tables wherever that landed. Inside braces `}}` is a literal `}`, which is
@@ -1999,7 +1999,7 @@ NAME_TESTS = [
 
 
 def _parse_connection_string(cs):
-    """Brace-aware split, as src/mssql_storage.cpp reads one.
+    """Brace-aware split, as src/mssql_connection_string.cpp reads one.
 
     The point of the fixture is what the PARSER sees: a `;` inside the braces
     must not become another key, and counting `Database=` in the text cannot
