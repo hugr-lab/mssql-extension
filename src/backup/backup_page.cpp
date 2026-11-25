@@ -98,20 +98,32 @@ static bool ZeroOrNamesItself(const PagePointer &want, const Page &copy) {
 	return zero || copy.header.page_id == want;
 }
 
+bool PageStore::HasLaterPass() const {
+	for (size_t i = 0; i < index_.PassCount(); i++) {
+		if (index_.Pass(i).number > 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool PageStore::IsPendingCopy(const PagePointer &want, const Page &copy) const {
 	// Only a backup that ran under changes: a second pass is the server copying what changed during the
 	// first (load fixture, 2022). In a quiet backup -- one pass -- a live page whose copy is a zero
 	// unit is a locator's or a short backup's fault, refused below as not a page.
-	bool later_pass = false;
-	for (size_t i = 0; i < index_.PassCount(); i++) {
-		later_pass = later_pass || index_.Pass(i).number > 0;
-	}
-	if (!later_pass) {
+	if (!HasLaterPass()) {
 		return false;
 	}
 	// A unit with bytes in it that names another page (E6's F2 units carry a page id) is a misplaced
 	// copy, not a pending one: the id check below refuses it.
 	return ZeroOrNamesItself(want, copy);
+}
+
+void PageStore::ThrowUncopied(const PagePointer &want, const std::string &message) const {
+	if (!HasLaterPass()) {
+		throw ZeroCopyError(message, want, this);
+	}
+	throw FormatError(message);
 }
 
 PageState PageStore::Fetch(uint16_t file, uint32_t page, Page &out) const {
@@ -121,10 +133,12 @@ PageState PageStore::Fetch(uint16_t file, uint32_t page, Page &out) const {
 	PagePointer want;
 	want.file = file;
 	want.page = page;
-	// A live page is in a full backup's first pass (E12): an index that does not find it searched
-	// wrongly or the backup is short, and either way the page is not there to read.
+	// A live page is in a full backup's first pass (E12), unless it was taken into use while a backup of one
+	// data pass ran, past the data the pass copies (see the pad below): a ZeroCopyError, Pending when the
+	// backup's log tail formats the page. Otherwise -- and always beside a later pass, which copies such a
+	// page -- an index that does not find it searched wrongly or the backup is short, refused.
 	if (!index_.ReadPage(file, page, out.bytes, true)) {
-		throw FormatError("backup: page " + want.ToString() + " is live, and the backup carries no copy of it");
+		ThrowUncopied(want, "backup: page " + want.ToString() + " is live, and the backup carries no copy of it");
 	}
 	if (out.bytes.size() != PAGE_SIZE) {
 		throw FormatError("backup: page " + want.ToString() + " read as " + std::to_string(out.bytes.size()) +
@@ -148,8 +162,13 @@ PageState PageStore::Fetch(uint16_t file, uint32_t page, Page &out) const {
 		throw FormatError(message);
 	}
 	if (out.header.type == PAGE_TYPE_PAD) {
-		// A pad is never read further (spec 085 § Rules, page index), whatever page it names.
-		throw FormatError("backup: the copy of page " + want.ToString() + " is a pad unit");
+		// A pad is never read further (spec 085 § Rules, page index), whatever page it names. Where a live page
+		// is: SQL Server 2017 sizes its one data pass when it starts (FILELISTONLY's BackupSizeInBytes), ends it
+		// with pad groups, and the GAM it copies a little later marks extents taken into use meanwhile, which
+		// the ranked pass map lays onto those pads (the oracle lane's load_full: extents 5457-5461 past 43,656
+		// pages copied, their pages formatted in the tail). A ZeroCopyError, Pending when the tail formats it;
+		// beside a later pass, which copies such a page, a locator's fault, refused.
+		ThrowUncopied(want, "backup: the copy of page " + want.ToString() + " is a pad unit");
 	}
 	if (!(out.header.page_id == want)) {
 		throw FormatError("backup: the copy of page " + want.ToString() + " says it is page " +

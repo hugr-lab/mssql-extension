@@ -237,6 +237,32 @@ int main() {
 				  std::string::npos,
 			  "two slots at one offset");
 	}
+	std::cout << "a record's page and slot by its fixed part" << std::endl;
+	{
+		// LOP_MIGRATE_LOCKS on 2017 (the oracle lane's load_log.trn): a fixed part of 30 bytes, the page at 24 and
+		// its file at 28, then the contents -- fn_dump_dblog gives the page (1:43599), and there is no slot.
+		std::vector<LogRecord> got;
+		auto keep = [&](const LogRecord &r) { got.push_back(r); };
+		for (uint16_t fixed : {24, 29, 30, 31, 32}) {
+			auto b = Block(1, fixed);
+			const uint8_t field[8] = {0x4f, 0xaa, 0x00, 0x00, 0x01, 0x00, 0x07, 0x00};	// 1:43599, slot 7
+			std::copy(field, field + 8, b.begin() + 72 + 24);
+			got.clear();
+			ParseLogBlock(b.data(), b.size(), 72, "test", keep);
+			if (got.size() != 1) {
+				Check(false, "a fixed part of " + std::to_string(fixed) + " bytes: one record");
+				continue;
+			}
+			const LogRecord &r = got.front();
+			const bool page = r.has_page && r.file == 1 && r.page == 43599;
+			const bool slot = r.has_slot && r.slot == 7;
+			Check(page == (fixed >= 30) && slot == (fixed >= 32) && (r.has_slot || r.slot == 0),
+				  "a fixed part of " + std::to_string(fixed) + " bytes: " +
+					  (fixed >= 32	 ? "page and slot"
+					   : fixed >= 30 ? "the page, no slot"
+									 : "neither"));
+		}
+	}
 	std::cout << "D11's rule for one transaction's changes on one page (ChangeShows)" << std::endl;
 	{
 		auto lsn = [](uint32_t block) {

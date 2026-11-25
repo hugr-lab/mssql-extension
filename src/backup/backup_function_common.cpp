@@ -163,8 +163,8 @@ void ThrowPendingOrFormat(ClientContext &context, const OpenedForStatement &open
 	throw PendingPageError(
 		"backup: page " + e.page.ToString() +
 			" became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
-			"backup), which is not replayed yet (a zero copy in a backup of one data pass, the page "
-			"formatted in its tail)",
+			"backup), which is not replayed yet (no copy of its own -- a zero unit, a pad or none -- in a "
+			"backup of one data pass, the page formatted in its tail)",
 		e.store);
 }
 
