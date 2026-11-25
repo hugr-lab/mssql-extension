@@ -293,17 +293,9 @@ bool NodeWriter::WriteWindowFrame(const WindowExpression &window, std::string &s
 	return true;
 }
 
-// QUALIFY (PR E2): T-SQL has none, so the node is written as a derived table
-// and a wrapper keeps the rows QUALIFY keeps, then applies the node's DISTINCT /
-// ORDER BY / LIMIT, which DuckDB applies after QUALIFY. A condition on
-// select-list aliases only (`QUALIFY rn = 1`) is the wrapper's WHERE on the
-// derived table's columns, the window evaluated once; any other is the node's
-// last result column -- `CASE WHEN <qualify> THEN 1 ELSE 0 END`, a bit (a NULL
-// condition drops the row, as QUALIFY does) -- and the wrapper keeps the 1s.
-// The wrapper's ORDER BY takes a result column's name or position only: its
-// rows are QUALIFY's, where DuckDB evaluates a window in ORDER BY before it and
-// binds a name inside an expression to the FROM first (review of E2).
-// Measured equal against DuckDB, PR E2.
+// The wrapper's ORDER BY under QUALIFY takes a result column's name or position
+// only: its rows are QUALIFY's, where DuckDB evaluates a window in ORDER BY
+// before it and binds a name inside an expression to the FROM first (review of E2).
 bool NodeWriter::CheckQualifyOrder(const SelectNode &node) {
 	for (auto &modifier : node.modifiers) {
 		if (modifier->type != ResultModifierType::ORDER_MODIFIER) {
@@ -345,6 +337,14 @@ static bool QualifiesOnAliases(const SelectNode &node, std::vector<std::string> 
 	return on_aliases && !names.empty();
 }
 
+// QUALIFY (PR E2): T-SQL has none, so the node is written as a derived table
+// and a wrapper keeps the rows QUALIFY keeps, then applies the node's DISTINCT /
+// ORDER BY / LIMIT, which DuckDB applies after QUALIFY. A condition on
+// select-list aliases only (`QUALIFY rn = 1`) is the wrapper's WHERE on the
+// derived table's columns, the window evaluated once; any other is the node's
+// last result column -- `CASE WHEN <qualify> THEN 1 ELSE 0 END`, a bit (a NULL
+// condition drops the row, as QUALIFY does) -- and the wrapper keeps the 1s.
+// Measured equal against DuckDB, PR E2.
 bool NodeWriter::WriteQualified(const SelectNode &node) {
 	if (!CheckQualifyOrder(node)) {
 		return false;
