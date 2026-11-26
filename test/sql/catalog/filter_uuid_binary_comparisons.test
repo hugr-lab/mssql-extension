@@ -1,0 +1,282 @@
+# name: test/sql/catalog/filter_uuid_binary_comparisons.test
+# description: A pushed comparison of a uniqueidentifier or a binary decides as DuckDB does (#639)
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# SQL Server orders a uniqueidentifier by its own byte groups (the last six bytes first), and compares
+# binary / varbinary values with the shorter one padded by zero bytes (0x01 = 0x0100). So a pushed range
+# on a uniqueidentifier, or a pushed comparison of binaries, returned other rows than DuckDB's: a
+# uniqueidentifier is compared on the server for equality only, a binary's equality is sent with the
+# lengths pinned (DATALENGTH) and its order with the lengths deciding a tie. Every answer below is checked
+# against DuckDB over a local copy of the same rows.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cmpx (TYPE mssql, remote_pushdown false);
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cmpr (TYPE mssql);
+
+# u1 = 10000000-...-000000000001, u2 = 00000000-...-000000000002, u3 = 20000000-...-000000000000: DuckDB
+# orders the text (u2 < u1 < u3), the server the last group first (u3 < u1 < u2).
+statement ok
+SELECT mssql_exec('cmpx', 'DROP TABLE IF EXISTS dbo.cmp_uuid; DROP TABLE IF EXISTS dbo.cmp_bin; DROP TABLE IF EXISTS dbo.cmp_binkey; DROP TABLE IF EXISTS dbo.cmp_rv; DROP TABLE IF EXISTS dbo.cmp_heap; DROP TABLE IF EXISTS dbo.cmp_strheap;
+	CREATE TABLE dbo.cmp_uuid (id int NOT NULL PRIMARY KEY, g uniqueidentifier NULL);
+	INSERT INTO dbo.cmp_uuid VALUES (1, ''10000000-0000-0000-0000-000000000001''), (2, ''00000000-0000-0000-0000-000000000002''),
+		(3, ''20000000-0000-0000-0000-000000000000''), (4, NULL);
+	CREATE TABLE dbo.cmp_bin (id int NOT NULL PRIMARY KEY, vb varbinary(8) NULL, b binary(2) NULL, other varbinary(8) NULL);
+	INSERT INTO dbo.cmp_bin VALUES (1, 0x01, 0x0100, 0x0100), (2, 0x0100, 0x01, 0x0100), (3, 0x010000, 0x0200, 0x01), (4, 0x02, NULL, 0x02), (5, NULL, 0x0100, NULL);
+	CREATE TABLE dbo.cmp_binkey (k varbinary(8) NOT NULL PRIMARY KEY, v int NOT NULL);
+	INSERT INTO dbo.cmp_binkey VALUES (0x0100, 1), (0x02, 2);
+	CREATE TABLE dbo.cmp_rv (id int NOT NULL PRIMARY KEY, rv rowversion);
+	INSERT INTO dbo.cmp_rv (id) VALUES (1), (2), (3)');
+
+statement ok
+CREATE TABLE loc_uuid AS SELECT * FROM cmpx.dbo.cmp_uuid;
+
+statement ok
+CREATE TABLE loc_bin AS SELECT * FROM cmpx.dbo.cmp_bin;
+
+# =============================================================================
+# uniqueidentifier: ranges in DuckDB, equality on the server
+# =============================================================================
+
+foreach db cmpx cmpr
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_uuid WHERE g > '10000000-0000-0000-0000-000000000001'::UUID;
+----
+3
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_uuid WHERE g <= '10000000-0000-0000-0000-000000000001'::UUID;
+----
+1,2
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_uuid
+WHERE g BETWEEN '00000000-0000-0000-0000-000000000002'::UUID AND '10000000-0000-0000-0000-000000000001'::UUID;
+----
+1,2
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_uuid WHERE g = '20000000-0000-0000-0000-000000000000'::UUID;
+----
+3
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_uuid WHERE g <> '20000000-0000-0000-0000-000000000000'::UUID;
+----
+1,2
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_uuid
+WHERE g IN ('20000000-0000-0000-0000-000000000000'::UUID, '00000000-0000-0000-0000-000000000002'::UUID);
+----
+2,3
+
+endloop
+
+# The same answers from DuckDB over the rows.
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM loc_uuid WHERE g > '10000000-0000-0000-0000-000000000001'::UUID;
+----
+3
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM loc_uuid
+WHERE g BETWEEN '00000000-0000-0000-0000-000000000002'::UUID AND '10000000-0000-0000-0000-000000000001'::UUID;
+----
+1,2
+
+# =============================================================================
+# binary / varbinary: every comparison with the lengths deciding a tie
+# =============================================================================
+
+foreach db cmpx cmpr
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE vb = '\x01'::BLOB;
+----
+1
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE vb <> '\x01'::BLOB;
+----
+2,3,4
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE vb > '\x01'::BLOB;
+----
+2,3,4
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE vb IN ('\x01'::BLOB, '\x02'::BLOB);
+----
+1,4
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE vb BETWEEN '\x01'::BLOB AND '\x01\x00'::BLOB;
+----
+1,2
+
+# A binary(2) is read whole: 0x01 is stored 0x0100, which a 1-byte constant does not equal.
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE b = '\x01'::BLOB;
+----
+NULL
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE b = '\x01\x00'::BLOB;
+----
+1,2,5
+
+# Two columns: 0x01 against 0x0100 is no match.
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE vb = other;
+----
+2,4
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE vb <> other;
+----
+1,3
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE vb >= '\x01\x00'::BLOB;
+----
+2,3,4
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE vb < '\x01\x00'::BLOB;
+----
+1
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ${db}.dbo.cmp_bin WHERE vb NOT IN ('\x01'::BLOB, '\x02'::BLOB);
+----
+2,3
+
+# A binary key's rowid: 0x01 is not the stored 0x0100.
+query I
+SELECT count(*) FROM ${db}.dbo.cmp_binkey WHERE rowid = '\x01'::BLOB;
+----
+0
+
+query I
+SELECT v FROM ${db}.dbo.cmp_binkey WHERE rowid = '\x01\x00'::BLOB;
+----
+1
+
+query I
+SELECT count(*) FROM ${db}.dbo.cmp_binkey WHERE rowid IN ('\x01'::BLOB, '\x02'::BLOB);
+----
+1
+
+# A rowversion, always 8 bytes, against a constant (an incremental read's watermark): DuckDB's answer, the
+# range sent in its exact form (test_filter_encoder.cpp shows the T-SQL).
+statement ok
+SET VARIABLE rv_mark = (SELECT min(rv) FROM ${db}.dbo.cmp_rv);
+
+query I
+SELECT count(*) FROM ${db}.dbo.cmp_rv WHERE rv > getvariable('rv_mark');
+----
+2
+
+endloop
+
+# The same answers from DuckDB over the rows.
+query TTTTTTT
+SELECT (SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM loc_bin WHERE vb = '\x01'::BLOB),
+	(SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM loc_bin WHERE vb > '\x01'::BLOB),
+	(SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM loc_bin WHERE vb >= '\x01\x00'::BLOB),
+	(SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM loc_bin WHERE vb NOT IN ('\x01'::BLOB, '\x02'::BLOB)),
+	(SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM loc_bin WHERE b = '\x01\x00'::BLOB),
+	(SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM loc_bin WHERE vb = other),
+	(SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM loc_bin WHERE vb <> other);
+----
+1	2,3,4	2,3,4	2,3	1,2,5	2,4	1,3
+
+# =============================================================================
+# DML on a table with no unique key: only the rows DuckDB's comparison picks
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('cmpx', 'CREATE TABLE dbo.cmp_heap (vb varbinary(8) NOT NULL, v int NOT NULL, tag int NOT NULL);
+	INSERT INTO dbo.cmp_heap VALUES (0x01, 1, 10), (0x0100, 1, 10), (0x02, 3, 30)');
+
+# Staged (every column the key, D3 rung 3): the two rows tie in every column but vb, so the stage's join matches
+# by vb alone, its length pinned.
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+UPDATE cmpx.dbo.cmp_heap SET tag = 99 WHERE vb = '\x01'::BLOB;
+
+query TI
+SELECT hex(vb), tag FROM cmpx.dbo.cmp_heap ORDER BY tag;
+----
+0100	10
+02	30
+01	99
+
+# The staged MERGE: ON compares the target's binary with the source's.
+statement ok
+MERGE INTO cmpx.dbo.cmp_heap AS t USING (SELECT '\x01\x00'::BLOB AS k, 77 AS n) AS s ON t.vb = s.k
+WHEN MATCHED THEN UPDATE SET tag = s.n;
+
+query TI
+SELECT hex(vb), tag FROM cmpx.dbo.cmp_heap ORDER BY tag;
+----
+02	30
+0100	77
+01	99
+
+# A DELETE: its filter on the scan, its rows matched through the stage (the remote-pushdown writer vetoes a
+# binary comparison, so mssql_dml_pushdown takes the same path here).
+statement ok
+SET mssql_dml_pushdown = true;
+
+statement ok
+DELETE FROM cmpx.dbo.cmp_heap WHERE vb = '\x01'::BLOB;
+
+query TI
+SELECT hex(vb), tag FROM cmpx.dbo.cmp_heap ORDER BY tag;
+----
+02	30
+0100	77
+
+# A string key column, matched by its bytes: varbinary pads those with zero bytes too, so 'a' would tie
+# 'a' + CHAR(0). BIN2, so the scan's filter itself tells them apart.
+statement ok
+SELECT mssql_exec('cmpx', 'CREATE TABLE dbo.cmp_strheap (vc varchar(10) COLLATE Latin1_General_100_BIN2 NULL, v int NOT NULL, tag int NOT NULL);
+	INSERT INTO dbo.cmp_strheap VALUES (''a'', 1, 0), (''a'' + CHAR(0), 1, 0)');
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+UPDATE cmpx.dbo.cmp_strheap SET tag = 9 WHERE vc = 'a';
+
+query II
+SELECT length(vc), tag FROM cmpx.dbo.cmp_strheap ORDER BY 1;
+----
+1	9
+2	0
+
+statement ok
+SET mssql_dml_pushdown = true;
+
+statement ok
+SELECT mssql_exec('cmpx', 'DROP TABLE dbo.cmp_uuid; DROP TABLE dbo.cmp_bin; DROP TABLE dbo.cmp_binkey; DROP TABLE dbo.cmp_rv; DROP TABLE dbo.cmp_heap; DROP TABLE dbo.cmp_strheap');
+
+statement ok
+DETACH cmpx;
+
+statement ok
+DETACH cmpr;

@@ -67,6 +67,13 @@ static bool IsCharacterString(const MSSQLColumnInfo &col) {
 	return t == "char" || t == "varchar" || t == "nchar" || t == "nvarchar" || t == "sysname";
 }
 
+//! Issue #639: a binary / varbinary, which the server compares with the shorter value padded by zero
+//! bytes (`0x01 = 0x0100`), so a match by it also pins the lengths. rowversion is 8 bytes always.
+static bool IsPaddedBinary(const MSSQLColumnInfo &col) {
+	const auto t = StringUtil::Lower(col.sql_type_name);
+	return t == "binary" || t == "varbinary";
+}
+
 static string OutName(idx_t i) {
 	return "c" + std::to_string(i);
 }
@@ -115,16 +122,32 @@ static string MatchCondition(const MSSQLStagedDmlTarget &target, const string &t
 			t_value = "CAST(" + t + " AS varbinary(max))";
 			s_value = "CAST(" + s + " AS varbinary(max))";
 		}
+		// #639: a table with no unique key (D3 rung 3) can hold 0x01 beside 0x0100, which `=` ties, and a
+		// string beside itself with trailing NULs, which the byte match (varbinary, padded too: measured
+		// for varchar and nvarchar) ties. The stage has the target's types, so a true match has equal lengths.
+		const bool pinned = IsPaddedBinary(col) || IsCharacterString(col);
+		const auto t_length = "DATALENGTH(" + t + ")";
+		const auto s_length = "DATALENGTH(" + s + ")";
 		if (!col.is_nullable) {
 			if (IsCharacterString(col)) {
 				add(t + " = " + s);
 			}
 			add(t_value + " = " + s_value);
+			if (pinned) {
+				add(t_length + " = " + s_length);
+			}
 		} else if (target.null_safe_operator) {
 			add(t_value + " IS NOT DISTINCT FROM " + s_value);
+			if (pinned) {
+				add(t_length + " IS NOT DISTINCT FROM " + s_length);
+			}
 		} else {
 			intersect_target += (intersect_target.empty() ? "" : ", ") + t_value;
 			intersect_stage += (intersect_stage.empty() ? "" : ", ") + s_value;
+			if (pinned) {
+				intersect_target += ", " + t_length;
+				intersect_stage += ", " + s_length;
+			}
 		}
 	}
 	if (!intersect_target.empty()) {
@@ -405,6 +428,11 @@ void MSSQLStagedDml::CheckMatchedEverything(ClientContext &context, idx_t matche
 		string keys;
 		for (idx_t i = 0; i < target_.key_columns.size(); i++) {
 			keys += (i ? ", " : "") + mssql::QuoteIdentifier(KeyName(i));
+			if (IsPaddedBinary(target_.key_columns[i])) {
+				// #639: 0x01 and 0x0100 are two keys, which DISTINCT alone would fold.
+				keys += ", DATALENGTH(" + mssql::QuoteIdentifier(KeyName(i)) + ") AS " +
+						mssql::QuoteIdentifier(KeyName(i) + "_length");
+			}
 		}
 		auto distinct = MSSQLSimpleQuery::ExecuteScalar(stage_.GetConnection(),
 														"SELECT COUNT_BIG(*) FROM (SELECT DISTINCT " + keys + " FROM " +

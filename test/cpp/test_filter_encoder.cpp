@@ -1115,6 +1115,65 @@ static void TestSpatialComparisonNotPushed() {
 	ASSERT_TRUE(MSSQLColumnInfo::BuildReadExpression("g", "geography", -1, "", true, true) == "[g]");
 }
 
+// Issue #639: the server orders a uniqueidentifier by its own byte groups and compares binaries with the
+// shorter value padded by zero bytes. A uniqueidentifier's equality is pushed, its order is not; a binary's
+// every comparison is pushed with the lengths deciding a tie.
+static void TestUuidAndBinaryComparisons() {
+	std::cout << "  TestUuidAndBinaryComparisons..." << std::endl;
+	Fixture fx;
+	std::vector<MSSQLColumnInfo> cols = {Col("id", 1, "int", 4, 10, 0), Col("dt", 2, "datetime2", 8, 27, 7),
+										 Col("flag", 3, "bit", 1, 1, 0), Col("name", 4, "uniqueidentifier", 16, 0, 0),
+										 Col("d", 5, "float", 8, 53, 0)};
+	ASSERT_TRUE(!cols[3].comparison_differs && cols[3].duckdb_type.id() == LogicalTypeId::UUID);
+	fx.column_types[COL_NAME] = cols[3].duckdb_type;
+	auto ctx = fx.Context();
+	ctx.mssql_columns = &cols;
+	const Value u = Value::UUID("10000000-0000-0000-0000-000000000001");
+	auto compare = [&](ExpressionType type, const Value &v) {
+		auto e = BoundComparisonExpression::Create(type, ColRef(fx, COL_NAME), Const(v));
+		return FilterEncoder::EncodeSearchCondition(*e, ctx);
+	};
+	ASSERT_TRUE(compare(ExpressionType::COMPARE_EQUAL, u).supported);
+	ASSERT_TRUE(compare(ExpressionType::COMPARE_NOTEQUAL, u).supported);
+	for (auto type : {ExpressionType::COMPARE_LESSTHAN, ExpressionType::COMPARE_GREATERTHAN,
+					  ExpressionType::COMPARE_LESSTHANOREQUALTO, ExpressionType::COMPARE_GREATERTHANOREQUALTO}) {
+		ASSERT_TRUE(!compare(type, u).supported);
+	}
+	auto between = BoundBetweenExpression::Create(ColRef(fx, COL_NAME), Const(u), Const(u), true, true);
+	ASSERT_TRUE(!FilterEncoder::EncodeSearchCondition(*between, ctx).supported);
+
+	cols[3] = Col("name", 4, "varbinary", 8, 0, 0);
+	ASSERT_TRUE(!cols[3].comparison_differs && cols[3].duckdb_type.id() == LogicalTypeId::BLOB);
+	fx.column_types[COL_NAME] = cols[3].duckdb_type;
+	const uint8_t one[] = {0x01};
+	const Value b = Value::BLOB(one, sizeof(one));
+	const auto eq = compare(ExpressionType::COMPARE_EQUAL, b);
+	ASSERT_TRUE(eq.supported && eq.sql.find("[name] = ") != std::string::npos &&
+				eq.sql.find(" AND DATALENGTH([name]) = DATALENGTH(") != std::string::npos);
+	const auto ne = compare(ExpressionType::COMPARE_NOTEQUAL, b);
+	ASSERT_TRUE(ne.supported && ne.sql.find("[name] <> ") != std::string::npos &&
+				ne.sql.find(" OR DATALENGTH([name]) <> DATALENGTH(") != std::string::npos);
+	const auto gt = compare(ExpressionType::COMPARE_GREATERTHAN, b);
+	ASSERT_TRUE(gt.supported && gt.sql.find("[name] >= ") != std::string::npos &&
+				gt.sql.find(" OR DATALENGTH([name]) > DATALENGTH(") != std::string::npos);
+	const auto le = compare(ExpressionType::COMPARE_LESSTHANOREQUALTO, b);
+	ASSERT_TRUE(le.supported && le.sql.find("[name] <= ") != std::string::npos &&
+				le.sql.find(" OR DATALENGTH([name]) <= DATALENGTH(") != std::string::npos);
+	auto in = make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN, LogicalType::BOOLEAN);
+	in->GetChildrenMutable().push_back(ColRef(fx, COL_NAME));
+	in->GetChildrenMutable().push_back(Const(b));
+	in->GetChildrenMutable().push_back(Const(b));
+	const auto in_sql = FilterEncoder::EncodeSearchCondition(*in, ctx);
+	ASSERT_TRUE(in_sql.supported && in_sql.sql.find(" IN (") == std::string::npos &&
+				in_sql.sql.find(" OR ") != std::string::npos &&
+				in_sql.sql.find("DATALENGTH([name])") != std::string::npos);
+	auto blob_between = BoundBetweenExpression::Create(ColRef(fx, COL_NAME), Const(b), Const(b), true, true);
+	const auto between_sql = FilterEncoder::EncodeSearchCondition(*blob_between, ctx);
+	ASSERT_TRUE(between_sql.supported && between_sql.sql.find(" BETWEEN ") == std::string::npos &&
+				between_sql.sql.find("DATALENGTH([name]) >= DATALENGTH(") != std::string::npos &&
+				between_sql.sql.find("DATALENGTH([name]) <= DATALENGTH(") != std::string::npos);
+}
+
 // The declaration table of spec 076 W1: the column's kind, never narrower
 // than the constant.
 static void TestDeclarationForColumn() {
@@ -1306,6 +1365,7 @@ int main() {
 	TestD2AnswersAreSeparate();
 	TestJsonComparisonNotPushed();
 	TestSpatialComparisonNotPushed();
+	TestUuidAndBinaryComparisons();
 	TestColumnResolver();
 	TestWideningCasts();
 

@@ -64,6 +64,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **A result whose metadata declares what no server sends is refused by the column's name.** A `time` / `datetime2` / `datetimeoffset` column declaring a fractional-second scale past 7 was refused as `Column '' declares …`: the message was built before the column's name had been read. A `decimal` / `numeric` column declaring a precision outside 1..38, or a scale past its precision, was not refused at all: a precision past 38 surfaced as a DuckDB internal error (`Decimal has a width of 39 which is bigger than the maximum supported width of 38`). Both, and a vector column's element type and length, are now checked once the name is read, and the error says `Column 'amount' declares precision 39 and scale 0; … The TDS stream is malformed.` Only a server (or a proxy) that breaks the protocol sends such metadata.
+- **A filter on a `uniqueidentifier` or `binary` / `varbinary` column returns the rows DuckDB's comparison picks** (#639). The filter was pushed to SQL Server, which compares these types differently.
+  - **`uniqueidentifier`:** the server orders it by its own byte groups (the last six bytes first). A pushed range on one returned other rows: `g > k` gave 923 rows where DuckDB gives 999, and a `BETWEEN` gave 802 where DuckDB gives 501.
+  - **`binary` / `varbinary`:** the server pads the shorter value with zero bytes, so `0x01 = 0x0100`. On a table with no unique key, `DELETE … WHERE vb = '\x01'::BLOB` also removed the `0x0100` row, and an `UPDATE` changed it.
+  - **What is pushed now:**
+    - a uniqueidentifier's `=`, `<>` and `IN` stay pushed, and its ranges run in DuckDB;
+    - a binary's comparisons are all still pushed, but in DuckDB's terms: `a = b` is sent as `a = b AND DATALENGTH(a) = DATALENGTH(b)` (an index seek remains), and a range lets the lengths decide a tie;
+    - so a `rowversion` range (`rv > @watermark`) is still pushed.
+  - **Where:**
+    - the scan's filters;
+    - `rowid` on a binary key;
+    - the staged `MERGE`'s conditions. A uniqueidentifier range in one is now refused by name;
+    - the staged UPDATE / DELETE on a table with no unique key. Its join pins a binary or string key column's length too: the byte match of a string, through `varbinary`, padded `'a'` to tie `'a' + CHAR(0)` as well.
+  - **Unchanged:**
+    - the remote-pushdown writer already refused both;
+    - a unique key cannot hold `0x01` beside `0x0100` (the server's error 2627), so the keyed DML paths were not affected.
 - **A backup made by SQL Server 2017 under writes reads a table whose extents were taken into use while it ran** (spec 085). SQL Server 2017 copies the data once, sizing the copy when it starts, and closes it with pad units; an extent allocated after that is not copied, its pages only in the backup's log tail. `mssql_backup_scan` failed on such a table, `the copy of page … is a pad unit` (or `the backup carries no copy of it`). The page is now read as one that became live while the backup ran, as a zero copy already was: when the log tail formats it, its rows are not read and a `WARNING` names it (refused under `fuzzy := 'error'`), and the table's fuzzy status already says it is stale (or dirty, for a transaction still open). A backup with a second data pass (2019 and later) copies such a page there, so one it lacks is still refused. Found by the oracle lane on a 2017 backup under load.
 - **`mssql_backup_transaction_records` gives the page of a `LOP_MIGRATE_LOCKS` record** (spec 085), as `fn_dump_dblog` does: its fixed part has the page and no slot, and the page was read only beside a slot. Its `slot` is NULL.
 - **A catalog scan no longer returns rows its query's filter excludes when DuckDB pushes filters into it twice** (#623). The WHERE clause a scan stores from DuckDB's complex filter pushdown was replaced by a second call on the same scan, and the first call's conditions had already left the plan. A materialized CTE does this: `WITH c AS MATERIALIZED (SELECT * FROM db.dbo.t WHERE year(d) = 2024) SELECT * FROM c WHERE x = 1` read every year's rows of `x = 1` (600 where 73 are), read by one consumer or two. Each call's conditions are now ANDed onto the stored ones, their parameters numbered after them.

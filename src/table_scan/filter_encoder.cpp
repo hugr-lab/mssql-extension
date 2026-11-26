@@ -471,6 +471,82 @@ static bool ReadsLossyColumn(const Expression &expr, const ExpressionEncodeConte
 	return reads;
 }
 
+//! Issue #639: how the server compares two values of a DuckDB type unlike DuckDB. A uniqueidentifier
+//! (UUID) is ordered by the server's own byte groups (bytes 10-15 first; measured: `g > k` found 923 rows
+//! where DuckDB finds 999), so only its equality is DuckDB's. A binary / varbinary (BLOB) is compared with
+//! the shorter value padded by zero bytes (`0x01 = 0x0100` is true; measured); DuckDB's comparison is the
+//! padded one with the lengths deciding a tie (ComparisonSql).
+enum class ServerComparison : uint8_t {
+	Like,		   //!< as DuckDB compares
+	EqualityOnly,  //!< `=` / `<>` / IN as DuckDB, no order
+	LengthPinned   //!< every comparison, with the lengths deciding a tie
+};
+
+static ServerComparison ServerComparisonOf(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::UUID:
+		return ServerComparison::EqualityOnly;
+	case LogicalTypeId::BLOB:
+		return ServerComparison::LengthPinned;
+	default:
+		return ServerComparison::Like;
+	}
+}
+
+static bool IsEqualityComparison(ExpressionType type) {
+	return type == ExpressionType::COMPARE_EQUAL || type == ExpressionType::COMPARE_NOTEQUAL;
+}
+
+//! Whether `left type right` of values of `type` may be sent at all (ComparisonSql renders it).
+static bool ServerComparesLike(const LogicalType &type, ExpressionType comparison) {
+	return ServerComparisonOf(type) != ServerComparison::EqualityOnly || IsEqualityComparison(comparison);
+}
+
+//! `left op right` as DuckDB decides it, for a comparison ServerComparesLike admits. For a binary: where
+//! the padded values differ the server's order is DuckDB's (the first difference is a byte both hold, or a
+//! non-zero byte of the longer one against the shorter's padding: the longer is greater on both sides);
+//! where they tie, the longer value -- trailing zero bytes -- is the greater in DuckDB. So `=` is the tie
+//! with equal lengths, `>` a greater padded value or a tie with a longer one (`a >= b AND (a > b OR
+//! DATALENGTH(a) > DATALENGTH(b))`), and so on; a NULL side is unknown, as DuckDB's.
+static std::string ComparisonSql(const LogicalType &type, ExpressionType comparison, const std::string &op,
+								 const std::string &left, const std::string &right) {
+	if (ServerComparisonOf(type) != ServerComparison::LengthPinned) {
+		return ExpressionVocabulary::Comparison(op, left, right);
+	}
+	const std::string left_length = "DATALENGTH(" + left + ")";
+	const std::string right_length = "DATALENGTH(" + right + ")";
+	switch (comparison) {
+	case ExpressionType::COMPARE_EQUAL:
+		return "(" + left + " = " + right + " AND " + left_length + " = " + right_length + ")";
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return "(" + left + " <> " + right + " OR " + left_length + " <> " + right_length + ")";
+	default: {
+		const bool greater = comparison == ExpressionType::COMPARE_GREATERTHAN ||
+							 comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+		std::string length_op;
+		ExpressionVocabulary::ComparisonOperator(comparison, length_op);
+		// A plain range first, so the server can seek on it; the lengths decide inside the tie.
+		return "(" + left + (greater ? " >= " : " <= ") + right + " AND (" + left + (greater ? " > " : " < ") + right +
+			   " OR " + left_length + length_op + right_length + "))";
+	}
+	}
+}
+
+//! `operand IN (items)` / NOT IN as DuckDB decides it for values of `type`: a binary's as its pinned
+//! equalities (an OR; NOT IN an AND of the inequalities), anything else as the server's IN.
+static std::string InSql(const LogicalType &type, const std::string &operand, const std::vector<std::string> &items,
+						 bool negated) {
+	if (ServerComparisonOf(type) != ServerComparison::LengthPinned) {
+		return ExpressionVocabulary::In(operand, items, negated);
+	}
+	std::vector<std::string> terms;
+	for (const auto &item : items) {
+		terms.push_back(ComparisonSql(type, negated ? ExpressionType::COMPARE_NOTEQUAL : ExpressionType::COMPARE_EQUAL,
+									  negated ? " <> " : " = ", operand, item));
+	}
+	return ExpressionVocabulary::Conjunction(terms, negated);
+}
+
 //! Issue #426: a column DuckDB does not read exactly is compared on the server
 //! only as itself against constants -- each made to decide as DuckDB's
 //! comparison of the read value does -- and a DATETIME column also against
@@ -767,7 +843,8 @@ ExpressionEncodeResult FilterEncoder::EncodeConstantComparison(const LegacyConst
 															   const std::string &column_name,
 															   const LogicalType &column_type) {
 	std::string op;
-	if (!GetComparisonOperator(filter.comparison_type, op) || !codec::datetime::ServerHoldsTemporal(filter.constant)) {
+	if (!GetComparisonOperator(filter.comparison_type, op) || !codec::datetime::ServerHoldsTemporal(filter.constant) ||
+		!ServerComparesLike(column_type, filter.comparison_type)) {	 // #639
 		return {"", false};
 	}
 
@@ -782,7 +859,8 @@ ExpressionEncodeResult FilterEncoder::EncodeConstantComparison(const LegacyConst
 	auto constant_ctx = ctx;
 	constant_ctx.constant_comparison = filter.comparison_type;
 	std::string sql =
-		column_name + op + EncodeConstantValue(filter.constant, column_type, constant_ctx, ctx.filter_column_info);
+		ComparisonSql(column_type, filter.comparison_type, op, column_name,
+					  EncodeConstantValue(filter.constant, column_type, constant_ctx, ctx.filter_column_info));
 	return {sql, true};
 }
 
@@ -822,17 +900,13 @@ ExpressionEncodeResult FilterEncoder::EncodeInFilter(const LegacyInFilter &filte
 		}
 		return {ExpressionVocabulary::Conjunction(ranges, false), true};
 	}
-	std::string sql = column_name + " IN (";
+	std::vector<std::string> items;
 	for (idx_t i = 0; i < filter.values.size(); i++) {
-		if (i > 0) {
-			sql += ", ";
-		}
-		sql += IsDatetimeColumn(ctx.filter_column_info)
-				   ? EncodeConstantValue(filter.values[i], column_type, item_ctx, ctx.filter_column_info)
-				   : ValueToSQLLiteral(filter.values[i], column_type);
+		items.push_back(IsDatetimeColumn(ctx.filter_column_info)
+							? EncodeConstantValue(filter.values[i], column_type, item_ctx, ctx.filter_column_info)
+							: ValueToSQLLiteral(filter.values[i], column_type));
 	}
-	sql += ")";
-	return {sql, true};
+	return {InSql(column_type, column_name, items, false), true};  // #639: a binary's as pinned equalities
 }
 
 ExpressionEncodeResult FilterEncoder::EncodeConjunctionAnd(const LegacyConjunctionAndFilter &filter,
@@ -1126,6 +1200,13 @@ ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundFunc
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: a lossy-read column against another value");
 		return {"", false};
 	}
+	// #639: a uniqueidentifier's order is not DuckDB's: only its equality is sent (a binary's every
+	// comparison is, in DuckDB's terms: ComparisonSql).
+	if (!ServerComparesLike(left.GetReturnType(), expr.GetExpressionType())) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: the server orders %s otherwise",
+							   left.GetReturnType().ToString().c_str());
+		return {"", false};
+	}
 
 	// #426: a time(7) / datetimeoffset(7) column against a constant, as DuckDB
 	// compares the value it reads.
@@ -1170,7 +1251,8 @@ ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundFunc
 		return {"", false};
 	}
 
-	std::string sql = ExpressionVocabulary::Comparison(op, left_result.sql, right_result.sql);
+	std::string sql =
+		ComparisonSql(left.GetReturnType(), expr.GetExpressionType(), op, left_result.sql, right_result.sql);
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeComparisonExpression: encoded -> %s", sql.c_str());
 	return {sql, true};
 }
@@ -1306,7 +1388,7 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 			}
 			items.push_back(item_result.sql);
 		}
-		std::string sql = ExpressionVocabulary::In(operand_result.sql, items, negated);
+		std::string sql = InSql(children[0]->GetReturnType(), operand_result.sql, items, negated);	// #639
 		MSSQL_FILTER_DEBUG_LOG(2, "EncodeOperatorExpression: encoded -> %s", sql.c_str());
 		return {sql, true};
 	}
@@ -1377,6 +1459,12 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: a lossy-read column against another value");
 		return {"", false};
 	}
+	// #639: a uniqueidentifier's order is not the server's.
+	const auto &between_type = BoundBetweenExpression::Input(expr).GetReturnType();
+	if (ServerComparisonOf(between_type) == ServerComparison::EqualityOnly) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: the server orders the input otherwise");
+		return {"", false};
+	}
 
 	const auto truncated = ColumnRefInfo(BoundBetweenExpression::Input(expr), ctx);
 	if (IsTruncatedReadColumn(truncated)) {
@@ -1431,8 +1519,24 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 		return {"", false};
 	}
 
-	std::string sql = ExpressionVocabulary::Between(input_result.sql, lower_result.sql, upper_result.sql,
-													lower_inclusive, upper_inclusive);
+	std::string sql;
+	if (ServerComparisonOf(between_type) == ServerComparison::LengthPinned) {
+		// #639: a binary's bounds as its exact comparisons.
+		const auto lower_type =
+			lower_inclusive ? ExpressionType::COMPARE_GREATERTHANOREQUALTO : ExpressionType::COMPARE_GREATERTHAN;
+		const auto upper_type =
+			upper_inclusive ? ExpressionType::COMPARE_LESSTHANOREQUALTO : ExpressionType::COMPARE_LESSTHAN;
+		std::string lower_op, upper_op;
+		GetComparisonOperator(lower_type, lower_op);
+		GetComparisonOperator(upper_type, upper_op);
+		sql = ExpressionVocabulary::Conjunction(
+			{ComparisonSql(between_type, lower_type, lower_op, input_result.sql, lower_result.sql),
+			 ComparisonSql(between_type, upper_type, upper_op, input_result.sql, upper_result.sql)},
+			true);
+	} else {
+		sql = ExpressionVocabulary::Between(input_result.sql, lower_result.sql, upper_result.sql, lower_inclusive,
+											upper_inclusive);
+	}
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: encoded -> %s", sql.c_str());
 	return {sql, true};
 }
@@ -1688,20 +1792,21 @@ ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &valu
 			if (i > 0) {
 				sql += " AND ";
 			}
-			sql += mssql::QuoteIdentifier((*ctx.pk_column_names)[i]);
-			sql += " = ";
-			sql += EncodeKeyConstant(children[i], (*ctx.pk_column_types)[i], ctx,
-									 ColumnInfoByName((*ctx.pk_column_names)[i], ctx));
+			// #639: a binary key component's length pinned.
+			sql += ComparisonSql((*ctx.pk_column_types)[i], ExpressionType::COMPARE_EQUAL, " = ",
+								 mssql::QuoteIdentifier((*ctx.pk_column_names)[i]),
+								 EncodeKeyConstant(children[i], (*ctx.pk_column_types)[i], ctx,
+												   ColumnInfoByName((*ctx.pk_column_names)[i], ctx)));
 		}
 		sql += ")";
 		MSSQL_FILTER_DEBUG_LOG(2, "EncodeRowidEquality: composite PK -> %s", sql.c_str());
 		return {sql, true};
 	} else {
 		// Scalar PK: rowid = value
-		std::string sql = mssql::QuoteIdentifier((*ctx.pk_column_names)[0]);
-		sql += " = ";
-		sql += EncodeKeyConstant(const_expr.GetValue(), (*ctx.pk_column_types)[0], ctx,
-								 ColumnInfoByName((*ctx.pk_column_names)[0], ctx));
+		std::string sql = ComparisonSql((*ctx.pk_column_types)[0], ExpressionType::COMPARE_EQUAL, " = ",
+										mssql::QuoteIdentifier((*ctx.pk_column_names)[0]),
+										EncodeKeyConstant(const_expr.GetValue(), (*ctx.pk_column_types)[0], ctx,
+														  ColumnInfoByName((*ctx.pk_column_names)[0], ctx)));
 		MSSQL_FILTER_DEBUG_LOG(2, "EncodeRowidEquality: scalar PK -> %s", sql.c_str());
 		return {sql, true};
 	}
