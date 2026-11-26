@@ -1,6 +1,9 @@
 # Spec 094 research: the DuckDB side (pin `4569c0a1eeb`, v2.0.0-dev70230)
 
 Sources: `duckdb/` submodule at `4569c0a1eeb27c69f7799d9a40453a4fc7c0299d`, the extension at `main` (`e604c797`).
+The extension's line references are to that commit. Since then `ComplexFilterPushdown` has moved to
+`src/table_scan/table_scan_pushdown.cpp`. DuckDB calls it more than once per scan; since #623 the extension
+appends each pass's conditions instead of replacing them.
 Plans come from `build/release/duckdb` (source id `4569c0a1ee`) run on local tables. No extension was loaded,
 so the MSSQL-side behaviour below is read from the source and was not run against a server. The scripts are
 `q*.sql` in `plans/`.
@@ -429,6 +432,9 @@ Constraints:
 - `ComplexFilterPushdown` erases only what it encodes. A **superset** predicate can be pushed while the exact
   `&&` stays in DuckDB: render the SQL and leave the expression in `filters`. That suits spatial filters, where
   the server's predicate differs.
+  - Correction (review of #622): today encoding is erasing, and four other callers take an encoded filter as
+    exact. A superset needs a result kind of its own, rendered once per expression in a slot of its own
+    (the passes append since #623). Spec D0 has the mechanism.
 - The encoder needs to see through the CRS-only cast. `ExpressionVocabulary::IsTransparentCast` handles
   string-to-string only today (`filter_encoder.cpp:982-986`).
 - Server semantics, not checked here (server note):
