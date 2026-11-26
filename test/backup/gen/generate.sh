@@ -482,11 +482,11 @@ for fixture in ${FIXTURES}; do
 			[ "$(scalar "${backing_up}" || true)" = 1 ] || tw_failed "backup was not running at hold ${hold}"
 			echo ">> tail_window: held $(scalar "SELECT CAST(percent_complete AS int) FROM sys.dm_exec_requests WHERE command LIKE 'BACKUP%'")% into the backup"
 			if [ "${hold}" = 2 ]; then
-				tw_before_pass2="$(tw_lsn)"
+				tw_before_pass2="$(tw_lsn)" || tw_failed "could not read the log's end before pass2.sql"
 				run_sql tail_window_pass2.sql
 			elif [ -n "${first_script}" ]; then
 				run_sql "${first_script}"
-				tw_after_pass1="$(tw_lsn)"
+				tw_after_pass1="$(tw_lsn)" || tw_failed "could not read the log's end after ${first_script}"
 			fi
 			docker exec "${CONTAINER}" touch "${DIR}/tw.g${hold}"
 		done
@@ -500,6 +500,9 @@ for fixture in ${FIXTURES}; do
 		# else they are in the copy and its tables read consistent; with a second pass, pass1.sql's before it,
 		# else the filler is stale. A necessary condition only (where the last pass was when pass2.sql ran is
 		# not in the header): the committed set's scenarios are checked by mssql_backup_tail_window.test.
+		# Whether log_end_lsn is the last record's LSN or the next one's, a checkpoint equal to it was written
+		# after every record before it, so it holds on both sides: a miss is CheckpointLSN > the log's end
+		# before pass2.sql, or < the log's end after pass1.sql.
 		tw_checkpoint="$(sql -Q "SET NOCOUNT ON; RESTORE HEADERONLY FROM DISK = '${DIR}/tail_window_full.bak'" -s '|' -W |
 			awk -F'|' 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "CheckpointLSN") c = i } NR == 3 && c { print $c }')"
 		for v in "${tw_checkpoint}" "${tw_before_pass2}" ${first_script:+"${tw_after_pass1}"}; do
@@ -508,7 +511,7 @@ for fixture in ${FIXTURES}; do
 		tw_missed=""
 		if ! lsn_le "${tw_checkpoint}" "${tw_before_pass2}"; then
 			tw_missed="its last data pass checkpointed at ${tw_checkpoint}, after pass2.sql began (${tw_before_pass2})"
-		elif [ -n "${first_script}" ] && lsn_le "${tw_checkpoint}" "${tw_after_pass1}"; then
+		elif [ -n "${first_script}" ] && ! lsn_le "${tw_after_pass1}" "${tw_checkpoint}"; then
 			tw_missed="its second data pass checkpointed at ${tw_checkpoint}, before pass1.sql ended (${tw_after_pass1})"
 		fi
 		if [ -z "${tw_missed}" ]; then
@@ -517,6 +520,8 @@ for fixture in ${FIXTURES}; do
 			tw_failed "missed its window: ${tw_missed}; generate it again"
 		else
 			echo ">> tail_window: WARNING: missed its window: ${tw_missed} (compared as fuzzy all the same)"
+			# On the run's summary too: a lane that misses it every time no longer exercises the dirty cases.
+			[ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::tail_window missed its window: ${tw_missed}"
 		fi
 		sql -Q "UPDATE tw_control.dbo.phase SET n = 3" >/dev/null
 		tw_wait "SELECT CASE WHEN (SELECT COUNT(*) FROM bak_tail_window.dbo.parallel_open WITH (READUNCOMMITTED)) = 0 THEN 1 ELSE 0 END" ||
