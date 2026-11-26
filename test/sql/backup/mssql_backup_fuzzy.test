@@ -3,9 +3,10 @@
 # group: [mssql]
 #
 # test/data/backup/open_tail (test/backup/gen/open_tail.sql, SQL Server 2025): one transaction, open_tail,
-# updates rows 1-10 of dbo.changed (v + 1000), deletes rows 50-52 and inserts 201-203, then stays open while
-# a copy-only full (open_tail_full) and a differential over open_tail_base (open_tail_diff) are taken, and
-# rolls back afterwards. Both backups hold its changes: dbo.changed is dirty, dbo.static consistent. The
+# deletes row 1 of dbo.variant_rows (a sql_variant column) and inserts rows 3-5 there, updates rows 1-10 of
+# dbo.changed (v + 1000), deletes rows 50-52 and inserts 201-203, then stays open while a copy-only full
+# (open_tail_full) and a differential over open_tail_base (open_tail_diff) are taken, and rolls back
+# afterwards. Both backups hold its changes: dbo.changed and dbo.variant_rows are dirty, dbo.static consistent. The
 # committed samples of test/data/backup are quiet: their tails hold a checkpoint only. No SQL Server is needed.
 
 require mssql
@@ -51,6 +52,7 @@ FROM mssql_backup_tables('test/data/backup/open_tail/open_tail_full.bak') WHERE 
 changed	dirty	1	0
 control	consistent	0	0
 static	consistent	0	0
+variant_rows	dirty	1	0
 
 query TTII
 SELECT table_name, fuzzy_status, open_transactions, stale_transactions
@@ -60,6 +62,7 @@ WHERE type = 'U' ORDER BY 1;
 changed	dirty	1	0
 control	consistent	0	0
 static	consistent	0	0
+variant_rows	dirty	1	0
 
 query I
 SELECT count(*) FROM mssql_backup_tables('test/data/backup/full.bak') WHERE fuzzy_status IS DISTINCT FROM 'consistent';
@@ -276,7 +279,7 @@ query TTTIT
 SELECT name, status, after_checkpoint, row_operations, [u.table_name || ':' || coalesce(u.effect, '-') FOR u IN tables]
 FROM mssql_backup_transactions('test/data/backup/open_tail/open_tail_full.bak') WHERE row_operations > 0;
 ----
-open_tail	open	false	16	['changed:dirty']
+open_tail	open	false	20	['changed:dirty', 'variant_rows:dirty']
 
 # The catalog's macro, and the differential over its full.
 query TT
@@ -295,9 +298,11 @@ statement ok
 ATTACH 'test/data/backup/open_tail/open_tail_base.bak' AS ot_diff (TYPE mssql_backup, diff 'test/data/backup/open_tail/open_tail_diff.bak');
 
 query TTT
-SELECT t.name, u.table_name, u.effect FROM ot_diff.transactions() t, unnest(t.tables) AS x(u) WHERE t.row_operations > 0;
+SELECT t.name, u.table_name, u.effect FROM ot_diff.transactions() t, unnest(t.tables) AS x(u) WHERE t.row_operations > 0
+ORDER BY 2;
 ----
 open_tail	changed	dirty
+open_tail	variant_rows	dirty
 
 query I
 SELECT count(*) FROM ot_diff.transaction_records() WHERE table_name = 'changed' AND operation = 'LOP_INSERT_ROWS';
@@ -325,6 +330,18 @@ LOP_DELETE_ROWS	{'row': {'id': 52, 'note': row 52, 'v': 52}}
 LOP_INSERT_ROWS	{'rows': [{'id': 201, 'note': new 201, 'v': 201}]}
 LOP_INSERT_ROWS	{'rows': [{'id': 202, 'note': new 202, 'v': 202}]}
 LOP_INSERT_ROWS	{'rows': [{'id': 203, 'note': new 203, 'v': 203}]}
+
+# A sql_variant column's row images: each value a VARIANT of its base type, NULL a VARIANT NULL (review of #631:
+# the STRUCT built from the staged row is cast to VARIANT with a VARIANT child).
+query TTT
+SELECT operation, contents::VARCHAR, variant_typeof(coalesce(contents.row, contents.rows[1]).sv)
+FROM mssql_backup_transaction_records('test/data/backup/open_tail/open_tail_full.bak')
+WHERE table_name = 'variant_rows' AND operation IN ('LOP_INSERT_ROWS', 'LOP_DELETE_ROWS') ORDER BY lsn;
+----
+LOP_DELETE_ROWS	{'row': {'id': 1, 'sv': 7}}	INT32
+LOP_INSERT_ROWS	{'rows': [{'id': 3, 'sv': 123.45}]}	DECIMAL(9, 2)
+LOP_INSERT_ROWS	{'rows': [{'id': 4, 'sv': 2026-11-26}]}	DATE
+LOP_INSERT_ROWS	{'rows': [{'id': 5, 'sv': NULL}]}	VARIANT_NULL
 
 # A modified row's byte range: v of row 1, 1 -> 1001 at offset 8 of the record.
 query IIT
