@@ -1,0 +1,91 @@
+# name: test/sql/dml/merge_set_bit_boolean.test
+# description: A MERGE assigning a boolean expression to a bit column writes it as a three-valued bit (#636)
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# T-SQL has no boolean value: a predicate where a value is assigned -- `SET b = (t.n < 0)` -- is error 102 / 156.
+# The MERGE's SET / INSERT values wrote the encoder's condition there, so the statement failed and wrote
+# nothing; the same value in an UPDATE works. Such a value is now written as the bit DuckDB gives it,
+# `CASE WHEN c THEN 1 WHEN NOT (c) THEN 0 END`, so an UNKNOWN stays NULL. Found by #633's property tests.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS mb (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('mb', 'DROP TABLE IF EXISTS dbo.mb_t; CREATE TABLE dbo.mb_t (k int NOT NULL PRIMARY KEY, n int NULL, b bit NULL, c bit NULL);
+	INSERT INTO dbo.mb_t VALUES (0, 5, NULL, 1), (1, NULL, NULL, 0), (2, -3, 1, 1)');
+
+statement ok
+CREATE TABLE mb_src AS SELECT * FROM (VALUES (0), (1), (2), (3)) t(k);
+
+# The reference: an UPDATE takes the value.
+statement ok
+UPDATE mb.dbo.mb_t SET b = (n > 0);
+
+query IIT
+SELECT k, n, b FROM mb.dbo.mb_t ORDER BY k;
+----
+0	5	true
+1	NULL	NULL
+2	-3	false
+
+# Staged MERGE (a local source): a comparison, NULL for an UNKNOWN.
+statement ok
+MERGE INTO mb.dbo.mb_t AS t USING mb_src AS s ON (t.k = s.k) WHEN MATCHED THEN UPDATE SET b = (t.n < 0);
+
+query IIT
+SELECT k, n, b FROM mb.dbo.mb_t ORDER BY k;
+----
+0	5	false
+1	NULL	NULL
+2	-3	true
+
+# IS NULL, never UNKNOWN.
+statement ok
+MERGE INTO mb.dbo.mb_t AS t USING mb_src AS s ON (t.k = s.k) WHEN MATCHED THEN UPDATE SET b = (t.n IS NULL);
+
+query IIT
+SELECT k, n, b FROM mb.dbo.mb_t ORDER BY k;
+----
+0	5	false
+1	NULL	true
+2	-3	false
+
+# NOT, an OR with a source value, and an INSERT of a condition over the source.
+statement ok
+MERGE INTO mb.dbo.mb_t AS t USING mb_src AS s ON (t.k = s.k)
+WHEN MATCHED THEN UPDATE SET b = NOT (t.n > 0), c = (t.n > 0 OR s.k = 1)
+WHEN NOT MATCHED THEN INSERT (k, n, b, c) VALUES (s.k, NULL, (s.k > 2), (s.k < 2));
+
+query IITT
+SELECT k, n, b, c FROM mb.dbo.mb_t ORDER BY k;
+----
+0	5	false	true
+1	NULL	NULL	true
+2	-3	true	false
+3	NULL	true	false
+
+# The source in the catalog: the pushed writer vetoes a predicate in SET, so this MERGE is staged too. AND of two
+# bit columns, three-valued.
+statement ok
+MERGE INTO mb.dbo.mb_t AS t USING mb.dbo.mb_t AS s ON (t.k = s.k) WHEN MATCHED THEN UPDATE SET b = (t.b AND s.c);
+
+query IT
+SELECT k, b FROM mb.dbo.mb_t ORDER BY k;
+----
+0	false
+1	NULL
+2	false
+3	false
+
+statement ok
+SELECT mssql_exec('mb', 'DROP TABLE dbo.mb_t');
+
+statement ok
+DETACH mb;

@@ -217,6 +217,24 @@ static void TestCaseWhenIsPredicatePosition() {
 	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*cmp, ctx), "(CASE WHEN ([flag] = 1) THEN [id] ELSE 0 END > 0)");
 }
 
+// Issue #636: a condition assigned as a value (a MERGE's SET into a bit column) is the bit DuckDB gives it,
+// three-valued; a value -- a bit column, a constant -- is written as it is.
+static void TestEncodeValueOfACondition() {
+	std::cout << "  TestEncodeValueOfACondition..." << std::endl;
+	Fixture fx;
+	auto ctx = fx.Context();
+	ctx.params = nullptr;
+	auto cmp = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, ColRef(fx, COL_ID),
+												 Const(Value::INTEGER(5)));
+	ASSERT_SQL(FilterEncoder::EncodeValue(*cmp, ctx),
+			   "CASE WHEN ([id] > 5) THEN CAST(1 AS bit) WHEN (NOT ([id] > 5)) THEN CAST(0 AS bit) END");
+	auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+	is_null->GetChildrenMutable().push_back(ColRef(fx, COL_ID));
+	ASSERT_SQL(FilterEncoder::EncodeValue(*is_null, ctx),
+			   "CASE WHEN ([id] IS NULL) THEN CAST(1 AS bit) WHEN (NOT ([id] IS NULL)) THEN CAST(0 AS bit) END");
+	ASSERT_SQL(FilterEncoder::EncodeValue(*ColRef(fx, COL_FLAG), ctx), "[flag]");
+}
+
 //==============================================================================
 // Test: the issue #242 removals stay removed. Each of these has a T-SQL form
 // that returns DIFFERENT ROWS than DuckDB does, so "not pushed" is the correct
@@ -1351,6 +1369,7 @@ int main() {
 	TestValueChangingCastNotStripped();
 	TestBitCoercionAtPredicatePositions();
 	TestCaseWhenIsPredicatePosition();
+	TestEncodeValueOfACondition();
 	TestDivergingFunctionsNotMapped();
 	TestModuloOperandTypes();
 	TestSearchConditionRefusedInValuePosition();

@@ -409,6 +409,13 @@ std::string ExpressionVocabulary::AsCondition(const SqlOperand &operand) {
 	return operand.sql;
 }
 
+std::string ExpressionVocabulary::AsValue(const SqlOperand &operand) {
+	if (!operand.is_condition) {
+		return operand.sql;
+	}
+	return "CASE WHEN " + operand.sql + " THEN CAST(1 AS bit) WHEN " + Not(operand.sql) + " THEN CAST(0 AS bit) END";
+}
+
 std::string ExpressionVocabulary::Comparison(const std::string &op, const std::string &left, const std::string &right) {
 	return "(" + left + op + right + ")";
 }
