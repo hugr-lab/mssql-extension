@@ -396,6 +396,31 @@ int main() {
 			Check(!ok && reason.find(b.second) != std::string::npos,
 				  "disk refused: " + b.second + " (got: " + reason + ")");
 		}
+		// The longest values a sql_variant holds are read; a longer one is no sql_variant (review of #631):
+		// an nvarchar of 8000 bytes (8008 on disk), a varbinary of 8000 (8004), and one of 9000 bytes.
+		{
+			auto nvarchar = Hex("e701401f08d00034");
+			nvarchar.resize(nvarchar.size() + 8000, 0x61);
+			auto varbinary = Hex("a501401f");
+			varbinary.resize(varbinary.size() + 8000, 0xab);
+			auto longer = Hex("a5012823");
+			longer.resize(longer.size() + 9000, 0xab);
+			std::string out, reason;
+			VariantTag t = VariantTag::VARIANT_NULL;
+			EncodeNote n;
+			Check(
+				nvarchar.size() == 8008 && EncodeDisk(nvarchar, scratch, out, t, n, reason) && t == VariantTag::VARCHAR,
+				"an nvarchar of 8000 bytes read (" + reason + ")");
+			out.clear();
+			Check(
+				varbinary.size() == 8004 && EncodeDisk(varbinary, scratch, out, t, n, reason) && t == VariantTag::BLOB,
+				"a varbinary of 8000 bytes read (" + reason + ")");
+			out.clear();
+			reason.clear();
+			Check(
+				!EncodeDisk(longer, scratch, out, t, n, reason) && reason.find("longer than any") != std::string::npos,
+				"a 9000-byte value refused (got: " + reason + ")");
+		}
 	}
 	std::cout << (failures ? "FAILED: " + std::to_string(failures) + " check(s)" : "all checks passed") << std::endl;
 	return failures ? 1 : 0;

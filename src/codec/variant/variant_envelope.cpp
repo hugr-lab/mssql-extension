@@ -305,6 +305,15 @@ bool SplitDiskVariant(const uint8_t *data, size_t size, WireVariant &out, DiskVa
 		why = "a sql_variant value of " + std::to_string(size) + " bytes, shorter than its header";
 		return false;
 	}
+	// No sql_variant is longer than the TDS form's bound (8009; 8008 on disk: a string's 8000 bytes, 2
+	// header and 6 property bytes), so a longer value -- a long one in a crafted record -- is not one, and
+	// is refused before it is decoded (review of #631: a string's UTF-16 copy and output went past the one
+	// reservation of its length). One stored off row is refused before its tree is read (PrepareRow).
+	if (size > tds::SQL_VARIANT_MAX_BYTES) {
+		why = "a sql_variant value of " + std::to_string(size) + " bytes, longer than any (" +
+			  std::to_string(tds::SQL_VARIANT_MAX_BYTES) + ")";
+		return false;
+	}
 	if (data[1] != 1) {
 		why = "a sql_variant of version " + std::to_string(data[1]) + ", not 1";
 		return false;

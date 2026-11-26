@@ -231,9 +231,10 @@ private:
 		OffRowPointer pointer;
 		uint64_t length = 0;
 		bool is_null = false;
-		bool direct = false;  // written straight into the vector as its bytes (a BLOB, a UTF-8 text)
-		bool stream = false;  // decoded block by block straight into the vector (UTF-16, a code page)
-		uint64_t output = 0;  // what a direct or streamed value allocates in the vector's heap
+		bool direct = false;	 // written straight into the vector as its bytes (a BLOB, a UTF-8 text)
+		bool stream = false;	 // decoded block by block straight into the vector (UTF-16, a code page)
+		uint64_t output = 0;	 // what a direct or streamed value allocates in the vector's heap
+		bool oversized = false;	 // a sql_variant longer than any: NULL and counted, its tree not read
 	};
 	void AppendOffRow(Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);
 	void AppendDirect(size_t column, Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);

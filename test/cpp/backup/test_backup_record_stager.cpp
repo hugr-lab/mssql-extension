@@ -585,6 +585,37 @@ int main() {
 				  variant_notes[0].variant.first_malformed.find("version 2") != std::string::npos,
 			  "a sql_variant column reads as a VARIANT, a value that is none NULL and noted: " +
 				  variant_chunk.GetValue(0, 0).ToString());
+		// One stored off row and longer than any sql_variant (review of #631): NULL and noted, its fragment
+		// never read (the fetch would throw) and nothing reserved for it.
+		{
+			std::vector<uint8_t> long_variant = {0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+			Put(long_variant, 9000, 4);	 // the value's length
+			Put(long_variant, 78, 4);	 // its DATA fragment: page 78, file 1, slot 0
+			Put(long_variant, 1, 2);
+			Put(long_variant, 0, 2);
+			const Page long_page = PageOf({Record(fixed, 19, 0, {note, long_variant}, 2)});
+			LobPageFetch fetch = [&](const PagePointer &, Page &) {
+				throw FormatError("the long sql_variant's fragment was read");
+			};
+			LobUnits units;
+			units.row_overflow = static_cast<uint64_t>(9) << 16;
+			RecordStager reads(with_variant, {37}, TypeForms());
+			reads.UseLayout(variant_layout);
+			reads.UseOffRow(&fetch, units);
+			DataChunk one;
+			one.Initialize(Allocator::DefaultAllocator(), reads.Types());
+			const auto row = ReadSlot(long_page.bytes.data(), PAGE_SIZE, 1, 0, "the test");
+			reads.BeginChunk(one);
+			const OffRowNeed need = reads.PrepareRow(row);	// as the scan: prepared in its chunk, then appended
+			reads.Append(row);
+			reads.FinalizeChunk(one);
+			const auto notes = reads.TypeNotes();
+			Check(need.Total() == 0 && one.size() == 1 && one.GetValue(0, 0).IsNull() && notes.size() == 1 &&
+					  notes[0].variant.malformed == 1 &&
+					  notes[0].variant.first_malformed.find("9000 bytes stored off row, longer than any") !=
+						  std::string::npos,
+				  "a 9000-byte sql_variant off row: NULL and noted, nothing read or reserved");
+		}
 		Check(ErrorOf([&]() { RecordStager(t, {99}, TypeForms()); }).find("has no column 99") != std::string::npos,
 			  "a column the table does not have");
 		RowsetLayout wrong = layout;

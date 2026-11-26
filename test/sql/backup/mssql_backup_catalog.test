@@ -99,6 +99,48 @@ SELECT count(*) FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysobjva
 ----
 242
 
+# Its sql_variant column, value, read as a VARIANT of the stored base types (spec 093 T8b): bit, int,
+# bigint and nvarchar values, and NULLs. A pin of what the reader reads from the committed full.bak: the
+# oracle lane compares user tables with the server, not this one (read through the DAC only). No value
+# is refused: a refused one is NULL too, so the log must say nothing of the column.
+statement ok
+SET enable_logging = true;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query TII
+SELECT variant_typeof(value), count(*), count(value)
+FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysobjvalues') GROUP BY 1 ORDER BY 1;
+----
+BOOL_FALSE	1	1
+BOOL_TRUE	1	1
+INT32	20	20
+INT64	198	198
+VARCHAR	20	20
+VARIANT_NULL	2	0
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%(sql_variant) holds%';
+----
+0
+
+statement ok
+SET enable_logging = false;
+
+query IIIITT
+SELECT valclass, objid, subobjid, valnum, variant_typeof(value), value::VARCHAR
+FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysobjvalues')
+WHERE (valclass = 7 AND objid IN (101, 1010, 1037, 1038)) OR (valclass = 10 AND objid = 1)
+ORDER BY valclass, objid, subobjid, valnum;
+----
+7	101	34	0	INT32	1525580473
+7	1010	0	1	VARIANT_NULL	NULL
+7	1037	0	1	BOOL_TRUE	true
+7	1038	0	1	BOOL_FALSE	false
+10	1	1	1	VARCHAR	microsoft.sqlserver.types.dll
+10	1	1	2	VARIANT_NULL	NULL
+
 # A heap is read as the scan reads one, its rows identified by their place (0x00, then page, file, slot):
 # sysfiles1 has no clustered key (the reader used to refuse it, and sysxmitqueue beside it).
 query TIT

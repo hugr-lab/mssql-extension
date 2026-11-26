@@ -491,6 +491,13 @@ OffRowNeed RecordStager::PrepareRow(const RowRecord &row) {
 		if (p.is_null) {
 			continue;
 		}
+		// A sql_variant longer than any (review of #631: a pointer to a long tree in a crafted record) is
+		// malformed, as SplitDiskVariant says of one in row: NULL and counted when staged, nothing read or
+		// reserved for it -- a value past the budget would otherwise be refused, and its row with it.
+		if (c.meta.variant_disk_form && p.length > tds::SQL_VARIANT_MAX_BYTES) {
+			p.oversized = true;
+			continue;
+		}
 		// A long value goes to its vector by the shortest way: its bytes (a BLOB, a UTF-8 text), or decoded
 		// block by block into room for its longest UTF-8 (3 bytes a UTF-16 unit or a code-page byte); a short
 		// one, and any other, is staged for its column's batch kernel.
@@ -527,7 +534,7 @@ std::string RecordStager::DescribePrepared() const {
 	std::string out;
 	for (size_t i : var_columns_) {
 		const PreparedValue &p = prepared_[i];
-		if (p.off_row && !p.is_null) {
+		if (p.off_row && !p.is_null && !p.oversized) {	// an oversized sql_variant: nothing reserved
 			out += (out.empty() ? "" : ", ") + columns_[i].name + " (" +
 				   StringUtil::BytesToHumanReadableString(p.length) + ")";
 		}
@@ -812,7 +819,14 @@ void RecordStager::Append(const RowRecord &row) {
 				throw FormatError("backup: " + c.name +
 								  " is a fixed-width column whose value is marked as stored off row");
 			}
-			if (prepared_[i].direct) {
+			if (prepared_[i].oversized) {
+				if (c.variant_notes.malformed++ == 0) {
+					c.variant_notes.first_malformed = "a sql_variant value of " + std::to_string(prepared_[i].length) +
+													  " bytes stored off row, longer than any (" +
+													  std::to_string(tds::SQL_VARIANT_MAX_BYTES) + ")";
+				}
+				st.AppendNull();
+			} else if (prepared_[i].direct) {
 				AppendDirect(i, c, st, prepared_[i]);
 			} else if (prepared_[i].stream) {
 				AppendStream(i, c, st, prepared_[i]);
