@@ -75,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - the scan's filters;
     - `rowid` on a binary key;
     - the staged `MERGE`'s conditions. A uniqueidentifier range in one is now refused by name;
+    - an `UPDATE` / `DELETE` on a table with no unique key, which needs every filter on the server. One filtered by a uniqueidentifier range or `BETWEEN` is now refused by name, where it ran on the server's rows;
     - the staged UPDATE / DELETE on a table with no unique key. Its join pins a binary or string key column's length too: the byte match of a string, through `varbinary`, padded `'a'` to tie `'a' + CHAR(0)` as well.
   - **Unchanged:**
     - the remote-pushdown writer already refused both;

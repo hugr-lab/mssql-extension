@@ -25,7 +25,7 @@ ATTACH '{MSSQL_TESTDB_DSN}' AS cmpr (TYPE mssql);
 # u1 = 10000000-...-000000000001, u2 = 00000000-...-000000000002, u3 = 20000000-...-000000000000: DuckDB
 # orders the text (u2 < u1 < u3), the server the last group first (u3 < u1 < u2).
 statement ok
-SELECT mssql_exec('cmpx', 'DROP TABLE IF EXISTS dbo.cmp_uuid; DROP TABLE IF EXISTS dbo.cmp_bin; DROP TABLE IF EXISTS dbo.cmp_binkey; DROP TABLE IF EXISTS dbo.cmp_rv; DROP TABLE IF EXISTS dbo.cmp_heap; DROP TABLE IF EXISTS dbo.cmp_strheap;
+SELECT mssql_exec('cmpx', 'DROP TABLE IF EXISTS dbo.cmp_uuid; DROP TABLE IF EXISTS dbo.cmp_bin; DROP TABLE IF EXISTS dbo.cmp_binkey; DROP TABLE IF EXISTS dbo.cmp_rv; DROP TABLE IF EXISTS dbo.cmp_heap; DROP TABLE IF EXISTS dbo.cmp_strheap; DROP TABLE IF EXISTS dbo.cmp_nullheap; DROP TABLE IF EXISTS dbo.cmp_uuidheap;
 	CREATE TABLE dbo.cmp_uuid (id int NOT NULL PRIMARY KEY, g uniqueidentifier NULL);
 	INSERT INTO dbo.cmp_uuid VALUES (1, ''10000000-0000-0000-0000-000000000001''), (2, ''00000000-0000-0000-0000-000000000002''),
 		(3, ''20000000-0000-0000-0000-000000000000''), (4, NULL);
@@ -269,11 +269,74 @@ SELECT length(vc), tag FROM cmpx.dbo.cmp_strheap ORDER BY 1;
 1	9
 2	0
 
+# Nullable key columns, in both of the stage's match forms: IS NOT DISTINCT FROM (2022+), and the
+# EXISTS (… INTERSECT …) every older server takes, forced here since the lane's server has the operator
+# (review of #642). 0x01 beside 0x0100, 'a' beside 'a' + CHAR(0): only the exact-length row each time. The
+# forced form goes first: every column is the key, so once tag differs the two rows no longer tie.
+statement ok
+SELECT mssql_exec('cmpx', 'CREATE TABLE dbo.cmp_nullheap (vb varbinary(8) NULL, vc varchar(10) COLLATE Latin1_General_100_BIN2 NULL, v int NOT NULL, tag int NOT NULL);
+	INSERT INTO dbo.cmp_nullheap VALUES (0x01, ''x'', 1, 0), (0x0100, ''x'', 1, 0), (0x02, ''a'', 2, 0), (0x02, ''a'' + CHAR(0), 2, 0)');
+
+foreach forced true false
+
+statement ok
+SET mssql_test_force_intersect_join_form = ${forced};
+
+statement ok
+UPDATE cmpx.dbo.cmp_nullheap SET tag = tag + 1 WHERE vb = '\x01'::BLOB;
+
+statement ok
+UPDATE cmpx.dbo.cmp_nullheap SET tag = tag + 10 WHERE vc = 'a';
+
+endloop
+
+query TII
+SELECT hex(vb), length(vc), tag FROM cmpx.dbo.cmp_nullheap ORDER BY 1, 2;
+----
+01	1	2
+0100	1	0
+02	1	20
+02	2	0
+
+statement ok
+DELETE FROM cmpx.dbo.cmp_nullheap WHERE vb = '\x01'::BLOB;
+
+statement ok
+DELETE FROM cmpx.dbo.cmp_nullheap WHERE vc = 'a';
+
+query TII
+SELECT hex(vb), length(vc), tag FROM cmpx.dbo.cmp_nullheap ORDER BY 1, 2;
+----
+0100	1	0
+02	2	0
+
+statement ok
+RESET mssql_test_force_intersect_join_form;
+
+# A table with no unique key needs every filter on the server, and a uniqueidentifier's range now runs in
+# DuckDB: the statement is refused by name (it ran before, on the server's rows). Equality still goes.
+statement ok
+SELECT mssql_exec('cmpx', 'CREATE TABLE dbo.cmp_uuidheap (g uniqueidentifier NULL, v int NOT NULL);
+	INSERT INTO dbo.cmp_uuidheap VALUES (''10000000-0000-0000-0000-000000000001'', 1), (''00000000-0000-0000-0000-000000000002'', 2)');
+
+statement error
+DELETE FROM cmpx.dbo.cmp_uuidheap WHERE g > '10000000-0000-0000-0000-000000000001'::UUID;
+----
+client
+
+statement ok
+DELETE FROM cmpx.dbo.cmp_uuidheap WHERE g = '10000000-0000-0000-0000-000000000001'::UUID;
+
+query I
+SELECT v FROM cmpx.dbo.cmp_uuidheap;
+----
+2
+
 statement ok
 SET mssql_dml_pushdown = true;
 
 statement ok
-SELECT mssql_exec('cmpx', 'DROP TABLE dbo.cmp_uuid; DROP TABLE dbo.cmp_bin; DROP TABLE dbo.cmp_binkey; DROP TABLE dbo.cmp_rv; DROP TABLE dbo.cmp_heap; DROP TABLE dbo.cmp_strheap');
+SELECT mssql_exec('cmpx', 'DROP TABLE dbo.cmp_uuid; DROP TABLE dbo.cmp_bin; DROP TABLE dbo.cmp_binkey; DROP TABLE dbo.cmp_rv; DROP TABLE dbo.cmp_heap; DROP TABLE dbo.cmp_strheap; DROP TABLE dbo.cmp_nullheap; DROP TABLE dbo.cmp_uuidheap');
 
 statement ok
 DETACH cmpx;
