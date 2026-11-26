@@ -709,6 +709,453 @@ const uint8_t *TdsProtocol::FindToken(const uint8_t *data, size_t length, TokenT
 	return nullptr;
 }
 
+//! Little-endian integers of a token.
+static uint16_t ReadU16LE(const uint8_t *p) {
+	return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
+}
+
+static uint32_t ReadU32LE(const uint8_t *p) {
+	return p[0] | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
+		   (static_cast<uint32_t>(p[3]) << 24);
+}
+
+//! What reading one token of a LOGIN response decided.
+enum class LoginTokenStep : uint8_t {
+	//! Read or skipped: go on with the next token.
+	NEXT,
+	//! The stream ends inside the token: nothing after it is read.
+	STOP,
+	//! An ERROR token was read: the response is the failure it describes, as it stands.
+	FAILED
+};
+
+//! The token stream of a LOGIN response and the response it fills: one reader per token type.
+//! Every length is the server's claim, made before authentication completes, so each reader checks
+//! it against the stream before it reads -- and against the token's own extent for the fields inside.
+struct TdsProtocol::LoginTokens {
+	const uint8_t *ptr;
+	const uint8_t *end;
+	LoginResponse &response;
+
+	//! A token's USHORT length with its whole body in the stream, `ptr` at the body; false when the
+	//! stream ends in either.
+	bool ReadBody(uint16_t &len) {
+		if (ptr + 2 > end) {
+			return false;
+		}
+		len = ReadU16LE(ptr);
+		ptr += 2;
+		return ptr + len <= end;
+	}
+
+	LoginTokenStep ReadToken(uint8_t token_type);
+	LoginTokenStep ReadLoginAck();
+	LoginTokenStep ReadError();
+	LoginTokenStep ReadDone();
+	LoginTokenStep ReadEnvChange();
+	void ApplyEnvChange(const uint8_t *env_data, uint16_t len);
+	void ApplyPacketSize(const uint8_t *env_data, uint16_t len);
+	void ApplyRouting(const uint8_t *env_data, uint16_t len);
+	LoginTokenStep ReadInfo();
+	LoginTokenStep ReadFedAuthInfo();
+	void ApplyFedAuthOption(const uint8_t *token_start, uint32_t token_len, const uint8_t *info_ptr);
+	LoginTokenStep ReadSspi();
+	LoginTokenStep ReadFeatureExtAck();
+	bool ReadFeatureAck(uint8_t feature_id);
+	LoginTokenStep SkipUnknown();
+};
+
+LoginTokenStep TdsProtocol::LoginTokens::ReadLoginAck() {
+	// Length (2 bytes, LE)
+	uint16_t len;
+	if (!ReadBody(len)) {
+		return LoginTokenStep::STOP;
+	}
+
+	// Interface (1 byte)
+	// TDSVersion (4 bytes)
+	// ProgName length (1 byte)
+	// ProgName (variable)
+	// ProgVersion (4 bytes)
+
+	const uint8_t *loginack_end = ptr + len;
+	if (len >= 10) {
+		// Skip interface
+		ptr++;
+		// Read TDS version (big-endian in LOGINACK)
+		response.tds_version = (static_cast<uint32_t>(ptr[0]) << 24) | (static_cast<uint32_t>(ptr[1]) << 16) |
+							   (static_cast<uint32_t>(ptr[2]) << 8) | static_cast<uint32_t>(ptr[3]);
+		ptr += 4;
+
+		// Server name length. Clamp to the token's own extent, not the
+		// whole buffer, so a crafted name_len can't read into the tokens
+		// that follow the LOGINACK (issue #183; same class as the ERROR
+		// msg_len clamp below).
+		uint8_t name_len = *ptr++;
+		if (ptr + static_cast<size_t>(name_len) * 2 <= loginack_end) {
+			response.server_name = ReadUTF16LE(ptr, name_len);
+		}
+	}
+
+	response.success = true;
+	// Not the end - the tokens after it are read for ENVCHANGE (ROUTING, PACKETSIZE, etc.)
+	ptr = loginack_end;
+	return LoginTokenStep::NEXT;
+}
+
+LoginTokenStep TdsProtocol::LoginTokens::ReadError() {
+	uint16_t len;
+	if (!ReadBody(len) || len < 14) {
+		return LoginTokenStep::STOP;
+	}
+
+	// Bound every field read below to the token's own declared extent, not
+	// the whole buffer, so a crafted length can't make us read into the next
+	// token (issue #183). token_end <= end by the check above.
+	const uint8_t *token_end = ptr + len;
+
+	// Error number (4 bytes, LE)
+	response.error_number = ReadU32LE(ptr);
+	ptr += 4;
+
+	// State (1 byte) -- disambiguates login failures (18456); see issue #164
+	response.error_state = ptr[0];
+	ptr++;
+	// Class (1 byte)
+	ptr++;
+
+	// Message length (2 bytes, LE) - in characters
+	uint16_t msg_len = ReadU16LE(ptr);
+	ptr += 2;
+
+	if (ptr + static_cast<size_t>(msg_len) * 2 <= token_end) {
+		response.error_message = ReadUTF16LE(ptr, msg_len);
+	}
+
+	response.success = false;
+	return LoginTokenStep::FAILED;
+}
+
+LoginTokenStep TdsProtocol::LoginTokens::ReadDone() {
+	// DONE token: Status(2) + CurCmd(2) + DoneRowCount(8) -- the row count
+	// is 8 bytes in TDS 7.2+ ([MS-TDS] 2.2.7.9), and we always log in as
+	// 7.4. Skipping the pre-7.2 size (4-byte count, 8 total) desynced the
+	// parse by 4 bytes per token; harmless when DONE is the final token
+	// (regular SQL Server sends LOGINACK first), fatal on Synapse
+	// Serverless, which runs internal procs during login and fronts the
+	// LOGINACK with a run of DONEINPROC tokens (issues #88, #164).
+	if (ptr + 12 > end) {
+		return LoginTokenStep::STOP;
+	}
+	ptr += 12;
+	return LoginTokenStep::NEXT;
+}
+
+LoginTokenStep TdsProtocol::LoginTokens::ReadEnvChange() {
+	uint16_t len;
+	if (!ReadBody(len)) {
+		return LoginTokenStep::STOP;  // truncated ENVCHANGE
+	}
+	// Empty ENVCHANGE: the token type + 2-byte length are already consumed,
+	// so skipping preserves loop progress (no infinite loop) and does NOT
+	// abandon later tokens (e.g. a following ERROR). Reading env_data[0] with
+	// len == 0 would be a 1-byte heap over-read (found by fuzz_login_response).
+	if (len == 0) {
+		return LoginTokenStep::NEXT;
+	}
+	ApplyEnvChange(ptr, len);
+	ptr += len;
+	return LoginTokenStep::NEXT;
+}
+
+void TdsProtocol::LoginTokens::ApplyEnvChange(const uint8_t *env_data, uint16_t len) {
+	// ENVCHANGE type is first byte
+	uint8_t env_type = env_data[0];
+	// Debug: log ENVCHANGE type
+	MSSQL_PROTO_DEBUG_LOG(2, "ParseLoginResponse: ENVCHANGE type=%d, len=%d", env_type, len);
+	// Type 4 = PACKETSIZE
+	if (env_type == 4 && len >= 3) {
+		ApplyPacketSize(env_data, len);
+	}
+	// Type 20 (0x14) = ROUTING (Azure SQL/Fabric gateway redirection)
+	else if (env_type == 20 && len >= 7) {
+		ApplyRouting(env_data, len);
+	}
+}
+
+void TdsProtocol::LoginTokens::ApplyPacketSize(const uint8_t *env_data, uint16_t len) {
+	// NewValueLen (1 byte)
+	uint8_t new_val_len = env_data[1];
+	// NewValue (string of digits in UTF-16LE)
+	if (new_val_len == 0 || 2 + new_val_len * 2 > len) {
+		return;
+	}
+	std::string packet_size_str = ReadUTF16LE(env_data + 2, new_val_len);
+	try {
+		// Clamped to the protocol's own range HERE, at the one place the
+		// value enters from the wire, because it then reaches both the
+		// receive framing (which sizes a buffer from it) and the send-side
+		// packet splitters (which subtract the header from it). MS-TDS
+		// defines 512..32767; a server answering outside that is
+		// non-conforming, and taking it at face value turns an ENVCHANGE
+		// into a multi-gigabyte allocation per pooled connection.
+		const unsigned long parsed = std::stoul(packet_size_str);
+		if (parsed >= TDS_MIN_PACKET_SIZE && parsed <= TDS_MAX_PACKET_SIZE) {
+			response.negotiated_packet_size = static_cast<uint32_t>(parsed);
+		}
+	} catch (...) {
+		// Ignore parse errors
+	}
+}
+
+void TdsProtocol::LoginTokens::ApplyRouting(const uint8_t *env_data, uint16_t len) {
+	MSSQL_PROTO_DEBUG_LOG(1, "ParseLoginResponse: ROUTING ENVCHANGE detected, len=%d", len);
+	// ROUTING ENVCHANGE structure:
+	// Type (1 byte) = 20
+	// ValueLength (2 bytes, LE)
+	// Protocol (1 byte) - 0 = TCP
+	// ProtocolProperty (2 bytes, LE) - new port
+	// AlternateServer length (2 bytes, LE) - in characters
+	// AlternateServer (UTF-16LE)
+	// OldValue (2 bytes) = 0x0000
+
+	const uint8_t *routing_ptr = env_data + 1;
+	const uint8_t *routing_end = env_data + len;
+
+	if (routing_ptr + 2 > routing_end) {
+		MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at value_len");
+		return;
+	}
+	// Skip ValueLength - already covered by outer len
+	uint16_t value_len = ReadU16LE(routing_ptr);
+	routing_ptr += 2;
+	MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: value_len=%d", value_len);
+
+	if (routing_ptr + 1 > routing_end) {
+		MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at protocol");
+		return;
+	}
+	uint8_t protocol = *routing_ptr++;
+	MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: protocol=%d", protocol);
+	if (protocol != 0) {  // Only TCP (0) supported
+		MSSQL_PROTO_DEBUG_LOG(1, "ROUTING: unsupported protocol %d, expected TCP (0)", protocol);
+		return;
+	}
+
+	if (routing_ptr + 2 > routing_end) {
+		MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at port");
+		return;
+	}
+	response.routed_port = ReadU16LE(routing_ptr);
+	routing_ptr += 2;
+	MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: port=%d", response.routed_port);
+
+	if (routing_ptr + 2 > routing_end) {
+		MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at server_len");
+		return;
+	}
+	uint16_t server_len_chars = ReadU16LE(routing_ptr);
+	routing_ptr += 2;
+	MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: server_len_chars=%d", server_len_chars);
+
+	if (routing_ptr + server_len_chars * 2 <= routing_end && server_len_chars > 0) {
+		response.routed_server = ReadUTF16LE(routing_ptr, server_len_chars);
+		response.has_routing = true;
+		MSSQL_PROTO_DEBUG_LOG(1, "ROUTING: parsed server=%s:%d", response.routed_server.c_str(), response.routed_port);
+	} else {
+		MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: server string out of bounds or empty");
+	}
+}
+
+LoginTokenStep TdsProtocol::LoginTokens::ReadInfo() {
+	uint16_t len;
+	if (!ReadBody(len)) {
+		return LoginTokenStep::STOP;
+	}
+	ptr += len;
+	return LoginTokenStep::NEXT;
+}
+
+LoginTokenStep TdsProtocol::LoginTokens::ReadFedAuthInfo() {
+	// FEDAUTHINFO token (0xEE) - Azure AD sends STS URL and SPN
+	// This is received in ADAL workflow after sending LOGIN7
+	// Structure per MS-TDS and go-mssqldb:
+	//   TokenLength (4 bytes, DWORD, LE)
+	//   CountOfInfoIDs (4 bytes, DWORD, LE)
+	//   InfoIDs[]: FedAuthInfoID (1 byte) + DataLength (4 bytes) + DataOffset (4 bytes)
+	//   Data: UTF-16LE strings at offsets specified in InfoIDs
+	if (ptr + 4 > end) {
+		return LoginTokenStep::STOP;
+	}
+
+	uint32_t token_len = ReadU32LE(ptr);
+	ptr += 4;
+	MSSQL_PROTO_DEBUG_LOG(1, "FEDAUTHINFO: token_len=%u", token_len);
+
+	if (ptr + token_len > end || token_len < 4) {
+		return LoginTokenStep::STOP;
+	}
+
+	const uint8_t *token_start = ptr;
+	const uint8_t *token_end = ptr + token_len;
+
+	// CountOfInfoIDs (4 bytes, LE)
+	uint32_t count = ReadU32LE(token_start);
+	const uint8_t *info_ptr = token_start + 4;
+	MSSQL_PROTO_DEBUG_LOG(2, "FEDAUTHINFO: count=%u", count);
+
+	// Read InfoID entries
+	for (uint32_t i = 0; i < count && info_ptr + 9 <= token_end; i++) {
+		ApplyFedAuthOption(token_start, token_len, info_ptr);
+		info_ptr += 9;
+	}
+
+	response.has_fedauth_info = true;
+	ptr = token_end;
+	return LoginTokenStep::NEXT;
+}
+
+//! One InfoID entry of a FEDAUTHINFO token (9 bytes at `info_ptr`) and the string it points at.
+void TdsProtocol::LoginTokens::ApplyFedAuthOption(const uint8_t *token_start, uint32_t token_len,
+												  const uint8_t *info_ptr) {
+	uint8_t info_id = info_ptr[0];
+	uint32_t data_len = ReadU32LE(info_ptr + 1);
+	uint32_t data_offset = ReadU32LE(info_ptr + 5);
+
+	MSSQL_PROTO_DEBUG_LOG(2, "FEDAUTHINFO: info_id=%d, data_len=%u, data_offset=%u", info_id, data_len, data_offset);
+
+	// Data is at token_start + data_offset. Validate WITHOUT overflow:
+	// data_offset + data_len can wrap (both attacker-controlled uint32),
+	// so a wrapped sum could pass "<= token_len" while data_offset alone
+	// points past token_end -> ReadUTF16LE reads wild memory (SEGV,
+	// found by fuzz_login_response). Rearranged so neither side wraps.
+	if (data_offset > token_len || data_len > token_len - data_offset) {
+		return;
+	}
+	const uint8_t *opt_data = token_start + data_offset;
+	// Convert from UTF-16LE (data_len is in bytes, 2 bytes per char)
+	uint16_t char_count = static_cast<uint16_t>(data_len / 2);
+	std::string value = ReadUTF16LE(opt_data, char_count);
+
+	if (info_id == FEDAUTHINFO_OPT_STS_URL) {
+		response.sts_url = value;
+		MSSQL_PROTO_DEBUG_LOG(1, "FEDAUTHINFO: STS_URL=%s", value.c_str());
+	} else if (info_id == FEDAUTHINFO_OPT_SPN) {
+		response.server_spn = value;
+		MSSQL_PROTO_DEBUG_LOG(1, "FEDAUTHINFO: SPN=%s", value.c_str());
+	}
+}
+
+LoginTokenStep TdsProtocol::LoginTokens::ReadSspi() {
+	// SSPI token (0xED) -- Integrated Auth continuation, Spec 042
+	// [MS-TDS] 2.2.7.21: TokenType(1) + USHORT length(2) + Data(variable)
+	if (ptr + 2 > end) {
+		return LoginTokenStep::STOP;
+	}
+	uint16_t blob_len = ReadU16LE(ptr);
+	ptr += 2;
+	if (ptr + blob_len > end) {
+		MSSQL_PROTO_DEBUG_LOG(1, "SSPI token truncated: claim=%u, available=%zu", blob_len,
+							  static_cast<size_t>(end - ptr));
+		return LoginTokenStep::STOP;
+	}
+	MSSQL_PROTO_DEBUG_LOG(1, "SSPI token: blob_len=%u", blob_len);
+	response.has_sspi_token = true;
+	response.sspi_token.assign(ptr, ptr + blob_len);
+	ptr += blob_len;
+	return LoginTokenStep::NEXT;
+}
+
+LoginTokenStep TdsProtocol::LoginTokens::ReadFeatureExtAck() {
+	// [MS-TDS] 2.2.7.11. NOT a length-prefixed token: it is a run of
+	//   FeatureId(1) | FeatureAckDataLen(4, LE) | FeatureAckData(n)
+	// ending at FeatureId 0xFF. The generic "skip a USHORT length" reader
+	// (SkipUnknown) reads the first two bytes of the first entry as a length --
+	// for the UTF8_SUPPORT ack (0x0A 0x01 00 00 00 ...) that is 0x010A =
+	// 266 bytes -- and walks off the token. Today that lands past the end
+	// of the buffer, after everything this parser needs has already been
+	// read, so nothing breaks; it is luck, not design, and it has been
+	// misparsing the FEDAUTH ack (0x02) since Azure AD support shipped.
+	response.has_feature_ext_ack = true;
+	while (ptr < end) {
+		const uint8_t feature_id = *ptr++;
+		if (feature_id == static_cast<uint8_t>(FeatureExtId::TERMINATOR)) {
+			break;
+		}
+		if (!ReadFeatureAck(feature_id)) {
+			ptr = end;
+			break;
+		}
+	}
+	return LoginTokenStep::NEXT;
+}
+
+//! One feature's acknowledgement, `ptr` at its length; false when the stream ends inside it.
+bool TdsProtocol::LoginTokens::ReadFeatureAck(uint8_t feature_id) {
+	if (ptr + 4 > end) {
+		MSSQL_PROTO_DEBUG_LOG(1, "FEATUREEXTACK truncated in length of feature 0x%02X", feature_id);
+		return false;
+	}
+	const uint32_t data_len = ReadU32LE(ptr);
+	ptr += 4;
+	if (data_len > static_cast<uint32_t>(end - ptr)) {
+		MSSQL_PROTO_DEBUG_LOG(1, "FEATUREEXTACK feature 0x%02X claims %u bytes, %zu available", feature_id, data_len,
+							  static_cast<size_t>(end - ptr));
+		return false;
+	}
+	MSSQL_PROTO_DEBUG_LOG(2, "FEATUREEXTACK: feature=0x%02X len=%u first=0x%02X", feature_id, data_len,
+						  data_len > 0 ? ptr[0] : 0);
+	if (feature_id == static_cast<uint8_t>(FeatureExtId::FEDAUTH)) {
+		response.fedauth_acked = true;
+	} else if (feature_id == static_cast<uint8_t>(FeatureExtId::UTF8SUPPORT)) {
+		response.utf8_support_acked = true;
+	} else if (feature_id == static_cast<uint8_t>(FeatureExtId::VECTORSUPPORT) && data_len >= 1) {
+		response.vector_support_version = ptr[0];
+	}
+	ptr += data_len;
+	return true;
+}
+
+LoginTokenStep TdsProtocol::LoginTokens::SkipUnknown() {
+	// Unknown token - try to skip by reading length if available
+	// Most tokens have 2-byte length after token type
+	if (ptr + 2 > end) {
+		return LoginTokenStep::STOP;
+	}
+	uint16_t len = ReadU16LE(ptr);
+	ptr += 2;
+	if (len > 0 && ptr + len <= end) {
+		ptr += len;
+	}
+	return LoginTokenStep::NEXT;
+}
+
+//! The token whose type byte was just read, `ptr` after it.
+LoginTokenStep TdsProtocol::LoginTokens::ReadToken(uint8_t token_type) {
+	switch (static_cast<TokenType>(token_type)) {
+	case TokenType::LOGINACK:
+		return ReadLoginAck();
+	case TokenType::ERROR_TOKEN:
+		return ReadError();
+	case TokenType::DONE:
+	case TokenType::DONEPROC:
+	case TokenType::DONEINPROC:
+		return ReadDone();
+	case TokenType::ENVCHANGE:
+		return ReadEnvChange();
+	case TokenType::INFO:
+		return ReadInfo();
+	case TokenType::FEDAUTHINFO:
+		return ReadFedAuthInfo();
+	case TokenType::SSPI:
+		return ReadSspi();
+	case TokenType::FEATUREEXTACK:
+		return ReadFeatureExtAck();
+	default:
+		return SkipUnknown();
+	}
+}
+
 LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) {
 	LoginResponse response = {};
 	response.success = false;
@@ -719,361 +1166,17 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 		return response;
 	}
 
-	const uint8_t *ptr = data.data();
-	const uint8_t *end = ptr + data.size();
-
-	// Look for LOGINACK token (0xAD)
-	while (ptr < end) {
-		uint8_t token_type = *ptr++;
-
-		if (token_type == static_cast<uint8_t>(TokenType::LOGINACK)) {
-			if (ptr + 2 > end)
-				break;
-
-			// Length (2 bytes, LE)
-			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
-			ptr += 2;
-
-			if (ptr + len > end)
-				break;
-
-			// Interface (1 byte)
-			// TDSVersion (4 bytes)
-			// ProgName length (1 byte)
-			// ProgName (variable)
-			// ProgVersion (4 bytes)
-
-			const uint8_t *loginack_end = ptr + len;
-			if (len >= 10) {
-				// Skip interface
-				ptr++;
-				// Read TDS version (big-endian in LOGINACK)
-				response.tds_version = (static_cast<uint32_t>(ptr[0]) << 24) | (static_cast<uint32_t>(ptr[1]) << 16) |
-									   (static_cast<uint32_t>(ptr[2]) << 8) | static_cast<uint32_t>(ptr[3]);
-				ptr += 4;
-
-				// Server name length. Clamp to the token's own extent, not the
-				// whole buffer, so a crafted name_len can't read into the tokens
-				// that follow the LOGINACK (issue #183; same class as the ERROR
-				// msg_len clamp below).
-				uint8_t name_len = *ptr++;
-				if (ptr + static_cast<size_t>(name_len) * 2 <= loginack_end) {
-					response.server_name = ReadUTF16LE(ptr, name_len);
-				}
-			}
-
-			response.success = true;
-			// Don't return yet - continue parsing for ENVCHANGE (ROUTING, PACKETSIZE, etc.)
-			ptr = loginack_end;
-
-		} else if (token_type == static_cast<uint8_t>(TokenType::ERROR_TOKEN)) {
-			if (ptr + 2 > end)
-				break;
-
-			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
-			ptr += 2;
-
-			if (ptr + len > end || len < 14)
-				break;
-
-			// Bound every field read below to the token's own declared extent, not
-			// the whole buffer, so a crafted length can't make us read into the next
-			// token (issue #183). token_end <= end by the check above.
-			const uint8_t *token_end = ptr + len;
-
-			// Error number (4 bytes, LE)
-			response.error_number = ptr[0] | (static_cast<uint32_t>(ptr[1]) << 8) |
-									(static_cast<uint32_t>(ptr[2]) << 16) | (static_cast<uint32_t>(ptr[3]) << 24);
-			ptr += 4;
-
-			// State (1 byte) -- disambiguates login failures (18456); see issue #164
-			response.error_state = ptr[0];
-			ptr++;
-			// Class (1 byte)
-			ptr++;
-
-			// Message length (2 bytes, LE) - in characters
-			uint16_t msg_len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
-			ptr += 2;
-
-			if (ptr + static_cast<size_t>(msg_len) * 2 <= token_end) {
-				response.error_message = ReadUTF16LE(ptr, msg_len);
-			}
-
-			response.success = false;
+	// Every token is read, whatever comes first: the LOGINACK (0xAD) says the login
+	// succeeded, the tokens around it carry the rest (ROUTING, PACKETSIZE, the feature acks).
+	LoginTokens tokens{data.data(), data.data() + data.size(), response};
+	while (tokens.ptr < tokens.end) {
+		const uint8_t token_type = *tokens.ptr++;
+		const LoginTokenStep step = tokens.ReadToken(token_type);
+		if (step == LoginTokenStep::FAILED) {
 			return response;
-
-		} else if (token_type == static_cast<uint8_t>(TokenType::DONE) ||
-				   token_type == static_cast<uint8_t>(TokenType::DONEPROC) ||
-				   token_type == static_cast<uint8_t>(TokenType::DONEINPROC)) {
-			// DONE token: Status(2) + CurCmd(2) + DoneRowCount(8) -- the row count
-			// is 8 bytes in TDS 7.2+ ([MS-TDS] 2.2.7.9), and we always log in as
-			// 7.4. Skipping the pre-7.2 size (4-byte count, 8 total) desynced the
-			// parse by 4 bytes per token; harmless when DONE is the final token
-			// (regular SQL Server sends LOGINACK first), fatal on Synapse
-			// Serverless, which runs internal procs during login and fronts the
-			// LOGINACK with a run of DONEINPROC tokens (issues #88, #164).
-			if (ptr + 12 <= end) {
-				ptr += 12;
-			} else {
-				break;
-			}
-		} else if (token_type == static_cast<uint8_t>(TokenType::ENVCHANGE)) {
-			if (ptr + 2 > end)
-				break;
-			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
-			ptr += 2;
-			if (ptr + len > end)
-				break;	// truncated ENVCHANGE
-			// Empty ENVCHANGE: the token type + 2-byte length are already consumed,
-			// so skipping preserves loop progress (no infinite loop) and does NOT
-			// abandon later tokens (e.g. a following ERROR). Reading env_data[0] with
-			// len == 0 would be a 1-byte heap over-read (found by fuzz_login_response).
-			if (len == 0)
-				continue;
-			{
-				const uint8_t *env_data = ptr;
-				// ENVCHANGE type is first byte
-				uint8_t env_type = env_data[0];
-				// Debug: log ENVCHANGE type
-				MSSQL_PROTO_DEBUG_LOG(2, "ParseLoginResponse: ENVCHANGE type=%d, len=%d", env_type, len);
-				// Type 4 = PACKETSIZE
-				if (env_type == 4 && len >= 3) {
-					// NewValueLen (1 byte)
-					uint8_t new_val_len = env_data[1];
-					// NewValue (string of digits in UTF-16LE)
-					if (new_val_len > 0 && 2 + new_val_len * 2 <= len) {
-						std::string packet_size_str = ReadUTF16LE(env_data + 2, new_val_len);
-						try {
-							// Clamped to the protocol's own range HERE, at the one place the
-							// value enters from the wire, because it then reaches both the
-							// receive framing (which sizes a buffer from it) and the send-side
-							// packet splitters (which subtract the header from it). MS-TDS
-							// defines 512..32767; a server answering outside that is
-							// non-conforming, and taking it at face value turns an ENVCHANGE
-							// into a multi-gigabyte allocation per pooled connection.
-							const unsigned long parsed = std::stoul(packet_size_str);
-							if (parsed >= TDS_MIN_PACKET_SIZE && parsed <= TDS_MAX_PACKET_SIZE) {
-								response.negotiated_packet_size = static_cast<uint32_t>(parsed);
-							}
-						} catch (...) {
-							// Ignore parse errors
-						}
-					}
-				}
-				// Type 20 (0x14) = ROUTING (Azure SQL/Fabric gateway redirection)
-				else if (env_type == 20 && len >= 7) {
-					MSSQL_PROTO_DEBUG_LOG(1, "ParseLoginResponse: ROUTING ENVCHANGE detected, len=%d", len);
-					// ROUTING ENVCHANGE structure:
-					// Type (1 byte) = 20
-					// ValueLength (2 bytes, LE)
-					// Protocol (1 byte) - 0 = TCP
-					// ProtocolProperty (2 bytes, LE) - new port
-					// AlternateServer length (2 bytes, LE) - in characters
-					// AlternateServer (UTF-16LE)
-					// OldValue (2 bytes) = 0x0000
-
-					const uint8_t *routing_ptr = env_data + 1;
-					const uint8_t *routing_end = env_data + len;
-
-					if (routing_ptr + 2 > routing_end) {
-						MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at value_len");
-						ptr += len;
-						continue;
-					}
-					// Skip ValueLength - already covered by outer len
-					uint16_t value_len = routing_ptr[0] | (static_cast<uint16_t>(routing_ptr[1]) << 8);
-					routing_ptr += 2;
-					MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: value_len=%d", value_len);
-
-					if (routing_ptr + 1 > routing_end) {
-						MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at protocol");
-						ptr += len;
-						continue;
-					}
-					uint8_t protocol = *routing_ptr++;
-					MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: protocol=%d", protocol);
-					if (protocol != 0) {  // Only TCP (0) supported
-						MSSQL_PROTO_DEBUG_LOG(1, "ROUTING: unsupported protocol %d, expected TCP (0)", protocol);
-						ptr += len;
-						continue;
-					}
-
-					if (routing_ptr + 2 > routing_end) {
-						MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at port");
-						ptr += len;
-						continue;
-					}
-					response.routed_port = routing_ptr[0] | (static_cast<uint16_t>(routing_ptr[1]) << 8);
-					routing_ptr += 2;
-					MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: port=%d", response.routed_port);
-
-					if (routing_ptr + 2 > routing_end) {
-						MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at server_len");
-						ptr += len;
-						continue;
-					}
-					uint16_t server_len_chars = routing_ptr[0] | (static_cast<uint16_t>(routing_ptr[1]) << 8);
-					routing_ptr += 2;
-					MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: server_len_chars=%d", server_len_chars);
-
-					if (routing_ptr + server_len_chars * 2 <= routing_end && server_len_chars > 0) {
-						response.routed_server = ReadUTF16LE(routing_ptr, server_len_chars);
-						response.has_routing = true;
-						MSSQL_PROTO_DEBUG_LOG(1, "ROUTING: parsed server=%s:%d", response.routed_server.c_str(),
-											  response.routed_port);
-					} else {
-						MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: server string out of bounds or empty");
-					}
-				}
-				ptr += len;
-			}
-		} else if (token_type == static_cast<uint8_t>(TokenType::INFO)) {
-			if (ptr + 2 > end)
-				break;
-			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
-			ptr += 2;
-			if (ptr + len <= end) {
-				ptr += len;
-			} else {
-				break;
-			}
-		} else if (token_type == static_cast<uint8_t>(TokenType::FEDAUTHINFO)) {
-			// FEDAUTHINFO token (0xEE) - Azure AD sends STS URL and SPN
-			// This is received in ADAL workflow after sending LOGIN7
-			// Structure per MS-TDS and go-mssqldb:
-			//   TokenLength (4 bytes, DWORD, LE)
-			//   CountOfInfoIDs (4 bytes, DWORD, LE)
-			//   InfoIDs[]: FedAuthInfoID (1 byte) + DataLength (4 bytes) + DataOffset (4 bytes)
-			//   Data: UTF-16LE strings at offsets specified in InfoIDs
-			if (ptr + 4 > end)
-				break;
-
-			uint32_t token_len = ptr[0] | (static_cast<uint32_t>(ptr[1]) << 8) | (static_cast<uint32_t>(ptr[2]) << 16) |
-								 (static_cast<uint32_t>(ptr[3]) << 24);
-			ptr += 4;
-			MSSQL_PROTO_DEBUG_LOG(1, "FEDAUTHINFO: token_len=%u", token_len);
-
-			if (ptr + token_len > end || token_len < 4)
-				break;
-
-			const uint8_t *token_start = ptr;
-			const uint8_t *token_end = ptr + token_len;
-
-			// CountOfInfoIDs (4 bytes, LE)
-			uint32_t count = token_start[0] | (static_cast<uint32_t>(token_start[1]) << 8) |
-							 (static_cast<uint32_t>(token_start[2]) << 16) |
-							 (static_cast<uint32_t>(token_start[3]) << 24);
-			const uint8_t *info_ptr = token_start + 4;
-			MSSQL_PROTO_DEBUG_LOG(2, "FEDAUTHINFO: count=%u", count);
-
-			// Read InfoID entries
-			for (uint32_t i = 0; i < count && info_ptr + 9 <= token_end; i++) {
-				uint8_t info_id = info_ptr[0];
-				uint32_t data_len = info_ptr[1] | (static_cast<uint32_t>(info_ptr[2]) << 8) |
-									(static_cast<uint32_t>(info_ptr[3]) << 16) |
-									(static_cast<uint32_t>(info_ptr[4]) << 24);
-				uint32_t data_offset = info_ptr[5] | (static_cast<uint32_t>(info_ptr[6]) << 8) |
-									   (static_cast<uint32_t>(info_ptr[7]) << 16) |
-									   (static_cast<uint32_t>(info_ptr[8]) << 24);
-				info_ptr += 9;
-
-				MSSQL_PROTO_DEBUG_LOG(2, "FEDAUTHINFO: info_id=%d, data_len=%u, data_offset=%u", info_id, data_len,
-									  data_offset);
-
-				// Data is at token_start + data_offset. Validate WITHOUT overflow:
-				// data_offset + data_len can wrap (both attacker-controlled uint32),
-				// so a wrapped sum could pass "<= token_len" while data_offset alone
-				// points past token_end -> ReadUTF16LE reads wild memory (SEGV,
-				// found by fuzz_login_response). Rearranged so neither side wraps.
-				if (data_offset <= token_len && data_len <= token_len - data_offset) {
-					const uint8_t *opt_data = token_start + data_offset;
-					// Convert from UTF-16LE (data_len is in bytes, 2 bytes per char)
-					uint16_t char_count = static_cast<uint16_t>(data_len / 2);
-					std::string value = ReadUTF16LE(opt_data, char_count);
-
-					if (info_id == FEDAUTHINFO_OPT_STS_URL) {
-						response.sts_url = value;
-						MSSQL_PROTO_DEBUG_LOG(1, "FEDAUTHINFO: STS_URL=%s", value.c_str());
-					} else if (info_id == FEDAUTHINFO_OPT_SPN) {
-						response.server_spn = value;
-						MSSQL_PROTO_DEBUG_LOG(1, "FEDAUTHINFO: SPN=%s", value.c_str());
-					}
-				}
-			}
-
-			response.has_fedauth_info = true;
-			ptr = token_end;
-		} else if (token_type == static_cast<uint8_t>(TokenType::SSPI)) {
-			// SSPI token (0xED) -- Integrated Auth continuation, Spec 042
-			// [MS-TDS] 2.2.7.21: TokenType(1) + USHORT length(2) + Data(variable)
-			if (ptr + 2 > end) {
-				break;
-			}
-			uint16_t blob_len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
-			ptr += 2;
-			if (ptr + blob_len > end) {
-				MSSQL_PROTO_DEBUG_LOG(1, "SSPI token truncated: claim=%u, available=%zu", blob_len,
-									  static_cast<size_t>(end - ptr));
-				break;
-			}
-			MSSQL_PROTO_DEBUG_LOG(1, "SSPI token: blob_len=%u", blob_len);
-			response.has_sspi_token = true;
-			response.sspi_token.assign(ptr, ptr + blob_len);
-			ptr += blob_len;
-		} else if (token_type == static_cast<uint8_t>(TokenType::FEATUREEXTACK)) {
-			// [MS-TDS] 2.2.7.11. NOT a length-prefixed token: it is a run of
-			//   FeatureId(1) | FeatureAckDataLen(4, LE) | FeatureAckData(n)
-			// ending at FeatureId 0xFF. The generic "skip a USHORT length" branch
-			// below reads the first two bytes of the first entry as a length --
-			// for the UTF8_SUPPORT ack (0x0A 0x01 00 00 00 ...) that is 0x010A =
-			// 266 bytes -- and walks off the token. Today that lands past the end
-			// of the buffer, after everything this parser needs has already been
-			// read, so nothing breaks; it is luck, not design, and it has been
-			// misparsing the FEDAUTH ack (0x02) since Azure AD support shipped.
-			response.has_feature_ext_ack = true;
-			while (ptr < end) {
-				const uint8_t feature_id = *ptr++;
-				if (feature_id == static_cast<uint8_t>(FeatureExtId::TERMINATOR)) {
-					break;
-				}
-				if (ptr + 4 > end) {
-					MSSQL_PROTO_DEBUG_LOG(1, "FEATUREEXTACK truncated in length of feature 0x%02X", feature_id);
-					ptr = end;
-					break;
-				}
-				const uint32_t data_len = static_cast<uint32_t>(ptr[0]) | (static_cast<uint32_t>(ptr[1]) << 8) |
-										  (static_cast<uint32_t>(ptr[2]) << 16) | (static_cast<uint32_t>(ptr[3]) << 24);
-				ptr += 4;
-				if (data_len > static_cast<uint32_t>(end - ptr)) {
-					MSSQL_PROTO_DEBUG_LOG(1, "FEATUREEXTACK feature 0x%02X claims %u bytes, %zu available", feature_id,
-										  data_len, static_cast<size_t>(end - ptr));
-					ptr = end;
-					break;
-				}
-				MSSQL_PROTO_DEBUG_LOG(2, "FEATUREEXTACK: feature=0x%02X len=%u first=0x%02X", feature_id, data_len,
-									  data_len > 0 ? ptr[0] : 0);
-				if (feature_id == static_cast<uint8_t>(FeatureExtId::FEDAUTH)) {
-					response.fedauth_acked = true;
-				} else if (feature_id == static_cast<uint8_t>(FeatureExtId::UTF8SUPPORT)) {
-					response.utf8_support_acked = true;
-				} else if (feature_id == static_cast<uint8_t>(FeatureExtId::VECTORSUPPORT) && data_len >= 1) {
-					response.vector_support_version = ptr[0];
-				}
-				ptr += data_len;
-			}
-		} else {
-			// Unknown token - try to skip by reading length if available
-			// Most tokens have 2-byte length after token type
-			if (ptr + 2 <= end) {
-				uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
-				ptr += 2;
-				if (len > 0 && ptr + len <= end) {
-					ptr += len;
-				}
-			} else {
-				break;
-			}
+		}
+		if (step == LoginTokenStep::STOP) {
+			break;
 		}
 	}
 
