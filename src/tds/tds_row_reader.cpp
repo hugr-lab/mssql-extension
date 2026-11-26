@@ -18,7 +18,8 @@ namespace {
 //! exists for the values that are not merely too big to stage but impossible.
 constexpr uint32_t MAX_LOB_VALUE_BYTES = 2147483647u;
 
-//! How the legacy per-value walk (RowReader::SkipValue) frames a value of a TDS type.
+//! How the per-value walks (RowReader::SkipValue and ReadValue, a ROW's and an NBCROW's) frame a value
+//! of a TDS type.
 enum class FramingKind : uint8_t {
 	//! A type the walk does not know: it cannot be skipped.
 	UNKNOWN = 0,
@@ -41,8 +42,8 @@ struct ValueFraming {
 	uint8_t width;	// FIXED: the value's bytes; other kinds: unused
 };
 
-//! The legacy walk's framing of every TDS type, by type id. It was a ~30-case switch on the type in
-//! SkipValue and, arm for arm, a second one in SkipValueNBC; the rows below are those arms.
+//! The per-value walks' framing of every TDS type, by type id. It was a ~30-case switch on the type in
+//! SkipValue and, arm for arm, in SkipValueNBC, ReadValue and ReadValueNBC; the rows below are those arms.
 //!
 //! Deliberately NOT ResolveSkipForm's switch, and not built from it: the fast walk is safe only while
 //! the two agree, and test_skip_form_equivalence holds that by comparing them as two independent
@@ -94,6 +95,38 @@ size_t SkipBytePrefixed(const uint8_t *data, size_t length) {
 	}
 	const uint8_t data_length = data[0];
 	return length >= 1 + data_length ? 1 + data_length : 0;
+}
+
+//! `width` bytes with no prefix, read into `value`; 0 when they have not all arrived.
+size_t ReadFixed(const uint8_t *data, size_t length, size_t width, std::vector<uint8_t> &value) {
+	if (length < width) {
+		return 0;  // Need more data
+	}
+	value.assign(data, data + width);
+	return width;
+}
+
+//! A 1-byte length, then that many bytes, read into `value`: the nullable fixed-length types, DECIMAL /
+//! NUMERIC, DATE, TIME, DATETIME2, DATETIMEOFFSET (each had a reader of its own, the same lines). With
+//! `zero_is_null` (a ROW) a length of 0 is NULL; without (an NBCROW's present value) it is an empty
+//! value. The length is taken as sent: a DATE of another length than 3 is the decoder's to refuse
+//! (datetime_codec.cpp).
+size_t ReadBytePrefixed(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null,
+						bool zero_is_null) {
+	if (length < 1) {
+		return 0;  // Need length byte
+	}
+	const uint8_t data_length = data[0];
+	if (data_length == 0 && zero_is_null) {
+		is_null = true;
+		value.clear();
+		return 1;
+	}
+	if (length < 1 + data_length) {
+		return 0;  // Need more data
+	}
+	value.assign(data + 1, data + 1 + data_length);
+	return 1 + data_length;
 }
 
 //! A 2-byte length, then that many bytes; 0xFFFF is NULL, the two bytes alone.
@@ -405,142 +438,48 @@ size_t RowReader::ReadValue(const uint8_t *data, size_t length, size_t col_idx, 
 							bool &is_null) {
 	const ColumnMetadata &col = columns_[col_idx];
 	is_null = false;
-
-	switch (col.type_id) {
-	// Fixed-length types (no length prefix)
-	case TDS_TYPE_TINYINT:
-	case TDS_TYPE_BIT:
-	case TDS_TYPE_SMALLINT:
-	case TDS_TYPE_INT:
-	case TDS_TYPE_BIGINT:
-	case TDS_TYPE_REAL:
-	case TDS_TYPE_FLOAT:
-	case TDS_TYPE_MONEY:
-	case TDS_TYPE_SMALLMONEY:
-	case TDS_TYPE_DATETIME:
-	case TDS_TYPE_SMALLDATETIME:
-		return ReadFixedType(data, length, col.type_id, value);
-
-	// Nullable fixed-length variants
-	case TDS_TYPE_INTN:
-	case TDS_TYPE_BITN:
-	case TDS_TYPE_FLOATN:
-	case TDS_TYPE_MONEYN:
-	case TDS_TYPE_DATETIMEN:
-		return ReadNullableFixedType(data, length, col.type_id, col.max_length, value, is_null);
-
-	// XML (always PLP)
-	case TDS_TYPE_XML:
-	case TDS_TYPE_UDT:
-		return ReadPLPType(data, length, value, is_null);
-
-	// sql_variant (spec 093 G2): a u32 length, then that many bytes; 0 is NULL in a ROW.
-	case TDS_TYPE_SQL_VARIANT:
-		return ReadVariant(data, length, value, is_null);
-
-	// Variable-length types
-	case TDS_TYPE_BIGCHAR:
-	case TDS_TYPE_BIGVARCHAR:
-	case TDS_TYPE_NCHAR:
-	case TDS_TYPE_NVARCHAR:
-	case TDS_TYPE_BIGBINARY:
-	case TDS_TYPE_BIGVARBINARY:
-	case TDS_TYPE_VECTOR:  // spec 093 D4: u16 length, 0xFFFF NULL
-		// Check for MAX types (PLP encoding)
-		if (col.IsPLPType()) {
-			return ReadPLPType(data, length, value, is_null);
-		}
-		return ReadVariableLengthType(data, length, col.type_id, value, is_null);
-
-	// DECIMAL/NUMERIC
-	case TDS_TYPE_DECIMAL:
-	case TDS_TYPE_NUMERIC:
-		return ReadDecimalType(data, length, value, is_null);
-
-	// DATE
-	case TDS_TYPE_DATE:
-		return ReadDateType(data, length, value, is_null);
-
-	// TIME
-	case TDS_TYPE_TIME:
-		return ReadTimeType(data, length, col.scale, value, is_null);
-
-	// DATETIME2
-	case TDS_TYPE_DATETIME2:
-		return ReadDateTime2Type(data, length, col.scale, value, is_null);
-
-	// DATETIMEOFFSET
-	case TDS_TYPE_DATETIMEOFFSET:
-		return ReadDateTimeOffsetType(data, length, col.scale, value, is_null);
-
-	// UNIQUEIDENTIFIER
-	case TDS_TYPE_UNIQUEIDENTIFIER:
+	// A ROW's UNIQUEIDENTIFIER is read as 16 bytes whatever its prefix says (ReadGuidType); every
+	// other type by its framing.
+	if (col.type_id == TDS_TYPE_UNIQUEIDENTIFIER) {
 		return ReadGuidType(data, length, value, is_null);
-
-	default:
-		throw std::runtime_error("Unsupported type in RowReader: " + col.GetTypeName());
 	}
+	return ReadFramed(data, length, col, value, is_null, false);
 }
 
-size_t RowReader::ReadFixedType(const uint8_t *data, size_t length, uint8_t type_id, std::vector<uint8_t> &value) {
-	size_t size = 0;
-	switch (type_id) {
-	case TDS_TYPE_TINYINT:
-	case TDS_TYPE_BIT:
-		size = 1;
-		break;
-	case TDS_TYPE_SMALLINT:
-		size = 2;
-		break;
-	case TDS_TYPE_INT:
-	case TDS_TYPE_REAL:
-	case TDS_TYPE_SMALLMONEY:
-	case TDS_TYPE_SMALLDATETIME:
-		size = 4;
-		break;
-	case TDS_TYPE_BIGINT:
-	case TDS_TYPE_FLOAT:
-	case TDS_TYPE_MONEY:
-	case TDS_TYPE_DATETIME:
-		size = 8;
-		break;
-	default:
-		throw std::runtime_error("Unknown fixed type: " + std::to_string(type_id));
-	}
+//! One value by its type's framing, for a ROW or (`nbc`) for a column an NBCROW's bitmap says is
+//! present. The two differ in one thing: a 1-byte prefix of 0 is NULL in a ROW and an empty value in
+//! an NBCROW, where the bitmap alone says NULL.
+size_t RowReader::ReadFramed(const uint8_t *data, size_t length, const ColumnMetadata &col, std::vector<uint8_t> &value,
+							 bool &is_null, bool nbc) {
+	const ValueFraming framing = LEGACY_FRAMINGS.Of(col.type_id);
 
-	if (length < size) {
-		return 0;  // Need more data
+	// The forms in the order rows meet them, as in SkipValue.
+	if (framing.kind == FramingKind::FIXED) {
+		return ReadFixed(data, length, framing.width, value);
 	}
-
-	value.assign(data, data + size);
-	return size;
+	if (framing.kind == FramingKind::BYTE_PREFIX) {
+		return ReadBytePrefixed(data, length, value, is_null, !nbc);
+	}
+	if (framing.kind == FramingKind::SHORT_PREFIX) {
+		// Check for MAX types (PLP encoding)
+		return col.IsPLPType() ? ReadPLPType(data, length, value, is_null)
+							   : ReadVariableLengthType(data, length, value, is_null);
+	}
+	if (framing.kind == FramingKind::PLP) {
+		return ReadPLPType(data, length, value, is_null);
+	}
+	if (framing.kind == FramingKind::VARIANT) {
+		// sql_variant (spec 093 G2): a u32 length, then that many bytes; 0 is NULL in a ROW.
+		return ReadVariant(data, length, value, is_null);
+	}
+	// A legacy LOB (TEXT / NTEXT / IMAGE) has a skip walk and no reader here, and an unknown type neither.
+	throw std::runtime_error(
+		std::string(nbc ? "Unsupported type in NBC RowReader: " : "Unsupported type in RowReader: ") +
+		col.GetTypeName());
 }
 
-size_t RowReader::ReadNullableFixedType(const uint8_t *data, size_t length, uint8_t type_id, uint8_t declared_length,
-										std::vector<uint8_t> &value, bool &is_null) {
-	if (length < 1) {
-		return 0;  // Need more data
-	}
-
-	uint8_t actual_length = data[0];
-
-	if (actual_length == 0) {
-		// NULL value
-		is_null = true;
-		value.clear();
-		return 1;
-	}
-
-	if (length < 1 + actual_length) {
-		return 0;  // Need more data
-	}
-
-	value.assign(data + 1, data + 1 + actual_length);
-	return 1 + actual_length;
-}
-
-size_t RowReader::ReadVariableLengthType(const uint8_t *data, size_t length, uint8_t type_id,
-										 std::vector<uint8_t> &value, bool &is_null) {
+size_t RowReader::ReadVariableLengthType(const uint8_t *data, size_t length, std::vector<uint8_t> &value,
+										 bool &is_null) {
 	if (length < 2) {
 		return 0;  // Need length field
 	}
@@ -560,119 +499,6 @@ size_t RowReader::ReadVariableLengthType(const uint8_t *data, size_t length, uin
 
 	value.assign(data + 2, data + 2 + data_length);
 	return 2 + data_length;
-}
-
-size_t RowReader::ReadDecimalType(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null) {
-	if (length < 1) {
-		return 0;  // Need length byte
-	}
-
-	uint8_t data_length = data[0];
-
-	if (data_length == 0) {
-		is_null = true;
-		value.clear();
-		return 1;
-	}
-
-	if (length < 1 + data_length) {
-		return 0;  // Need more data
-	}
-
-	value.assign(data + 1, data + 1 + data_length);
-	return 1 + data_length;
-}
-
-size_t RowReader::ReadDateType(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null) {
-	// DATE has a 1-byte length prefix (0=NULL, 3=data)
-	if (length < 1) {
-		return 0;
-	}
-
-	uint8_t data_length = data[0];
-
-	if (data_length == 0) {
-		is_null = true;
-		value.clear();
-		return 1;
-	}
-
-	// DATE data is always 3 bytes
-	if (length < 1 + data_length) {
-		return 0;
-	}
-
-	value.assign(data + 1, data + 1 + data_length);
-	return 1 + data_length;
-}
-
-size_t RowReader::ReadTimeType(const uint8_t *data, size_t length, uint8_t scale, std::vector<uint8_t> &value,
-							   bool &is_null) {
-	// TIME has length prefix even though it's "fixed" size based on scale
-	if (length < 1) {
-		return 0;
-	}
-
-	uint8_t data_length = data[0];
-
-	if (data_length == 0) {
-		is_null = true;
-		value.clear();
-		return 1;
-	}
-
-	if (length < 1 + data_length) {
-		return 0;
-	}
-
-	value.assign(data + 1, data + 1 + data_length);
-	return 1 + data_length;
-}
-
-size_t RowReader::ReadDateTime2Type(const uint8_t *data, size_t length, uint8_t scale, std::vector<uint8_t> &value,
-									bool &is_null) {
-	// DATETIME2 has length prefix
-	if (length < 1) {
-		return 0;
-	}
-
-	uint8_t data_length = data[0];
-
-	if (data_length == 0) {
-		is_null = true;
-		value.clear();
-		return 1;
-	}
-
-	if (length < 1 + data_length) {
-		return 0;
-	}
-
-	value.assign(data + 1, data + 1 + data_length);
-	return 1 + data_length;
-}
-
-size_t RowReader::ReadDateTimeOffsetType(const uint8_t *data, size_t length, uint8_t scale, std::vector<uint8_t> &value,
-										 bool &is_null) {
-	// DATETIMEOFFSET has length prefix: time (3-5 bytes) + date (3 bytes) + offset (2 bytes)
-	if (length < 1) {
-		return 0;
-	}
-
-	uint8_t data_length = data[0];
-
-	if (data_length == 0) {
-		is_null = true;
-		value.clear();
-		return 1;
-	}
-
-	if (length < 1 + data_length) {
-		return 0;
-	}
-
-	value.assign(data + 1, data + 1 + data_length);
-	return 1 + data_length;
 }
 
 size_t RowReader::ReadGuidType(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null) {
@@ -898,137 +724,12 @@ size_t RowReader::SkipPLPType(const uint8_t *data, size_t length) {
 	return offset;
 }
 
-// NBC row value reading - for non-NULL columns (no length prefix for nullable types)
+// NBC row value reading - for the columns the bitmap says are present. Framed as in a ROW; what
+// differs is in ReadFramed (it was a second copy of ReadValue's switch).
 size_t RowReader::ReadValueNBC(const uint8_t *data, size_t length, size_t col_idx, std::vector<uint8_t> &value,
 							   bool &is_null) {
-	const ColumnMetadata &col = columns_[col_idx];
 	is_null = false;  // NBC rows don't include data for NULL columns
-
-	switch (col.type_id) {
-	// Fixed-length types (same as regular row)
-	case TDS_TYPE_TINYINT:
-	case TDS_TYPE_BIT:
-	case TDS_TYPE_SMALLINT:
-	case TDS_TYPE_INT:
-	case TDS_TYPE_BIGINT:
-	case TDS_TYPE_REAL:
-	case TDS_TYPE_FLOAT:
-	case TDS_TYPE_MONEY:
-	case TDS_TYPE_SMALLMONEY:
-	case TDS_TYPE_DATETIME:
-	case TDS_TYPE_SMALLDATETIME:
-		return ReadFixedType(data, length, col.type_id, value);
-
-	// Nullable fixed-length - in NBC rows, INTN/BITN/FLOATN/MONEYN/DATETIMEN still have a
-	// 1-byte length prefix indicating the actual data size, followed by the data bytes.
-	// The NULL bitmap only tells us if the column is NULL; non-NULL columns still include length.
-	case TDS_TYPE_INTN:
-	case TDS_TYPE_BITN:
-	case TDS_TYPE_FLOATN:
-	case TDS_TYPE_MONEYN:
-	case TDS_TYPE_DATETIMEN: {
-		if (length < 1)
-			return 0;
-		uint8_t actual_length = data[0];
-		if (length < 1 + actual_length)
-			return 0;
-		value.assign(data + 1, data + 1 + actual_length);
-		return 1 + actual_length;
-	}
-
-	// XML (always PLP)
-	case TDS_TYPE_XML:
-	case TDS_TYPE_UDT:
-		return ReadPLPType(data, length, value, is_null);
-
-	// sql_variant (spec 093 G2): a u32 length, then that many bytes; 0 is NULL in a ROW.
-	case TDS_TYPE_SQL_VARIANT:
-		return ReadVariant(data, length, value, is_null);
-
-	// Variable-length types still have 2-byte length prefix (or PLP for MAX types)
-	case TDS_TYPE_BIGCHAR:
-	case TDS_TYPE_BIGVARCHAR:
-	case TDS_TYPE_NCHAR:
-	case TDS_TYPE_NVARCHAR:
-	case TDS_TYPE_BIGBINARY:
-	case TDS_TYPE_BIGVARBINARY:
-	case TDS_TYPE_VECTOR:  // spec 093 D4: u16 length, 0xFFFF NULL
-		// Check for MAX types (PLP encoding)
-		if (col.IsPLPType()) {
-			return ReadPLPType(data, length, value, is_null);
-		}
-		return ReadVariableLengthType(data, length, col.type_id, value, is_null);
-
-	// DECIMAL/NUMERIC - has 1-byte length prefix in NBC rows
-	case TDS_TYPE_DECIMAL:
-	case TDS_TYPE_NUMERIC: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		if (length < 1 + data_length)
-			return 0;
-		value.assign(data + 1, data + 1 + data_length);
-		return 1 + data_length;
-	}
-
-	// DATE - has 1-byte length prefix in NBC rows (0 or 3)
-	case TDS_TYPE_DATE: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		if (length < 1 + data_length)
-			return 0;
-		value.assign(data + 1, data + 1 + data_length);
-		return 1 + data_length;
-	}
-
-	// TIME - has 1-byte length prefix in NBC rows
-	case TDS_TYPE_TIME: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		if (length < 1 + data_length)
-			return 0;
-		value.assign(data + 1, data + 1 + data_length);
-		return 1 + data_length;
-	}
-
-	// DATETIME2 - has 1-byte length prefix in NBC rows
-	case TDS_TYPE_DATETIME2: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		if (length < 1 + data_length)
-			return 0;
-		value.assign(data + 1, data + 1 + data_length);
-		return 1 + data_length;
-	}
-
-	// DATETIMEOFFSET - has 1-byte length prefix in NBC rows
-	case TDS_TYPE_DATETIMEOFFSET: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		if (length < 1 + data_length)
-			return 0;
-		value.assign(data + 1, data + 1 + data_length);
-		return 1 + data_length;
-	}
-
-	// UNIQUEIDENTIFIER - has 1-byte length prefix in NBC rows (0 or 16)
-	case TDS_TYPE_UNIQUEIDENTIFIER: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		if (length < 1 + data_length)
-			return 0;
-		value.assign(data + 1, data + 1 + data_length);
-		return 1 + data_length;
-	}
-
-	default:
-		throw std::runtime_error("Unsupported type in NBC RowReader: " + col.GetTypeName());
-	}
+	return ReadFramed(data, length, columns_[col_idx], value, is_null, true);
 }
 
 size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_idx) {

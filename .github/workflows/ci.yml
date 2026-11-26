@@ -741,8 +741,9 @@ jobs:
 
           echo "::group::test_skip_form_equivalence (spec 058 D1-alt — fast skip walk vs the legacy arms)"
           # TDS-only, like the two above. Pins ResolveSkipForm/SkipByForm against
-          # SkipValue/SkipValueNBC for every type: the two switches live in one
-          # file with nothing else holding them together, and a width edited in
+          # SkipValue/SkipValueNBC for every type: the fast walk's switch and the
+          # per-value walks' framing table live in one file with nothing else
+          # holding them together, and a width edited in
           # one and not the other misframes every row after that column with no
           # other test failing.
           "${CXX:-c++}" -std=c++17 -pthread -Wno-deprecated-declarations \

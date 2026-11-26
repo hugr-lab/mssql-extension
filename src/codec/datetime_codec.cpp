@@ -758,7 +758,7 @@ static size_t FixedTemporalReadLen(const tds::ColumnMetadata &col) {
 // issue-#89 string fallback -- did not, using `size` solely to tell DATETIMEN's
 // 4 bytes from its 8. A server-declared 1-byte DATE therefore reached
 // ConvertDate, which reads three bytes whatever it is handed, for a read a few
-// bytes past the value buffer. RowReader::ReadDateType does not catch it either:
+// bytes past the value buffer. RowReader's ReadBytePrefixed does not catch it either:
 // it checks that the declared length is BUFFERED, not that it is the type's
 // width. Found by the q2 query in joern/ ("byte-buffer method that indexes
 // without comparing anything"), which flagged every one of these kernels; the
