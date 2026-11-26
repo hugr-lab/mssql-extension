@@ -21,6 +21,7 @@
 #include "tds/tds_connection.hpp"
 #include "tds/tds_types.hpp"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -722,131 +723,106 @@ void TargetResolver::DropTable(tds::TdsConnection &conn, const BCPCopyTarget &ta
 // IsTypeCompatible - Helper to check type compatibility
 //===----------------------------------------------------------------------===//
 
-static bool IsTypeCompatible(const LogicalType &source_type, const string &target_type_name) {
-	// Normalize target type name to lowercase for comparison
-	string target_lower = StringUtil::Lower(target_type_name);
+//! A source type and the SQL Server types (lowercase, as sys.types names them) a COPY may write it into.
+struct CompatibleTargets {
+	LogicalTypeId source;
+	vector<string> targets;
+};
 
-	if (target_lower == "sql_variant") {
-		// Spec 093 T2: the envelope's base type comes from a VARIANT value's tag (D3); another source
-		// is a type mismatch here -- cast it to VARIANT in the COPY's query.
-		return source_type.id() == LogicalTypeId::VARIANT;
-	}
-	switch (source_type.id()) {
-	case LogicalTypeId::VARIANT:
-		return false;  // only into a sql_variant column (above)
-
-	case LogicalTypeId::BOOLEAN:
-		return target_lower == "bit";
-
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::UTINYINT:
-		return target_lower == "tinyint" || target_lower == "smallint" || target_lower == "int" ||
-			   target_lower == "bigint";
-
-	case LogicalTypeId::SMALLINT:
-		return target_lower == "smallint" || target_lower == "int" || target_lower == "bigint" ||
-			   target_lower == "tinyint";
-
-	case LogicalTypeId::INTEGER:
-		return target_lower == "int" || target_lower == "bigint" || target_lower == "smallint" ||
-			   target_lower == "tinyint";
-
-	case LogicalTypeId::BIGINT:
+//! Every source type a COPY into an existing table takes, with its targets. A source type with no row
+//! is REFUSED, not waved through: admitting the unknown was how INTERVAL reached an encoder that throws
+//! an INTERNAL Error (issue #238), and how nested types were "allowed" with no evidence anyone had
+//! tried. The refusal is at bind time with the pair named; the fix on the user's side is an explicit
+//! cast. UHUGEINT is deliberately NOT here: advertising it would pass bind and then die in the decimal
+//! encoder, whose widening has no UINT128 arm -- the user-side fix is a cast to HUGEINT or DECIMAL. A
+//! VARIANT has no row either: it goes only into a sql_variant column (IsTypeCompatible).
+static const vector<CompatibleTargets> &CompatibleTargetTable() {
+	static const vector<string> integers = {"tinyint", "smallint", "int", "bigint"};
+	static const vector<string> decimals = {"decimal", "numeric", "money", "smallmoney"};
+	static const vector<string> floats = {"real", "float"};
+	static const vector<string> binaries = {"varbinary", "binary", "image"};
+	static const vector<string> timestamps = {"datetime2", "datetime", "smalldatetime"};
+	static const vector<CompatibleTargets> table = {
+		{LogicalTypeId::BOOLEAN, {"bit"}},
+		{LogicalTypeId::TINYINT, integers},
+		{LogicalTypeId::UTINYINT, integers},
+		{LogicalTypeId::SMALLINT, integers},
+		{LogicalTypeId::INTEGER, integers},
 		// Issue #153. Narrowing is allowed because the encoder performs it with a
 		// range check and refuses the row that does not fit — the same answer SQL
 		// Server gives, arrived at before the batch is sent rather than by
 		// aborting it mid-stream. DuckDB defaults integer arithmetic to BIGINT, so
 		// refusing this made appending to an `int` column need REPLACE=true and a
 		// schema change the user did not want.
-		return target_lower == "bigint" || target_lower == "int" || target_lower == "smallint" ||
-			   target_lower == "tinyint";
-
-	case LogicalTypeId::UBIGINT:
+		{LogicalTypeId::BIGINT, integers},
+		{LogicalTypeId::USMALLINT, {"smallint", "int", "bigint"}},
+		{LogicalTypeId::UINTEGER, {"int", "bigint"}},
 		// UBIGINT travels as DECIMAL(20,0) on the wire, so the decimal family
 		// takes it natively — refusing `decimal` here made the column CTAS
 		// itself creates from a UBIGINT source unappendable, and left D4's
 		// UINT64 columnar arm dead code for existing targets (caught by the
 		// spec 064 review's added test, not by the review itself). The integer
-		// narrowing arms above still do not apply: the wire form is not an
+		// narrowing rows above still do not apply: the wire form is not an
 		// integer. A value too big for the target's precision is refused per
 		// value by the #177 mantissa guard, the same answer BIGINT narrowing
 		// gives.
-		return target_lower == "bigint" || target_lower == "decimal" || target_lower == "numeric" ||
-			   target_lower == "money" || target_lower == "smallmoney";
-
-	case LogicalTypeId::FLOAT:
-		return target_lower == "real" || target_lower == "float";
-
-	case LogicalTypeId::DOUBLE:
-		return target_lower == "float" || target_lower == "real";
-
-	case LogicalTypeId::USMALLINT:
-		return target_lower == "int" || target_lower == "bigint" || target_lower == "smallint";
-
-	case LogicalTypeId::UINTEGER:
-		return target_lower == "bigint" || target_lower == "int";
-
-	case LogicalTypeId::DECIMAL:
-	case LogicalTypeId::HUGEINT:
-		// UHUGEINT is deliberately NOT here: advertising it would pass bind and
-		// then die in the decimal encoder, whose widening has no UINT128 arm —
-		// exactly the INTERNAL-error shape this default:false exists to remove.
-		// The user-side fix is an explicit cast to HUGEINT or DECIMAL.
-		return target_lower == "decimal" || target_lower == "numeric" || target_lower == "money" ||
-			   target_lower == "smallmoney";
-
-	case LogicalTypeId::VARCHAR:
+		{LogicalTypeId::UBIGINT, {"bigint", "decimal", "numeric", "money", "smallmoney"}},
+		{LogicalTypeId::FLOAT, floats},
+		{LogicalTypeId::DOUBLE, floats},
+		{LogicalTypeId::DECIMAL, decimals},
+		{LogicalTypeId::HUGEINT, decimals},
 		// `json` belongs here for the same reason `xml` does: the server takes
 		// a string for it and validates the content itself. Without it a COPY
 		// into an existing table with a JSON column was refused at bind while
 		// an INSERT into the same column worked, which is the kind of split
 		// nobody can guess (issue #296 self-review).
-		return target_lower == "varchar" || target_lower == "nvarchar" || target_lower == "char" ||
-			   target_lower == "nchar" || target_lower == "text" || target_lower == "ntext" || target_lower == "xml" ||
-			   target_lower == "json";
-
-	case LogicalTypeId::BLOB:
-		return target_lower == "varbinary" || target_lower == "binary" || target_lower == "image";
-
-	case LogicalTypeId::GEOMETRY:
+		{LogicalTypeId::VARCHAR, {"varchar", "nvarchar", "char", "nchar", "text", "ntext", "xml", "json"}},
+		{LogicalTypeId::BLOB, binaries},
 		// A GEOMETRY vector's payload is standard WKB (verified byte-identical to
 		// ST_AsWKB output), and it landed in varbinary through the VarString arm
-		// long before this switch had a default. Refusing it here was a spec 064
-		// review-caught regression, not a cleanup.
-		return target_lower == "varbinary" || target_lower == "binary" || target_lower == "image";
-
-	case LogicalTypeId::UUID:
-		return target_lower == "uniqueidentifier";
-
-	case LogicalTypeId::ARRAY:
+		// long before this table refused the unknown. Refusing it here was a spec
+		// 064 review-caught regression, not a cleanup.
+		{LogicalTypeId::GEOMETRY, binaries},
+		{LogicalTypeId::UUID, {"uniqueidentifier"}},
 		// Spec 093 T3: a FLOAT[n] into a vector column; the dimensions are the encoder's to check (the
-		// target's are not in its name). A DOUBLE[n] is a mismatch: the cast to FLOAT[n] is the user's.
-		return target_lower == "vector" && ArrayType::GetChildType(source_type).id() == LogicalTypeId::FLOAT;
+		// target's are not in its name). Only a FLOAT[n]: IsTypeCompatible asks the child type.
+		{LogicalTypeId::ARRAY, {"vector"}},
+		{LogicalTypeId::DATE, {"date", "datetime", "datetime2", "smalldatetime"}},
+		{LogicalTypeId::TIME, {"time"}},
+		{LogicalTypeId::TIMESTAMP, timestamps},
+		{LogicalTypeId::TIMESTAMP_MS, timestamps},
+		{LogicalTypeId::TIMESTAMP_NS, timestamps},
+		{LogicalTypeId::TIMESTAMP_SEC, timestamps},
+		{LogicalTypeId::TIMESTAMP_TZ, {"datetimeoffset"}},
+	};
+	return table;
+}
 
-	case LogicalTypeId::DATE:
-		return target_lower == "date" || target_lower == "datetime" || target_lower == "datetime2" ||
-			   target_lower == "smalldatetime";
+//! The targets of a source type, or null for one a COPY does not take.
+static const vector<string> *CompatibleTargetsOf(LogicalTypeId source) {
+	for (auto &row : CompatibleTargetTable()) {
+		if (row.source == source) {
+			return &row.targets;
+		}
+	}
+	return nullptr;
+}
 
-	case LogicalTypeId::TIME:
-		return target_lower == "time";
+static bool IsTypeCompatible(const LogicalType &source_type, const string &target_type_name) {
+	// Normalize target type name to lowercase for comparison
+	const string target_lower = StringUtil::Lower(target_type_name);
 
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_SEC:
-		return target_lower == "datetime2" || target_lower == "datetime" || target_lower == "smalldatetime";
-
-	case LogicalTypeId::TIMESTAMP_TZ:
-		return target_lower == "datetimeoffset";
-
-	default:
-		// An unknown source type is REFUSED, not waved through. `return true`
-		// here was how INTERVAL reached an encoder that throws an INTERNAL Error
-		// (issue #238), and how nested types were "allowed" with no evidence
-		// anyone had tried. The refusal is at bind time with the pair named;
-		// the fix on the user's side is an explicit cast.
+	if (target_lower == "sql_variant") {
+		// Spec 093 T2: the envelope's base type comes from a VARIANT value's tag (D3); another source
+		// is a type mismatch here -- cast it to VARIANT in the COPY's query.
+		return source_type.id() == LogicalTypeId::VARIANT;
+	}
+	// A DOUBLE[n] is a mismatch for a vector column: the cast to FLOAT[n] is the user's.
+	if (source_type.id() == LogicalTypeId::ARRAY && ArrayType::GetChildType(source_type).id() != LogicalTypeId::FLOAT) {
 		return false;
 	}
+	const auto *targets = CompatibleTargetsOf(source_type.id());
+	return targets && std::find(targets->begin(), targets->end(), target_lower) != targets->end();
 }
 
 //===----------------------------------------------------------------------===//
