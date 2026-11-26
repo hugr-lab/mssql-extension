@@ -12,7 +12,7 @@
 // These exist because the behaviour they cover was otherwise only asserted by
 // test/sql/query/collation_metadata_warnings.test, which needs a live SQL
 // Server and therefore does NOT gate a PR. A regression -- the TEXT/NTEXT arm
-// of ParseTypeInfo drifting from the BIGVARCHAR arm, or the 0x04000000 bit
+// of the COLMETADATA parse (ReadLob) drifting from the BIGVARCHAR arm, or the 0x04000000 bit
 // position being "simplified" -- would have shipped green.
 //
 // No SQL Server, no DuckDB runtime: synthetic COLMETADATA bytes fed through

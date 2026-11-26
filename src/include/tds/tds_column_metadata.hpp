@@ -74,7 +74,7 @@ struct ColumnMetadata {
 	bool IsVectorText() const {
 		return user_type == VECTOR_USER_TYPE && (type_id == TDS_TYPE_BIGVARCHAR || type_id == TDS_TYPE_NVARCHAR);
 	}
-	//! The dimensions of a VECTORTYPE column (ParseTypeInfo checked them).
+	//! The dimensions of a VECTORTYPE column (the COLMETADATA parse checked them: CheckVector).
 	uint16_t VectorDimensions() const {
 		return static_cast<uint16_t>((max_length - VECTOR_HEADER_BYTES) / VectorElementBytes(vector_element_type));
 	}
@@ -171,16 +171,6 @@ public:
 	// Returns true if parsing succeeded, false if more data needed
 	// Throws on parse error
 	static bool Parse(const uint8_t *data, size_t length, size_t &bytes_consumed, std::vector<ColumnMetadata> &columns);
-
-private:
-	// Parse a single column definition
-	static bool ParseColumn(const uint8_t *data, size_t length, size_t &offset, ColumnMetadata &column);
-
-	// Parse type-specific metadata (length, precision, scale, collation)
-	static bool ParseTypeInfo(const uint8_t *data, size_t length, size_t &offset, ColumnMetadata &column);
-
-	// Parse B_VARCHAR column name
-	static bool ParseColumnName(const uint8_t *data, size_t length, size_t &offset, std::string &name);
 };
 
 // Spec 058 D1-alt. The skip walk's job per value is tiny — read a length
