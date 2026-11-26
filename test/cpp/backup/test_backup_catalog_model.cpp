@@ -716,6 +716,22 @@ int main() {
 		});
 		Check(has(why, "column id (xtype 56) is stored as a variable column, which its type is not"),
 			  "a fixed type stored as a variable column: " + why);
+		// A sparse char(12) whose stored width says 14: refused here, not at its first value (review of #626).
+		auto sparse_char = [&](BootstrapTables &t, uint16_t stored_length) {
+			SysColumn &d = declared(t, "code");
+			d.xtype = XTYPE_CHAR;
+			d.length = 12;
+			d.status |= COLUMN_SPARSE;
+			SysRsCol &s = stored(t, "code");
+			s.ti = (static_cast<uint32_t>(stored_length) << 8) | XTYPE_CHAR;
+			s.status |= 0x100;
+			s.offset = 0;
+		};
+		Check(reason_after([&](BootstrapTables &t) { sparse_char(t, 12); }) == "decodable",
+			  "a sparse char(12) stored as 12 bytes: decodable");
+		why = reason_after([&](BootstrapTables &t) { sparse_char(t, 14); });
+		Check(has(why, "column code is stored as 14 bytes, declared 12"),
+			  "a sparse char stored wider than declared: " + why);
 		why = reason_after([&](BootstrapTables &t) { stored(t, "name").offset = 4; });
 		Check(has(why, "column name (xtype 231) is stored as a fixed column, which its type is not"),
 			  "a variable type stored at a fixed offset: " + why);

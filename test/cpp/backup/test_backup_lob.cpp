@@ -213,7 +213,7 @@ int main() {
 	p.pages[101] = TextPage(101, {Internal({{5, 100, 0}, {8, 100, 1}})});
 
 	Check(Read(p, Root({{5, 100, 0}, {8, 100, 1}})) == "helloabc", "a root over two DATA fragments");
-	Check(Read(p, Root({{8, 101, 0}}, 5, 1)) == "helloabc", "a root over an INTERNAL node over two DATA fragments");
+	Check(Read(p, Root({{8, 101, 0}}, 4, 1)) == "helloabc", "a root over an INTERNAL node over two DATA fragments");
 
 	auto refused = [&](const std::string &root, const std::string &want, const std::string &what,
 					   uint64_t max = 1 << 20) {
@@ -239,6 +239,8 @@ int main() {
 	refused(Root({{6, 100, 0}}), "holds 5 bytes where its parent claims 6",
 			"a leaf whose size is not its parent's claim");
 	refused(Root({{5, 100, 0}}, 2), "kind 2", "a row-overflow pointer, to the catalog reader");
+	// Kind 5 is the sparse vector (spec 086 E24), not an in-row root: refused by name (review of #626).
+	refused(Root({{5, 100, 0}}, 5), "kind 5", "a kind-5 value, the sparse vector's tag, is no in-row root");
 	refused(Root({{5, 100, 0}, {5, 100, 1}}), "do not ascend", "root links whose sizes do not ascend");
 	refused(Root({{5, 100, 2}}), "past the page's 2", "a slot past the page's slots");
 

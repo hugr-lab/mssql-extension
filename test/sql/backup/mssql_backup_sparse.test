@@ -7,8 +7,9 @@
 # row-overflow inside the vector, 1000 sparse columns, a column set, ALTER COLUMN ... ADD / DROP SPARSE (rows
 # rewritten, the old entries kept under a dropped hbcolid), a dropped sparse column, a heap's forwarded rows, a
 # non-unique clustered index (a uniquifier of 0 is not stored, so the vector takes its index), a partitioned
-# table, char / binary under ANSI_PADDING OFF and row versioning; then a differential. The values below are the
-# scan's, which the oracle lane compares with RESTORE (compare_rows.sh: 10 tables, 0 failures on 2025). No SQL
+# table, char / binary under ANSI_PADDING OFF, a text column before the vector, an empty column beside a dropped
+# column's entry and row versioning; then a differential. The values below are the scan's, which the oracle lane
+# compares with RESTORE (compare_rows.sh: 13 tables, 0 failures on 2025). No SQL
 # Server is needed.
 
 require mssql
@@ -25,11 +26,14 @@ SELECT table_name, decodable FROM mssql_backup_tables(getvariable('f')) WHERE sc
 alter_sparse	true
 ansi_sparse	true
 colset_sparse	true
+dropped_sparse	true
 heap_sparse	true
 ovf_sparse	true
 part_sparse	true
+text_sparse	true
 types_sparse	true
 uniq_sparse	true
+unsparsed	true
 ver_sparse	true
 wide_sparse	true
 
@@ -173,6 +177,36 @@ SELECT id, '[' || c || ']', b FROM mssql_backup_scan(getvariable('f'), 'dbo', 'a
 3	[abcdefgh]	\x01\x02\x03\x04\x05\x06
 4	NULL	NULL
 5	[a]	\x01
+
+# A text column the last regular variable column (its 16-byte root pointer, the regular complex form that can
+# begin with the vector's tag), set or NULL beside the sparse column set or NULL (review of #626).
+query ITI
+SELECT id, t, s FROM mssql_backup_scan(getvariable('f'), 'dbo', 'text_sparse') ORDER BY id;
+----
+1	some text	11
+2	more text	NULL
+3	NULL	33
+4	NULL	NULL
+5	(empty)	55
+
+# An empty last regular column ('', not stored: the vector takes its index) beside a vector that still holds the
+# dropped column a's entry (review of #626).
+query ITI
+SELECT id, v, b FROM mssql_backup_scan(getvariable('f'), 'dbo', 'dropped_sparse') ORDER BY id;
+----
+1	(empty)	10
+2	x	20
+3	(empty)	NULL
+4	NULL	40
+
+# The same beside y's entry after ALTER COLUMN y DROP SPARSE (the rows rewritten, y now a regular column).
+query ITII
+SELECT id, v, y, z FROM mssql_backup_scan(getvariable('f'), 'dbo', 'unsparsed') ORDER BY id;
+----
+1	(empty)	1	10
+2	x	2	20
+3	(empty)	NULL	30
+4	(empty)	4	NULL
 
 query III
 SELECT count(*), sum(v), count(s) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'ver_sparse');

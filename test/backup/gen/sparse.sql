@@ -154,6 +154,23 @@ GO
 -- 10. A filtered index on a sparse column (a secondary index: the base table is what is read).
 CREATE INDEX ix_types_sparse_int ON dbo.types_sparse (s_int) WHERE s_int IS NOT NULL;
 GO
+-- 10b. Review of #626: a text column (its 16-byte root pointer, the regular complex form that can begin with the
+-- vector's tag) as the last regular variable column, every combination of it and the sparse column set or NULL;
+-- and an empty last regular column ('') beside a vector holding the entry of a sparse column dropped, or made
+-- not sparse by ALTER COLUMN ... DROP SPARSE.
+CREATE TABLE dbo.text_sparse (id int NOT NULL PRIMARY KEY, t text NULL, s bigint SPARSE NULL);
+INSERT dbo.text_sparse VALUES (1, 'some text', 11), (2, 'more text', NULL), (3, NULL, 33), (4, NULL, NULL), (5, '', 55);
+GO
+CREATE TABLE dbo.dropped_sparse (id int NOT NULL PRIMARY KEY, v varchar(10) NULL, a int SPARSE NULL, b int SPARSE NULL);
+INSERT dbo.dropped_sparse VALUES (1, '', 1, 10), (2, 'x', 2, 20), (3, '', 3, NULL), (4, NULL, 4, 40);
+GO
+ALTER TABLE dbo.dropped_sparse DROP COLUMN a;
+GO
+CREATE TABLE dbo.unsparsed (id int NOT NULL PRIMARY KEY, v varchar(10) NULL, y int SPARSE NULL, z int SPARSE NULL);
+INSERT dbo.unsparsed VALUES (1, '', 1, 10), (2, 'x', 2, 20), (3, '', NULL, 30), (4, '', 4, NULL);
+GO
+ALTER TABLE dbo.unsparsed ALTER COLUMN y DROP SPARSE;
+GO
 -- 11. Row versioning (RCSI) last: version tags on records with a vector.
 ALTER DATABASE bak_sparse SET ALLOW_SNAPSHOT_ISOLATION ON;
 ALTER DATABASE bak_sparse SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;

@@ -438,7 +438,8 @@ void IndexSparse(RowsetLayout &layout) {
 namespace {
 
 constexpr uint16_t SPARSE_VECTOR_TAG = 0x0005;
-constexpr size_t SPARSE_VECTOR_HEADER = 4;	// the tag, the count
+constexpr size_t SPARSE_VECTOR_HEADER = 4;	 // the tag, the count
+constexpr uint16_t ROOT_POINTER_BYTES = 16;	 // a pointer to a LOB root record (E21)
 
 // Variable index `i`'s regular column holds a value in `record`: its null bit says so (a column added after
 // the record, past its column count, holds none; a record without a null bitmap holds every column).
@@ -482,10 +483,12 @@ SparseVector FindSparseVector(const RecordView &record, size_t var_count, const 
 	// Tagged, it is the vector whatever the null bitmap says of the regular column at its index: an empty value
 	// ('', N'', 0x) closing the regular ones is not stored, as a NULL is not, and the vector takes its index
 	// (review of #626, fixture sparse.sql; so does a uniquifier of 0). A regular column's complex form starts with
-	// kind 2 or 4 (E24); a text / ntext / image root pointer with its blob id, whose low 16 bits were 0 in every
-	// value (E21). Where the bitmap says that column holds a value, the vector must also be whole by stricter
-	// checks -- every id a sparse column's of the layout, its last value ending at its end --, else it is that
-	// column, not an error.
+	// kind 2 or 4 (E24); a 16-byte root pointer (text / ntext / image, and a MAX type or xml under `large value
+	// types out of row`, E21) with its blob id, whose low 16 bits were 0 in every value (E21). Where the bitmap
+	// says that column holds a value, the vector must also be whole by stricter checks -- every id a sparse
+	// column's of the layout, its last value ending at its end --, else, when it is a root pointer's 16 bytes, it
+	// is that column; any other size is a damaged vector, refused by name (review of #626: read as no vector, the
+	// row's sparse columns were NULL with nothing said).
 	const bool regular_here = last < layout.var_null_bits.size() && VarHoldsValue(record, layout, last);
 	const uint16_t count = SparseU16(data, 2);
 	const size_t values = SPARSE_VECTOR_HEADER + 4 * static_cast<size_t>(count);
@@ -518,7 +521,7 @@ SparseVector FindSparseVector(const RecordView &record, size_t var_count, const 
 		why = "whose values end at " + std::to_string(previous_end) + ", not at its end " + std::to_string(size);
 	}
 	if (!why.empty()) {
-		if (regular_here) {
+		if (regular_here && size == ROOT_POINTER_BYTES) {
 			return s;
 		}
 		throw FormatError("backup: the record of " + layout.table + " at offset " + std::to_string(record.offset) +

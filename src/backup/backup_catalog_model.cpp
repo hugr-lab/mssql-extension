@@ -285,13 +285,16 @@ bool CheckStorageForm(const PhysicalColumn &physical, const CatalogColumn &c, bo
 		return false;
 	}
 	// A fixed char / nchar / binary is as wide as its declaration: a sysrscols width that disagrees
-	// with syscolpars' would read the neighbouring columns as its value (review of #552).
-	if (padded && physical.offset > 0 && physical.length != c.max_length) {
+	// with syscolpars' would read the neighbouring columns as its value (review of #552). A sparse column of a
+	// fixed type is checked too: its entry must have that width (LocateValue), so a disagreement found here
+	// refuses the table by name rather than its scan at the first value (review of #626).
+	const bool fixed_width = physical.offset > 0 || (physical.Sparse() && KnownFixedXtype(physical.xtype));
+	if (padded && fixed_width && physical.length != c.max_length) {
 		why = "column " + c.name + " is stored as " + std::to_string(physical.length) + " bytes, declared " +
 			  std::to_string(c.max_length);
 		return false;
 	}
-	if (physical.offset > 0) {
+	if (fixed_width) {
 		try {
 			(void)physical.FixedLength(table);
 		} catch (FormatError &e) {

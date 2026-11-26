@@ -226,7 +226,8 @@ struct SparseVector {
 //! bitmap says (review of #626). Past every regular column it must be one. Every part checked: a FormatError
 //! naming the table and the record's offset -- except where the bitmap says the regular column at that index
 //! holds a value: the vector must then also pass stricter checks (every id a sparse column's, the last value
-//! ending at its end), else it is that column. None (data null) otherwise.
+//! ending at its end), else it is that column when it has a LOB root pointer's 16 bytes, and
+//! a FormatError otherwise. None (data null) otherwise.
 SparseVector FindSparseVector(const RecordView &record, size_t var_count, const RowsetLayout &layout);
 
 //! Column `k` of `layout` in `record`, whose table variable columns are `var_count`

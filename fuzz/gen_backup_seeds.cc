@@ -424,10 +424,10 @@ static Bytes LeafPage() {
 	return TextPage(100, {Fragment(3, HELLO), Fragment(3, ABC)});
 }
 
-//! An in-row root (kind 5) of `level` whose links (cumulative, page, slot) name file 1.
+//! An in-row root (kind 4) of `level` whose links (cumulative, page, slot) name file 1.
 static Bytes InRowRoot(uint8_t level, const std::vector<std::array<uint32_t, 3>> &links) {
 	Bytes root(12 + 12 * links.size(), 0);
-	root[0] = 5;
+	root[0] = 4;
 	root[2] = level;
 	for (size_t i = 0; i < links.size(); i++) {
 		Put32(root, 12 + 12 * i, links[i][0]);

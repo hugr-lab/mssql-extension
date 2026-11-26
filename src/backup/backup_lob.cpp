@@ -308,7 +308,8 @@ OffRowPointer ParseOffRowPointer(const uint8_t *bytes, size_t size, const std::s
 		p.length = r.U32(12);
 		return p;
 	}
-	if (kind == 4 || kind == 5) {
+	// Kind 4 only: kind 5 is the sparse vector (E24), never seen as a value of its own (E21; review of #626).
+	if (kind == 4) {
 		if (size < ROOT_HEADER + ROOT_LINK || (size - ROOT_HEADER) % ROOT_LINK != 0) {
 			throw FormatError("backup: " + what + "'s in-row LOB root is " + std::to_string(size) +
 							  " bytes, not a header and whole links");

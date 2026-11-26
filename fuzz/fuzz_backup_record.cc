@@ -124,6 +124,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 		for (int32_t id = 0; sparse.data && id <= static_cast<int32_t>(MAX_COLUMNS); id++) {
 			Touch(sparse.Find(id), page, PhysicalColumn());
 		}
+		// Every entry by its own id, whatever it is (review of #626: ids past MAX_COLUMNS were never read).
+		for (uint16_t i = 0; sparse.data && i < sparse.count; i++) {
+			const size_t at = 4 + 2 * static_cast<size_t>(i);
+			Touch(sparse.Find(static_cast<int32_t>(sparse.data[at] | (sparse.data[at + 1] << 8))), page,
+				  PhysicalColumn());
+		}
 		if (sparse.data) {
 			vars--;	 // as RowRecord::Fixed counts it: the vector is not a regular variable column
 		}
