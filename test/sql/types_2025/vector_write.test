@@ -296,8 +296,54 @@ SELECT count(*) FROM vw.dbo.vec_w2 r JOIN vw_exp e USING (id) WHERE r.v IS NOT D
 statement ok
 DETACH vwj;
 
+# Issue #644: a float16 vector holds up to 3996 dimensions, the same 8000 bytes as a float32 vector(1998).
+# Read (as JSON text under VECTORSUPPORT 1, which SQL Server 2025 grants) and written through INSERT BULK and
+# as a statement.
 statement ok
-SELECT mssql_exec('vw', 'DROP TABLE IF EXISTS dbo.vec_w; DROP TABLE IF EXISTS dbo.vec_w2; DROP TABLE IF EXISTS dbo.vec_copy; DROP TABLE IF EXISTS dbo.vec_copy_new; DROP TABLE IF EXISTS dbo.vec_ctas; DROP TABLE IF EXISTS dbo.vec_bad');
+SELECT mssql_exec('vw', 'DROP TABLE IF EXISTS dbo.vec_f16_wide; CREATE TABLE dbo.vec_f16_wide (id int NOT NULL PRIMARY KEY, h vector(3996, float16) NULL);
+	INSERT INTO dbo.vec_f16_wide SELECT 1, CAST(''['' + STRING_AGG(CAST(''0.5'' AS nvarchar(max)), '','') + '']'' AS vector(3996, float16)) FROM GENERATE_SERIES(1, 3996)');
+
+statement ok
+SELECT mssql_invalidate_cache('vw');
+
+query TII
+SELECT typeof(h), len(h), list_sum(h::FLOAT[])::INTEGER FROM vw.dbo.vec_f16_wide;
+----
+FLOAT[3996]	3996	1998
+
+statement ok
+CREATE TEMP TABLE vw_f16_wide AS SELECT id, list_transform(range(3996), lambda x: 0.25::FLOAT)::FLOAT[3996] AS h
+FROM (VALUES (2), (4)) AS t(id);
+
+# Two rows through INSERT BULK (more rows than the threshold of 1), then one as a statement.
+statement ok
+SET mssql_insert_bcp_threshold = 1;
+
+statement ok
+INSERT INTO vw.dbo.vec_f16_wide SELECT id, h FROM vw_f16_wide;
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+statement ok
+SET mssql_insert_use_bcp = false;
+
+statement ok
+INSERT INTO vw.dbo.vec_f16_wide SELECT 3, h FROM vw_f16_wide WHERE id = 2;
+
+statement ok
+RESET mssql_insert_use_bcp;
+
+query III
+SELECT id, len(h), h[3996] FROM vw.dbo.vec_f16_wide ORDER BY id;
+----
+1	3996	0.5
+2	3996	0.25
+3	3996	0.25
+4	3996	0.25
+
+statement ok
+SELECT mssql_exec('vw', 'DROP TABLE IF EXISTS dbo.vec_w; DROP TABLE IF EXISTS dbo.vec_w2; DROP TABLE IF EXISTS dbo.vec_copy; DROP TABLE IF EXISTS dbo.vec_copy_new; DROP TABLE IF EXISTS dbo.vec_ctas; DROP TABLE IF EXISTS dbo.vec_bad; DROP TABLE IF EXISTS dbo.vec_f16_wide');
 
 statement ok
 DETACH vw;
