@@ -109,6 +109,9 @@ private:
 	// sql_variant (0x62): a u32 length, 0 for NULL, then the value (spec 093 G2).
 	size_t ReadVariant(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null);
 	size_t SkipVariant(const uint8_t *data, size_t length);
+	//! SkipValue's forms few columns have (PLP, legacy LOB, sql_variant, unknown); `kind` is the
+	//! framing kind of tds_row_reader.cpp.
+	size_t SkipRareForm(const uint8_t *data, size_t length, uint8_t kind);
 
 	const std::vector<ColumnMetadata> &columns_;
 };

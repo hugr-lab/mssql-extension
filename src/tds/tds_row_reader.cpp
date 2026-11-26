@@ -1,5 +1,6 @@
 #include "tds/tds_row_reader.hpp"
 #include <cstring>
+#include <initializer_list>
 #include <stdexcept>
 #include "tds/tds_types.hpp"
 
@@ -16,13 +17,137 @@ namespace {
 //! its own (lower) MAX_STAGING_PAYLOAD_BYTES, with its own message. This bound
 //! exists for the values that are not merely too big to stage but impossible.
 constexpr uint32_t MAX_LOB_VALUE_BYTES = 2147483647u;
+
+//! How the legacy per-value walk (RowReader::SkipValue) frames a value of a TDS type.
+enum class FramingKind : uint8_t {
+	//! A type the walk does not know: it cannot be skipped.
+	UNKNOWN = 0,
+	//! `width` bytes, no prefix.
+	FIXED,
+	//! A 1-byte length, then that many bytes (0 is NULL).
+	BYTE_PREFIX,
+	//! A 2-byte length, then that many bytes (0xFFFF is NULL) -- or a PLP chunk list for a MAX column.
+	SHORT_PREFIX,
+	//! A PLP chunk list, always.
+	PLP,
+	//! TEXT / NTEXT / IMAGE: the text-pointer form.
+	LEGACY_LOB,
+	//! sql_variant (spec 093 G2): a u32 length, then that many bytes.
+	VARIANT
+};
+
+struct ValueFraming {
+	FramingKind kind;
+	uint8_t width;	// FIXED: the value's bytes; other kinds: unused
+};
+
+//! The legacy walk's framing of every TDS type, by type id. It was a ~30-case switch on the type in
+//! SkipValue and, arm for arm, a second one in SkipValueNBC; the rows below are those arms.
+//!
+//! Deliberately NOT ResolveSkipForm's switch, and not built from it: the fast walk is safe only while
+//! the two agree, and test_skip_form_equivalence holds that by comparing them as two independent
+//! statements of the wire's framing (spec 058 D1-alt). A width edited here and not there fails it.
+struct LegacyFramings {
+	ValueFraming by_type[256];
+
+	LegacyFramings() : by_type() {
+		// Fixed-length types
+		Set(FramingKind::FIXED, 1, {TDS_TYPE_TINYINT, TDS_TYPE_BIT});
+		Set(FramingKind::FIXED, 2, {TDS_TYPE_SMALLINT});
+		Set(FramingKind::FIXED, 4, {TDS_TYPE_INT, TDS_TYPE_REAL, TDS_TYPE_SMALLMONEY, TDS_TYPE_SMALLDATETIME});
+		Set(FramingKind::FIXED, 8, {TDS_TYPE_BIGINT, TDS_TYPE_FLOAT, TDS_TYPE_MONEY, TDS_TYPE_DATETIME});
+		// Nullable fixed-length (1-byte length prefix), in a ROW and in an NBCROW alike
+		Set(FramingKind::BYTE_PREFIX, 0,
+			{TDS_TYPE_INTN, TDS_TYPE_BITN, TDS_TYPE_FLOATN, TDS_TYPE_MONEYN, TDS_TYPE_DATETIMEN, TDS_TYPE_DECIMAL,
+			 TDS_TYPE_NUMERIC, TDS_TYPE_DATE, TDS_TYPE_TIME, TDS_TYPE_DATETIME2, TDS_TYPE_DATETIMEOFFSET,
+			 TDS_TYPE_UNIQUEIDENTIFIER});
+		// Legacy LOBs (TEXT/NTEXT/IMAGE)
+		Set(FramingKind::LEGACY_LOB, 0, {TDS_TYPE_TEXT, TDS_TYPE_NTEXT, TDS_TYPE_IMAGE});
+		// XML (always PLP)
+		Set(FramingKind::PLP, 0, {TDS_TYPE_XML, TDS_TYPE_UDT});
+		Set(FramingKind::VARIANT, 0, {TDS_TYPE_SQL_VARIANT});
+		// Variable-length (2-byte length prefix, or PLP for MAX types); VECTOR per spec 093 D4
+		Set(FramingKind::SHORT_PREFIX, 0,
+			{TDS_TYPE_BIGCHAR, TDS_TYPE_BIGVARCHAR, TDS_TYPE_NCHAR, TDS_TYPE_NVARCHAR, TDS_TYPE_BIGBINARY,
+			 TDS_TYPE_BIGVARBINARY, TDS_TYPE_VECTOR});
+	}
+
+	void Set(FramingKind kind, uint8_t width, std::initializer_list<uint8_t> types) {
+		for (const uint8_t type_id : types) {
+			by_type[type_id] = ValueFraming{kind, width};
+		}
+	}
+
+	ValueFraming Of(uint8_t type_id) const {
+		return by_type[type_id];
+	}
+};
+
+//! Built when the library loads. Nothing skips a row during another file's static initialisation, so
+//! no reader can see it unbuilt; a function-local static would put a guard test on every value.
+const LegacyFramings LEGACY_FRAMINGS;
+
+//! A 1-byte length, then that many bytes.
+size_t SkipBytePrefixed(const uint8_t *data, size_t length) {
+	if (length < 1) {
+		return 0;
+	}
+	const uint8_t data_length = data[0];
+	return length >= 1 + data_length ? 1 + data_length : 0;
+}
+
+//! A 2-byte length, then that many bytes; 0xFFFF is NULL, the two bytes alone.
+size_t SkipShortPrefixed(const uint8_t *data, size_t length) {
+	if (length < 2) {
+		return 0;
+	}
+	const uint16_t data_length = static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
+	if (data_length == 0xFFFF) {
+		return 2;  // NULL
+	}
+	return length >= 2 + data_length ? 2 + data_length : 0;
+}
+
+//! Legacy LOBs (TEXT/NTEXT/IMAGE): 1-byte text-pointer length (0 = NULL), the
+//! pointer itself, an 8-byte timestamp, then a 4-byte data length. Nothing
+//! else on the wire is framed this way.
+size_t SkipLegacyLob(const uint8_t *data, size_t length) {
+	if (length < 1) {
+		return 0;
+	}
+	const size_t pointer_len = data[0];
+	if (pointer_len == 0) {
+		return 1;  // NULL
+	}
+	const size_t header = 1 + pointer_len + 8 + 4;
+	if (length < header) {
+		return 0;
+	}
+	uint32_t data_length;
+	std::memcpy(&data_length, data + 1 + pointer_len + 8, 4);
+	if (data_length > MAX_LOB_VALUE_BYTES) {
+		// A 4-byte length is the only framing field on the read path that can
+		// declare more than a value could ever be. Returning 0 here would mean
+		// "need more data", and the parser would buffer the whole rest of the
+		// stream waiting for bytes that are never coming.
+		// std::runtime_error, not a DuckDB exception: this layer is compiled
+		// standalone by the fuzz harness (fuzz/build.sh) with no DuckDB include
+		// path, which is what makes it fuzzable at all. Every other throw in
+		// this file is the same for the same reason.
+		throw std::runtime_error("TEXT/NTEXT/IMAGE value declares " + std::to_string(data_length) +
+								 " bytes, past the " + std::to_string(MAX_LOB_VALUE_BYTES) +
+								 "-byte maximum for the type. The TDS stream is malformed.");
+	}
+	const size_t total = header + data_length;
+	return length >= total ? total : 0;
+}
 }  // namespace
 
 RowReader::RowReader(const std::vector<ColumnMetadata> &columns) : columns_(columns) {}
 
 // Spec 058 D1-alt: one value of the fast walk. Byte-identical semantics to the
 // corresponding SkipValue arms — same prefix reads, same bounds tests, 0 still
-// means "need more data" — only the per-value type_id switch is gone. Shared by
+// means "need more data" — only the per-value lookup by type_id is gone. Shared by
 // the ROW and NBC walks because the wire forms are identical for both.
 static inline size_t SkipByForm(const uint8_t *data, size_t length, SkipDesc desc) {
 	switch (desc.form) {
@@ -91,7 +216,7 @@ SkipDesc ResolveSkipForm(const ColumnMetadata &col) {
 		return col.IsPLPType() ? SkipDesc{SkipForm::SLOW, 0} : SkipDesc{SkipForm::PREFIX2, 0};
 	default:
 		// XML (always PLP), TEXT/NTEXT/IMAGE (text-pointer form + MAX_LOB
-		// guard), and anything unknown: the legacy switch stays the one
+		// guard), and anything unknown: the legacy walk (SkipValue) stays the one
 		// implementation of the hard forms.
 		return {SkipForm::SLOW, 0};
 	}
@@ -245,106 +370,32 @@ bool RowReader::SkipNBCRow(const uint8_t *data, size_t length, size_t &bytes_con
 
 size_t RowReader::SkipValue(const uint8_t *data, size_t length, size_t col_idx) {
 	const ColumnMetadata &col = columns_[col_idx];
+	const ValueFraming framing = LEGACY_FRAMINGS.Of(col.type_id);
 
-	switch (col.type_id) {
-	// Fixed-length types
-	case TDS_TYPE_TINYINT:
-	case TDS_TYPE_BIT:
-		return length >= 1 ? 1 : 0;
-	case TDS_TYPE_SMALLINT:
-		return length >= 2 ? 2 : 0;
-	case TDS_TYPE_INT:
-	case TDS_TYPE_REAL:
-	case TDS_TYPE_SMALLMONEY:
-	case TDS_TYPE_SMALLDATETIME:
-		return length >= 4 ? 4 : 0;
-	case TDS_TYPE_BIGINT:
-	case TDS_TYPE_FLOAT:
-	case TDS_TYPE_MONEY:
-	case TDS_TYPE_DATETIME:
-		return length >= 8 ? 8 : 0;
-
-	// Nullable fixed-length (1-byte length prefix)
-	case TDS_TYPE_INTN:
-	case TDS_TYPE_BITN:
-	case TDS_TYPE_FLOATN:
-	case TDS_TYPE_MONEYN:
-	case TDS_TYPE_DATETIMEN:
-	case TDS_TYPE_DECIMAL:
-	case TDS_TYPE_NUMERIC:
-	case TDS_TYPE_DATE:
-	case TDS_TYPE_TIME:
-	case TDS_TYPE_DATETIME2:
-	case TDS_TYPE_DATETIMEOFFSET:
-	case TDS_TYPE_UNIQUEIDENTIFIER: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		return length >= 1 + data_length ? 1 + data_length : 0;
+	// The forms in the order rows meet them: a chain of tests on one byte, not a second jump.
+	if (framing.kind == FramingKind::FIXED) {
+		return length >= framing.width ? framing.width : 0;
 	}
-
-	// Legacy LOBs (TEXT/NTEXT/IMAGE): 1-byte text-pointer length (0 = NULL), the
-	// pointer itself, an 8-byte timestamp, then a 4-byte data length. Nothing
-	// else on the wire is framed this way.
-	case TDS_TYPE_TEXT:
-	case TDS_TYPE_NTEXT:
-	case TDS_TYPE_IMAGE: {
-		if (length < 1)
-			return 0;
-		const size_t pointer_len = data[0];
-		if (pointer_len == 0)
-			return 1;  // NULL
-		const size_t header = 1 + pointer_len + 8 + 4;
-		if (length < header)
-			return 0;
-		uint32_t data_length;
-		std::memcpy(&data_length, data + 1 + pointer_len + 8, 4);
-		if (data_length > MAX_LOB_VALUE_BYTES) {
-			// A 4-byte length is the only framing field on the read path that can
-			// declare more than a value could ever be. Returning 0 here would mean
-			// "need more data", and the parser would buffer the whole rest of the
-			// stream waiting for bytes that are never coming.
-			// std::runtime_error, not a DuckDB exception: this layer is compiled
-			// standalone by the fuzz harness (fuzz/build.sh) with no DuckDB include
-			// path, which is what makes it fuzzable at all. Every other throw in
-			// this file is the same for the same reason.
-			throw std::runtime_error("TEXT/NTEXT/IMAGE value declares " + std::to_string(data_length) +
-									 " bytes, past the " + std::to_string(MAX_LOB_VALUE_BYTES) +
-									 "-byte maximum for the type. The TDS stream is malformed.");
-		}
-		const size_t total = header + data_length;
-		return length >= total ? total : 0;
+	if (framing.kind == FramingKind::BYTE_PREFIX) {
+		return SkipBytePrefixed(data, length);
 	}
-
-	// XML (always PLP)
-	case TDS_TYPE_XML:
-	case TDS_TYPE_UDT:
-		return SkipPLPType(data, length);
-
-	// sql_variant (spec 093 G2): a u32 length, then that many bytes.
-	case TDS_TYPE_SQL_VARIANT:
-		return SkipVariant(data, length);
-
-	// Variable-length (2-byte length prefix, or PLP for MAX types)
-	case TDS_TYPE_BIGCHAR:
-	case TDS_TYPE_BIGVARCHAR:
-	case TDS_TYPE_NCHAR:
-	case TDS_TYPE_NVARCHAR:
-	case TDS_TYPE_BIGBINARY:
-	case TDS_TYPE_BIGVARBINARY:
-	case TDS_TYPE_VECTOR: {	 // spec 093 D4: u16 length, 0xFFFF NULL
+	if (framing.kind == FramingKind::SHORT_PREFIX) {
 		// Check for MAX types (PLP encoding)
-		if (col.IsPLPType()) {
-			return SkipPLPType(data, length);
-		}
-		if (length < 2)
-			return 0;
-		uint16_t data_length = static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
-		if (data_length == 0xFFFF)
-			return 2;  // NULL
-		return length >= 2 + data_length ? 2 + data_length : 0;
+		return col.IsPLPType() ? SkipPLPType(data, length) : SkipShortPrefixed(data, length);
 	}
+	return SkipRareForm(data, length, static_cast<uint8_t>(framing.kind));
+}
 
+//! The forms few columns have: a PLP chunk list, a legacy LOB, a sql_variant -- or a type the walk
+//! does not know, which cannot be skipped.
+size_t RowReader::SkipRareForm(const uint8_t *data, size_t length, uint8_t kind) {
+	switch (static_cast<FramingKind>(kind)) {
+	case FramingKind::PLP:
+		return SkipPLPType(data, length);
+	case FramingKind::LEGACY_LOB:
+		return SkipLegacyLob(data, length);
+	case FramingKind::VARIANT:
+		return SkipVariant(data, length);
 	default:
 		return 0;  // Unknown type - can't skip
 	}
@@ -981,152 +1032,11 @@ size_t RowReader::ReadValueNBC(const uint8_t *data, size_t length, size_t col_id
 }
 
 size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_idx) {
-	const ColumnMetadata &col = columns_[col_idx];
-
-	switch (col.type_id) {
-	// Fixed-length types
-	case TDS_TYPE_TINYINT:
-	case TDS_TYPE_BIT:
-		return length >= 1 ? 1 : 0;
-	case TDS_TYPE_SMALLINT:
-		return length >= 2 ? 2 : 0;
-	case TDS_TYPE_INT:
-	case TDS_TYPE_REAL:
-	case TDS_TYPE_SMALLMONEY:
-	case TDS_TYPE_SMALLDATETIME:
-		return length >= 4 ? 4 : 0;
-	case TDS_TYPE_BIGINT:
-	case TDS_TYPE_FLOAT:
-	case TDS_TYPE_MONEY:
-	case TDS_TYPE_DATETIME:
-		return length >= 8 ? 8 : 0;
-
-	// Nullable fixed-length - still has 1-byte length prefix in NBC rows
-	case TDS_TYPE_INTN:
-	case TDS_TYPE_BITN:
-	case TDS_TYPE_FLOATN:
-	case TDS_TYPE_MONEYN:
-	case TDS_TYPE_DATETIMEN: {
-		if (length < 1)
-			return 0;
-		uint8_t actual_length = data[0];
-		return length >= 1 + actual_length ? 1 + actual_length : 0;
-	}
-
-	// Legacy LOBs (TEXT/NTEXT/IMAGE): 1-byte text-pointer length (0 = NULL), the
-	// pointer itself, an 8-byte timestamp, then a 4-byte data length. Nothing
-	// else on the wire is framed this way.
-	case TDS_TYPE_TEXT:
-	case TDS_TYPE_NTEXT:
-	case TDS_TYPE_IMAGE: {
-		if (length < 1)
-			return 0;
-		const size_t pointer_len = data[0];
-		if (pointer_len == 0)
-			return 1;  // NULL
-		const size_t header = 1 + pointer_len + 8 + 4;
-		if (length < header)
-			return 0;
-		uint32_t data_length;
-		std::memcpy(&data_length, data + 1 + pointer_len + 8, 4);
-		if (data_length > MAX_LOB_VALUE_BYTES) {
-			// A 4-byte length is the only framing field on the read path that can
-			// declare more than a value could ever be. Returning 0 here would mean
-			// "need more data", and the parser would buffer the whole rest of the
-			// stream waiting for bytes that are never coming.
-			// std::runtime_error, not a DuckDB exception: this layer is compiled
-			// standalone by the fuzz harness (fuzz/build.sh) with no DuckDB include
-			// path, which is what makes it fuzzable at all. Every other throw in
-			// this file is the same for the same reason.
-			throw std::runtime_error("TEXT/NTEXT/IMAGE value declares " + std::to_string(data_length) +
-									 " bytes, past the " + std::to_string(MAX_LOB_VALUE_BYTES) +
-									 "-byte maximum for the type. The TDS stream is malformed.");
-		}
-		const size_t total = header + data_length;
-		return length >= total ? total : 0;
-	}
-
-	// XML (always PLP)
-	case TDS_TYPE_XML:
-	case TDS_TYPE_UDT:
-		return SkipPLPType(data, length);
-
-	// sql_variant (spec 093 G2): a u32 length, then that many bytes.
-	case TDS_TYPE_SQL_VARIANT:
-		return SkipVariant(data, length);
-
-	// Variable-length (still have 2-byte length prefix, or PLP for MAX types)
-	case TDS_TYPE_BIGCHAR:
-	case TDS_TYPE_BIGVARCHAR:
-	case TDS_TYPE_NCHAR:
-	case TDS_TYPE_NVARCHAR:
-	case TDS_TYPE_BIGBINARY:
-	case TDS_TYPE_BIGVARBINARY:
-	case TDS_TYPE_VECTOR: {	 // spec 093 D4: u16 length, 0xFFFF NULL
-		// Check for MAX types (PLP encoding)
-		if (col.IsPLPType()) {
-			return SkipPLPType(data, length);
-		}
-		if (length < 2)
-			return 0;
-		uint16_t data_length = static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
-		if (data_length == 0xFFFF)
-			return 2;  // Should not happen in NBC for non-NULL
-		return length >= 2 + data_length ? 2 + data_length : 0;
-	}
-
-	// DECIMAL/NUMERIC - has 1-byte length prefix
-	case TDS_TYPE_DECIMAL:
-	case TDS_TYPE_NUMERIC: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		return length >= 1 + data_length ? 1 + data_length : 0;
-	}
-
-	// DATE - has 1-byte length prefix
-	case TDS_TYPE_DATE: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		return length >= 1 + data_length ? 1 + data_length : 0;
-	}
-
-	// TIME - has 1-byte length prefix
-	case TDS_TYPE_TIME: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		return length >= 1 + data_length ? 1 + data_length : 0;
-	}
-
-	// DATETIME2 - has 1-byte length prefix
-	case TDS_TYPE_DATETIME2: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		return length >= 1 + data_length ? 1 + data_length : 0;
-	}
-
-	// DATETIMEOFFSET - has 1-byte length prefix
-	case TDS_TYPE_DATETIMEOFFSET: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		return length >= 1 + data_length ? 1 + data_length : 0;
-	}
-
-	// UNIQUEIDENTIFIER - has 1-byte length prefix
-	case TDS_TYPE_UNIQUEIDENTIFIER: {
-		if (length < 1)
-			return 0;
-		uint8_t data_length = data[0];
-		return length >= 1 + data_length ? 1 + data_length : 0;
-	}
-
-	default:
-		return 0;  // Unknown type
-	}
+	// A value present in an NBCROW is framed as it is in a ROW -- the bitmap only leaves the NULL
+	// columns out, and a present value keeps its length prefix -- so this is the same walk. (It was a
+	// second copy of SkipValue's switch, arm for arm.) A 0xFFFF prefix should not happen here, for a
+	// value the bitmap says is present; it is skipped as the two bytes it is, as before.
+	return SkipValue(data, length, col_idx);
 }
 
 }  // namespace tds

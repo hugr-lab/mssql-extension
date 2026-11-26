@@ -174,8 +174,9 @@ public:
 };
 
 // Spec 058 D1-alt. The skip walk's job per value is tiny — read a length
-// prefix, bounds-check, advance — but SkipValue selects it with a ~30-case
-// switch on type_id PER VALUE. The wire has only four framing shapes, and
+// prefix, bounds-check, advance — but SkipValue selects it by type_id PER
+// VALUE (a ~30-case switch when this was measured, a table now). The wire has
+// only four framing shapes, and
 // which one a column uses is fixed at COLMETADATA, so the parser resolves each
 // column to a form ONCE and the walk dispatches on a 2-bit form from a
 // contiguous array instead. Measured before the change: the whole walk is
@@ -194,7 +195,7 @@ struct SkipDesc {
 	uint8_t width;	// FIXED: payload bytes; other forms: unused
 };
 
-//! Defined in tds_row_reader.cpp beside the switch it mirrors.
+//! Defined in tds_row_reader.cpp beside the legacy walk's framing table, which it mirrors.
 SkipDesc ResolveSkipForm(const ColumnMetadata &col);
 
 }  // namespace tds
