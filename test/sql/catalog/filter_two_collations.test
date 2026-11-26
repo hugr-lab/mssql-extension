@@ -50,6 +50,23 @@ SELECT k FROM ${db}.dbo.cc_two WHERE v BETWEEN u AND 'b' ORDER BY k;
 1
 3
 
+# A CASE carries its branches' collation: against a column of another it is the same 468, and branches of two
+# collations are the server's 457 wherever the CASE is used (review of #647).
+query I
+SELECT k FROM ${db}.dbo.cc_two WHERE CASE WHEN n = 0 THEN v ELSE w END < u ORDER BY k;
+----
+2
+
+query I
+SELECT k FROM ${db}.dbo.cc_two WHERE CASE WHEN n = 0 THEN v ELSE u END = 'a' ORDER BY k;
+----
+2
+3
+
+query I
+SELECT k FROM ${db}.dbo.cc_two WHERE CASE WHEN n = 0 THEN v ELSE u END IS NULL ORDER BY k;
+----
+
 # One collation, and a column against a constant: still pushed, the same answers.
 query I
 SELECT k FROM ${db}.dbo.cc_two WHERE v < w ORDER BY k;
@@ -119,6 +136,27 @@ b	b	1
 
 statement error
 UPDATE ccs.dbo.cc_heap SET n = 2 WHERE v < u;
+----
+client
+
+# A CASE over one collation and a constant is still pushed; over two collations it is refused by name.
+statement ok
+UPDATE ccs.dbo.cc_heap SET n = n + 100 WHERE CASE WHEN n = 1 THEN v ELSE w30 END = 'b';
+
+query TTI
+SELECT v, w30, n FROM ccs.dbo.cc_heap ORDER BY v, w30;
+----
+a	a	11
+a	c	10
+b	b	101
+
+statement error
+UPDATE ccs.dbo.cc_heap SET n = 2 WHERE CASE WHEN n = 1 THEN v ELSE w30 END < u;
+----
+client
+
+statement error
+UPDATE ccs.dbo.cc_heap SET n = 2 WHERE CASE WHEN n = 1 THEN v ELSE u END = 'b';
 ----
 client
 
