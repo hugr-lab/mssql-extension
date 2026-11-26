@@ -243,6 +243,39 @@ AppendArm DirectArm(uint8_t type_id, uint32_t width) {
 	}
 }
 
+//! The kernel of a column staged on a binary arm (bounded, PLP or legacy LOB): the arms carry
+//! CHAR / VARCHAR / TEXT, VARBINARY / IMAGE and the CLR types alike, and the column says which.
+FinalizeKernel BinaryArmKernel(const tds::ColumnMetadata &column, const LogicalType &target_type) {
+	// Spec 093 T5: a geometry / geography UDT stages its bytes on the PLP binary
+	// arm and is decoded into WKB -- always into a GEOMETRY, into a BLOB unless
+	// geometry_as 'native' asks for the stored bytes.
+	if (column.IsSpatialUdt() &&
+		(target_type.id() == LogicalTypeId::GEOMETRY || column.geometry_as != tds::GeometryAs::Native)) {
+		return FinalizeKernel::Spatial;
+	}
+	// Spec 093 T4: a hierarchyid UDT stages its bytes on the PLP binary arm and is decoded to text; a
+	// user CLR type stays bytes.
+	if (column.IsHierarchyIdUdt()) {
+		return FinalizeKernel::HierarchyId;
+	}
+	// The binary arms carry VARBINARY / IMAGE as well; code_page is set on
+	// single-byte text only, and only when its catalog transcodes.
+	return column.code_page != nullptr ? FinalizeKernel::CodePage : FinalizeKernel::Binary;
+}
+
+//! The kernel of a column staged at a fixed width: three families share the staged-fixed
+//! framing; the TDS type says which.
+FinalizeKernel FixedArmKernel(const tds::ColumnMetadata &column) {
+	if (column.type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER) {
+		return FinalizeKernel::Uuid;
+	}
+	if (column.type_id == tds::TDS_TYPE_MONEY || column.type_id == tds::TDS_TYPE_SMALLMONEY ||
+		column.type_id == tds::TDS_TYPE_MONEYN) {
+		return FinalizeKernel::Money;
+	}
+	return FinalizeKernel::Datetime;
+}
+
 //! Which kernel publishes the column, given the arm the walk will use.
 //!
 //! One switch in one place, so a new staging arm cannot be added without saying
@@ -276,36 +309,14 @@ FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &co
 	case AppendArm::P2StageBinary:
 	case AppendArm::PlpStageBinary:
 	case AppendArm::LobStageBinary:
-		// Spec 093 T5: a geometry / geography UDT stages its bytes on the PLP binary
-		// arm and is decoded into WKB -- always into a GEOMETRY, into a BLOB unless
-		// geometry_as 'native' asks for the stored bytes.
-		if (column.IsSpatialUdt() &&
-			(target_type.id() == LogicalTypeId::GEOMETRY || column.geometry_as != tds::GeometryAs::Native)) {
-			return FinalizeKernel::Spatial;
-		}
-		// Spec 093 T4: a hierarchyid UDT stages its bytes on the PLP binary arm and is decoded to text; a
-		// user CLR type stays bytes.
-		if (column.IsHierarchyIdUdt()) {
-			return FinalizeKernel::HierarchyId;
-		}
-		// The binary arms carry VARBINARY / IMAGE as well; code_page is set on
-		// single-byte text only, and only when its catalog transcodes.
-		return column.code_page != nullptr ? FinalizeKernel::CodePage : FinalizeKernel::Binary;
+		return BinaryArmKernel(column, target_type);
 	case AppendArm::P1StageDecimal:
 		return FinalizeKernel::Decimal;
 	case AppendArm::P4StageVariant:
 		return FinalizeKernel::Variant;
 	case AppendArm::P1StageFixed:
 	case AppendArm::RawStageFixed:
-		// Three families share the staged-fixed framing; the TDS type says which.
-		if (column.type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER) {
-			return FinalizeKernel::Uuid;
-		}
-		if (column.type_id == tds::TDS_TYPE_MONEY || column.type_id == tds::TDS_TYPE_SMALLMONEY ||
-			column.type_id == tds::TDS_TYPE_MONEYN) {
-			return FinalizeKernel::Money;
-		}
-		return FinalizeKernel::Datetime;
+		return FixedArmKernel(column);
 	}
 	return FinalizeKernel::None;
 }
