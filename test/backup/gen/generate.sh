@@ -37,7 +37,8 @@
 # tail_window.sql, changes made at known points of a backup's copy -- the backup written into a FIFO this
 # script reads, held in its first data pass and inside its second (review of #591: tail_window_full, compared
 # with its RESTORE as compare_rows.sh's FUZZY; committed under test/data/backup/tail_window, made by its
-# generate.sh);
+# generate.sh, which sets TAIL_WINDOW_REQUIRED=1: a backup that missed its window fails, where the lane's
+# only says so);
 # bench_changes.sql, a benchmark of 10 million rows and differentials of 10k / 110k / 1.1M changes and an index rebuild
 # (PR 4c-3: bench_full, bench_diff_*, each also compressed as *_x; not run by default). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
@@ -415,6 +416,17 @@ for fixture in ${FIXTURES}; do
 			done
 			return 1
 		}
+		tw_lsn() {	# the log's end, in RESTORE HEADERONLY's numeric form (VLF * 10^15 + offset * 10^5 + slot):
+			# sys.dm_db_log_stats takes no lock (fn_dblog in the database waited out its lock timeout, 1222,
+			# beside the open transactions)
+			scalar "SELECT CAST(CONVERT(bigint, CONVERT(varbinary(4), LEFT(l, 8), 2)) AS decimal(25, 0))
+				* 1000000000000000 + CONVERT(bigint, CONVERT(varbinary(4), SUBSTRING(l, 10, 8), 2)) * 100000
+				+ CONVERT(int, CONVERT(varbinary(2), RIGHT(l, 4), 2))
+				FROM (SELECT log_end_lsn AS l FROM sys.dm_db_log_stats(DB_ID(N'bak_tail_window'))) d"
+		}
+		lsn_le() {	# $1 <= $2, two LSNs of that form (digits: past bash's integers)
+			[ "${#1}" -lt "${#2}" ] || { [ "${#1}" -eq "${#2}" ] && [[ ! "$1" > "$2" ]]; }
+		}
 		tw_wait "SELECT CASE WHEN (SELECT COUNT(*) FROM bak_tail_window.dbo.rollback_insert WITH (READUNCOMMITTED)) = 150
 			AND (SELECT COUNT(*) FROM bak_tail_window.dbo.rollback_delete WITH (READUNCOMMITTED)) = 50
 			AND (SELECT n FROM tw_control.dbo.opened WITH (READUNCOMMITTED)) = 1
@@ -432,8 +444,11 @@ for fixture in ${FIXTURES}; do
 		# 256 KiB or more past the second pass's start (tail_window_pass1.sql at the first, pass2.sql at the
 		# second). SQL Server 2017 copies the data once (its pages changed meanwhile are in the log only: the
 		# lane's 2017 backups): one hold, 512 KiB before its log -- inside the filler, the file's last extents,
-		# past the other tables' pages -- for pass2.sql, the first hold's script skipped. The server waits on
-		# its writes meanwhile (two 64 KiB buffers and the pipe's: it reads up to about 192 KiB ahead).
+		# past the other tables' pages -- for pass2.sql, the first hold's script skipped. The holds place the
+		# scripts only roughly: the server reads ahead of its writes by more than its buffers (measured on 2019,
+		# #631's lane: a run held at 512 KiB had already copied the filler, megabytes on; another started its
+		# second pass after every change of pass2.sql). So what the copy caught is checked below, from the
+		# server's own answer, not assumed; the lane compares the set as fuzzy whatever it caught.
 		if [ -n "${pass2}" ]; then
 			hold1=8
 			hold2=$(((pass2 + 65535) / 65536 + 4 - hold1))
@@ -467,9 +482,11 @@ for fixture in ${FIXTURES}; do
 			[ "$(scalar "${backing_up}" || true)" = 1 ] || tw_failed "backup was not running at hold ${hold}"
 			echo ">> tail_window: held $(scalar "SELECT CAST(percent_complete AS int) FROM sys.dm_exec_requests WHERE command LIKE 'BACKUP%'")% into the backup"
 			if [ "${hold}" = 2 ]; then
+				tw_before_pass2="$(tw_lsn)" || tw_failed "could not read the log's end before pass2.sql"
 				run_sql tail_window_pass2.sql
 			elif [ -n "${first_script}" ]; then
 				run_sql "${first_script}"
+				tw_after_pass1="$(tw_lsn)" || tw_failed "could not read the log's end after ${first_script}"
 			fi
 			docker exec "${CONTAINER}" touch "${DIR}/tw.g${hold}"
 		done
@@ -478,6 +495,34 @@ for fixture in ${FIXTURES}; do
 			tw_failed "backup said more than its FIFO's size error"
 		fi
 		sql -Q "RESTORE VERIFYONLY FROM DISK = '${DIR}/tail_window_full.bak'" >/dev/null || tw_failed "backup does not verify"
+		# The window, from the server's answer: a full backup checkpoints where its last data pass starts
+		# (CheckpointLSN; the second pass's, measured: #631's lane). pass2.sql's changes must come after it,
+		# else they are in the copy and its tables read consistent; with a second pass, pass1.sql's before it,
+		# else the filler is stale. A necessary condition only (where the last pass was when pass2.sql ran is
+		# not in the header): the committed set's scenarios are checked by mssql_backup_tail_window.test.
+		# Whether log_end_lsn is the last record's LSN or the next one's, a checkpoint equal to it was written
+		# after every record before it, so it holds on both sides: a miss is CheckpointLSN > the log's end
+		# before pass2.sql, or < the log's end after pass1.sql.
+		tw_checkpoint="$(sql -Q "SET NOCOUNT ON; RESTORE HEADERONLY FROM DISK = '${DIR}/tail_window_full.bak'" -s '|' -W |
+			awk -F'|' 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "CheckpointLSN") c = i } NR == 3 && c { print $c }')"
+		for v in "${tw_checkpoint}" "${tw_before_pass2}" ${first_script:+"${tw_after_pass1}"}; do
+			[[ "${v}" =~ ^[0-9]+$ ]] || tw_failed "an LSN of its window check is not a number: '${v}'"
+		done
+		tw_missed=""
+		if ! lsn_le "${tw_checkpoint}" "${tw_before_pass2}"; then
+			tw_missed="its last data pass checkpointed at ${tw_checkpoint}, after pass2.sql began (${tw_before_pass2})"
+		elif [ -n "${first_script}" ] && ! lsn_le "${tw_after_pass1}" "${tw_checkpoint}"; then
+			tw_missed="its second data pass checkpointed at ${tw_checkpoint}, before pass1.sql ended (${tw_after_pass1})"
+		fi
+		if [ -z "${tw_missed}" ]; then
+			echo ">> tail_window: the window held (CheckpointLSN ${tw_checkpoint})"
+		elif [ "${TAIL_WINDOW_REQUIRED:-0}" = 1 ]; then
+			tw_failed "missed its window: ${tw_missed}; generate it again"
+		else
+			echo ">> tail_window: WARNING: missed its window: ${tw_missed} (compared as fuzzy all the same)"
+			# On the run's summary too: a lane that misses it every time no longer exercises the dirty cases.
+			[ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::tail_window missed its window: ${tw_missed}"
+		fi
 		sql -Q "UPDATE tw_control.dbo.phase SET n = 3" >/dev/null
 		tw_wait "SELECT CASE WHEN (SELECT COUNT(*) FROM bak_tail_window.dbo.parallel_open WITH (READUNCOMMITTED)) = 0 THEN 1 ELSE 0 END" ||
 			tw_failed "open transaction did not end 60 s after it was asked to"

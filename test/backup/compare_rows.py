@@ -27,9 +27,9 @@ there: a fuzzy backup may hold a row twice (a split torn by the backup, E3§3), 
 _mssql_lob are not. A table differs too when a column's system type is not the restored one's (an ALTER
 COLUMN in the tail: the values may compare equal across the two types). --flagged-equal names the tables
 (schema.table, comma-separated) that may read 'stale' while equal: the status's known price (an index
-rebuilt in the tail frees its old extents as a TRUNCATE does, backup_fuzzy). --must-differ names the tables
-that must differ from the restored ones: a fixture whose changes are made at known points of the copy
-(tail_window), so a run that missed its window fails rather than passing on equal tables.
+rebuilt in the tail frees its old extents as a TRUNCATE does, backup_fuzzy). Which tables differ is the
+server's timing (how far its copy was when a change was made: tail_window's holds do not decide it), so no
+table is required to differ: the scenarios are checked on the committed tail_window backup.
 """
 import argparse
 import json
@@ -170,9 +170,6 @@ def main():
                         help="a backup taken under load: check each table's fuzzy_status against whether it differs")
     parser.add_argument("--flagged-equal", default="",
                         help="with --fuzzy: tables (schema.table, comma-separated) that may read 'stale' while equal")
-    parser.add_argument("--must-differ", default="",
-                        help="with --fuzzy: tables (schema.table, comma-separated) that must differ from the restored ones; "
-                             "one not compared (absent, not decodable) is a failure")
     args = parser.parse_args()
     try:
         session = Session(args.duckdb, os.environ["MSSQL_ROWS_PORT"], os.environ["MSSQL_ROWS_PASSWORD"],
@@ -202,8 +199,6 @@ def main():
 
     compared, failures, rows_total = 0, [], 0
     statuses = {}
-    must_differ = [n for n in args.must_differ.split(",") if n]
-    checked = set()  # the --must-differ tables compared (review of #619: one absent or skipped passed silently)
     for t in tables:
         schema, table = t["schema_name"], t["table_name"]
         where = f"{schema}.{table}"
@@ -257,10 +252,6 @@ def main():
                 differs = differs or retyped
                 verdict = "ok"
                 allowed = where in [n for n in args.flagged_equal.split(",") if n]
-                checked.add(where)
-                if not differs and where in must_differ:
-                    failures.append(f"{where}: equal to the restored table, where its changes were made after its "
-                                    "copy: the fixture missed its window")
                 if differs and fuzzy == "consistent":
                     verdict = "MISSED"
                     failures.append(f"{where}: differs from the restored table ({only_backup} rows only in the backup, "
@@ -414,9 +405,6 @@ def main():
         else:
             print(f"  ok   {where}: equal, _mssql_rid included; each of {len(described)} columns alone too")
 
-    for name in must_differ if args.fuzzy else []:
-        if name not in checked:
-            failures.append(f"{name}: named by --must-differ but not compared (not in the listing, or not decodable)")
     if args.fuzzy:
         print(f"compare_rows: fuzzy_status of the tables compared: "
               f"{', '.join(f'{n} {k}' for k, n in sorted(statuses.items())) or 'none'}")

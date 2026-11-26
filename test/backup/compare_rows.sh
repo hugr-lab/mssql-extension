@@ -154,13 +154,13 @@ fi
 # overlays.txt among them (FUZZY_OVERLAYS), restored -- RESTORE recovers them: the tail redone, its open
 # transactions undone -- and compared with --fuzzy: each table's fuzzy_status against whether it differs.
 # Every one asked for must be there.
-# tail_window (changes at known points of the copy, review of #591) among them. Per set (set=schema.table,...):
-# FUZZY_FLAGGED_EQUAL the tables that may read stale while equal (an index rebuilt in the tail),
-# FUZZY_MUST_DIFFER those that must differ (changed after their copy: a run that missed its window fails).
+# tail_window (changes made while its backup copies, review of #591) among them, checked the same way: what
+# the copy caught is the server's timing, so no table is required to differ (its scenarios are checked on the
+# committed test/data/backup/tail_window). Per set (set=schema.table,...): FUZZY_FLAGGED_EQUAL the tables that
+# may read stale while equal (an index rebuilt in the tail).
 FUZZY="${FUZZY-fuzzy_full fuzzy_xpress load_full load_xpress tail_window_full}"
 FUZZY_OVERLAYS="${FUZZY_OVERLAYS-fuzzy_over}"
 FUZZY_FLAGGED_EQUAL="${FUZZY_FLAGGED_EQUAL-tail_window_full=dbo.rebuilt}"
-FUZZY_MUST_DIFFER="${FUZZY_MUST_DIFFER-tail_window_full=dbo.stale_update,dbo.rollback_insert,dbo.rollback_delete,dbo.rollback_loaded,dbo.rollback_truncated,dbo.savepoint,dbo.parallel_open,dbo.open_truncated,dbo.open_grown,dbo.loaded,dbo.truncated,dbo.widened}"
 of_set() {	# $1 = set, $2 = a list of set=tables entries: the set's tables
 	printf '%s\n' $2 | awk -F= -v n="$1" '$1 == n { print $2 }'
 }
@@ -168,8 +168,7 @@ fuzzy_compare() {	# $1 = what, then compare_rows.py's arguments
 	local what="$1"
 	shift
 	if python3 -I "${HERE}/compare_rows.py" --duckdb "${DUCKDB}" --fuzzy \
-		--flagged-equal "$(of_set "${what}" "${FUZZY_FLAGGED_EQUAL}")" \
-		--must-differ "$(of_set "${what}" "${FUZZY_MUST_DIFFER}")" "$@"; then
+		--flagged-equal "$(of_set "${what}" "${FUZZY_FLAGGED_EQUAL}")" "$@"; then
 		compared=$((compared + 1))
 	else
 		echo "ERROR: ${what}: a fuzzy_status disagrees with the RESTORE" >&2
