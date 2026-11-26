@@ -943,6 +943,14 @@ std::string SqlTypeText(const std::string &type_name, const std::string &system_
 				   ? std::string()
 				   : SqlTypeText(system_type_name, system_type_name, system_type_id, max_length, precision, scale);
 	}
+	// Spec 093 T8d: a vector (varbinary underneath, utype 255) by its declaration, as SQL Server writes it --
+	// its dimensions from the length, its element type its scale (V4) -- so a changed vector(n) is a change.
+	std::string lower = type_name;
+	std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return std::tolower(ch); });
+	if (system_type_id == 165 && lower == "vector" && max_length > 8 && scale <= 1) {
+		const int element = scale == 1 ? 2 : 4;
+		return "vector(" + std::to_string((max_length - 8) / element) + (scale == 1 ? ", float16)" : ")");
+	}
 	if (system_type_name.empty() || type_name != system_type_name) {
 		return type_name;
 	}

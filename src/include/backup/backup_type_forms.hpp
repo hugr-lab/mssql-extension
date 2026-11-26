@@ -46,6 +46,18 @@ LogicalType ClrSystemTypeOf(const CatalogColumn &c, const TypeForms &forms);
 //! with the HierarchyId or Spatial kernel. IsClrSystemType(c) holds.
 void DescribeClrSystemType(const CatalogColumn &c, const TypeForms &forms, tds::ColumnMetadata &m);
 
+//! Whether `c` is a SQL Server 2025 `vector` (spec 093 T8d, D9): syscolpars has xtype 165 (varbinary)
+//! and utype 255, sysscalartypes' row of that utype named `vector` (measured V4). Its declaration may
+//! still be one no server writes: VectorDeclaration says.
+bool IsVectorColumn(const CatalogColumn &c);
+//! A vector column's dimensions, its element type its `scale` (0 float32, 1 float16) and its length
+//! 8 + n x element size (V4); 0, with `why`, for a declaration no vector(n) has.
+uint16_t VectorDeclaration(const CatalogColumn &c, std::string &why);
+//! `m` made the TDS path's column of `c`'s vector: a VECTORTYPE (0xF5) of the stored length and element
+//! type, UserType 255, so ResolveColumnOps finalizes its stored bytes -- the 0xF5 wire value's, V4 --
+//! with the Vector kernel. IsVectorColumn(c) holds and VectorDeclaration(c) answered n.
+void DescribeVector(const CatalogColumn &c, tds::ColumnMetadata &m);
+
 //! `m` made the TDS path's column of a sql_variant read from a record (spec 093 T8b): the Variant kernel's,
 //! its values in the form a record stores them (`variant_disk_form`: SplitDiskVariant), read as VARIANT
 //! as TYPE mssql reads them (T1).

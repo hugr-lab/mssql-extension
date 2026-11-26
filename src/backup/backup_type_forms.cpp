@@ -52,6 +52,41 @@ void DescribeSqlVariant(tds::ColumnMetadata &m) {
 	m.variant_disk_form = true;
 }
 
+bool IsVectorColumn(const CatalogColumn &c) {
+	return c.system_type_id == XTYPE_VARBINARY && c.user_type_id == static_cast<int32_t>(tds::VECTOR_USER_TYPE) &&
+		   StringUtil::Lower(c.type_name) == "vector";
+}
+
+// The most dimensions of a vector of `element_type`: its values fill at most 8000 - 8 bytes (1998 float32,
+// 3996 float16; measured on SQL Server 2025, #644).
+static int32_t MaxVectorDimensions(uint8_t element_type) {
+	return (8000 - tds::VECTOR_HEADER_BYTES) / tds::VectorElementBytes(element_type);
+}
+
+uint16_t VectorDeclaration(const CatalogColumn &c, std::string &why) {
+	if (c.scale != tds::VECTOR_ELEMENT_FLOAT32 && c.scale != tds::VECTOR_ELEMENT_FLOAT16) {
+		why = "a vector of element type " + std::to_string(c.scale) + ", which no vector has (0 float32, 1 float16)";
+		return 0;
+	}
+	const int32_t element = tds::VectorElementBytes(c.scale);
+	const int32_t values = static_cast<int32_t>(c.max_length) - tds::VECTOR_HEADER_BYTES;
+	const int32_t dimensions = values > 0 && values % element == 0 ? values / element : 0;
+	if (dimensions < 1 || dimensions > MaxVectorDimensions(c.scale)) {
+		why = "a vector declared " + std::to_string(c.max_length) + " bytes long, which no " +
+			  (c.scale == tds::VECTOR_ELEMENT_FLOAT16 ? "float16" : "float32") + " vector(1.." +
+			  std::to_string(MaxVectorDimensions(c.scale)) + ") is";
+		return 0;
+	}
+	return static_cast<uint16_t>(dimensions);
+}
+
+void DescribeVector(const CatalogColumn &c, tds::ColumnMetadata &m) {
+	m.type_id = tds::TDS_TYPE_VECTOR;
+	m.user_type = tds::VECTOR_USER_TYPE;
+	m.vector_element_type = c.scale;
+	m.max_length = static_cast<uint16_t>(c.max_length);
+}
+
 std::string GeometryAsGiven(const std::string &value, const char *source) {
 	ParseGeometryAs(value, source);
 	return value;

@@ -527,7 +527,7 @@ std::string RawByType(const CatalogColumn &c, const std::string &type) {
 	if (c.system_type_name.empty()) {
 		return type + " is a type the reader does not know";
 	}
-	if (c.system_type_name == "json" || c.system_type_name == "vector") {
+	if (c.system_type_name == "json") {
 		return type + " is converted later, with the TDS path's";
 	}
 	// Only a storage type the record decoder knows is converted: the kernels are keyed by the TDS id the
@@ -602,6 +602,17 @@ ColumnReading TypeReading(const CatalogColumn &c, const TypeForms &forms) {
 		r.note = "its stored bytes, not converted: " + why;
 		return r;
 	};
+	// Spec 093 T8d: a vector as TYPE mssql reads it, FLOAT[n], by T3's kernel over its stored bytes (the
+	// 0xF5 wire value's, V4: DescribeVector); a declaration no vector(n) has, its bytes.
+	if (IsVectorColumn(c)) {
+		std::string vector_why;
+		const uint16_t dimensions = VectorDeclaration(c, vector_why);
+		if (dimensions == 0) {
+			return raw(vector_why);
+		}
+		r.type = LogicalType::ARRAY(LogicalType::FLOAT, dimensions);
+		return r;
+	}
 	std::string why = RawByType(c, type);
 	if (why.empty()) {
 		why = RawByCodePage(c);

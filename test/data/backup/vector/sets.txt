@@ -1,0 +1,2 @@
+vector_full|vector_full.bak
+vector_diff|vector_diff.bak

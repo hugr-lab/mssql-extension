@@ -1,0 +1,4 @@
+LogicalName|PhysicalName|Type|FileGroupName|Size|MaxSize|FileId|CreateLSN|DropLSN|UniqueId|ReadOnlyLSN|ReadWriteLSN|BackupSizeInBytes|SourceBlockSize|FileGroupId|LogGroupGUID|DifferentialBaseLSN|DifferentialBaseGUID|IsReadOnly|IsPresent|TDEThumbprint|SnapshotUrl
+-----------|------------|----|-------------|----|-------|------|---------|-------|--------|-----------|------------|-----------------|---------------|-----------|------------|-------------------|--------------------|----------|---------|-------------|-----------
+bak_vector|/var/opt/mssql/data/bak_vector.mdf|D|PRIMARY|8388608|35184372080640|1|0|0|71793025-74B2-4931-BA71-D8E3D64ACAD0|0|0|5111808|4096|1|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL
+bak_vector_log|/var/opt/mssql/data/bak_vector_log.ldf|L|NULL|8388608|2199023255552|2|0|0|64B72493-CFD9-4902-87D7-9B899E897505|0|0|0|4096|0|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL

@@ -28,23 +28,17 @@ namespace {
 								static_cast<int>(dimensions), DescribeStatus(status));
 }
 
-//! One value into `elements` (the column's `dimensions` floats).
-void DecodeValue(const uint8_t *data, size_t size, const tds::ColumnMetadata &meta, uint16_t dimensions,
-				 float *elements, std::string &scratch) {
-	VectorStatus status;
+//! One value into `elements` (the column's `dimensions` floats): Ok, or why it is not one.
+VectorStatus DecodeValue(const uint8_t *data, size_t size, const tds::ColumnMetadata &meta, uint16_t dimensions,
+						 float *elements, std::string &scratch) {
 	if (meta.IsVectorWire()) {
-		status = CheckValue(data, size, dimensions, meta.vector_element_type);
+		const VectorStatus status = CheckValue(data, size, dimensions, meta.vector_element_type);
 		if (status == VectorStatus::Ok) {
 			WidenElements(data, dimensions, meta.vector_element_type, elements);
-			return;
 		}
-	} else {
-		status = ParseText(data, size, meta.type_id == tds::TDS_TYPE_NVARCHAR, dimensions, elements, scratch);
-		if (status == VectorStatus::Ok) {
-			return;
-		}
+		return status;
 	}
-	RefuseRead(meta, status, dimensions);
+	return ParseText(data, size, meta.type_id == tds::TDS_TYPE_NVARCHAR, dimensions, elements, scratch);
 }
 
 [[noreturn]] void RefuseWrite(const std::string &column, const std::string &why) {
@@ -66,8 +60,8 @@ LogicalType FloatArrayType(uint16_t dimensions) {
 	return LogicalType::ARRAY(LogicalType::FLOAT, static_cast<idx_t>(dimensions));
 }
 
-void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
-							Vector &out) {
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta, Vector &out,
+							VectorColumnNotes *notes) {
 	const auto dimensions = static_cast<uint16_t>(ArrayType::GetSize(out.GetType()));
 	float *elements = FlatVector::GetDataMutable<float>(ArrayVector::GetChildMutable(out));
 	const uint8_t *payload = st.buffer.data();
@@ -78,7 +72,20 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 			std::memset(row_elements, 0, static_cast<size_t>(dimensions) * sizeof(float));
 			continue;
 		}
-		DecodeValue(payload + st.offsets[row], st.lengths[row], meta, dimensions, row_elements, scratch);
+		const VectorStatus status =
+			DecodeValue(payload + st.offsets[row], st.lengths[row], meta, dimensions, row_elements, scratch);
+		if (status == VectorStatus::Ok) {
+			continue;
+		}
+		if (!notes) {
+			RefuseRead(meta, status, dimensions);
+		}
+		// Spec 093 T8d: a backup's value that is not one -- NULL, counted, its row read.
+		std::memset(row_elements, 0, static_cast<size_t>(dimensions) * sizeof(float));
+		FlatVector::SetNull(out, row, true);
+		if (notes->malformed++ == 0) {
+			notes->first_malformed = status;
+		}
 	}
 }
 
@@ -86,7 +93,11 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	const auto dimensions = static_cast<uint16_t>(ArrayType::GetSize(out.GetType()));
 	float *elements = FlatVector::GetDataMutable<float>(ArrayVector::GetChildMutable(out));
 	std::string scratch;
-	DecodeValue(bytes.data(), bytes.size(), meta, dimensions, elements + row * dimensions, scratch);
+	const VectorStatus status =
+		DecodeValue(bytes.data(), bytes.size(), meta, dimensions, elements + row * dimensions, scratch);
+	if (status != VectorStatus::Ok) {
+		RefuseRead(meta, status, dimensions);
+	}
 }
 
 std::string FormatDdlTypeName(const LogicalType &type) {

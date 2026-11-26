@@ -254,6 +254,13 @@ reserved bytes), then a copy (float32) or a widening loop (float16) into the arr
 parsed locale-free (DuckDB's fast_float), exact for float16, within one ulp for float32 (V2: 8 digits
 do not identify every float32), which a `WARNING` says once per column of a statement on a connection
 without the feature. A raw scan types VECTORTYPE as FLOAT[n] and the text as VARCHAR (no n on the wire).
+
+**In a backup** (spec 093 T8d). A vector is stored as `varbinary`, xtype 165 and utype 255, with its element
+type in `scale` and its length `8 + n × element size`. Its bytes are the VECTORTYPE value's (measured V4), so the
+same code reads them into FLOAT[n]. A value that is no vector of the column's declared shape (a damaged page)
+is NULL with one `WARNING` per column, where a connection's is an error. A declaration no vector has stays its
+stored bytes (BLOB).
+
 Filters on a vector run in DuckDB, it is never a key, and a pushed SELECT does not carry one in its
 result (its wire form follows the session).
 

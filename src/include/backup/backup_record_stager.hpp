@@ -24,6 +24,7 @@
 #include "backup/backup_type_forms.hpp"
 #include "codec/clr/hierarchyid_codec.hpp"
 #include "codec/clr/spatial_codec.hpp"
+#include "codec/sql_vector/vector_codec.hpp"
 #include "codec/staging/column_ops.hpp"
 #include "codec/staging/column_staging.hpp"
 #include "codec/variant/variant_codec.hpp"
@@ -186,13 +187,14 @@ public:
 	//! statement.
 	struct TypeNote {
 		std::string name;
-		std::string type;  // geometry / geography / hierarchyid / sql_variant
+		std::string type;  // geometry / geography / hierarchyid / sql_variant / vector
 		codec::spatial::SpatialColumnNotes spatial;
 		codec::hierarchyid::HierarchyIdColumnNotes hierarchyid;
 		codec::variant::VariantColumnNotes variant;
+		codec::sql_vector::VectorColumnNotes vector;
 		//! Values the column's kernel read as NULL, its rows read.
 		idx_t Unreadable() const {
-			return spatial.malformed + hierarchyid.malformed + variant.malformed;
+			return spatial.malformed + hierarchyid.malformed + variant.malformed + vector.malformed;
 		}
 	};
 	std::vector<TypeNote> TypeNotes() const;
@@ -214,6 +216,7 @@ private:
 		codec::spatial::SpatialColumnNotes spatial_notes;			   // the Spatial kernel's, across chunks
 		codec::hierarchyid::HierarchyIdColumnNotes hierarchyid_notes;  // the HierarchyId kernel's, across chunks
 		codec::variant::VariantColumnNotes variant_notes;			   // the Variant kernel's, across chunks
+		codec::sql_vector::VectorColumnNotes vector_notes;			   // the Vector kernel's, across chunks
 	};
 
 	//! The constructor's steps: a projected column resolved to its staging (its arm chosen by ArmOf and
@@ -234,7 +237,8 @@ private:
 		bool direct = false;	 // written straight into the vector as its bytes (a BLOB, a UTF-8 text)
 		bool stream = false;	 // decoded block by block straight into the vector (UTF-16, a code page)
 		uint64_t output = 0;	 // what a direct or streamed value allocates in the vector's heap
-		bool oversized = false;	 // a sql_variant longer than any: NULL and counted, its tree not read
+		bool oversized = false;	 // a sql_variant longer than any, a vector not its shape's length: NULL and
+								 // counted, its tree not read
 	};
 	void AppendOffRow(Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);
 	void AppendDirect(size_t column, Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);

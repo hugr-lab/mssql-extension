@@ -7,6 +7,7 @@
 #include "codec/sql_vector/vector_bytes.hpp"
 #include "codec/sql_vector/vector_codec.hpp"
 #include "codec/staging/column_ops.hpp"
+#include "codec/staging/column_staging.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/vector/array_vector.hpp"
@@ -353,6 +354,28 @@ void TestRead() {
 		  "a value of another shape refused naming the column, got '" + error + "'");
 	Check(!Throws([&] { DecodeFromTds(Ascii("[1,2]"), TextColumn(tds::TDS_TYPE_BIGVARCHAR), out, 0); }).empty(),
 		  "a text of two elements for FLOAT[3] refused");
+
+	// The batch path (spec 093 T8d): with no notes -- the server's own values -- a value of another shape is
+	// refused naming the column; with notes -- a backup's pages -- it is NULL and counted, the other rows read.
+	{
+		duckdb::mssql::codec::staging::ColumnStaging st;
+		st.Configure(duckdb::mssql::codec::staging::StagingKind::Var, 0);
+		st.AppendVar(f32.data(), static_cast<uint32_t>(f32.size()));
+		st.AppendVar(wrong.data(), static_cast<uint32_t>(wrong.size()));
+		st.AppendVar(f32.data(), static_cast<uint32_t>(f32.size()));
+		Vector refused(FloatArrayType(3), 3);
+		const auto batch_error = Throws([&] { DecodeChunkFromStaging(st, 3, WireColumn(3, 0), refused, nullptr); });
+		Check(batch_error.find("column \"v\"") != std::string::npos,
+			  "the batch path with no notes refuses a value of another shape, got '" + batch_error + "'");
+		Vector noted(FloatArrayType(3), 3);
+		VectorColumnNotes notes;
+		DecodeChunkFromStaging(st, 3, WireColumn(3, 0), noted, &notes);
+		const float *n = FlatVector::GetData<float>(ArrayVector::GetChild(noted));
+		Check(notes.malformed == 1 && notes.first_malformed != VectorStatus::Ok &&
+				  !FlatVector::Validity(noted).RowIsValid(1) && FlatVector::Validity(noted).RowIsValid(0) &&
+				  FlatVector::Validity(noted).RowIsValid(2) && n[0] == 1 && n[8] == 3,
+			  "the batch path with notes: that value NULL and counted, the others read");
+	}
 
 	// The staged path chooses the Vector kernel for both forms, and the text form only into FLOAT[n].
 	using namespace duckdb::mssql::codec::staging;
