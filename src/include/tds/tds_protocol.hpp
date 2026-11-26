@@ -278,6 +278,9 @@ private:
 
 	// Helper to find token in response
 	static const uint8_t *FindToken(const uint8_t *data, size_t length, TokenType token);
+
+	// ParseLoginResponse's token readers (tds_protocol.cpp)
+	struct LoginTokens;
 };
 
 }  // namespace tds
