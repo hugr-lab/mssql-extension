@@ -547,6 +547,43 @@ static std::string InSql(const LogicalType &type, const std::string &operand, co
 	return ExpressionVocabulary::Conjunction(terms, negated);
 }
 
+//! Issue #635: two string columns of different collations meeting in a comparison are the server's error
+//! 468 ("Cannot resolve the collation conflict"), so such a comparison stays with DuckDB. The operands are
+//! read through the no-op casts DuckDB puts over a column (ColumnInfoOf: MSSQL_VARCHAR(n) of two lengths, or
+//! nvarchar beside varchar, get one), in any order; a constant takes its peer's collation and is left out.
+//! An operand whose collation is not known here (a CASE, a staged MERGE's CTAS-typed #src column, declared
+//! COLLATE DATABASE_DEFAULT) does not refuse: only two known, different collations do, which is the 468.
+static bool StringOperandsShareCollation(const Expression &subject, const vector<const Expression *> &others,
+										 const ExpressionEncodeContext &ctx) {
+	if (subject.GetReturnType().id() != LogicalTypeId::VARCHAR) {
+		return true;
+	}
+	const std::string *collation = nullptr;
+	auto agrees = [&](const Expression &operand) {
+		if (operand.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+			return true;
+		}
+		const MSSQLColumnInfo *column = ColumnInfoOf(operand, ctx);
+		if (!column || column->collation_name.empty()) {
+			return true;
+		}
+		if (!collation) {
+			collation = &column->collation_name;
+			return true;
+		}
+		return *collation == column->collation_name;
+	};
+	if (!agrees(subject)) {
+		return false;
+	}
+	for (auto other : others) {
+		if (!agrees(*other)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 //! Issue #426: a column DuckDB does not read exactly is compared on the server
 //! only as itself against constants -- each made to decide as DuckDB's
 //! comparison of the read value does -- and a DATETIME column also against
@@ -1207,6 +1244,10 @@ ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundFunc
 							   left.GetReturnType().ToString().c_str());
 		return {"", false};
 	}
+	if (!StringOperandsShareCollation(left, {&right}, ctx)) {  // #635
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: string columns of two collations (468)");
+		return {"", false};
+	}
 
 	// #426: a time(7) / datetimeoffset(7) column against a constant, as DuckDB
 	// compares the value it reads.
@@ -1346,6 +1387,10 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN over a lossy-read column and another value");
 			return {"", false};
 		}
+		if (!StringOperandsShareCollation(*children[0], list, ctx)) {  // #635
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN over string columns of two collations (468)");
+			return {"", false};
+		}
 		auto operand_ctx = ctx.child();
 		auto operand_result = EncodeValueExpression(*children[0], operand_ctx);
 		const auto truncated = ColumnRefInfo(*children[0], ctx);
@@ -1463,6 +1508,13 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 	const auto &between_type = BoundBetweenExpression::Input(expr).GetReturnType();
 	if (ServerComparisonOf(between_type) == ServerComparison::EqualityOnly) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: the server orders the input otherwise");
+		return {"", false};
+	}
+	if (!StringOperandsShareCollation(
+			BoundBetweenExpression::Input(expr),
+			{&BoundBetweenExpression::LowerBound(expr), &BoundBetweenExpression::UpperBound(expr)},
+			ctx)) {	 // #635
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: string columns of two collations (468)");
 		return {"", false};
 	}
 

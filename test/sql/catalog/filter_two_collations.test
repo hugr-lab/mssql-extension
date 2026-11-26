@@ -1,0 +1,132 @@
+# name: test/sql/catalog/filter_two_collations.test
+# description: A filter comparing two string columns of different collations stays in DuckDB (#635)
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Two collations meeting in a comparison are SQL Server's error 468 ("Cannot resolve the collation conflict").
+# The catalog scan pushed such a filter, so a SELECT, an UPDATE and a DELETE filtered by it failed. Two strings
+# that are not constants are now compared on the server only as columns of one collation, as the
+# remote-pushdown writer already required; the rest runs in DuckDB. Found by #633's property tests.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cc (TYPE mssql);
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ccs (TYPE mssql, remote_pushdown false);
+
+statement ok
+SELECT mssql_exec('cc', 'DROP TABLE IF EXISTS dbo.cc_two; CREATE TABLE dbo.cc_two (k int NOT NULL PRIMARY KEY,
+	u varchar(20) COLLATE Latin1_General_100_BIN2_UTF8 NULL, v varchar(20) COLLATE Latin1_General_100_BIN2 NULL,
+	w varchar(20) COLLATE Latin1_General_100_BIN2 NULL, n int NOT NULL);
+	INSERT INTO dbo.cc_two VALUES (1, ''a'', ''b'', ''b'', 0), (2, ''b'', ''a'', ''c'', 0), (3, ''a'', ''a'', ''a'', 0)');
+
+foreach db cc ccs
+
+# Two collations: left to DuckDB.
+query I
+SELECT k FROM ${db}.dbo.cc_two WHERE v < u ORDER BY k;
+----
+2
+
+query I
+SELECT k FROM ${db}.dbo.cc_two WHERE v = u ORDER BY k;
+----
+3
+
+query I
+SELECT k FROM ${db}.dbo.cc_two WHERE v IN (u, 'z') ORDER BY k;
+----
+3
+
+query I
+SELECT k FROM ${db}.dbo.cc_two WHERE v BETWEEN u AND 'b' ORDER BY k;
+----
+1
+3
+
+# One collation, and a column against a constant: still pushed, the same answers.
+query I
+SELECT k FROM ${db}.dbo.cc_two WHERE v < w ORDER BY k;
+----
+2
+
+query I
+SELECT k FROM ${db}.dbo.cc_two WHERE u < 'b' ORDER BY k;
+----
+1
+3
+
+endloop
+
+# The DML of the reproducer: filtered by the two-collation comparison.
+statement ok
+UPDATE cc.dbo.cc_two SET n = 1 WHERE v < u;
+
+query II
+SELECT k, n FROM cc.dbo.cc_two ORDER BY k;
+----
+1	0
+2	1
+3	0
+
+statement ok
+DELETE FROM cc.dbo.cc_two WHERE v < u;
+
+query I
+SELECT k FROM cc.dbo.cc_two ORDER BY k;
+----
+1
+3
+
+# nvarchar columns of one length and two collations: no cast over either, the collations themselves compared.
+statement ok
+SELECT mssql_exec('cc', 'DROP TABLE IF EXISTS dbo.cc_nv; CREATE TABLE dbo.cc_nv (k int NOT NULL PRIMARY KEY,
+	a nvarchar(20) COLLATE Latin1_General_100_BIN2 NULL, b nvarchar(20) COLLATE Latin1_General_100_CI_AS NULL);
+	INSERT INTO dbo.cc_nv VALUES (1, N''x'', N''y''), (2, N''y'', N''x''), (3, N''x'', N''x'')');
+
+query I
+SELECT k FROM ccs.dbo.cc_nv WHERE a = b ORDER BY k;
+----
+3
+
+# A table with no unique key: its UPDATE / DELETE needs every filter on the server (rung 3), so a statement
+# that runs proves its filter was pushed. One collation at two lengths (a no-op cast over one side) and a
+# constant on the left are pushed; two collations are refused by name, where they failed with 468.
+statement ok
+SELECT mssql_exec('cc', 'DROP TABLE IF EXISTS dbo.cc_heap; CREATE TABLE dbo.cc_heap (
+	u varchar(20) COLLATE Latin1_General_100_BIN2_UTF8 NULL, v varchar(20) COLLATE Latin1_General_100_BIN2 NULL,
+	w30 varchar(30) COLLATE Latin1_General_100_BIN2 NULL, n int NOT NULL);
+	INSERT INTO dbo.cc_heap VALUES (''a'', ''b'', ''b'', 0), (''b'', ''a'', ''c'', 0), (''a'', ''a'', ''a'', 0)');
+
+statement ok
+UPDATE ccs.dbo.cc_heap SET n = 1 WHERE v = w30;
+
+statement ok
+UPDATE ccs.dbo.cc_heap SET n = n + 10 WHERE 'b' > v OR n = 5;
+
+query TTI
+SELECT v, w30, n FROM ccs.dbo.cc_heap ORDER BY v, w30;
+----
+a	a	11
+a	c	10
+b	b	1
+
+statement error
+UPDATE ccs.dbo.cc_heap SET n = 2 WHERE v < u;
+----
+client
+
+statement ok
+SELECT mssql_exec('cc', 'DROP TABLE dbo.cc_two; DROP TABLE dbo.cc_nv; DROP TABLE dbo.cc_heap');
+
+statement ok
+DETACH cc;
+
+statement ok
+DETACH ccs;
