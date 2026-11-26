@@ -6,6 +6,9 @@
 
 #include "codec/staging/column_ops.hpp"
 
+#include <algorithm>
+#include <initializer_list>
+
 #include "tds/encoding/type_converter.hpp"
 #include "tds/tds_types.hpp"
 
@@ -240,6 +243,39 @@ AppendArm DirectArm(uint8_t type_id, uint32_t width) {
 	}
 }
 
+//! The kernel of a column staged on a binary arm (bounded, PLP or legacy LOB): the arms carry
+//! CHAR / VARCHAR / TEXT, VARBINARY / IMAGE and the CLR types alike, and the column says which.
+FinalizeKernel BinaryArmKernel(const tds::ColumnMetadata &column, const LogicalType &target_type) {
+	// Spec 093 T5: a geometry / geography UDT stages its bytes on the PLP binary
+	// arm and is decoded into WKB -- always into a GEOMETRY, into a BLOB unless
+	// geometry_as 'native' asks for the stored bytes.
+	if (column.IsSpatialUdt() &&
+		(target_type.id() == LogicalTypeId::GEOMETRY || column.geometry_as != tds::GeometryAs::Native)) {
+		return FinalizeKernel::Spatial;
+	}
+	// Spec 093 T4: a hierarchyid UDT stages its bytes on the PLP binary arm and is decoded to text; a
+	// user CLR type stays bytes.
+	if (column.IsHierarchyIdUdt()) {
+		return FinalizeKernel::HierarchyId;
+	}
+	// The binary arms carry VARBINARY / IMAGE as well; code_page is set on
+	// single-byte text only, and only when its catalog transcodes.
+	return column.code_page != nullptr ? FinalizeKernel::CodePage : FinalizeKernel::Binary;
+}
+
+//! The kernel of a column staged at a fixed width: three families share the staged-fixed
+//! framing; the TDS type says which.
+FinalizeKernel FixedArmKernel(const tds::ColumnMetadata &column) {
+	if (column.type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER) {
+		return FinalizeKernel::Uuid;
+	}
+	if (column.type_id == tds::TDS_TYPE_MONEY || column.type_id == tds::TDS_TYPE_SMALLMONEY ||
+		column.type_id == tds::TDS_TYPE_MONEYN) {
+		return FinalizeKernel::Money;
+	}
+	return FinalizeKernel::Datetime;
+}
+
 //! Which kernel publishes the column, given the arm the walk will use.
 //!
 //! One switch in one place, so a new staging arm cannot be added without saying
@@ -273,81 +309,85 @@ FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &co
 	case AppendArm::P2StageBinary:
 	case AppendArm::PlpStageBinary:
 	case AppendArm::LobStageBinary:
-		// Spec 093 T5: a geometry / geography UDT stages its bytes on the PLP binary
-		// arm and is decoded into WKB -- always into a GEOMETRY, into a BLOB unless
-		// geometry_as 'native' asks for the stored bytes.
-		if (column.IsSpatialUdt() &&
-			(target_type.id() == LogicalTypeId::GEOMETRY || column.geometry_as != tds::GeometryAs::Native)) {
-			return FinalizeKernel::Spatial;
-		}
-		// Spec 093 T4: a hierarchyid UDT stages its bytes on the PLP binary arm and is decoded to text; a
-		// user CLR type stays bytes.
-		if (column.IsHierarchyIdUdt()) {
-			return FinalizeKernel::HierarchyId;
-		}
-		// The binary arms carry VARBINARY / IMAGE as well; code_page is set on
-		// single-byte text only, and only when its catalog transcodes.
-		return column.code_page != nullptr ? FinalizeKernel::CodePage : FinalizeKernel::Binary;
+		return BinaryArmKernel(column, target_type);
 	case AppendArm::P1StageDecimal:
 		return FinalizeKernel::Decimal;
 	case AppendArm::P4StageVariant:
 		return FinalizeKernel::Variant;
 	case AppendArm::P1StageFixed:
 	case AppendArm::RawStageFixed:
-		// Three families share the staged-fixed framing; the TDS type says which.
-		if (column.type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER) {
-			return FinalizeKernel::Uuid;
-		}
-		if (column.type_id == tds::TDS_TYPE_MONEY || column.type_id == tds::TDS_TYPE_SMALLMONEY ||
-			column.type_id == tds::TDS_TYPE_MONEYN) {
-			return FinalizeKernel::Money;
-		}
-		return FinalizeKernel::Datetime;
+		return FixedArmKernel(column);
 	}
 	return FinalizeKernel::None;
 }
 
-//! The arm/kind/stride half of the resolution; ResolveColumnOps adds the kernel.
-ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &target_type) {
-	ColumnOps ops;
+//! Is `type_id` one of `types`? A list rather than a switch, so the families below read as the lists
+//! they are.
+bool IsOneOf(uint8_t type_id, std::initializer_list<uint8_t> types) {
+	return std::find(types.begin(), types.end(), type_id) != types.end();
+}
 
-	// Spec 093 T3 (D4): a vector column into FLOAT[n], in whichever form the session streams it --
-	// VECTORTYPE, framed as a bounded varbinary, or the JSON text, a varchar(max) / nvarchar(max) PLP --
-	// so before the divergence test, which would take the text form for a VARCHAR and render it.
-	if (target_type.id() == LogicalTypeId::ARRAY && ArrayType::GetChildType(target_type).id() == LogicalTypeId::FLOAT &&
-		(column.IsVectorWire() || (column.IsVectorText() && column.IsPLPType()))) {
-		ops.kind = StagingKind::Var;
-		ops.vector_kernel = true;
-		if (column.IsVectorWire()) {
-			ops.arm = AppendArm::P2StageBinary;
-			ops.max_value_bytes = column.max_length;
-		} else {
-			ops.arm = AppendArm::PlpStageBinary;
-		}
-		return ops;
+//! The column claimed as a variable-length one staged on `arm`. `max_value_bytes` is the most one value
+//! costs in the staging buffer, 0 for a type with no bound (PLP / MAX, the legacy LOBs).
+bool ClaimVar(ColumnOps &ops, AppendArm arm, uint32_t max_value_bytes = 0) {
+	ops.kind = StagingKind::Var;
+	ops.arm = arm;
+	ops.max_value_bytes = max_value_bytes;
+	return true;
+}
+
+//! The column claimed as a fixed-width one staged on `arm`, `stride` bytes a value.
+bool ClaimFixed(ColumnOps &ops, AppendArm arm, uint32_t stride) {
+	ops.kind = StagingKind::Fixed;
+	ops.arm = arm;
+	ops.stride = stride;
+	return true;
+}
+
+// ResolveAppend asks the steps below in order, and the first that claims the column decides its arm:
+// each returns true with `ops` filled, or false with `ops` untouched. The order is part of the answer
+// (the vector step before the divergence test, the fixed-width steps before the variable ones).
+
+//! Spec 093 T3 (D4): a vector column into FLOAT[n], in whichever form the session streams it --
+//! VECTORTYPE, framed as a bounded varbinary, or the JSON text, a varchar(max) / nvarchar(max) PLP --
+//! so before the divergence test, which would take the text form for a VARCHAR and render it.
+bool StageVector(const tds::ColumnMetadata &column, const LogicalType &target_type, ColumnOps &ops) {
+	if (target_type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(target_type).id() != LogicalTypeId::FLOAT) {
+		return false;
 	}
+	if (column.IsVectorWire()) {
+		ops.vector_kernel = true;
+		return ClaimVar(ops, AppendArm::P2StageBinary, column.max_length);
+	}
+	if (column.IsVectorText() && column.IsPLPType()) {
+		ops.vector_kernel = true;
+		return ClaimVar(ops, AppendArm::PlpStageBinary);
+	}
+	return false;
+}
 
-	// Does the wire type agree with the vector being written into? A view with an
-	// inline CAST can make the catalog promise VARCHAR while TDS delivers
-	// something else (issue #89); the scan can also CAST VARCHAR to NVARCHAR
-	// itself (spec 026).
-	//
-	// Resolving that once, here, keeps the check off the per-cell path. The
-	// column still stages by its WIRE framing — the bytes are the bytes — and
-	// only the finalize kernel changes, to one that renders each value as text.
-	// What it must NOT do is write wire bytes straight into a vector of a
-	// different physical type, so a divergent column never takes a direct write.
+//! Does the wire type disagree with the vector being written into? A view with an
+//! inline CAST can make the catalog promise VARCHAR while TDS delivers
+//! something else (issue #89); the scan can also CAST VARCHAR to NVARCHAR
+//! itself (spec 026).
+//!
+//! Resolving that once, here, keeps the check off the per-cell path. The
+//! column still stages by its WIRE framing — the bytes are the bytes — and
+//! only the finalize kernel changes, to one that renders each value as text.
+//! What it must NOT do is write wire bytes straight into a vector of a
+//! different physical type, so a divergent column never takes a direct write.
+//!
+//! False when the wire type is one GetDuckDBType does not know: such a type cannot
+//! be framed either. Initialize() already threw on it while building the column
+//! list, so this is unreachable from the stream — but it must not silently pick a
+//! framing.
+bool WireTypeDiverges(const tds::ColumnMetadata &column, const LogicalType &target_type, bool &diverges) {
 	LogicalType wire_type;
 	try {
 		wire_type = tds::encoding::TypeConverter::GetDuckDBType(column);
 	} catch (const std::exception &) {
-		// A type GetDuckDBType does not know cannot be framed either. Initialize()
-		// already threw on it while building the column list, so this is
-		// unreachable from the stream — but it must not silently pick a framing.
-		ops.arm = AppendArm::Unsupported;
-		return ops;
+		return false;
 	}
-
 	// Spec 060: two VARCHARs never diverge from each other, whatever annotations
 	// they carry. LogicalType equality compares the aux info too, so a catalog
 	// column reporting the declared nvarchar(n) bound would otherwise "diverge"
@@ -356,178 +396,197 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 	// the wire sends — is unaffected: VARCHAR against INTEGER still differs by id.
 	const bool same_type = wire_type == target_type ||
 						   (wire_type.id() == LogicalTypeId::VARCHAR && target_type.id() == LogicalTypeId::VARCHAR);
-	const bool diverges = !same_type && !IsSupportedRetarget(column, target_type);
-	ops.needs_value_fallback = diverges;
+	diverges = !same_type && !IsSupportedRetarget(column, target_type);
+	return true;
+}
 
-	const uint32_t width = FixedWireWidth(column);
-	// A direct write stores wire bytes into the output vector at `width` stride,
-	// so the wire width MUST equal the width DuckDB reserves per slot. The two
-	// come from different files (FixedWireWidth here, GetDuckDBType in the type
-	// converter) and today they agree for every direct type — TINYINT/BIT are one
-	// byte in both, REAL/FLOAT four, and so on. Proving it here, once per column,
-	// means a future remapping degrades to staging instead of writing 1 byte into
-	// a 2-byte slot.
-	if (!diverges && width > 0 && IsDirectWritable(column, width) &&
-		width == GetTypeIdSize(target_type.InternalType())) {
-		ops.kind = DirectKindForWidth(width);
-		ops.arm = DirectArm(column.type_id, width);
-		ops.stride = width;
-		ops.direct_write = true;
-		return ops;
+//! A direct write stores wire bytes into the output vector at `width` stride,
+//! so the wire width MUST equal the width DuckDB reserves per slot. The two
+//! come from different files (FixedWireWidth here, GetDuckDBType in the type
+//! converter) and today they agree for every direct type — TINYINT/BIT are one
+//! byte in both, REAL/FLOAT four, and so on. Proving it here, once per column,
+//! means a future remapping degrades to staging instead of writing 1 byte into
+//! a 2-byte slot. Never for a diverging column.
+bool StageDirect(const tds::ColumnMetadata &column, const LogicalType &target_type, uint32_t width, ColumnOps &ops) {
+	if (ops.needs_value_fallback || width == 0 || !IsDirectWritable(column, width) ||
+		width != GetTypeIdSize(target_type.InternalType())) {
+		return false;
 	}
-	if ((column.type_id == tds::TDS_TYPE_DECIMAL || column.type_id == tds::TDS_TYPE_NUMERIC) && column.precision > 0 &&
-		column.precision <= 38) {
-		ops.kind = StagingKind::Fixed;
-		ops.arm = AppendArm::P1StageDecimal;
-		ops.stride = DecimalWireWidth(column.precision);
-		return ops;
-	}
+	ops.kind = DirectKindForWidth(width);
+	ops.arm = DirectArm(column.type_id, width);
+	ops.stride = width;
+	ops.direct_write = true;
+	return true;
+}
 
-	// Fixed-width families with a batch kernel: UNIQUEIDENTIFIER and the temporal
-	// types. DATETIME and SMALLDATETIME arrive bare; everything else carries the
-	// one-byte length prefix.
+//! DECIMAL / NUMERIC of a precision the kernel takes: a sign byte and a mantissa sized by the precision.
+bool StageDecimal(const tds::ColumnMetadata &column, ColumnOps &ops) {
+	if (!IsOneOf(column.type_id, {tds::TDS_TYPE_DECIMAL, tds::TDS_TYPE_NUMERIC}) || column.precision == 0 ||
+		column.precision > 38) {
+		return false;
+	}
+	return ClaimFixed(ops, AppendArm::P1StageDecimal, DecimalWireWidth(column.precision));
+}
+
+//! Fixed-width families with a batch kernel: UNIQUEIDENTIFIER, the temporal types
+//! and money. DATETIME, SMALLDATETIME, MONEY and SMALLMONEY arrive bare; everything
+//! else carries the one-byte length prefix.
+bool StageFixedFamily(const tds::ColumnMetadata &column, uint32_t width, ColumnOps &ops) {
 	const uint32_t fixed_width = width > 0 ? width : TemporalWireWidth(column);
-	if (fixed_width > 0 && IsStageableFixedWidth(fixed_width)) {
-		const bool staged_family =
-			column.type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER || column.type_id == tds::TDS_TYPE_DATE ||
-			column.type_id == tds::TDS_TYPE_TIME || column.type_id == tds::TDS_TYPE_DATETIME2 ||
-			column.type_id == tds::TDS_TYPE_DATETIMEOFFSET || column.type_id == tds::TDS_TYPE_DATETIME ||
-			column.type_id == tds::TDS_TYPE_SMALLDATETIME || column.type_id == tds::TDS_TYPE_DATETIMEN ||
-			column.type_id == tds::TDS_TYPE_MONEY || column.type_id == tds::TDS_TYPE_SMALLMONEY ||
-			column.type_id == tds::TDS_TYPE_MONEYN;
-		if (staged_family) {
-			const bool bare = column.type_id == tds::TDS_TYPE_DATETIME ||
-							  column.type_id == tds::TDS_TYPE_SMALLDATETIME || column.type_id == tds::TDS_TYPE_MONEY ||
-							  column.type_id == tds::TDS_TYPE_SMALLMONEY;
-			ops.kind = StagingKind::Fixed;
-			ops.arm = bare ? AppendArm::RawStageFixed : AppendArm::P1StageFixed;
-			ops.stride = fixed_width;
-			return ops;
-		}
+	if (fixed_width == 0 || !IsStageableFixedWidth(fixed_width)) {
+		return false;
 	}
-	if (width > 0) {
-		// A DIVERGING column reaches here (without a divergence a fixed-width type
-		// is either direct-written or claimed by the staged-fixed families above),
-		// and so does any *N variant whose declared width is not a width the staged
-		// append can copy. It still needs an arm — leaving it Unsupported made the
-		// issue-#89 fallback throw for exactly the integer, float and BIT types it
-		// exists to rescue, instead of rendering them as text the way the pre-055
-		// path did. The Text kernel reads Fixed staging positionally, so Fixed is
-		// the right shape.
-		//
-		// The width has to be one AppendStagedFixed actually has a case for.
-		// Without this test it took `stride` on trust and fell into the switch's
-		// default, which copies SEVENTEEN bytes: a DATETIMEN declaring 52 then had
-		// 17 bytes read out of a one-byte NULL value. No conforming server sends
-		// such a width, so there is nothing to rescue — say so instead, and let the
-		// error name the column when a value arrives.
-		if (!IsStageableFixedWidth(width)) {
-			ops.arm = AppendArm::Unsupported;
-			return ops;
-		}
-		ops.kind = StagingKind::Fixed;
-		ops.stride = width;
-		ops.arm = HasOneBytePrefix(column.type_id) ? AppendArm::P1StageFixed : AppendArm::RawStageFixed;
-		return ops;
+	const bool bare = IsOneOf(column.type_id, {tds::TDS_TYPE_DATETIME, tds::TDS_TYPE_SMALLDATETIME, tds::TDS_TYPE_MONEY,
+											   tds::TDS_TYPE_SMALLMONEY});
+	const bool prefixed =
+		IsOneOf(column.type_id,
+				{tds::TDS_TYPE_UNIQUEIDENTIFIER, tds::TDS_TYPE_DATE, tds::TDS_TYPE_TIME, tds::TDS_TYPE_DATETIME2,
+				 tds::TDS_TYPE_DATETIMEOFFSET, tds::TDS_TYPE_DATETIMEN, tds::TDS_TYPE_MONEYN});
+	if (!bare && !prefixed) {
+		return false;
 	}
+	return ClaimFixed(ops, bare ? AppendArm::RawStageFixed : AppendArm::P1StageFixed, fixed_width);
+}
 
-	const bool binary = column.type_id == tds::TDS_TYPE_BIGVARBINARY || column.type_id == tds::TDS_TYPE_BIGBINARY;
-
-	// SQL_VARIANT (spec 093 T1): the envelope as it arrives, at most SQL_VARIANT_MAX_BYTES a value.
-	if (column.type_id == tds::TDS_TYPE_SQL_VARIANT && target_type.id() == LogicalTypeId::VARIANT) {
-		ops.kind = StagingKind::Var;
-		ops.arm = AppendArm::P4StageVariant;
-		ops.max_value_bytes = tds::SQL_VARIANT_MAX_BYTES;
-		return ops;
+//! Any other fixed-width column, which is always claimed: staged, or Unsupported.
+//!
+//! A DIVERGING column reaches here (without a divergence a fixed-width type
+//! is either direct-written or claimed by the staged-fixed families above),
+//! and so does any *N variant whose declared width is not a width the staged
+//! append can copy. It still needs an arm — leaving it Unsupported made the
+//! issue-#89 fallback throw for exactly the integer, float and BIT types it
+//! exists to rescue, instead of rendering them as text the way the pre-055
+//! path did. The Text kernel reads Fixed staging positionally, so Fixed is
+//! the right shape.
+//!
+//! The width has to be one AppendStagedFixed actually has a case for.
+//! Without this test it took `stride` on trust and fell into the switch's
+//! default, which copies SEVENTEEN bytes: a DATETIMEN declaring 52 then had
+//! 17 bytes read out of a one-byte NULL value. No conforming server sends
+//! such a width, so there is nothing to rescue — say so instead, and let the
+//! error name the column when a value arrives.
+bool StageOtherFixed(const tds::ColumnMetadata &column, uint32_t width, ColumnOps &ops) {
+	if (width == 0) {
+		return false;
 	}
-
-	// A CLR type, always PLP (spec 093 T4, T5): hierarchyid into VARCHAR (its text), a user CLR type into
-	// BLOB (its bytes), geometry / geography into a GEOMETRY (the WKB) or a BLOB (the WKB, or the stored
-	// bytes under geometry_as 'native'). All stage the assembled bytes; ResolveKernel picks the kernel.
-	if ((column.IsHierarchyIdUdt() && target_type.id() == LogicalTypeId::VARCHAR) ||
-		(column.IsUserClrUdt() && target_type.id() == LogicalTypeId::BLOB) ||
-		(column.IsSpatialUdt() &&
-		 (target_type.id() == LogicalTypeId::GEOMETRY || target_type.id() == LogicalTypeId::BLOB))) {
-		ops.kind = StagingKind::Var;
-		ops.arm = AppendArm::PlpStageBinary;
-		return ops;
+	if (!IsStageableFixedWidth(width)) {
+		ops.arm = AppendArm::Unsupported;
+		return true;
 	}
+	return ClaimFixed(ops, HasOneBytePrefix(column.type_id) ? AppendArm::P1StageFixed : AppendArm::RawStageFixed,
+					  width);
+}
 
-	// The legacy LOBs. A catalog scan casts them server-side and never produces
-	// them (spec 055 D9), but raw mssql_scan has no metadata to cast from — so
-	// they are decoded natively too rather than left as the one shape the
-	// extension cannot read.
+//! SQL_VARIANT (spec 093 T1): the envelope as it arrives, at most SQL_VARIANT_MAX_BYTES a value.
+bool StageVariant(const tds::ColumnMetadata &column, const LogicalType &target_type, ColumnOps &ops) {
+	if (column.type_id != tds::TDS_TYPE_SQL_VARIANT || target_type.id() != LogicalTypeId::VARIANT) {
+		return false;
+	}
+	return ClaimVar(ops, AppendArm::P4StageVariant, tds::SQL_VARIANT_MAX_BYTES);
+}
+
+//! A CLR type, always PLP (spec 093 T4, T5): hierarchyid into VARCHAR (its text), a user CLR type into
+//! BLOB (its bytes), geometry / geography into a GEOMETRY (the WKB) or a BLOB (the WKB, or the stored
+//! bytes under geometry_as 'native'). All stage the assembled bytes; ResolveKernel picks the kernel.
+bool StageClr(const tds::ColumnMetadata &column, const LogicalType &target_type, ColumnOps &ops) {
+	const auto target = target_type.id();
+	const bool hierarchyid = column.IsHierarchyIdUdt() && target == LogicalTypeId::VARCHAR;
+	const bool user_type = column.IsUserClrUdt() && target == LogicalTypeId::BLOB;
+	const bool spatial = column.IsSpatialUdt() && (target == LogicalTypeId::GEOMETRY || target == LogicalTypeId::BLOB);
+	if (!hierarchyid && !user_type && !spatial) {
+		return false;
+	}
+	return ClaimVar(ops, AppendArm::PlpStageBinary);
+}
+
+//! The legacy LOBs. A catalog scan casts them server-side and never produces
+//! them (spec 055 D9), but raw mssql_scan has no metadata to cast from — so
+//! they are decoded natively too rather than left as the one shape the
+//! extension cannot read. TEXT is single-byte like CHAR/VARCHAR: same bytes,
+//! same kernels as IMAGE's.
+bool StageLegacyLob(const tds::ColumnMetadata &column, ColumnOps &ops) {
 	if (column.type_id == tds::TDS_TYPE_NTEXT) {
-		ops.kind = StagingKind::Var;
-		ops.arm = AppendArm::LobStageString;
-		return ops;
+		return ClaimVar(ops, AppendArm::LobStageString);
 	}
-	if (column.type_id == tds::TDS_TYPE_TEXT || column.type_id == tds::TDS_TYPE_IMAGE) {
-		// TEXT is single-byte like CHAR/VARCHAR: same bytes, same kernels.
-		ops.kind = StagingKind::Var;
-		ops.arm = AppendArm::LobStageBinary;
-		return ops;
+	if (IsOneOf(column.type_id, {tds::TDS_TYPE_TEXT, tds::TDS_TYPE_IMAGE})) {
+		return ClaimVar(ops, AppendArm::LobStageBinary);
 	}
+	return false;
+}
 
-	// UTF-16 string columns take the batch decode (D5), MAX forms included: the
-	// chunk list is assembled incrementally into the same staged layout.
-	//
-	// NCHAR is included: its trailing-space trim moves to the OUTPUT, where it is
-	// equally correct on invalid UTF-16. The kernel derives that from the TDS
-	// type itself, so the rule lives with the family that applies it.
-	const bool utf16_string = column.type_id == tds::TDS_TYPE_NVARCHAR || column.type_id == tds::TDS_TYPE_NCHAR ||
-							  column.type_id == tds::TDS_TYPE_XML;
-	if (utf16_string && column.IsPLPType()) {
+//! UTF-16 string columns take the batch decode (D5), MAX forms included: the
+//! chunk list is assembled incrementally into the same staged layout.
+//!
+//! NCHAR is included: its trailing-space trim moves to the OUTPUT, where it is
+//! equally correct on invalid UTF-16. The kernel derives that from the TDS
+//! type itself, so the rule lives with the family that applies it.
+bool StageUtf16(const tds::ColumnMetadata &column, ColumnOps &ops) {
+	if (!IsOneOf(column.type_id, {tds::TDS_TYPE_NVARCHAR, tds::TDS_TYPE_NCHAR, tds::TDS_TYPE_XML})) {
+		return false;
+	}
+	if (column.IsPLPType()) {
 		// Same staged layout and the same finalize kernel as the bounded form;
 		// only the framing differs, because the value arrives as a chunk list.
-		ops.kind = StagingKind::Var;
-		ops.arm = AppendArm::PlpStageString;
-		return ops;
+		return ClaimVar(ops, AppendArm::PlpStageString);
 	}
-	if (utf16_string && !column.IsPLPType() && column.max_length > 0) {
-		ops.kind = StagingKind::Var;
-		ops.arm = AppendArm::P2StageString;
-		// +2 for the U+0000 the batch decode splits on: it is staged with the
-		// value and is part of what one value COSTS in the buffer. Without it a
-		// full chunk of maximum-length values overruns the "provable worst case"
-		// by exactly two bytes per row, so the column both grows and keeps
-		// claiming it cannot — which is what the D10 grow counter reported.
-		ops.max_value_bytes = static_cast<uint32_t>(column.max_length) + 2;
-		return ops;
+	if (column.max_length == 0) {
+		return false;
 	}
+	// +2 for the U+0000 the batch decode splits on: it is staged with the
+	// value and is part of what one value COSTS in the buffer. Without it a
+	// full chunk of maximum-length values overruns the "provable worst case"
+	// by exactly two bytes per row, so the column both grows and keeps
+	// claiming it cannot — which is what the D10 grow counter reported.
+	return ClaimVar(ops, AppendArm::P2StageString, static_cast<uint32_t>(column.max_length) + 2);
+}
 
-	// Single-byte CHAR/VARCHAR: staged as they are, back to back with no delimiter,
-	// like VARBINARY. ResolveKernel decides what publishes them: the code-page
-	// kernel (spec 092), or one allocation and one copy of the bytes.
-	const bool single_byte_char = column.type_id == tds::TDS_TYPE_BIGCHAR || column.type_id == tds::TDS_TYPE_BIGVARCHAR;
-	if ((single_byte_char || binary) && column.IsPLPType()) {
-		// VARCHAR(MAX) and VARBINARY(MAX): raw bytes either way, so the same
-		// kernel as their bounded forms.
-		ops.kind = StagingKind::Var;
-		ops.arm = AppendArm::PlpStageBinary;
-		return ops;
+//! Single-byte CHAR/VARCHAR and BINARY/VARBINARY: staged as they are, back to back
+//! with no delimiter. ResolveKernel decides what publishes a CHAR/VARCHAR: the
+//! code-page kernel (spec 092), or one allocation and one copy of the bytes, as for
+//! VARBINARY, which has no conversion at all. The MAX forms are raw bytes either
+//! way, so the same kernel as their bounded forms.
+bool StageBytes(const tds::ColumnMetadata &column, ColumnOps &ops) {
+	if (!IsOneOf(column.type_id, {tds::TDS_TYPE_BIGCHAR, tds::TDS_TYPE_BIGVARCHAR, tds::TDS_TYPE_BIGVARBINARY,
+								  tds::TDS_TYPE_BIGBINARY})) {
+		return false;
 	}
-	if (single_byte_char && !column.IsPLPType() && column.max_length > 0) {
-		ops.kind = StagingKind::Var;
-		ops.arm = AppendArm::P2StageBinary;
-		ops.max_value_bytes = static_cast<uint32_t>(column.max_length);
-		return ops;
+	if (column.IsPLPType()) {
+		return ClaimVar(ops, AppendArm::PlpStageBinary);
 	}
+	if (column.max_length == 0) {
+		return false;
+	}
+	return ClaimVar(ops, AppendArm::P2StageBinary, static_cast<uint32_t>(column.max_length));
+}
 
-	// VARBINARY: no conversion at all, so the batch path is one allocation and
-	// one copy per column instead of one of each per value.
-	if (binary && !column.IsPLPType() && column.max_length > 0) {
-		ops.kind = StagingKind::Var;
-		ops.arm = AppendArm::P2StageBinary;
-		ops.max_value_bytes = static_cast<uint32_t>(column.max_length);
+//! A column of fixed wire width (`width`, 0 for a decimal or a temporal type, which have their own).
+bool StageFixedWidth(const tds::ColumnMetadata &column, const LogicalType &target_type, ColumnOps &ops) {
+	const uint32_t width = FixedWireWidth(column);
+	return StageDirect(column, target_type, width, ops) || StageDecimal(column, ops) ||
+		   StageFixedFamily(column, width, ops) || StageOtherFixed(column, width, ops);
+}
+
+//! A column whose values vary in length.
+bool StageVariableWidth(const tds::ColumnMetadata &column, const LogicalType &target_type, ColumnOps &ops) {
+	return StageVariant(column, target_type, ops) || StageClr(column, target_type, ops) ||
+		   StageLegacyLob(column, ops) || StageUtf16(column, ops) || StageBytes(column, ops);
+}
+
+//! The arm/kind/stride half of the resolution; ResolveColumnOps adds the kernel.
+ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &target_type) {
+	ColumnOps ops;	// Unsupported until a step claims the column
+	if (StageVector(column, target_type, ops)) {
 		return ops;
 	}
-
-	// Nothing above claimed it. The types that reach here are the legacy LOBs
-	// (TEXT / NTEXT / IMAGE) when they arrive without the catalog's server-side
-	// CAST, plus UDT and a SQL_VARIANT not read as a VARIANT — none of which the shipped row reader can
-	// decode either. Say so instead of inventing a framing.
-	ops.arm = AppendArm::Unsupported;
+	if (!WireTypeDiverges(column, target_type, ops.needs_value_fallback)) {
+		return ops;
+	}
+	// Nothing claiming it leaves it Unsupported. The types that end there are the
+	// legacy LOBs (TEXT / NTEXT / IMAGE) when they arrive without the catalog's
+	// server-side CAST, plus UDT and a SQL_VARIANT not read as a VARIANT — none of
+	// which the shipped row reader can decode either. Say so instead of inventing a
+	// framing.
+	(void)(StageFixedWidth(column, target_type, ops) || StageVariableWidth(column, target_type, ops));
 	return ops;
 }
 
