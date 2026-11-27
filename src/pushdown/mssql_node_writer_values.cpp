@@ -162,6 +162,14 @@ bool NodeWriter::BindConstant(const Operand &peer, Operand &constant, bool arith
 		// varchar(20) column), a literal is nvarchar(4000). DuckDB keeps the
 		// column's type. So it must fit the column's own declaration, and a
 		// literal says it (measured, both).
+		//
+		// A computed string -- another COALESCE / CASE -- has no declaration to
+		// fit, and none to read: `'12' - COALESCE(name, 'x')` reaches here from
+		// WriteArithmetic, before DuckDB's binder has refused the statement, and
+		// took the process down on the null column (issue #662).
+		if (!peer.column) {
+			return Veto("a string constant beside the computed string " + peer_name);
+		}
 		const std::string own =
 			ExpressionVocabulary::DeclarationForColumn(*peer.column, Value(""), LogicalType::VARCHAR);
 		if (own.empty() || ExpressionVocabulary::DeclarationForColumn(*peer.column, value, value.type()) != own) {
