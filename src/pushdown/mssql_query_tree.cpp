@@ -124,140 +124,162 @@ static void VisitTableRef(TableRef &ref, const NestedNodeVisitor &on_node, const
 	}
 }
 
-void VisitNode(QueryNode &node, const NestedNodeVisitor &on_node, const BaseTableVisitor &on_table) {
+static void VisitOptionalExpression(unique_ptr<ParsedExpression> &expr, const NestedNodeVisitor &on_node) {
+	if (expr) {
+		VisitExpression(*expr, on_node);
+	}
+}
+
+static void VisitExpressions(vector<unique_ptr<ParsedExpression>> &exprs, const NestedNodeVisitor &on_node) {
+	for (auto &expr : exprs) {
+		VisitExpression(*expr, on_node);
+	}
+}
+
+static void VisitOptionalTableRef(unique_ptr<TableRef> &ref, const NestedNodeVisitor &on_node,
+								  const BaseTableVisitor &on_table) {
+	if (ref) {
+		VisitTableRef(*ref, on_node, on_table);
+	}
+}
+
+// A SET's condition and its values: an UPDATE's, and a MERGE action's
+// UPDATE SET.
+static void VisitUpdateSetInfo(unique_ptr<UpdateSetInfo> &set_info, const NestedNodeVisitor &on_node) {
+	if (!set_info) {
+		return;
+	}
+	VisitOptionalExpression(set_info->condition, on_node);
+	VisitExpressions(set_info->expressions, on_node);
+}
+
+static void VisitCommonTableExpressions(QueryNode &node, const NestedNodeVisitor &on_node) {
 	for (auto &cte : node.cte_map.map) {
 		if (cte.second->query_node) {
 			on_node(cte.second->query_node);
 		}
-		for (auto &key : cte.second->key_targets) {
-			VisitExpression(*key, on_node);
+		VisitExpressions(cte.second->key_targets, on_node);
+	}
+}
+
+static void VisitSetOperationParts(SetOperationNode &setop, const NestedNodeVisitor &on_node) {
+	for (auto &child : setop.children) {
+		on_node(child);
+	}
+}
+
+static void VisitSelectParts(SelectNode &select, const NestedNodeVisitor &on_node, const BaseTableVisitor &on_table) {
+	VisitOptionalTableRef(select.from_table, on_node, on_table);
+	VisitExpressions(select.select_list, on_node);
+	VisitExpressions(select.groups.group_expressions, on_node);
+	VisitOptionalExpression(select.where_clause, on_node);
+	VisitOptionalExpression(select.having, on_node);
+	VisitOptionalExpression(select.qualify, on_node);
+}
+
+// Spec 080 D1: a pushed UPDATE's tables -- its target, its FROM's, a
+// subquery expression's -- are resolved like a SELECT's.
+static void VisitUpdateParts(UpdateQueryNode &update, const NestedNodeVisitor &on_node,
+							 const BaseTableVisitor &on_table) {
+	VisitOptionalTableRef(update.table, on_node, on_table);
+	VisitOptionalTableRef(update.from_table, on_node, on_table);
+	VisitUpdateSetInfo(update.set_info, on_node);
+	VisitExpressions(update.returning_list, on_node);
+}
+
+// Spec 080 PR 3d: an INSERT's SELECT is its nested node; the target is a
+// name (qualified_name), resolved by the catalog on its own.
+static void VisitInsertParts(InsertQueryNode &insert, const NestedNodeVisitor &on_node) {
+	if (insert.select_statement && insert.select_statement->node) {
+		on_node(insert.select_statement->node);
+	}
+	VisitExpressions(insert.returning_list, on_node);
+}
+
+static void VisitDeleteParts(DeleteQueryNode &del, const NestedNodeVisitor &on_node, const BaseTableVisitor &on_table) {
+	VisitOptionalTableRef(del.table, on_node, on_table);
+	for (auto &ref : del.using_clauses) {
+		VisitTableRef(*ref, on_node, on_table);
+	}
+	VisitOptionalExpression(del.condition, on_node);
+	VisitExpressions(del.returning_list, on_node);
+}
+
+// One WHEN clause of a MERGE: its AND condition, an UPDATE's SET, an INSERT's
+// values.
+static void VisitMergeAction(MergeIntoAction &action, const NestedNodeVisitor &on_node) {
+	VisitOptionalExpression(action.condition, on_node);
+	VisitUpdateSetInfo(action.update_info, on_node);
+	VisitExpressions(action.expressions, on_node);
+}
+
+// Spec 080 PR 4a: a pushed MERGE's tables -- its target, its source
+// (a table, a join, a derived table) -- and every expression of its ON
+// and its actions.
+static void VisitMergeParts(MergeQueryNode &merge, const NestedNodeVisitor &on_node, const BaseTableVisitor &on_table) {
+	VisitOptionalTableRef(merge.target, on_node, on_table);
+	VisitOptionalTableRef(merge.source, on_node, on_table);
+	VisitOptionalExpression(merge.join_condition, on_node);
+	for (auto &entry : merge.actions) {
+		for (auto &action : entry.second) {
+			VisitMergeAction(*action, on_node);
 		}
 	}
+	VisitExpressions(merge.returning_list, on_node);
+}
+
+// The expressions of an ORDER BY, a LIMIT / OFFSET or a DISTINCT ON; any
+// other modifier holds none.
+static void VisitModifier(ResultModifier &modifier, const NestedNodeVisitor &on_node) {
+	switch (modifier.type) {
+	case ResultModifierType::ORDER_MODIFIER:
+		for (auto &order : modifier.Cast<OrderModifier>().orders) {
+			VisitExpression(*order.expression, on_node);
+		}
+		break;
+	case ResultModifierType::LIMIT_MODIFIER: {
+		auto &limit = modifier.Cast<LimitModifier>();
+		VisitOptionalExpression(limit.limit, on_node);
+		VisitOptionalExpression(limit.offset, on_node);
+		break;
+	}
+	case ResultModifierType::DISTINCT_MODIFIER:
+		VisitExpressions(modifier.Cast<DistinctModifier>().distinct_on_targets, on_node);
+		break;
+	default:
+		break;
+	}
+}
+
+void VisitNode(QueryNode &node, const NestedNodeVisitor &on_node, const BaseTableVisitor &on_table) {
+	VisitCommonTableExpressions(node, on_node);
 	// A RECURSIVE_CTE_NODE is not walked: the writer refuses it, so it is
-	// never pushed nor handed back with parts (checked live).
-	if (node.type == QueryNodeType::SET_OPERATION_NODE) {
-		for (auto &child : node.Cast<SetOperationNode>().children) {
-			on_node(child);
-		}
-	} else if (node.type == QueryNodeType::SELECT_NODE) {
-		auto &select = node.Cast<SelectNode>();
-		if (select.from_table) {
-			VisitTableRef(*select.from_table, on_node, on_table);
-		}
-		for (auto &item : select.select_list) {
-			VisitExpression(*item, on_node);
-		}
-		for (auto &key : select.groups.group_expressions) {
-			VisitExpression(*key, on_node);
-		}
-		for (auto *clause : {&select.where_clause, &select.having, &select.qualify}) {
-			if (*clause) {
-				VisitExpression(**clause, on_node);
-			}
-		}
-	} else if (node.type == QueryNodeType::UPDATE_QUERY_NODE) {
-		// Spec 080 D1: a pushed UPDATE's tables -- its target, its FROM's, a
-		// subquery expression's -- are resolved like a SELECT's.
-		auto &update = node.Cast<UpdateQueryNode>();
-		for (auto *ref : {&update.table, &update.from_table}) {
-			if (*ref) {
-				VisitTableRef(**ref, on_node, on_table);
-			}
-		}
-		if (update.set_info) {
-			if (update.set_info->condition) {
-				VisitExpression(*update.set_info->condition, on_node);
-			}
-			for (auto &value : update.set_info->expressions) {
-				VisitExpression(*value, on_node);
-			}
-		}
-		for (auto &item : update.returning_list) {
-			VisitExpression(*item, on_node);
-		}
-	} else if (node.type == QueryNodeType::INSERT_QUERY_NODE) {
-		// Spec 080 PR 3d: an INSERT's SELECT is its nested node; the target is a
-		// name (qualified_name), resolved by the catalog on its own.
-		auto &insert = node.Cast<InsertQueryNode>();
-		if (insert.select_statement && insert.select_statement->node) {
-			on_node(insert.select_statement->node);
-		}
-		for (auto &item : insert.returning_list) {
-			VisitExpression(*item, on_node);
-		}
-	} else if (node.type == QueryNodeType::DELETE_QUERY_NODE) {
-		auto &del = node.Cast<DeleteQueryNode>();
-		if (del.table) {
-			VisitTableRef(*del.table, on_node, on_table);
-		}
-		for (auto &ref : del.using_clauses) {
-			VisitTableRef(*ref, on_node, on_table);
-		}
-		if (del.condition) {
-			VisitExpression(*del.condition, on_node);
-		}
-		for (auto &item : del.returning_list) {
-			VisitExpression(*item, on_node);
-		}
-	} else if (node.type == QueryNodeType::MERGE_QUERY_NODE) {
-		// Spec 080 PR 4a: a pushed MERGE's tables -- its target, its source
-		// (a table, a join, a derived table) -- and every expression of its ON
-		// and its actions.
-		auto &merge = node.Cast<MergeQueryNode>();
-		for (auto *ref : {&merge.target, &merge.source}) {
-			if (*ref) {
-				VisitTableRef(**ref, on_node, on_table);
-			}
-		}
-		if (merge.join_condition) {
-			VisitExpression(*merge.join_condition, on_node);
-		}
-		for (auto &entry : merge.actions) {
-			for (auto &action : entry.second) {
-				if (action->condition) {
-					VisitExpression(*action->condition, on_node);
-				}
-				if (action->update_info) {
-					if (action->update_info->condition) {
-						VisitExpression(*action->update_info->condition, on_node);
-					}
-					for (auto &value : action->update_info->expressions) {
-						VisitExpression(*value, on_node);
-					}
-				}
-				for (auto &value : action->expressions) {
-					VisitExpression(*value, on_node);
-				}
-			}
-		}
-		for (auto &item : merge.returning_list) {
-			VisitExpression(*item, on_node);
-		}
+	// never pushed nor handed back with parts (checked live). Nor is any other
+	// type with no case here.
+	switch (node.type) {
+	case QueryNodeType::SET_OPERATION_NODE:
+		VisitSetOperationParts(node.Cast<SetOperationNode>(), on_node);
+		break;
+	case QueryNodeType::SELECT_NODE:
+		VisitSelectParts(node.Cast<SelectNode>(), on_node, on_table);
+		break;
+	case QueryNodeType::UPDATE_QUERY_NODE:
+		VisitUpdateParts(node.Cast<UpdateQueryNode>(), on_node, on_table);
+		break;
+	case QueryNodeType::INSERT_QUERY_NODE:
+		VisitInsertParts(node.Cast<InsertQueryNode>(), on_node);
+		break;
+	case QueryNodeType::DELETE_QUERY_NODE:
+		VisitDeleteParts(node.Cast<DeleteQueryNode>(), on_node, on_table);
+		break;
+	case QueryNodeType::MERGE_QUERY_NODE:
+		VisitMergeParts(node.Cast<MergeQueryNode>(), on_node, on_table);
+		break;
+	default:
+		break;
 	}
 	for (auto &modifier : node.modifiers) {
-		switch (modifier->type) {
-		case ResultModifierType::ORDER_MODIFIER:
-			for (auto &order : modifier->Cast<OrderModifier>().orders) {
-				VisitExpression(*order.expression, on_node);
-			}
-			break;
-		case ResultModifierType::LIMIT_MODIFIER: {
-			auto &limit = modifier->Cast<LimitModifier>();
-			for (auto *count : {&limit.limit, &limit.offset}) {
-				if (*count) {
-					VisitExpression(**count, on_node);
-				}
-			}
-			break;
-		}
-		case ResultModifierType::DISTINCT_MODIFIER:
-			for (auto &target : modifier->Cast<DistinctModifier>().distinct_on_targets) {
-				VisitExpression(*target, on_node);
-			}
-			break;
-		default:
-			break;
-		}
+		VisitModifier(*modifier, on_node);
 	}
 }
 
