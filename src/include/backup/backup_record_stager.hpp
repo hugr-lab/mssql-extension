@@ -24,6 +24,7 @@
 #include "backup/backup_type_forms.hpp"
 #include "codec/clr/hierarchyid_codec.hpp"
 #include "codec/clr/spatial_codec.hpp"
+#include "codec/json/json_codec.hpp"
 #include "codec/sql_vector/vector_codec.hpp"
 #include "codec/staging/column_ops.hpp"
 #include "codec/staging/column_staging.hpp"
@@ -196,9 +197,11 @@ public:
 		//! mssql's D8 counts them; their rows read. Not Unreadable(): the value is sound, its type is the
 		//! choice (datetime2_7_as 'timestamp' reads it).
 		idx_t out_of_range = 0;
+		//! Spec 086 PR 6: json values whose stored bytes are no json document, read as NULL.
+		codec::json::JsonColumnNotes json;
 		//! Values the column's kernel read as NULL, its rows read.
 		idx_t Unreadable() const {
-			return spatial.malformed + hierarchyid.malformed + variant.malformed + vector.malformed;
+			return spatial.malformed + hierarchyid.malformed + variant.malformed + vector.malformed + json.malformed;
 		}
 	};
 	std::vector<TypeNote> TypeNotes() const;
@@ -224,6 +227,10 @@ private:
 		//! A datetime2 read as TIMESTAMP_NS (spec 093 T8c): its values that did not fit, across chunks.
 		bool counts_out_of_range = false;
 		idx_t out_of_range = 0;
+		//! Spec 086 PR 6: a json column (its stored binary form, decoded by the codec's Json kernel), and the
+		//! kernel's notes across chunks.
+		bool json = false;
+		codec::json::JsonColumnNotes json_notes;
 	};
 
 	//! The constructor's steps: a projected column resolved to its staging (its arm chosen by ArmOf and

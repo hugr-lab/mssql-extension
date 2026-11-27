@@ -792,6 +792,12 @@ bool TakeOption(const string &name, const std::string &key, const Value &value, 
 			value.IsNull() ? std::string()
 						   : mssql::backup::GeometryAsGiven(
 								 value.ToString(), ("ATTACH " + name + " (TYPE mssql_backup): geometry_as").c_str());
+	} else if (key == "json_as") {
+		// Spec 086 PR 6: 'json' (the default) or 'variant', checked now.
+		o.form_options.json_as =
+			value.IsNull() ? std::string()
+						   : mssql::backup::JsonAsGiven(value.ToString(),
+														("ATTACH " + name + " (TYPE mssql_backup): json_as").c_str());
 	} else if (key == "datetime2_7_as") {
 		// Spec 093 T8c: TYPE mssql's option, checked now; unset, the setting at ATTACH (below).
 		o.form_options.datetime2_7_as =
@@ -823,7 +829,7 @@ BackupAttachOptions ReadAttachOptions(const string &name, AttachOptions &options
 		throw InvalidInputException(
 			"ATTACH %s (TYPE mssql_backup): '%s' is not an option of an attached backup "
 			"(schema_filter, table_filter, schema_exclude, table_exclude, diff, history, snapshot_version, "
-			"snapshot_time, fuzzy, geometry_as, datetime2_7_as)",
+			"snapshot_time, fuzzy, geometry_as, datetime2_7_as, json_as)",
 			name, option.first);
 	}
 	return o;

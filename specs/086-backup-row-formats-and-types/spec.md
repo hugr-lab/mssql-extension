@@ -428,6 +428,20 @@ counts of the two later runs were not recorded.
 17. E9 spike — 5–10 d (timeboxed, not in the total)
 18. Decoder, `fuzz_backup_json`, fixtures — 3 d (only after the gate)
 
+*PR 6 as built (2026-11-27).* E9's gate passed (432 / 432); E9b (`measured/E9-json.md`) measured the rest
+-- a node's flag byte its spare slots, the key and decimal forms, the defaulted column, and (J1) that the
+server sends the text over the wire, JSONSUPPORT granted or not, so the binary form is a backup's alone.
+The decoder is a codec family (owner: the type's code belongs in `src/codec`), `src/codec/json/`:
+`json_binary` (DuckDB-free: `JsonDocument`, `RenderJsonText`, `UnescapeJsonKey`; `fuzz_json_binary`,
+`test_json_binary`) and `json_codec` (the staged kernel `FinalizeKernel::Json` and the per-value
+`DecodeFromTds`, as every family's), reached by `ColumnMetadata::json_disk_form`, which the backup
+reader sets. A column reads as `JSON` (its server's text, TYPE mssql's D7) or, under `json_as
+'variant'` (a call parameter and an ATTACH option, like `geometry_as`), a `VARIANT` built in one pass the
+way DuckDB's JSON -> VARIANT builds it from that text (owner, 2026-11-27: DuckDB's semantics -- an integer
+UINT64 / INT64, any other number DOUBLE, keys unescaped and sorted). A value no document is NULL with one
+WARNING per column. Fixture `json` (2025 only); the oracle lane compares it with RESTORE through TYPE
+mssql (`json_full`, `json_over` on 2025).
+
 **Across PRs**
 
 19. Docs per PR (README type table, `DATAMODEL.md` row-engine section, CLAUDE.md, CHANGELOG) — 1 d

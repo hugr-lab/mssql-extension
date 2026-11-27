@@ -60,6 +60,10 @@ struct ColumnMetadata {
 	// A sql_variant column's values as a record stores them (a backup's, spec 093 T8b: SplitDiskVariant),
 	// not a TDS row's envelope. Set by the backup reader only.
 	bool variant_disk_form = false;
+	// A json column's values in their stored binary form (spec 086 PR 6, codec/json): a backup's record. The
+	// server sends a json column as varchar(max) text, JSONSUPPORT granted or not (J1). Set by the backup
+	// reader only, on a BIGVARBINARY PLP column whose target is JSON or VARIANT.
+	bool json_disk_form = false;
 
 	//! COLMETADATA's UserType (4 bytes), kept since spec 093 T3: VECTOR_USER_TYPE marks a vector column
 	//! in every form it streams, the JSON text included (measured V1).

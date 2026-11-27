@@ -29,12 +29,17 @@ namespace backup {
 //! attached catalog, else 'geometry' (TYPE mssql's default; no setting); and (spec 093 T8c) the type a
 //! datetime2(7) is read as: the `datetime2_7_as` of the call, else of the attached catalog, else the
 //! setting mssql_datetime2_7_as, else 'timestamp_ns' -- TYPE mssql's order.
+//! Spec 086 PR 6: what a json column (SQL Server 2025) is read as -- its server's text as JSON (TYPE mssql's
+//! D7), or a VARIANT, as DuckDB's own JSON -> VARIANT gives that text.
+enum class JsonAs : uint8_t { Json, Variant };
+
 struct TypeForms {
 	tds::GeometryAs geometry_as = tds::GeometryAs::Geometry;
 	MSSQLDatetime2Read datetime2_read = MSSQLDatetime2Read::Nanoseconds;
+	JsonAs json_as = JsonAs::Json;
 
 	bool operator==(const TypeForms &other) const {
-		return geometry_as == other.geometry_as && datetime2_read == other.datetime2_read;
+		return geometry_as == other.geometry_as && datetime2_read == other.datetime2_read && json_as == other.json_as;
 	}
 };
 
@@ -43,11 +48,18 @@ struct TypeForms {
 struct TypeFormOptions {
 	std::string geometry_as;
 	std::string datetime2_7_as;
+	std::string json_as;
 
 	bool operator==(const TypeFormOptions &other) const {
-		return geometry_as == other.geometry_as && datetime2_7_as == other.datetime2_7_as;
+		return geometry_as == other.geometry_as && datetime2_7_as == other.datetime2_7_as && json_as == other.json_as;
 	}
 };
+
+//! Whether `c` is of SQL Server 2025's json type (spec 086 PR 6), read by backup_json's decoder.
+bool IsJsonColumn(const CatalogColumn &c);
+//! A `json_as` the call or the ATTACH gives (not NULL): 'json' or 'variant', any case, trimmed; returned as
+//! given. Refused otherwise, naming `source`.
+std::string JsonAsGiven(const std::string &value, const char *source);
 
 //! Whether `c` is of a CLR system type (schema sys): hierarchyid, geometry or geography. A user CLR
 //! type (its own schema, no system type underneath) is not: opaque by design, its stored bytes.

@@ -48,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A backup's SQL Server 2025 `json` columns are read** (spec 086 PR 6), decoded from the binary form a record stores them in (E9 / E9b, measured), where they were their stored bytes (`BLOB`):
+  - as `JSON` by default: the server's own text, byte for byte what `CAST(j AS nvarchar(max))` gives, as `TYPE mssql` reads the column;
+  - or, with `json_as := 'variant'` on the call (`mssql_backup_scan`, `mssql_backup_catalog`, the change listing) or `ATTACH … (TYPE mssql_backup, json_as 'variant')`, as a `VARIANT`, built in one pass the way DuckDB's own `CAST(text AS JSON)::VARIANT` builds it: an integer `UBIGINT` / `BIGINT`, any other number `DOUBLE`, keys unescaped and sorted.
+  - Every storage form reads: in row and off row, ROW and PAGE compression, documents changed in place by `JSON_MODIFY` or `.modify()`, a column added with a default. A value that is no json document is NULL with one WARNING per column, its row read.
+  - The decoder is a codec family, `src/codec/json/`, with a fuzz harness (`fuzz_json_binary`). Over the wire the server always sends json as text, even with JSONSUPPORT granted (measured): the binary form is a backup's alone.
+  - Fixture `json` (2025): E9's corpora, keys of every escape, documents of up to 70,000 keys, and 240 documents grown in place (a scratch experiment) render to the server's text exactly; the oracle lane compares it with RESTORE (4,966 rows, 0 failures), and the VARIANT equals DuckDB's own cast of that text for every row.
 - **A backup's `datetime2(7)` columns take `datetime2_7_as`, as `TYPE mssql`'s do** (spec 093 T8c). They were always `TIMESTAMP_NS`, a value outside 1677–2262 NULL with nothing said: a temporal table's period end, `9999-12-31 23:59:59.9999999`, read as NULL in every current row. Now:
   - `'timestamp_ns'` is still the default. Such a value is NULL with one WARNING per column per scan, as over a connection.
   - `'timestamp'` reads the column as `TIMESTAMP` over 0001–9999, the 100 ns digit truncated.

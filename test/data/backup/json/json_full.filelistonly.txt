@@ -1,0 +1,4 @@
+LogicalName|PhysicalName|Type|FileGroupName|Size|MaxSize|FileId|CreateLSN|DropLSN|UniqueId|ReadOnlyLSN|ReadWriteLSN|BackupSizeInBytes|SourceBlockSize|FileGroupId|LogGroupGUID|DifferentialBaseLSN|DifferentialBaseGUID|IsReadOnly|IsPresent|TDEThumbprint|SnapshotUrl
+-----------|------------|----|-------------|----|-------|------|---------|-------|--------|-----------|------------|-----------------|---------------|-----------|------------|-------------------|--------------------|----------|---------|-------------|-----------
+bak_json|/var/opt/mssql/data/bak_json.mdf|D|PRIMARY|75497472|35184372080640|1|0|0|0CBBD78F-50F7-412E-B4B8-E99EFB41CCA2|0|0|12058624|4096|1|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL
+bak_json_log|/var/opt/mssql/data/bak_json_log.ldf|L|NULL|75497472|2199023255552|2|0|0|BA702386-5C7B-4288-89C1-BF9C7D89A6E6|0|0|0|4096|0|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL

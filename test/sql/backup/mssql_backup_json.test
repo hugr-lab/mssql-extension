@@ -1,0 +1,199 @@
+# name: test/sql/backup/mssql_backup_json.test
+# description: Spec 086 PR 6 -- SQL Server 2025's json type read from a backup: its stored binary form decoded to the server's text (JSON), or under json_as 'variant' to the VARIANT DuckDB's JSON -> VARIANT gives that text
+# group: [mssql]
+#
+# test/data/backup/json (test/backup/gen/json.sql and json_changes.sql, SQL Server 2025): E9's corpora -- every JSON type in
+# every container, the length-prefix widths, escapes and Unicode, integers and decimals at their edges, nesting to 128,
+# wide documents -- uncompressed, ROW and PAGE; documents changed in place (JSON_MODIFY, .modify()); a json column added
+# with a default; a differential. The oracle lane compares every table with a RESTORE through TYPE mssql (the server's
+# text); this pins the committed backup's values and both forms. No SQL Server is needed.
+
+require mssql
+
+statement ok
+SET VARIABLE f = 'test/data/backup/json/json_full.bak';
+
+statement ok
+SET VARIABLE d = 'test/data/backup/json/json_diff.bak';
+
+# Read as JSON, as TYPE mssql reads the column (D7); no longer its stored bytes.
+query TTTT
+SELECT table_name, column_name, duckdb_type, state FROM mssql_backup_columns(getvariable('f'), 'dbo')
+WHERE sql_type = 'json' ORDER BY 1, 2;
+----
+j_added	jd	JSON	converted
+j_added	jn	JSON	converted
+j_corpus	j	JSON	converted
+j_mod	j	JSON	converted
+j_page	j	JSON	converted
+j_row	j	JSON	converted
+j_rows	j	JSON	converted
+
+# The server's text, byte for byte: no whitespace, keys as stored (every escape as written, \u0041 included),
+# first of two duplicate keys, numbers as stored (2.50 keeps its scale, an exponent a decimal(38,10)).
+query IT
+SELECT id, j FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus') WHERE id IN (1, 3, 7, 8, 10, 11, 13, 15, 18, 21, 23)
+ORDER BY id;
+----
+1	{}
+3	{"":""}
+7	[[],{}]
+8	{"t":true,"f":false,"n":null}
+10	{"a":1}
+11	{"b":1,"a":2,"c":3}
+13	[0,1,-1,536870911,536870912,-536870912,-536870913]
+15	[0.5,-0.5,2.50,1.000,0.1,123456789.123456789,-0.0000001]
+18	[100.0000000000,0.0000000001,-1500.0000000000,200000.0000000000,0.0000000000,0,0.0]
+21	{"a\"b":1,"c\\d":2,"\u0041":3,"é":4,"😀":5}
+23	NULL
+
+query TT
+SELECT typeof(j), j::VARCHAR FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus') WHERE id = 2;
+----
+JSON	[]
+
+# The length-prefix widths and nesting to the server's limit, read whole (values off row included).
+query IIII
+SELECT count(*), count(j), sum(length(j::VARCHAR)), max(length(j::VARCHAR))
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus');
+----
+61	60	3227215	1027789
+
+query III
+SELECT id, length(j::VARCHAR), left(j::VARCHAR, 6) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus')
+WHERE id IN (428, 438) ORDER BY id;
+----
+428	257	[[[[[[
+438	769	{"o":{
+
+# Changed in place: the old items and nodes kept, the trailer naming the new root; a member deleted in place left
+# out; a node grown past its count (its flag byte its spare slots, E9b).
+query IT
+SELECT id, j FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_mod') WHERE id <> 4 ORDER BY id;
+----
+1	{"a":2,"b":"x","c":[1,2],"d":{"e":1}}
+2	{"a":1,"b":"x","c":[1,2],"d":{"e":1},"z":"added"}
+3	{"a":1,"c":[1,2],"d":{"e":1}}
+5	{"a":1,"b":"x","c":[1,2,3],"d":{"e":"nested"}}
+6	{"a":7,"n":2}
+
+# A json column added with a default: the rows written before read its default, in the same binary form.
+query ITT
+SELECT count(*), any_value(jd), count(jn) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_added');
+----
+301	{"default":[1,2]}	1
+
+# Every storage form reads alike: the corpus in ROW and PAGE tables equals the uncompressed one.
+query II
+SELECT count(*), count(*) FILTER (WHERE r.j::VARCHAR IS DISTINCT FROM c.j::VARCHAR OR p.j::VARCHAR IS DISTINCT FROM c.j::VARCHAR)
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus') c
+JOIN mssql_backup_scan(getvariable('f'), 'dbo', 'j_row') r USING (id)
+JOIN mssql_backup_scan(getvariable('f'), 'dbo', 'j_page') p USING (id);
+----
+49	0
+
+# json_as 'variant': the VARIANT DuckDB's own JSON -> VARIANT gives the server's text -- its number types (an
+# integer UINT64 or INT64, any other number DOUBLE), its keys unescaped and sorted -- for every value.
+query TT
+SELECT variant_typeof(j), j::VARCHAR FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus', json_as := 'variant')
+WHERE id IN (8, 13, 15, 21) ORDER BY id;
+----
+OBJECT(f, n, t)	{'f': false, 'n': NULL, 't': true}
+ARRAY(7)	[0, 1, -1, 536870911, 536870912, -536870912, -536870913]
+ARRAY(7)	[0.5, -0.5, 2.5, 1.0, 0.1, 123456789.12345679, -1e-07]
+OBJECT(A, a"b, c\d, é, 😀)	{'A': 3, 'a"b': 1, 'c\\d': 2, 'é': 4, '😀': 5}
+
+# Keys as DuckDB keys them: unescaped (\u escapes, a surrogate pair, a control character), two that unescape
+# alike one child holding the last value (as DuckDB's JSON -> VARIANT), sorted by their bytes ('Z' before 'z').
+# A VARIANT whose keys differ only in case does not cast to VARCHAR in DuckDB (its STRUCT names are
+# case-insensitive), so row 27 is checked by its type.
+query ITT
+SELECT id, variant_typeof(j), variant_extract(j, 'a/b')::VARCHAR FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus', json_as := 'variant')
+WHERE id IN (24, 26, 27) ORDER BY id;
+----
+24	OBJECT(a/b)	2
+26	OBJECT(x/, été, 😀)	NULL
+27	OBJECT(Z, a, z, ~, , é)	NULL
+
+query I
+SELECT count(*) FILTER (WHERE v.j IS DISTINCT FROM TRY_CAST(t.j AS VARIANT))
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus') t
+JOIN mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus', json_as := 'Variant') v USING (id);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE v.j IS DISTINCT FROM t.j::VARIANT)
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_rows') t
+JOIN mssql_backup_scan(getvariable('f'), 'dbo', 'j_rows', json_as := 'variant') v USING (id);
+----
+0
+
+query TT
+SELECT variant_typeof(variant_extract(j, 'neg')), variant_typeof(variant_extract(j, 'd'))
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_rows', json_as := 'variant') WHERE id = 7;
+----
+INT64	DOUBLE
+
+# A lone surrogate: the server keeps it in a key as written (and makes it U+FFFD in a string), so the text is
+# the server's; DuckDB's JSON parse refuses that key, so the VARIANT is NULL, with a WARNING -- never an error.
+query IT
+SELECT t.j::VARCHAR = '{"\uD800":["'||chr(65533)||'"]}', v.j IS NULL
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus') t
+JOIN mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus', json_as := 'variant') v USING (id) WHERE id = 28;
+----
+true	true
+
+# An ATTACH takes json_as as an option; a call's wins; the listings follow it.
+statement ok
+ATTACH 'test/data/backup/json/json_full.bak' AS bj (TYPE mssql_backup, json_as 'variant');
+
+query TT
+SELECT (SELECT typeof(j) FROM bj.dbo.j_mod LIMIT 1),
+	(SELECT duckdb_type FROM mssql_backup_columns('bj', 'dbo', 'j_mod') WHERE column_name = 'j');
+----
+VARIANT	VARIANT
+
+query T
+SELECT typeof(j) FROM mssql_backup_scan('bj', 'dbo', 'j_mod', json_as := 'json') LIMIT 1;
+----
+JSON
+
+statement ok
+DETACH bj;
+
+statement error
+SELECT * FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_mod', json_as := 'text');
+----
+json_as
+
+statement error
+ATTACH 'test/data/backup/json/json_full.bak' AS bj2 (TYPE mssql_backup, json_as 'binary');
+----
+json_as
+
+# The differential over the full: documents replaced, changed in place again (.modify's value a string, as the
+# server takes it), set to NULL and back.
+query IT
+SELECT id, j FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_corpus', diff := getvariable('d')) WHERE id IN (1, 11, 23)
+ORDER BY id;
+----
+1	{"replaced":true}
+11	NULL
+23	[1]
+
+query IT
+SELECT id, j FROM mssql_backup_scan(getvariable('f'), 'dbo', 'j_mod', diff := getvariable('d')) WHERE id IN (1, 5) ORDER BY id;
+----
+1	{"a":3,"b":"x","c":[1,2],"d":{"e":1}}
+5	{"a":1,"b":"x","c":[1,2,3],"d":"{\"deep\":1}"}
+
+# The change listing reads both states' documents.
+query ITT
+SELECT id, change_type, j FROM mssql_backup_table_changes(getvariable('f'), 'dbo', 'j_corpus', diff := getvariable('d'))
+WHERE id IN (11, 23) ORDER BY id, change_type;
+----
+11	update_postimage	NULL
+11	update_preimage	{"b":1,"a":2,"c":3}
+23	update_postimage	[1]
+23	update_preimage	NULL

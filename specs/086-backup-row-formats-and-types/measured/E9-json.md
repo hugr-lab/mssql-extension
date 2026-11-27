@@ -46,7 +46,8 @@ is kept out of the repository).
   - any other control character as `\u` and four upper-case hex digits;
   - `/` and everything else, non-ASCII included, as itself.
 - **A key is written as it was given**, its escapes included: `{"a\"b":1}` stays `{"a\"b":1}`. A key
-  given as `A` is stored as `A`.
+  given as `\u0041` is stored as `\u0041` (E9b corrected this: E9's corpus had lost the escape before the
+  server saw it).
 
 ## The stored form
 
@@ -120,3 +121,61 @@ a 16-byte trailer.
   - a document on a page not yet rewritten since an in-place change;
   - a `json` column added with a default (metadata-only ADD);
   - a document past 2 GB is out of scope (the backup reader's 2^31 − 1 value limit).
+
+## E9b: what PR 6 measured (2026-11-27)
+
+The same server (SQL Server 2025 RTM-CU10, 17.0.5035), a throwaway container. The fixture `json`
+(`test/backup/gen/json.sql`, `json_changes.sql`; 2025's committed under `test/data/backup/json`) holds E9's
+corpora again, keys of every escape (the self-review of PR 6 found E9's had lost theirs), documents of
+32,767, 32,768 and 65,535 keys around the narrow / wide boundary, and a scratch experiment of its own: 240
+documents grown in place one change at a time. Ground truth: each value's server text read through
+`TYPE mssql` from a RESTOREd copy, beside its stored bytes from the backup. The decoder
+(`src/codec/json/json_binary.cpp`) renders every value to that text byte for byte: the 240 grown
+documents and the 4,751 of an earlier cut of the fixture, then `compare_rows.sh` on the committed one --
+4,966 rows of the full and 4,907 of the full + differential, 0 failures. Its VARIANT
+(`src/codec/json/json_codec.cpp`) equals DuckDB's own `TRY_CAST(text AS VARIANT)` for all 10,475 rows of both
+states, NULLs included.
+
+What it found beyond E9:
+
+- **A node's flag byte is its number of spare slots.** A container that grew in place keeps room for
+  more: an object or array of count *c* and flag *f* holds *c* + *f* slots in each of its slot arrays
+  (key references, values), *f* up to *c* measured (an object of 14 members grown by 6 kept 14 spare).
+  E9's flag `0x01` is one spare slot. In the key table the low 7 bits are the spare count and the top bit
+  (`0x80`) the sorted-hash permutation, as E9 found.
+- **A key is at most 7,998 bytes** (13646 past it), so a key's length prefix is at most 2 bytes; a string
+  value's goes to 3 (70,000 measured) and E9's 4.
+- **A key keeps every escape as written:** `"a\"b"`, `"c\\d"`, `"a\/b"`, `"line\nbreak"`, `"\u0041"`,
+  `"\u00e9t\u00e9"`, a surrogate pair `"\uD83D\uDE00"` -- all stored byte for byte as given, and the text writes them
+  so. Two keys that unescape alike (`"a\/b"` and `"a/b"`) are two members to the server. A JSON -> VARIANT
+  reader unescapes them, as DuckDB's parse of the text does, and keeps one child per key, the last value
+  (DuckDB's `ConvertJSONObject`); a key whose escapes are not valid makes the document malformed.
+- **A lone surrogate** (`"\uD800"`) is taken: in a key it is stored as written, so the text holds it, and
+  DuckDB's JSON parse refuses that text ("no low surrogate"); in a string value the server stores U+FFFD.
+  The JSON reading is the server's text, the key included; the VARIANT reading is NULL with a WARNING
+  (`RenderJsonText(…, check_keys)`), where DuckDB's cast of the text throws.
+- **A copied subtree is copied:** `JSON_MODIFY(j, '$.b', JSON_QUERY(j, '$.a'))` and `j.modify('$.b', JSON_QUERY(j,
+  '$.a'))` over a 1,000-element array, and over an object, write the nodes again -- no node is named by two
+  slots, so the walk's budget (size / 4 + 1 values) holds (measured on a scratch database of the same server).
+- **Narrow or wide:** documents of 32,767, 32,768 and 65,535 keys render to the server's text (a narrow
+  key reference's top bit is the deleted mark, so the server must widen by 32,768).
+- **A string value's control characters** below 0x20 are written as `\u00XX`, upper-case; DEL (0x7F) is
+  written as itself.
+- **A decimal item:** a length *n*, then precision, scale, a sign byte (1 positive, 0 negative), and a
+  little-endian unsigned mantissa of 2 × (*n* − 1) bytes: 4, 8, 12 or 16, as SQL Server's own `numeric`
+  (38 digits in 16 bytes). `2.50` is `05 07 03 02 01 FA000000`.
+- **A json column added with a default** (`ALTER TABLE … ADD jd json NOT NULL DEFAULT '…'`, metadata
+  only) reads its default for the rows written before, in the same binary form: the reader's column
+  default, nothing of its own.
+- **A document changed in place on a page not rewritten since** decodes like any other (the old items kept,
+  the trailer naming the new root).
+- **Over the wire the value is always text (J1).** `SELECT j` through `mssql_scan`: without JSONSUPPORT the
+  column is `varchar(max)` (TDS `A7 FFFF`, a UTF-8 collation) carrying the text; with JSONSUPPORT (`0x0D`,
+  version 1) requested in LOGIN7 the server grants it in FEATUREEXTACK and still sends `A7 FFFF` text --
+  no JSONTYPE `0xF4`. The binary form is a storage form only: a backup's.
+
+So the decoder refuses (as malformed, NULL with a WARNING) only what neither E9 nor E9b saw: a header bit
+beyond bit 0 of its second byte, a trailer of another shape, an item tag or constant E9 did not list, a
+decimal mantissa past 16 bytes, a key reference past the key table, a key whose escapes are not valid, nesting
+past 128, a walk past size / 4 + 1 values (a cycle, or a node two slots name: each value of a well-formed
+document fills a 4-byte slot of its own), a text past 2^31 - 1 bytes (a key referenced often enough).

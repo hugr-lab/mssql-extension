@@ -1,0 +1,2 @@
+schema_name|table_name|boundary_id|base_type|value_text
+-----------|----------|-----------|---------|----------

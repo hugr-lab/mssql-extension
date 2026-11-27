@@ -30,6 +30,7 @@
 
 #include "codec/clr/hierarchyid_codec.hpp"
 #include "codec/clr/spatial_codec.hpp"
+#include "codec/json/json_codec.hpp"
 #include "codec/sql_vector/vector_codec.hpp"
 #include "codec/staging/column_ops.hpp"
 #include "codec/staging/column_staging.hpp"
@@ -103,7 +104,7 @@ void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t 
 						  Vector &out, variant::VariantColumnNotes *variant_notes,
 						  spatial::SpatialColumnNotes *spatial_notes,
 						  hierarchyid::HierarchyIdColumnNotes *hierarchyid_notes,
-						  sql_vector::VectorColumnNotes *vector_notes);
+						  sql_vector::VectorColumnNotes *vector_notes, json::JsonColumnNotes *json_notes = nullptr);
 
 //! AND the staged NULLs of `count` rows into `out`'s mask (a kernel may have set NULLs of its own,
 //! which must stay); nothing when the column staged none.

@@ -1,0 +1,16 @@
+schema_name|table_name|column_id|column_name|type_name|type_schema|system_type_id|max_length|precision|scale|collation_name|is_nullable|is_identity|is_computed|is_sparse|is_column_set|is_rowguidcol
+-----------|----------|---------|-----------|---------|-----------|--------------|----------|---------|-----|--------------|-----------|-----------|-----------|---------|-------------|-------------
+dbo|j_added|1|id|int|sys|56|4|10|0|NULL|0|0|0|0|0|0
+dbo|j_added|2|v|int|sys|56|4|10|0|NULL|0|0|0|0|0|0
+dbo|j_added|3|jd|json|sys|244|-1|0|0|NULL|0|0|0|0|0|0
+dbo|j_added|4|jn|json|sys|244|-1|0|0|NULL|1|0|0|0|0|0
+dbo|j_corpus|1|id|int|sys|56|4|10|0|NULL|0|0|0|0|0|0
+dbo|j_corpus|2|j|json|sys|244|-1|0|0|NULL|1|0|0|0|0|0
+dbo|j_mod|1|id|int|sys|56|4|10|0|NULL|0|0|0|0|0|0
+dbo|j_mod|2|j|json|sys|244|-1|0|0|NULL|0|0|0|0|0|0
+dbo|j_page|1|id|int|sys|56|4|10|0|NULL|0|0|0|0|0|0
+dbo|j_page|2|j|json|sys|244|-1|0|0|NULL|1|0|0|0|0|0
+dbo|j_row|1|id|int|sys|56|4|10|0|NULL|0|0|0|0|0|0
+dbo|j_row|2|j|json|sys|244|-1|0|0|NULL|1|0|0|0|0|0
+dbo|j_rows|1|id|int|sys|56|4|10|0|NULL|0|0|0|0|0|0
+dbo|j_rows|2|j|json|sys|244|-1|0|0|NULL|1|0|0|0|0|0

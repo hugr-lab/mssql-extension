@@ -100,6 +100,31 @@ std::string Datetime2AsSetting(ClientContext &context) {
 	return std::string();
 }
 
+namespace {
+
+JsonAs ParseJsonAs(const std::string &value, const std::string &source) {
+	std::string v = StringUtil::Lower(value);
+	StringUtil::Trim(v);
+	if (v == "json") {
+		return JsonAs::Json;
+	}
+	if (v == "variant") {
+		return JsonAs::Variant;
+	}
+	throw InvalidInputException("%s: '%s' is not 'json' or 'variant'", source, value);
+}
+
+}  // namespace
+
+bool IsJsonColumn(const CatalogColumn &c) {
+	return StringUtil::CIEquals(c.system_type_name, "json");
+}
+
+std::string JsonAsGiven(const std::string &value, const char *source) {
+	ParseJsonAs(value, source);
+	return value;
+}
+
 TypeFormOptions TypeFormOptionsOf(ClientContext &context, const named_argument_map_t &named,
 								  const vector<std::string> &paths, const std::string &function) {
 	TypeFormOptions options;
@@ -109,6 +134,10 @@ TypeFormOptions TypeFormOptionsOf(ClientContext &context, const named_argument_m
 	auto geometry_as = named.find("geometry_as");
 	if (geometry_as != named.end() && !geometry_as->second.IsNull()) {
 		options.geometry_as = GeometryAsGiven(geometry_as->second.ToString(), (function + ": geometry_as").c_str());
+	}
+	auto json_as = named.find("json_as");
+	if (json_as != named.end() && !json_as->second.IsNull()) {
+		options.json_as = JsonAsGiven(json_as->second.ToString(), (function + ": json_as").c_str());
 	}
 	auto datetime2_7_as = named.find("datetime2_7_as");
 	if (datetime2_7_as != named.end() && !datetime2_7_as->second.IsNull()) {
@@ -128,6 +157,9 @@ TypeForms TypeFormsOf(const TypeFormOptions &options, const std::string &where) 
 	}
 	if (!options.datetime2_7_as.empty()) {
 		forms.datetime2_read = ParseDatetime2Read(options.datetime2_7_as, where + ": datetime2_7_as");
+	}
+	if (!options.json_as.empty()) {
+		forms.json_as = ParseJsonAs(options.json_as, where + ": json_as");
 	}
 	return forms;
 }

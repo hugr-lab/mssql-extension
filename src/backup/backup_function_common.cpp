@@ -511,8 +511,7 @@ Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
 namespace {
 
 // Why column `c` (called `type` in a reason) is read as its stored bytes for what its type is, or "":
-// a type converted later with the TDS path's, one the reader does not know, or an xtype that is no
-// storage type.
+// a type the reader does not know, or an xtype that is no storage type.
 std::string RawByType(const CatalogColumn &c, const std::string &type) {
 	switch (c.system_type_id) {
 	case XTYPE_XML:
@@ -526,9 +525,6 @@ std::string RawByType(const CatalogColumn &c, const std::string &type) {
 	}
 	if (c.system_type_name.empty()) {
 		return type + " is a type the reader does not know";
-	}
-	if (c.system_type_name == "json") {
-		return type + " is converted later, with the TDS path's";
 	}
 	// Only a storage type the record decoder knows is converted: the kernels are keyed by the TDS id the
 	// xtype is passed as, and an xtype that is no storage type (a TDS-only id -- INTN, BITN, the legacy
@@ -591,6 +587,12 @@ ColumnReading TypeReading(const CatalogColumn &c, const TypeForms &forms) {
 	// Spec 093 T8b: a sql_variant as TYPE mssql reads it, by T1's kernel (its disk form: DescribeSqlVariant).
 	if (c.system_type_id == XTYPE_SQL_VARIANT) {
 		r.type = LogicalType::VARIANT();
+		return r;
+	}
+	// Spec 086 PR 6: a json column's stored binary form decoded (backup_json): JSON, its server's text, as TYPE
+	// mssql reads the column (D7), or under json_as 'variant' a VARIANT.
+	if (IsJsonColumn(c)) {
+		r.type = forms.json_as == JsonAs::Variant ? LogicalType::VARIANT() : LogicalType::JSON();
 		return r;
 	}
 	const std::string type = c.system_type_name.empty()

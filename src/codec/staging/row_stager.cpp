@@ -308,7 +308,7 @@ void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t 
 						  Vector &out, variant::VariantColumnNotes *variant_notes,
 						  spatial::SpatialColumnNotes *spatial_notes,
 						  hierarchyid::HierarchyIdColumnNotes *hierarchyid_notes,
-						  sql_vector::VectorColumnNotes *vector_notes) {
+						  sql_vector::VectorColumnNotes *vector_notes, json::JsonColumnNotes *json_notes) {
 	switch (kernel) {
 	case FinalizeKernel::None:
 		break;
@@ -341,6 +341,9 @@ void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t 
 		break;
 	case FinalizeKernel::Spatial:
 		spatial::DecodeChunkFromStaging(st, count, meta, out, spatial_notes);
+		break;
+	case FinalizeKernel::Json:
+		json::DecodeChunkFromStaging(st, count, meta, out, json_notes);
 		break;
 	case FinalizeKernel::HierarchyId:
 		hierarchyid::DecodeChunkFromStaging(st, count, meta, out, hierarchyid_notes);
@@ -808,9 +811,10 @@ bool RowStager::TryEmitConstant(idx_t c, const ColumnStaging &st, const tds::Col
 		return false;
 	}
 	Vector &out = *targets_[c];
-	if (ops_[c].kernel == FinalizeKernel::Variant || ops_[c].kernel == FinalizeKernel::Vector) {
+	if (ops_[c].kernel == FinalizeKernel::Variant || ops_[c].kernel == FinalizeKernel::Vector ||
+		ops_[c].kernel == FinalizeKernel::Json) {
 		// A VARIANT vector is lists and a blob, a FLOAT[n] an array: their kernels build them whole, NULLs
-		// included (spec 093 T1, T3).
+		// included (spec 093 T1, T3); a json column's kernel builds a JSON or a VARIANT (spec 086 PR 6).
 		return false;
 	}
 
@@ -910,6 +914,7 @@ void RowStager::DecodeFirstValue(idx_t c, const ColumnStaging &st, const tds::Co
 		break;
 	case FinalizeKernel::Variant:  // never constant (TryEmitConstant)
 	case FinalizeKernel::Vector:
+	case FinalizeKernel::Json:
 	case FinalizeKernel::None:
 	case FinalizeKernel::Text:
 		break;

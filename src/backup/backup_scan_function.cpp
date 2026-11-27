@@ -263,6 +263,7 @@ void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_dat
 	serializer.WritePropertyWithDefault<std::string>(113, "function", data.function, FUNCTION);
 	serializer.WritePropertyWithDefault<std::string>(114, "geometry_as", data.form_options.geometry_as);
 	serializer.WritePropertyWithDefault<std::string>(115, "datetime2_7_as", data.form_options.datetime2_7_as);
+	serializer.WritePropertyWithDefault<std::string>(116, "json_as", data.form_options.json_as);
 }
 
 unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunction &) {
@@ -283,6 +284,7 @@ unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunct
 	data->function = deserializer.ReadPropertyWithExplicitDefault<std::string>(113, "function", FUNCTION);
 	data->form_options.geometry_as = deserializer.ReadPropertyWithDefault<std::string>(114, "geometry_as");
 	data->form_options.datetime2_7_as = deserializer.ReadPropertyWithDefault<std::string>(115, "datetime2_7_as");
+	data->form_options.json_as = deserializer.ReadPropertyWithDefault<std::string>(116, "json_as");
 	BindTable(deserializer.Get<ClientContext &>(), *data, nullptr);
 	// The plan's column positions and vectors are those it was bound with: a file at the same path that
 	// reads otherwise now (a nightly backup replaced: a column added, dropped, renamed or retyped) is
@@ -1196,6 +1198,8 @@ TableFunction MakeScanFunction(const LogicalType &path, bool catalog = false) {
 	f.GetSignature().AddKeywordOnly("geometry_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	// Spec 093 T8c: TYPE mssql's datetime2_7_as; NULL (the default): the ATTACH's, else the setting.
 	f.GetSignature().AddKeywordOnly("datetime2_7_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
+	// Spec 086 PR 6: a json column as 'json' (its server's text, the default) or 'variant'; NULL: the ATTACH's.
+	f.GetSignature().AddKeywordOnly("json_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	AddVersionParameters(f);
 	f.projection_pushdown = true;
 	f.get_partition_data = PartitionData;
@@ -1227,6 +1231,13 @@ void TypeWarnings::Say(ClientContext &context, const char *function, const std::
 							   "bytes",
 							   function, n.name.c_str(), n.type.c_str(), n.type.c_str(),
 							   codec::ssclrt::DescribeStatus(n.spatial.first_malformed));
+		}
+		// Spec 086 PR 6: a json value whose stored bytes are no json document, NULL.
+		if (n.json.malformed > 0 && said_.insert(n.name + "|json").second) {
+			DUCKDB_LOG_WARNING(context,
+							   "%s: column %s (json) holds values whose stored bytes cannot be read as a json document "
+							   "(the first: %s), read as NULL, their rows read",
+							   function, n.name.c_str(), n.json.first_malformed.c_str());
 		}
 		// Spec 093 T8c: a datetime2(7) outside TIMESTAMP_NS's range, NULL, as TYPE mssql says it (D8).
 		if (n.out_of_range > 0 && said_.insert(n.name + "|datetime2").second) {

@@ -1,0 +1,2 @@
+schema_name|table_name|function_name|scheme_name|column_name|column_id|parameter_type|max_length|precision|scale|range_right|fanout|next_used
+-----------|----------|-------------|-----------|-----------|---------|--------------|----------|---------|-----|-----------|------|---------

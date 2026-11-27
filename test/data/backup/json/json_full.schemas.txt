@@ -1,0 +1,15 @@
+schema_id|schema_name
+---------|-----------
+1|dbo
+2|guest
+3|INFORMATION_SCHEMA
+4|sys
+16384|db_owner
+16385|db_accessadmin
+16386|db_securityadmin
+16387|db_ddladmin
+16389|db_backupoperator
+16390|db_datareader
+16391|db_datawriter
+16392|db_denydatareader
+16393|db_denydatawriter
