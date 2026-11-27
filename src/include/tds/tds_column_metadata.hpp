@@ -57,6 +57,9 @@ struct ColumnMetadata {
 	// column by whoever reads its COLMETADATA for a catalog (the stream, the describe, the RETURNING
 	// parser), before its type is asked. The parser leaves the default.
 	GeometryAs geometry_as = GeometryAs::Geometry;
+	// A sql_variant column's values as a record stores them (a backup's, spec 093 T8b: SplitDiskVariant),
+	// not a TDS row's envelope. Set by the backup reader only.
+	bool variant_disk_form = false;
 
 	//! COLMETADATA's UserType (4 bytes), kept since spec 093 T3: VECTOR_USER_TYPE marks a vector column
 	//! in every form it streams, the JSON text included (measured V1).

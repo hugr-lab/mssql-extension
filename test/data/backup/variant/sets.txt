@@ -1,0 +1,2 @@
+variant_full|variant_full.bak
+variant_diff|variant_diff.bak

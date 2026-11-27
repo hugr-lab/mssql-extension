@@ -26,6 +26,7 @@
 #include "codec/clr/spatial_codec.hpp"
 #include "codec/staging/column_ops.hpp"
 #include "codec/staging/column_staging.hpp"
+#include "codec/variant/variant_codec.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "tds/tds_column_metadata.hpp"
 
@@ -178,17 +179,23 @@ public:
 	//! cardinality (Count()). The DataChunk form sets it.
 	void FinalizeChunk();
 	void FinalizeChunk(DataChunk &out);
-	//! A geometry / geography / hierarchyid column's decode notes since the stager was made (spec 093 T8:
-	//! values read as NULL -- a curve under GEOMETRY, bytes that are not MS-SSCLRT or not a hierarchyid's),
-	//! with its `table.column` name; the caller words the WARNING (ClrWarnings, backup_scan_internal) once a
-	//! column a statement.
-	struct ClrNote {
+	//! A geometry / geography / hierarchyid / sql_variant column's decode notes since the stager was made
+	//! (spec 093 T8: values read as NULL -- a curve under GEOMETRY, bytes that are not MS-SSCLRT, not a
+	//! hierarchyid's or not a sql_variant's -- and a sql_variant string read as its bytes, T8b), with its
+	//! `table.column` name; the caller words the WARNING (TypeWarnings, backup_scan_internal) once a column a
+	//! statement.
+	struct TypeNote {
 		std::string name;
-		std::string type;  // geometry / geography / hierarchyid
+		std::string type;  // geometry / geography / hierarchyid / sql_variant
 		codec::spatial::SpatialColumnNotes spatial;
 		codec::hierarchyid::HierarchyIdColumnNotes hierarchyid;
+		codec::variant::VariantColumnNotes variant;
+		//! Values the column's kernel read as NULL, its rows read.
+		idx_t Unreadable() const {
+			return spatial.malformed + hierarchyid.malformed + variant.malformed;
+		}
 	};
-	std::vector<ClrNote> ClrNotes() const;
+	std::vector<TypeNote> TypeNotes() const;
 
 private:
 	struct Column {
@@ -206,6 +213,7 @@ private:
 		bool code_page_kernel = false;	// decoded from its code page (varchar, text): streamed when long
 		codec::spatial::SpatialColumnNotes spatial_notes;			   // the Spatial kernel's, across chunks
 		codec::hierarchyid::HierarchyIdColumnNotes hierarchyid_notes;  // the HierarchyId kernel's, across chunks
+		codec::variant::VariantColumnNotes variant_notes;			   // the Variant kernel's, across chunks
 	};
 
 	//! The constructor's steps: a projected column resolved to its staging (its arm chosen by ArmOf and
@@ -223,9 +231,10 @@ private:
 		OffRowPointer pointer;
 		uint64_t length = 0;
 		bool is_null = false;
-		bool direct = false;  // written straight into the vector as its bytes (a BLOB, a UTF-8 text)
-		bool stream = false;  // decoded block by block straight into the vector (UTF-16, a code page)
-		uint64_t output = 0;  // what a direct or streamed value allocates in the vector's heap
+		bool direct = false;	 // written straight into the vector as its bytes (a BLOB, a UTF-8 text)
+		bool stream = false;	 // decoded block by block straight into the vector (UTF-16, a code page)
+		uint64_t output = 0;	 // what a direct or streamed value allocates in the vector's heap
+		bool oversized = false;	 // a sql_variant longer than any: NULL and counted, its tree not read
 	};
 	void AppendOffRow(Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);
 	void AppendDirect(size_t column, Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);

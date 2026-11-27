@@ -3,7 +3,8 @@
 -- a heap, and values stored off row. The spatial values are T5's (test/sql/types/spatial_read.test: every
 -- OGC type, EMPTY, Z / M, curves, an invalid polygon, FullGlobe), the hierarchyid ones T4's forms. Run by
 -- default, so the oracle lane compares them with a RESTORE through TYPE mssql on every version; 2025's
--- committed under test/data/backup/clr_types (made by its generate.sh). Compressed (MS_XPRESS): small.
+-- committed under test/data/backup/clr_types (made by its generate.sh), with clr_types_changes.sql's differential
+-- (clr_types_over: the change listing on two states). Compressed (MS_XPRESS): small.
 -- Synthetic values only (T4).
 SET NOCOUNT ON;
 SET QUOTED_IDENTIFIER ON;

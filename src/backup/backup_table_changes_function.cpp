@@ -82,7 +82,7 @@ struct TableChangesState : public GlobalTableFunctionState {
 	std::unique_ptr<ChangeCollector> collector;
 	std::atomic<size_t> next_unit{0};
 	idx_t max_threads = 1;
-	ClrWarnings clr_warnings;  // spec 093 T8
+	TypeWarnings type_warnings;	 // spec 093 T8
 	//! D17, as the scan's: a chunk's staging reserved for the call that stages it, by side (the newer, the
 	//! older -- whose values are staged and then cast: twice), against half of memory_limit.
 	std::unique_ptr<ReservationGate> gate;
@@ -747,7 +747,7 @@ void StageChanges(ClientContext &context, const TableChangesBindData &data, Tabl
 	local.pos = i;
 	const idx_t count = stager.Count();
 	stager.FinalizeChunk();
-	global.clr_warnings.Say(context, data.function, stager.ClrNotes());
+	global.type_warnings.Say(context, data.function, stager.TypeNotes());
 	if (old_side) {
 		CastOldValues(context, data, local, output, count);
 	}

@@ -1,1 +1,2 @@
 clr_types_full|clr_types_full.bak
+clr_types_diff|clr_types_diff.bak

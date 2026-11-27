@@ -139,7 +139,7 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 | `created`, `modified` | `TIMESTAMP` | `sys.tables.create_date` / `modify_date` |
 | `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether `mssql_backup_scan` reads the table, and why not (a clustered columnstore, for now; ROW and PAGE compression are read) |
 | `fuzzy_status`, `open_transactions`, `stale_transactions` | `VARCHAR`, `INTEGER`, `INTEGER` | `consistent`, `stale`, `dirty` or `stale+dirty` (see [A backup taken under writes](#a-backup-taken-under-writes)); the transactions whose open changes the table's page copies hold, and those whose finished changes they lack |
-| `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `type_schema` (the schema of the column's type: `sys` for a system type, the one an alias or CLR type was created in), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type the scan returns: the one `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off -- a plain `VARCHAR` for a string --, or for now `BLOB`, its stored bytes, for `sql_variant`, `xml`, `vector` and `json`, which a later release converts, and for a user CLR type), `decodable` (false only for a column the scan cannot read: a computed one not persisted, a sparse one), `reason` (why a column is not converted or not readable) |
+| `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `type_schema` (the schema of the column's type: `sys` for a system type, the one an alias or CLR type was created in), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type the scan returns: the one `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off -- a plain `VARCHAR` for a string --, or for now `BLOB`, its stored bytes, for `xml`, `vector` and `json`, which a later release converts, and for a user CLR type), `decodable` (false only for a column the scan cannot read: a computed one not persisted, a sparse one), `reason` (why a column is not converted or not readable) |
 | `allocation_units` | `LIST(STRUCT(…))` | the table's allocation units: `au_id`, `type` (`IN_ROW_DATA`, `LOB_DATA`, `ROW_OVERFLOW_DATA`), `rowset_id`, `index_id`, `partition_number`, `compression`, `filegroup_id`, `first_page`, `root_page`, `first_iam_page`, `live_pages` (NULL for now) |
 | `partitioning` | `STRUCT(…)` | for a partitioned table (NULL on a filegroup): `function_name`, `scheme_name`, `column_name`, `column_id`, `parameter_type`, `range_right`, `boundaries` (a list of `VARIANT`s in the parameter's type, in boundary order; a NULL boundary is a NULL element), `destinations` (the filegroup of each partition), `next_used`, and `reason` when the reader cannot give it exactly (the boundaries are then NULL, never a partial list; the destinations and `next_used` are still given when only a boundary's value could not be read). The table's rows are read either way |
 | `partitions` | `LIST(STRUCT(…))` | every partition: `partition_number`, `rows`, `compression`, `filegroup` |
@@ -159,7 +159,7 @@ The states:
 | state | meaning |
 |---|---|
 | `converted` | read as `duckdb_type` |
-| `stored_bytes` | read as its stored bytes (`BLOB`): a type whose conversion comes later (`sql_variant`, `xml`, `vector`, `json`), and a user CLR type, opaque by design |
+| `stored_bytes` | read as its stored bytes (`BLOB`): a type whose conversion comes later (`xml`, `vector`, `json`), and a user CLR type, opaque by design |
 | `not_stored` | a computed column that is not persisted: it has no stored value |
 | `storage_format` | a sparse column or a column set: its value is in the row's sparse vector, read in a later release |
 
@@ -235,7 +235,9 @@ is NULL with one WARNING per column; `geometry_as := 'wkb'` (ISO WKB, the curves
 `'native'` (the stored bytes), on the call or as an ATTACH option, reads them, as `TYPE mssql`'s ATTACH
 option does. A value whose stored bytes cannot be read as its type (a damaged page) is NULL with one
 WARNING per column too, its row read; `mssql_backup_transaction_records` keeps such a row image as its
-bytes. A type whose conversion comes in a later release -- `sql_variant`, `xml`, `vector`,
+bytes. A `sql_variant` is a `VARIANT`, each value in its own base type, as `TYPE mssql` reads it (a
+string under a collation with no code page here, its bytes, with one WARNING per column). A type whose
+conversion comes in a later release -- `xml`, `vector`,
 `json` -- and a user CLR type are returned as their stored bytes, a `BLOB`; no column is refused for
 its type. A column the scan cannot read -- a computed column that is not persisted (no
 stored value) or a sparse column -- is left out of `SELECT *`; a query that names it is refused,

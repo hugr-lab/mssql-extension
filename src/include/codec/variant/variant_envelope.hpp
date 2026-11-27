@@ -87,6 +87,27 @@ struct WireVariant {
 //! `why` for a base type sql_variant cannot hold or a shape it does not have.
 bool SplitTdsVariant(const uint8_t *data, size_t size, WireVariant &out, std::string &why);
 
+//! Where SplitDiskVariant puts the parts of a disk value whose TDS form differs (spec 093 T8b,
+//! measured/S1d.md): a string's properties and the value of a money, datetime or smalldatetime. One per
+//! chunk of a column (the kernel's), reused value after value: the last CollationId's wire collation is kept.
+struct DiskVariant {
+	uint8_t properties[7] = {};
+	uint8_t value[8] = {};
+	int64_t collation_id = -1;	// the CollationId `wire_collation` is of; -1 none yet
+	uint8_t wire_collation[5] = {};
+};
+
+//! Splits a sql_variant value as a record stores it (a backup's; `size` > 0): u8 base type (an xtype), u8
+//! version (1), the properties, the value. `out` is what SplitTdsVariant gives for the same value -- the
+//! TDS base type (bit 0x32, not its xtype 0x68), the TDS properties (a string's 5-byte collation from its
+//! CollationId, then its maximum length) and the TDS value bytes (money's halves, datetime's and
+//! smalldatetime's parts in the TDS order) -- its pointers into `data` or `scratch`, every length checked
+//! as SplitTdsVariant checks it, so EncodeVariant reads either alike. A CollationId the generated tables
+//! do not have gives a collation of zeros: a char / varchar value is then its bytes (EncodeNote's
+//! unknown_collation). False with `why` for another version, a base type sql_variant cannot hold or a
+//! shape it does not have.
+bool SplitDiskVariant(const uint8_t *data, size_t size, WireVariant &out, DiskVariant &scratch, std::string &why);
+
 //! What EncodeVariant reports beside the payload.
 struct EncodeNote {
 	//! A char / varchar value whose collation names no code page this build has: written as its

@@ -216,3 +216,66 @@ statement error
 ATTACH 'test/data/backup/clr_types/clr_types_full.bak' AS bad (TYPE mssql_backup, geometry_as 'svg');
 ----
 geometry_as must be 'geometry'
+
+# Two states (review of #621: clr_types_changes.sql's differential over the full): the listing reads each
+# value by its kernel on both sides -- a curve NULL under GEOMETRY (one WARNING), its ISO WKB under 'wkb'
+# --, in every storage form, a value grown off row included.
+statement ok
+SET VARIABLE cd = 'test/data/backup/clr_types/clr_types_diff.bak';
+
+query TI
+SELECT change_type, count(*) FROM mssql_backup_table_changes(getvariable('ct'), 'dbo', 'shapes', diff := getvariable('cd'))
+GROUP BY ALL ORDER BY ALL;
+----
+insert	2
+update_postimage	3
+update_preimage	3
+
+query TII
+SELECT change_type, id, octet_length(g) FROM mssql_backup_table_changes(getvariable('ct'), 'dbo', 'shapes',
+	diff := getvariable('cd'), geometry_as := 'wkb') WHERE id IN (2, 1002) ORDER BY id, change_type;
+----
+update_postimage	2	57
+update_preimage	2	21
+insert	1002	107
+
+query TIT
+SELECT change_type, id, g IS NULL FROM mssql_backup_table_changes(getvariable('ct'), 'dbo', 'shapes', diff := getvariable('cd'))
+WHERE id IN (2, 1002) ORDER BY id, change_type;
+----
+update_postimage	2	true
+update_preimage	2	false
+insert	1002	true
+
+query TIT
+SELECT change_type, id, h FROM mssql_backup_table_changes(getvariable('ct'), 'dbo', 'nodes', diff := getvariable('cd'))
+ORDER BY id, change_type;
+----
+update_postimage	2	/9/8/7/
+update_preimage	2	/1/
+update_postimage	3	NULL
+update_preimage	3	/1/2/
+insert	1001	/1.5/-2/
+
+query TTI
+SELECT t, change_type, count(*) FROM (
+	SELECT 'page' AS t, change_type FROM mssql_backup_table_changes(getvariable('ct'), 'dbo', 'mixed_page', diff := getvariable('cd'))
+	UNION ALL SELECT 'heap', change_type FROM mssql_backup_table_changes(getvariable('ct'), 'dbo', 'mixed_heap', diff := getvariable('cd'))
+	UNION ALL SELECT 'row', change_type FROM mssql_backup_table_changes(getvariable('ct'), 'dbo', 'mixed_row', diff := getvariable('cd')))
+GROUP BY ALL ORDER BY ALL;
+----
+heap	delete	2
+heap	update_postimage	24
+heap	update_preimage	24
+page	delete	2
+page	update_postimage	24
+page	update_preimage	24
+row	delete	2
+row	update_postimage	24
+row	update_preimage	24
+
+query IIT
+SELECT id, octet_length(g), _mssql_lob IS NOT NULL FROM mssql_backup_scan(getvariable('ct'), 'dbo', 'mixed_heap',
+	diff := getvariable('cd'), geometry_as := 'wkb') WHERE id = 1;
+----
+1	19225	true

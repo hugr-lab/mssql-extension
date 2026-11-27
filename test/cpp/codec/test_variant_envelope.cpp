@@ -146,6 +146,66 @@ std::string Varchar(const std::string &utf8) {
 	return LeHex(utf8.size(), 1) + ToHex(utf8);
 }
 
+// S1d (measured/S1d.md): S1's values as a record stores them, by S1's ids (48, NULL, has none).
+const std::pair<int, const char *> DISK_ROWS[] = {
+	{1, "680101"},
+	{2, "680100"},
+	{3, "3001ff"},
+	{4, "34010080"},
+	{5, "380100000080"},
+	{6, "7f010000000000000080"},
+	{7, "3b010000c03f"},
+	{8, "3e01039300aa4bdd3dfe"},
+	{9, "6a0101010105000000"},
+	{10, "6a0109020015cd5b07"},
+	{11, "6a011200014ef330a64b9bb601"},
+	{12, "6a011309011581e97df4102211"},
+	{13, "6a011c08004ef338be917a796deb35fd03"},
+	{14, "6a01260001ffffffff3f228a097ac4865aa84c3b4b"},
+	{15, "6a0126260001000000"},
+	{16, "6c010a0301d4300000"},
+	{17, "3c010000000000000080"},
+	{18, "7a01ffffff7f"},
+	{19, "2801000000"},
+	{20, "2801dab937"},
+	{21, "2901007f5101"},
+	{22, "2901037b512502"},
+	{23, "290106404ac66108"},
+	{24, "29010787e6bed153"},
+	{25, "2a0100a08c0020490b"},
+	{26, "2a01037b51250220490b"},
+	{27, "2a0106404ac6610820490b"},
+	{28, "2a010787e6bed15320490b"},
+	{29, "2a0107ffbf692ac9dab937"},
+	{30, "2a01070000000000000000"},
+	{31, "3d017198750001b50000"},
+	{32, "3a01ac0101b5"},
+	{33, "2b01004019011f490b4803"},
+	{34, "2b010640e201000021490bb8fc"},
+	{35, "2b010787aa06b82520490b4a01"},
+	{36, "2b0107ffbf692ac9dab9370000"},
+	{37, "2401ff19966f868b11d0b42d00c04fc964ff"},
+	{38, "ad01040001020000"},
+	{39, "a5010a00010203"},
+	{40, "af01050008d000346162202020"},
+	{41, "a7010a0008d00034636166e9"},
+	{42, "a7010a0015d00000e4eeec"},
+	{43, "a7010a0010d000008abf8e9a"},
+	{44, "a701140088d10400f09f9880c3a9"},
+	{45, "ef01140008d000346100620020002000200020002000200020002000"},
+	{46, "e701280008d104003dd800de7800"},
+	{47, "af01060015d00000e4eeec202020"},
+	{49, "a701050008d00034"},
+	{50, "a5010500"},
+};
+
+//! A disk value (S1d) split and encoded with one scratch, as a column's kernel keeps it.
+bool EncodeDisk(const std::vector<uint8_t> &disk, DiskVariant &scratch, std::string &blob, VariantTag &tag,
+				EncodeNote &note, std::string &why) {
+	WireVariant v;
+	return SplitDiskVariant(disk.data(), disk.size(), v, scratch, why) && EncodeVariant(v, blob, tag, note, why);
+}
+
 }  // namespace
 
 int main() {
@@ -279,6 +339,87 @@ int main() {
 			EncodeNote note;
 			const bool ok = Encode(b.first, blob, tag, note, why);
 			Check(!ok && why.find(b.second) != std::string::npos, "refused: " + b.second + " (got: " + why + ")");
+		}
+	}
+	std::cout << "sql_variant as a record stores it -> VARIANT (spec 093 T8b, experiment S1d)" << std::endl;
+	{
+		// Every disk value reads as its TDS envelope (S1's row of the same id) reads: tag and payload alike. One
+		// scratch for all of them, as a column's kernel keeps one, so the collation it caches changes between rows.
+		DiskVariant scratch;
+		for (const auto &d : DISK_ROWS) {
+			const Row *tds = nullptr;
+			for (const auto &r : ROWS) {
+				if (r.id == d.first) {
+					tds = &r;
+				}
+			}
+			std::string disk_blob, tds_blob, why;
+			VariantTag disk_tag = VariantTag::VARIANT_NULL, tds_tag = VariantTag::VARIANT_NULL;
+			EncodeNote disk_note, tds_note;
+			const bool disk_ok = EncodeDisk(Hex(d.second), scratch, disk_blob, disk_tag, disk_note, why);
+			const bool tds_ok =
+				tds && Encode(Envelope(tds->base_type, tds->properties, tds->value), tds_blob, tds_tag, tds_note, why);
+			Check(disk_ok && tds_ok && disk_tag == tds_tag && disk_blob == tds_blob && !disk_note.unknown_collation,
+				  "disk row " + std::to_string(d.first) + " reads as its TDS envelope (" + why + ")");
+		}
+		// A CollationId the generated tables do not have: a char / varchar value is its bytes, an nvarchar is
+		// read (its collation says nothing of UTF-16).
+		std::string blob, why;
+		VariantTag tag = VariantTag::VARIANT_NULL;
+		EncodeNote note;
+		Check(EncodeDisk(Hex("a7010a00ffffff7f636166e9"), scratch, blob, tag, note, why) && tag == VariantTag::BLOB &&
+				  note.unknown_collation,
+			  "an unknown CollationId: the varchar's bytes, noted");
+		blob.clear();
+		note = EncodeNote();
+		Check(EncodeDisk(Hex("e7010400ffffff7f61006200"), scratch, blob, tag, note, why) && tag == VariantTag::VARCHAR,
+			  "an unknown CollationId beside an nvarchar: read");
+		const std::vector<std::pair<std::string, std::string>> bad = {
+			{"", "shorter than its header"},
+			{"68", "shorter than its header"},
+			{"680201", "version 2"},
+			{"320101", "base type 0x32"},
+			{"62010000", "base type 0x62"},
+			{"3801000000", "bytes where its base type has 4"},
+			{"a7010a0008d000", "property bytes"},
+			{"e7010400080d0034610062", "odd"},
+			{"6a0109020015cd5b", "not a sign and 4, 8, 12 or 16"},
+			{"3d0171987500", "bytes where its base type has 8"},
+			{"3c01000000000000", "bytes where its base type has 8"},
+			{"3a01ac01", "bytes where its base type has 4"},
+		};
+		for (const auto &b : bad) {
+			std::string out, reason;
+			VariantTag t;
+			EncodeNote n;
+			const bool ok = EncodeDisk(Hex(b.first), scratch, out, t, n, reason);
+			Check(!ok && reason.find(b.second) != std::string::npos,
+				  "disk refused: " + b.second + " (got: " + reason + ")");
+		}
+		// The longest values a sql_variant holds are read; a longer one is no sql_variant (review of #631):
+		// an nvarchar of 8000 bytes (8008 on disk), a varbinary of 8000 (8004), and one of 9000 bytes.
+		{
+			auto nvarchar = Hex("e701401f08d00034");
+			nvarchar.resize(nvarchar.size() + 8000, 0x61);
+			auto varbinary = Hex("a501401f");
+			varbinary.resize(varbinary.size() + 8000, 0xab);
+			auto longer = Hex("a5012823");
+			longer.resize(longer.size() + 9000, 0xab);
+			std::string out, reason;
+			VariantTag t = VariantTag::VARIANT_NULL;
+			EncodeNote n;
+			Check(
+				nvarchar.size() == 8008 && EncodeDisk(nvarchar, scratch, out, t, n, reason) && t == VariantTag::VARCHAR,
+				"an nvarchar of 8000 bytes read (" + reason + ")");
+			out.clear();
+			Check(
+				varbinary.size() == 8004 && EncodeDisk(varbinary, scratch, out, t, n, reason) && t == VariantTag::BLOB,
+				"a varbinary of 8000 bytes read (" + reason + ")");
+			out.clear();
+			reason.clear();
+			Check(
+				!EncodeDisk(longer, scratch, out, t, n, reason) && reason.find("longer than any") != std::string::npos,
+				"a 9000-byte value refused (got: " + reason + ")");
 		}
 	}
 	std::cout << (failures ? "FAILED: " + std::to_string(failures) + " check(s)" : "all checks passed") << std::endl;

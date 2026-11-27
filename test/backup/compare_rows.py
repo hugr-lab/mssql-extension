@@ -52,7 +52,7 @@ def tsql_ident(s):
 
 
 class Session:
-    def __init__(self, binary, port, password, database):
+    def __init__(self, binary, port, password, database, geometry_as=""):
         self.binary = binary
         self.password = password
         dsn = (f"Server=localhost,{port};Database={database};User Id=sa;Password={password};"
@@ -60,7 +60,8 @@ class Session:
         # No log on the console: a WARNING (a curve read as NULL, spec 093 T8) would be printed into the JSON.
         self.preamble = (".output /dev/null\n"
                          "SET enable_logging = false;\n"
-                         f"ATTACH {sql_string(dsn)} AS srv (TYPE mssql, native_types false);\n"
+                         f"ATTACH {sql_string(dsn)} AS srv (TYPE mssql, native_types false"
+                         f"{', geometry_as ' + sql_string(geometry_as) if geometry_as else ''});\n"
                          ".output\n")
 
     def mask(self, text):
@@ -166,6 +167,9 @@ def main():
     parser.add_argument("--diff", default="", help="a differential to lay over the backup: its stripes comma-separated")
     parser.add_argument("--log", default="",
                         help="compare the backup's log with fn_dump_dblog over these server paths (comma-separated)")
+    parser.add_argument("--geometry-as", default="",
+                        help="read geometry / geography as this on both sides (spec 093 T8: 'native' compares the "
+                             "stored bytes, the curves included, with the server's own)")
     parser.add_argument("--fuzzy", action="store_true",
                         help="a backup taken under load: check each table's fuzzy_status against whether it differs")
     parser.add_argument("--flagged-equal", default="",
@@ -173,7 +177,7 @@ def main():
     args = parser.parse_args()
     try:
         session = Session(args.duckdb, os.environ["MSSQL_ROWS_PORT"], os.environ["MSSQL_ROWS_PASSWORD"],
-                          os.environ["MSSQL_ROWS_DATABASE"])
+                          os.environ["MSSQL_ROWS_DATABASE"], args.geometry_as)
     except KeyError as e:
         sys.exit(f"compare_rows: set {e.args[0]}")
     files = [f for f in args.backup.split(",") if f]
@@ -183,6 +187,8 @@ def main():
     opts = (", diff := [" + ", ".join(sql_string(f) for f in diff) + "]") if diff else ""
     # A table's status is checked from the listing; its scan reads it whatever the status (no WARNING in the output).
     scan_opts = opts + (", fuzzy := 'ignore'" if args.fuzzy else "")
+    if args.geometry_as:
+        scan_opts += f", geometry_as := {sql_string(args.geometry_as)}"
 
     if args.log:
         sys.exit(compare_log(session, args, paths))

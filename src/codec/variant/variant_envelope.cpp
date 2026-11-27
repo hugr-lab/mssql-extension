@@ -19,8 +19,8 @@ constexpr int64_t DAYS_FROM_0001_TO_EPOCH = 719162;	 // 0001-01-01 .. 1970-01-01
 constexpr int64_t DAYS_FROM_1900_TO_EPOCH = 25567;	 // 1900-01-01 .. 1970-01-01
 constexpr int64_t SECONDS_PER_DAY = 86400;
 constexpr int64_t MICROS_PER_DAY = SECONDS_PER_DAY * 1000000;
-// A decimal's mantissa: 16 bytes at every precision on 2022 (S1); the column form's 4 / 8 / 12 are
-// taken too, so a server that sends those reads as well.
+// A decimal's mantissa: 16 bytes at every precision over TDS (S1); a record stores the fewest of 4 / 8 / 12
+// / 16 that hold the value (S1d), each read at its width.
 constexpr uint8_t DECIMAL_MANTISSA_BYTES = 16;
 
 uint64_t Load(const uint8_t *p, size_t bytes) {
@@ -80,7 +80,7 @@ void Pow10Wide(uint8_t p, uint64_t &hi, uint64_t &lo) {
 	}
 }
 
-//! A decimal / numeric: sign byte (1 = positive) and a 16-byte mantissa, below 10^precision.
+//! A decimal / numeric: sign byte (1 = positive) and a mantissa of 4, 8, 12 or 16 bytes, below 10^precision.
 bool EncodeDecimal(uint8_t precision, uint8_t scale, const uint8_t *value, size_t bytes, std::string &blob,
 				   std::string &why) {
 	const bool positive = value[0] != 0;
@@ -268,6 +268,12 @@ BaseShape ShapeOf(uint8_t base_type) {
 	}
 }
 
+//! A value's lengths against its base type's shape (`out` split by either splitter).
+bool CheckValue(const WireVariant &out, const BaseShape &shape, std::string &why);
+
+//! bit's xtype, its base type on disk (S1d); its TDS base type is TDS_TYPE_BIT (0x32).
+constexpr uint8_t DISK_BIT = 0x68;
+
 }  // namespace
 
 bool SplitTdsVariant(const uint8_t *data, size_t size, WireVariant &out, std::string &why) {
@@ -291,6 +297,98 @@ bool SplitTdsVariant(const uint8_t *data, size_t size, WireVariant &out, std::st
 	out.properties = data + 2;
 	out.value = data + 2 + out.property_bytes;
 	out.value_bytes = size - 2 - out.property_bytes;
+	return CheckValue(out, shape, why);
+}
+
+bool SplitDiskVariant(const uint8_t *data, size_t size, WireVariant &out, DiskVariant &scratch, std::string &why) {
+	if (size < 2) {
+		why = "a sql_variant value of " + std::to_string(size) + " bytes, shorter than its header";
+		return false;
+	}
+	// No sql_variant is longer than the TDS form's bound (8009; 8008 on disk: a string's 8000 bytes, 2
+	// header and 6 property bytes), so a longer value -- a long one in a crafted record -- is not one, and
+	// is refused before it is decoded (review of #631: a string's UTF-16 copy and output went past the one
+	// reservation of its length). One stored off row is refused before its tree is read (PrepareRow).
+	if (size > tds::SQL_VARIANT_MAX_BYTES) {
+		why = "a sql_variant value of " + std::to_string(size) + " bytes, longer than any (" +
+			  std::to_string(tds::SQL_VARIANT_MAX_BYTES) + ")";
+		return false;
+	}
+	if (data[1] != 1) {
+		why = "a sql_variant of version " + std::to_string(data[1]) + ", not 1";
+		return false;
+	}
+	// bit is the one base type whose xtype is not its TDS type code (S1d).
+	out.base_type = data[0] == DISK_BIT ? tds::TDS_TYPE_BIT : data[0];
+	const BaseShape shape = ShapeOf(out.base_type);
+	if (!shape.known || data[0] == tds::TDS_TYPE_BIT) {
+		why = "a sql_variant of base type 0x" + std::string(1, "0123456789ABCDEF"[data[0] >> 4]) +
+			  std::string(1, "0123456789ABCDEF"[data[0] & 15]) + ", which sql_variant cannot hold";
+		return false;
+	}
+	using namespace tds;
+	const bool text = out.base_type == TDS_TYPE_BIGCHAR || out.base_type == TDS_TYPE_BIGVARCHAR ||
+					  out.base_type == TDS_TYPE_NCHAR || out.base_type == TDS_TYPE_NVARCHAR;
+	// A string's properties are 6 bytes on disk (u16 length, u32 CollationId), 7 over TDS; every other
+	// base type's are the same.
+	const uint8_t disk_property_bytes = text ? 6 : shape.property_bytes;
+	if (size < 2u + disk_property_bytes) {
+		why = "a sql_variant of " + std::to_string(size) + " bytes, shorter than its base type's " +
+			  std::to_string(disk_property_bytes) + " property bytes";
+		return false;
+	}
+	const uint8_t *props = data + 2;
+	out.property_bytes = shape.property_bytes;
+	out.properties = props;
+	out.value = data + 2 + disk_property_bytes;
+	out.value_bytes = size - 2 - disk_property_bytes;
+	switch (out.base_type) {
+	case TDS_TYPE_BIGCHAR:
+	case TDS_TYPE_BIGVARCHAR:
+	case TDS_TYPE_NCHAR:
+	case TDS_TYPE_NVARCHAR: {
+		// Disk: u16 maximum length, u32 CollationId; TDS: the 5-byte collation, then the length.
+		const int64_t id = static_cast<int32_t>(Load(props + 2, 4));
+		if (id != scratch.collation_id) {
+			const auto *row = code_page::FindCollationById(static_cast<int32_t>(id));
+			if (!row || !code_page::WireCollationForName(row->name, std::strlen(row->name), scratch.wire_collation)) {
+				std::memset(scratch.wire_collation, 0, sizeof(scratch.wire_collation));
+			}
+			scratch.collation_id = id;
+		}
+		std::memcpy(scratch.properties, scratch.wire_collation, 5);
+		std::memcpy(scratch.properties + 5, props, 2);
+		out.properties = scratch.properties;
+		break;
+	}
+	case TDS_TYPE_MONEY:
+		// Disk: an int64 little-endian; TDS: its high half first.
+		if (out.value_bytes == 8) {
+			std::memcpy(scratch.value, out.value + 4, 4);
+			std::memcpy(scratch.value + 4, out.value, 4);
+			out.value = scratch.value;
+		}
+		break;
+	case TDS_TYPE_DATETIME:
+	case TDS_TYPE_SMALLDATETIME: {
+		// Disk: the time part, then the days; TDS: the days, then the time part (4 + 4, 2 + 2 bytes).
+		const size_t half = out.base_type == TDS_TYPE_DATETIME ? 4 : 2;
+		if (out.value_bytes == 2 * half) {
+			std::memcpy(scratch.value, out.value + half, half);
+			std::memcpy(scratch.value + half, out.value, half);
+			out.value = scratch.value;
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	return CheckValue(out, shape, why);
+}
+
+namespace {
+
+bool CheckValue(const WireVariant &out, const BaseShape &shape, std::string &why) {
 	size_t expected = shape.fixed_value_bytes;
 	if (out.property_bytes == 1) {	// time / datetime2 / datetimeoffset: the scale
 		const uint8_t scale = out.properties[0];
@@ -317,6 +415,8 @@ bool SplitTdsVariant(const uint8_t *data, size_t size, WireVariant &out, std::st
 	}
 	return true;
 }
+
+}  // namespace
 
 bool EncodeVariant(const WireVariant &v, std::string &blob, VariantTag &tag, EncodeNote &note, std::string &why) {
 	using namespace tds;

@@ -225,11 +225,13 @@ public:
 			stager_->Append(row);
 			const idx_t unread = Unreadable();
 			stager_->FinalizeChunk(chunk_);
-			// A CLR value its kernel read as NULL (bytes that are not MS-SSCLRT or a hierarchyid's): the scan
-			// says it in a WARNING, the records have none, so the image keeps its bytes and says why (review of
-			// #621).
+			// A CLR or sql_variant value its kernel read as NULL (bytes that are not MS-SSCLRT, a hierarchyid's or
+			// a sql_variant's): the scan says it in a WARNING, the records have none, so the image keeps its bytes
+			// and says why (review of #621; spec 093 T8b).
 			if (Unreadable() != unread) {
-				reason = "a geometry, geography or hierarchyid value whose stored bytes cannot be read as its type";
+				reason =
+					"a geometry, geography, hierarchyid or sql_variant value whose stored bytes cannot be read as "
+					"its type";
 				return false;
 			}
 			child_list_t<Value> values;
@@ -247,11 +249,11 @@ public:
 	}
 
 private:
-	//! The values the stager's CLR kernels read as NULL so far (RecordStager::ClrNotes).
+	//! The values the stager's CLR and sql_variant kernels read as NULL so far (RecordStager::TypeNotes).
 	idx_t Unreadable() const {
 		idx_t n = 0;
-		for (const auto &note : stager_->ClrNotes()) {
-			n += note.spatial.malformed + note.hierarchyid.malformed;
+		for (const auto &note : stager_->TypeNotes()) {
+			n += note.Unreadable();
 		}
 		return n;
 	}

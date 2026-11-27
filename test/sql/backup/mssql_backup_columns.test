@@ -27,12 +27,11 @@ dbo	items	6	flag	flag	bit	sys	bit	BOOLEAN	converted	NULL
 dbo	items	7	blob	blob	varbinary(64)	sys	varbinary(64)	BLOB	converted	NULL
 
 # The tables of schema sys are listed too, read as any table: every column converted, a sql_variant one as
-# its stored bytes (spec 093 T1's VARIANT for a backup is still to come).
+# VARIANT (spec 093 T8b).
 query TI
 SELECT state, count(*) FROM mssql_backup_columns('test/data/backup/full.bak', 'sys') GROUP BY ALL ORDER BY ALL;
 ----
-converted	1265
-stored_bytes	4
+converted	1269
 
 # One schema's, one table's; every family of a striped set, a compressed one.
 query I
