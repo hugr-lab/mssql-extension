@@ -43,7 +43,9 @@ struct ValueFraming {
 };
 
 //! The per-value walks' framing of every TDS type, by type id. It was a ~30-case switch on the type in
-//! SkipValue and, arm for arm, in SkipValueNBC, ReadValue and ReadValueNBC; the rows below are those arms.
+//! SkipValue and, arm for arm, in SkipValueNBC; the rows below are those arms. ReadValue and ReadValueNBC
+//! had the same switch less two things, which they keep: no reader for TEXT / NTEXT / IMAGE (LEGACY_LOB
+//! is refused there), and a ROW's UNIQUEIDENTIFIER read before the table is asked.
 //!
 //! Deliberately NOT ResolveSkipForm's switch, and not built from it: the fast walk is safe only while
 //! the two agree, and test_skip_form_equivalence holds that by comparing them as two independent

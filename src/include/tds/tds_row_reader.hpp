@@ -47,7 +47,8 @@ public:
 	// NBC variants - for the columns an NBCROW's bitmap says are present. Such a value is framed as it
 	// is in a ROW, length prefix included (the bitmap only leaves the NULL columns out): SkipValueNBC is
 	// SkipValue, and ReadValueNBC reads a 1-byte prefix of 0 as an empty value where a ROW's is NULL.
-	// Kept as entry points of their own for the staged path and the tests.
+	// SkipValueNBC is kept as an entry point of its own for the staged path and the tests; ReadValueNBC
+	// is ReadNBCRow's.
 	size_t SkipValueNBC(const uint8_t *data, size_t length, size_t col_idx);
 	size_t ReadValueNBC(const uint8_t *data, size_t length, size_t col_idx, std::vector<uint8_t> &value, bool &is_null);
 

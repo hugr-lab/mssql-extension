@@ -176,12 +176,11 @@ public:
 // Spec 058 D1-alt. The skip walk's job per value is tiny — read a length
 // prefix, bounds-check, advance — but SkipValue selects it by type_id PER
 // VALUE (a ~30-case switch when this was measured, a table now). The wire has
-// only four framing shapes, and
-// which one a column uses is fixed at COLMETADATA, so the parser resolves each
-// column to a form ONCE and the walk dispatches on a 2-bit form from a
-// contiguous array instead. Measured before the change: the whole walk is
-// 1.7–2.1 ns/value, ~13% of the entire client-side read of a cheap type
-// (spec 058 §3a/T0e).
+// only four framing shapes, and which one a column uses is fixed at
+// COLMETADATA, so the parser resolves each column to a form ONCE and the walk
+// dispatches on a 2-bit form from a contiguous array instead. Measured before
+// the change: the whole walk is 1.7–2.1 ns/value, ~13% of the entire
+// client-side read of a cheap type (spec 058 §3a/T0e).
 //
 // SLOW keeps the legacy SkipValue/SkipValueNBC as the one implementation of
 // the hard forms: PLP chunk lists, the TEXT/NTEXT/IMAGE text-pointer form and

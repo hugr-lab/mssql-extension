@@ -428,20 +428,29 @@ For `BEGIN_TRANS` (type 8): the 8-byte transaction descriptor is stored and incl
 
 `RowReader` (`src/tds/tds_row_reader.cpp`) extracts column values from ROW and NBCROW tokens.
 
-### Type-Specific Readers
+### Per-Value Readers
 
-| Method | Types Handled |
-|---|---|
-| `ReadFixedType` | TINYINT, BIT, SMALLINT, INT, BIGINT, REAL, FLOAT, MONEY, DATETIME |
-| `ReadNullableFixedType` | INTN, BITN, FLOATN, MONEYN, DATETIMEN |
-| `ReadVariableLengthType` | VARCHAR, NVARCHAR, VARBINARY (2-byte length prefix) |
-| `ReadDecimalType` | DECIMAL, NUMERIC (sign byte + magnitude) |
-| `ReadDateType` | DATE (3 bytes) |
-| `ReadTimeType` | TIME (3-5 bytes, scale-dependent) |
-| `ReadDateTime2Type` | DATETIME2 (variable time + 3-byte date) |
-| `ReadDateTimeOffsetType` | DATETIMEOFFSET (time + date + 2-byte offset) |
-| `ReadGuidType` | UNIQUEIDENTIFIER (16 bytes, mixed-endian) |
-| `ReadPLPType` | VARCHAR(MAX), NVARCHAR(MAX), VARBINARY(MAX) |
+`ReadValue` (a ROW's value) and `ReadValueNBC` (a value an NBCROW's bitmap says is present) look the
+column's type up in one framing table (`LegacyFramings`), which `SkipValue` reads too, and read the
+value by its framing:
+
+| Framing | Read by | Types |
+|---|---|---|
+| Fixed width | `ReadFixed` | TINYINT, BIT, SMALLINT, INT, BIGINT, REAL, FLOAT, MONEY, SMALLMONEY, DATETIME, SMALLDATETIME |
+| 1-byte length prefix | `ReadBytePrefixed` | INTN, BITN, FLOATN, MONEYN, DATETIMEN, DECIMAL, NUMERIC, DATE, TIME, DATETIME2, DATETIMEOFFSET, UNIQUEIDENTIFIER (in an NBCROW) |
+| 16 bytes after the prefix | `ReadGuidType` | UNIQUEIDENTIFIER in a ROW |
+| 2-byte length prefix | `ReadVariableLengthType` | CHAR, VARCHAR, NCHAR, NVARCHAR, BINARY, VARBINARY, VECTOR |
+| PLP chunk list | `ReadPLPType` | the MAX forms of those, XML, UDT |
+| 4-byte length | `ReadVariant` | SQL_VARIANT |
+
+A value in an NBCROW is framed as in a ROW, its length prefix included; the bitmap only leaves the NULL
+columns out. The two forms differ in one thing: a 1-byte length of 0 is NULL in a ROW and an empty
+value in an NBCROW. TEXT / NTEXT / IMAGE can be skipped and are not read by these readers (a catalog
+scan casts them on the server).
+
+The fast skip walk (`SkipByForm`, by `ResolveSkipForm`) states the framing a second time, on purpose:
+`test_skip_form_equivalence` holds it to `SkipValue`, and `test_row_reader_values` holds the readers
+to the skip walks.
 
 ### PLP Format (for MAX types)
 
