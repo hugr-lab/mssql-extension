@@ -388,7 +388,8 @@ beyond X§4:
   0 is not stored either, so the vector can take its index. Its tag decides where the null bitmap says no
   regular column is stored at that index; where the bitmap says one is (an empty value's null bit is clear:
   review of #626), a tagged column is the vector only if every id is a sparse column's of the layout and its
-  last value ends at its end, else it is read as that regular column (E24, "What the reader does").
+  last value ends at its end; one that fails is read as that regular column only when it is a LOB root pointer's
+  16 bytes, and refused by name at any other size (E24, "What the reader does").
 - **The ids** are `sysrscols.hbcolid`: after `ALTER COLUMN … ADD SPARSE` a column's value is under a new one,
   and after `DROP SPARSE` or a dropped column the old entries stay under the dropped column's.
 - **Bit 15** of an entry's end marks an off-row value: an in-row LOB root, a row-overflow pointer.
@@ -409,8 +410,9 @@ RESTORE on 2025: `compare_rows` 10 tables, 5,648 rows, the overlay 5,907, 0 fail
 fields, 0 differences; the change listing equal to the two scans' differences on every table. Those counts are
 the first fixture's: the review of #626 added 46 rows (4 in `types_sparse`, 40 in `heap_sparse`, 2 in
 `uniq_sparse`) and the committed fixture was regenerated; `compare_rows` was run again on it against RESTORE on
-2019, 2022 and 2025, 0 failures for the full backup and the overlay (PR #626's review reply; the new counts
-were not recorded).
+2019, 2022 and 2025, 0 failures for the full backup and the overlay (PR #626's review reply). The second
+review fix regenerated it once more on 2025: 13 tables, 0 failures against RESTORE (commit `cad9e6e2`). The row
+counts of the two later runs were not recorded.
 
 **PR 4 — `xml`**
 

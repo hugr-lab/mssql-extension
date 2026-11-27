@@ -102,8 +102,9 @@ that is not persisted, and read as one (owner, 2026-11-24: decision A).
   whose low 16 bits were 0 in every value (E21). Past every regular column, the last one must be the vector.
   Every part is checked: n, the ids ascending, the ends ascending and within the vector. Where the bitmap says
   the regular column at that index holds a value, the vector must also have every id a sparse column's of the
-  layout (live or dropped) and its last value end at its end; a tagged column that fails is that column, not
-  an error. The vector is then not counted among the
+  layout (live or dropped) and its last value end at its end; a tagged column that fails is that column only when it
+  is a LOB root pointer's 16 bytes (a text / ntext / image root), and is refused by name at any other size. The
+  vector is then not counted among the
   record's regular variable columns, so a regular one at its index is not stored.
 - **The change listing:** a sparse table's rows are compared by their values, not their bytes. `ALTER`
   rewrites every row with its values the same, and a vector keeps a dropped column's entries.
