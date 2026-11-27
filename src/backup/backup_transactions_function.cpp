@@ -171,12 +171,14 @@ std::unordered_map<uint64_t, UnitOwner> OwnersOf(const CatalogModel &model) {
 //! keep their bytes, and say why.
 class RowImageDecoder {
 public:
-	explicit RowImageDecoder(const CatalogTable &table) : table_(table) {
+	//! `datetime2_read`: the ATTACH's datetime2_7_as, else the setting (spec 093 T8c), as the scan reads.
+	RowImageDecoder(const CatalogTable &table, MSSQLDatetime2Read datetime2_read) : table_(table) {
 		// Spec 093 T8: a geometry / geography value as its ISO WKB (a BLOB in the VARIANT), whatever an
 		// ATTACH's geometry_as says: no value is lost -- a curve or FullGlobe, which a GEOMETRY cannot hold,
 		// would be NULL with nothing to say it, the records having no WARNING of their own.
 		TypeForms forms;
 		forms.geometry_as = tds::GeometryAs::Wkb;
+		forms.datetime2_read = datetime2_read;
 		const ScanColumns columns = ScanColumnsOf(table, forms);
 		names_ = columns.names;
 		stager_.reset(new RecordStager(table, columns.column_ids, forms));
@@ -231,12 +233,14 @@ public:
 			const idx_t unread = Unreadable();
 			stager_->FinalizeChunk(chunk_);
 			// A CLR or sql_variant value its kernel read as NULL (bytes that are not MS-SSCLRT, a hierarchyid's or
-			// a sql_variant's): the scan says it in a WARNING, the records have none, so the image keeps its bytes
-			// and says why (review of #621; spec 093 T8b).
+			// a sql_variant's), or a datetime2(7) past TIMESTAMP_NS (spec 093 T8c): the scan says it in a WARNING,
+			// the records have none, so the image keeps its bytes and says why (review of #621; spec 093 T8b).
 			if (Unreadable() != unread) {
 				reason =
-					"a geometry, geography, hierarchyid or sql_variant value whose stored bytes cannot be read as "
-					"its type";
+					"a geometry, geography, hierarchyid or sql_variant value whose stored bytes cannot be read "
+					"as its type, or a datetime2(7) outside TIMESTAMP_NS's range (datetime2_7_as 'timestamp' "
+					"as an ATTACH option, or SET mssql_datetime2_7_as = 'timestamp' before the ATTACH or before a "
+					"call over files, reads it)";
 				return false;
 			}
 			child_list_t<Value> values;
@@ -254,11 +258,12 @@ public:
 	}
 
 private:
-	//! The values the stager's CLR and sql_variant kernels read as NULL so far (RecordStager::TypeNotes).
+	//! The values the stager's CLR and sql_variant kernels read as NULL so far, and its datetime2(7) values
+	//! that did not fit TIMESTAMP_NS (RecordStager::TypeNotes).
 	idx_t Unreadable() const {
 		idx_t n = 0;
 		for (const auto &note : stager_->TypeNotes()) {
-			n += note.Unreadable();
+			n += note.Unreadable() + note.out_of_range;
 		}
 		return n;
 	}
@@ -276,6 +281,8 @@ struct LogBindData : public TableFunctionData {
 	vector<std::string> diff;
 	BackupAt at;
 	bool records = false;
+	//! Spec 093 T8c: how a row image's datetime2(7) is read -- the ATTACH's datetime2_7_as, else the setting.
+	MSSQLDatetime2Read datetime2_read = MSSQLDatetime2Read::Nanoseconds;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<LogBindData>();
@@ -283,11 +290,13 @@ struct LogBindData : public TableFunctionData {
 		copy->diff = diff;
 		copy->at = at;
 		copy->records = records;
+		copy->datetime2_read = datetime2_read;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<LogBindData>();
-		return paths == other.paths && diff == other.diff && at.Same(other.at) && records == other.records;
+		return paths == other.paths && diff == other.diff && at.Same(other.at) && records == other.records &&
+			   datetime2_read == other.datetime2_read;
 	}
 	//! As the listings: an attached name's version is pinned again by every EXECUTE.
 	bool SupportStatementCache() const override {
@@ -321,6 +330,7 @@ struct LogState : public GlobalTableFunctionState {
 	std::unique_ptr<LogTailCursor> cursor;
 	std::unique_ptr<ReservedBytes> cursor_memory;  // the cursor's chunk, reserved with DuckDB (D17)
 	std::map<const CatalogTable *, std::unique_ptr<RowImageDecoder>> decoders;
+	MSSQLDatetime2Read datetime2_read = MSSQLDatetime2Read::Nanoseconds;  // the bind's (spec 093 T8c)
 
 	const FileBinding &Binding() const {
 		return catalog ? catalog->Binding() : opened.binding;
@@ -383,6 +393,8 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	if (data->paths.size() == 1) {
 		PinAttachedVersion(context, data->paths.front(), data->at);
 	}
+	data->datetime2_read =
+		TypeFormsOf(TypeFormOptionsOf(context, input.named_parameters, data->paths, function), function).datetime2_read;
 	for (const auto &column : RECORDS_FUNCTION ? RecordColumns() : TransactionColumns()) {
 		names.emplace_back(column.name);
 		return_types.push_back(column.type);
@@ -425,6 +437,7 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 	const auto &data = input.bind_data->Cast<LogBindData>();
 	const char *function = data.records ? RECORDS : TRANSACTIONS;
 	auto state = make_uniq<LogState>();
+	state->datetime2_read = data.datetime2_read;
 	const std::vector<std::string> paths(data.paths.begin(), data.paths.end());
 	const std::vector<std::string> diff(data.diff.begin(), data.diff.end());
 	try {
@@ -552,7 +565,7 @@ Value RowValue(LogState &state, const UnitOwner *owner, const LogRecord &r, cons
 	}
 	auto &decoder = state.decoders[owner->table];
 	if (!decoder) {
-		decoder.reset(new RowImageDecoder(*owner->table));
+		decoder.reset(new RowImageDecoder(*owner->table, state.datetime2_read));
 	}
 	Value out;
 	std::string why;
