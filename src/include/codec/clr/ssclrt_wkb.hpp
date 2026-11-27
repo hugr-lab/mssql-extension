@@ -111,8 +111,20 @@ private:
 	template <bool WRITE>
 	friend class Emitter;
 
+	SpatialStatus ReadSingle(const uint8_t *data, size_t size, bool point);
+	SpatialStatus ReadShaped(const uint8_t *data, size_t size, uint8_t version, bool curves);
 	SpatialStatus ReadArrays(const uint8_t *data, size_t size, uint8_t version);
 	SpatialStatus Validate(uint8_t version, bool &geometry_holds);
+	//! Validate's steps.
+	bool FiguresInOrder() const;
+	SpatialStatus PlaceShape(uint32_t s, uint8_t version, int32_t &previous_figure, bool &geometry_holds);
+	bool FirstFigureInOrder(const Shape &shape, int32_t &previous_figure) const;
+	bool ParentHolds(uint32_t s) const;
+	SpatialStatus LinkMember(uint32_t s, bool &geometry_holds);
+	void EndFigures();
+	bool LeafHoldsItsFigures(uint32_t s) const;
+	bool FullGlobeIsAlone(uint32_t s) const;
+	bool PointHasOnePoint(uint32_t s) const;
 
 	const uint8_t *data_ = nullptr;
 	size_t size_ = 0;
