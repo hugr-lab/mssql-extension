@@ -36,12 +36,14 @@ struct VariantColumnNotes {
 };
 
 //! The staged envelopes of `count` rows (`st`: Var staging, NULL rows invalid) into `out`, a fresh flat
-//! VARIANT vector. An envelope that is not a sql_variant is an InvalidInputException naming the column.
+//! VARIANT vector. An envelope that is not a sql_variant: a TDS column's is an InvalidInputException naming
+//! the column; a backup record's (`col.variant_disk_form`) is NULL, counted in `notes->malformed`, and
+//! throws as a TDS one does only when `notes` is null.
 void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col, Vector &out,
 							VariantColumnNotes *notes);
 
-//! One envelope (`bytes`, non-empty) into `out` at `row` (the per-value path), counted into `notes` as the
-//! chunk path counts.
+//! One envelope (`bytes`, non-empty) into `out` at `row` (the per-value path), counted into `notes` and
+//! refused or read as NULL as the chunk path does.
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row,
 				   VariantColumnNotes *notes);
 
