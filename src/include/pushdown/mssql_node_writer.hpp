@@ -450,6 +450,42 @@ private:
 	//! Types `constant` from `peer` and renders it. An operand of arithmetic
 	//! keeps its type in literal form too (see the definition).
 	bool BindConstant(const Operand &peer, Operand &constant, bool arithmetic = false);
+	//! The steps of the functions above (mssql_node_writer_values.cpp). ConstantFor by the constant's
+	//! form: a typed literal (`DATE '2024-01-01'`), a string literal, a number.
+	bool TypedLiteralFor(const LogicalType &target, const std::string &peer_name, const ParsedExpression &expr,
+						 Value &out);
+	bool StringLiteralFor(ComparableKind kind, const LogicalType &target, const ParsedExpression &expr, Value &out);
+	bool NumericLiteralFor(ComparableKind kind, const LogicalType &target, const std::string &peer_name,
+						   const ParsedExpression &expr, Value &out);
+	//! WriteValue by the expression's class. A column reference: QUALIFY's select-list alias, a
+	//! correlated column of a node around this one, or a column of the node's own.
+	bool WriteColumnRef(const ColumnRefExpression &ref, Operand &out);
+	const OutputColumn *QualifyAliasOf(const ColumnRefExpression &ref) const;
+	bool WriteQualifyAlias(const OutputColumn &alias, Operand &out);
+	bool ResolveOwnOrOuter(const ColumnRefExpression &ref, idx_t &index, Operand &out, bool &found);
+	bool WriteTableColumn(idx_t index, Operand &out);
+	bool WriteOperands(const vector<unique_ptr<ParsedExpression>> &children, std::vector<Operand> &operands);
+	bool WriteCoalesceOrNullIf(const OperatorExpression &op, Operand &out);
+	bool WriteFunctionValue(const FunctionExpression &fn, Operand &out);
+	bool WriteAggregateCall(const FunctionExpression &fn, AggregateKind aggregate, Operand &out);
+	bool WriteNullIfFunction(const FunctionExpression &fn, Operand &out);
+	//! Unify: what a branch that is not a constant must be beside the peer, and the constants typed from it.
+	bool CheckBranch(const Operand &operand, const Operand &peer);
+	bool CheckStringBranch(const Operand &operand, const Operand &peer);
+	bool BindBranchConstants(std::vector<Operand> &operands, const Operand &peer, bool &typed_constant);
+	//! WriteArithmetic: `-x`, and `+ - * %` with a decimal result's type.
+	bool WriteNegation(const FunctionExpression &fn, const Operand &operand, Operand &out);
+	bool WriteBinaryArithmetic(const FunctionExpression &fn, Operand &left, Operand &right, Operand &out);
+	bool BindArithmeticConstant(const FunctionExpression &fn, Operand &left, Operand &right);
+	bool TypeDecimalSum(const Operand &left, const Operand &right, bool with_constant, Operand &out);
+	bool TypeDecimalProduct(const Operand &left, const Operand &right, bool with_constant, Operand &out);
+	//! WritePredicateImpl by the expression's class.
+	bool WriteConjunction(const ParsedExpression &expr, std::string &sql);
+	bool WriteFunctionPredicate(const FunctionExpression &fn, std::string &sql);
+	bool WriteOperatorPredicate(const OperatorExpression &op, std::string &sql);
+	bool WriteNot(const OperatorExpression &op, std::string &sql);
+	bool WriteIsNull(const OperatorExpression &op, std::string &sql);
+	bool WriteBitCondition(const ParsedExpression &expr, std::string &sql);
 	//! A column in WHERE / GROUP BY / an expression. One table: its bare
 	//! name. A join: qualified by the relation's own alias, `[r1].[c]`, which no
 	//! user alias or table name can shadow.
