@@ -44,7 +44,11 @@ public:
 	size_t SkipValue(const uint8_t *data, size_t length, size_t col_idx);
 	size_t ReadValue(const uint8_t *data, size_t length, size_t col_idx, std::vector<uint8_t> &value, bool &is_null);
 
-	// NBC variants - for non-NULL columns in NBC rows (no length prefix for nullable types)
+	// NBC variants - for the columns an NBCROW's bitmap says are present. Such a value is framed as it
+	// is in a ROW, length prefix included (the bitmap only leaves the NULL columns out): SkipValueNBC is
+	// SkipValue, and ReadValueNBC reads a 1-byte prefix of 0 as an empty value where a ROW's is NULL.
+	// SkipValueNBC is kept as an entry point of its own for the staged path and the tests; ReadValueNBC
+	// is ReadNBCRow's.
 	size_t SkipValueNBC(const uint8_t *data, size_t length, size_t col_idx);
 	size_t ReadValueNBC(const uint8_t *data, size_t length, size_t col_idx, std::vector<uint8_t> &value, bool &is_null);
 
@@ -77,25 +81,11 @@ private:
 	const SkipDesc *skip_descs_ = nullptr;
 
 	// Type-specific readers
-	size_t ReadFixedType(const uint8_t *data, size_t length, uint8_t type_id, std::vector<uint8_t> &value);
+	//! One value by its type's framing, for a ROW or (`nbc`) an NBCROW's present column.
+	size_t ReadFramed(const uint8_t *data, size_t length, const ColumnMetadata &col, std::vector<uint8_t> &value,
+					  bool &is_null, bool nbc);
 
-	size_t ReadNullableFixedType(const uint8_t *data, size_t length, uint8_t type_id, uint8_t declared_length,
-								 std::vector<uint8_t> &value, bool &is_null);
-
-	size_t ReadVariableLengthType(const uint8_t *data, size_t length, uint8_t type_id, std::vector<uint8_t> &value,
-								  bool &is_null);
-
-	size_t ReadDecimalType(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null);
-
-	size_t ReadDateType(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null);
-
-	size_t ReadTimeType(const uint8_t *data, size_t length, uint8_t scale, std::vector<uint8_t> &value, bool &is_null);
-
-	size_t ReadDateTime2Type(const uint8_t *data, size_t length, uint8_t scale, std::vector<uint8_t> &value,
-							 bool &is_null);
-
-	size_t ReadDateTimeOffsetType(const uint8_t *data, size_t length, uint8_t scale, std::vector<uint8_t> &value,
-								  bool &is_null);
+	size_t ReadVariableLengthType(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null);
 
 	size_t ReadGuidType(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null);
 
@@ -109,6 +99,9 @@ private:
 	// sql_variant (0x62): a u32 length, 0 for NULL, then the value (spec 093 G2).
 	size_t ReadVariant(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null);
 	size_t SkipVariant(const uint8_t *data, size_t length);
+	//! SkipValue's forms few columns have (PLP, legacy LOB, sql_variant, unknown); `kind` is the
+	//! framing kind of tds_row_reader.cpp.
+	size_t SkipRareForm(const uint8_t *data, size_t length, uint8_t kind);
 
 	const std::vector<ColumnMetadata> &columns_;
 };

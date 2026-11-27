@@ -3,8 +3,10 @@
 // Spec 058 D1-alt: the skip walk dispatches on a per-column `SkipDesc` resolved
 // once at COLMETADATA, instead of a per-value switch on `type_id`. That is only
 // safe while `ResolveSkipForm` agrees with the `SkipValue` / `SkipValueNBC`
-// arms it replaces, and that agreement is a TWO-SWITCH invariant living in one
-// file with nothing holding it.
+// arms it replaces, and that agreement is an invariant between two statements
+// of the wire's framing -- ResolveSkipForm's switch and the per-value walks'
+// table (LegacyFramings; a second switch until the walks were split) -- living
+// in one file with nothing holding it.
 //
 // The asymmetry is what makes it worth a test:
 //
