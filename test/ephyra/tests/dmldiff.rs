@@ -101,7 +101,8 @@ fn dml_table(g: &mut Source) -> Table {
     let mut t = table(g);
     // `datetime` holds 1/300 s: a local TIMESTAMP column is no model for it
     for ci in 1..t.cols.len() {
-        if matches!(t.cols[ci].ty, Ty::DateTime | Ty::Time7 | Ty::Dto7 | Ty::SmallDateTime) {
+        // binary(4) pads what is assigned: a local BLOB column is no model for it
+        if matches!(t.cols[ci].ty, Ty::DateTime | Ty::Time7 | Ty::Dto7 | Ty::SmallDateTime | Ty::Binary) {
             t.cols[ci].ty = Ty::Int;
             for r in &mut t.rows {
                 r[ci] = None;

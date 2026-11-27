@@ -76,3 +76,23 @@ No existing issue was found for any of them. None was filed.
   under pushdown, the backup reader.
 - Ephyra is a git dependency with no pinned revision beyond `Cargo.lock`, and
   its API is not frozen.
+
+## Update, 2026-11-27: rerun on main 6ddbcea5
+
+The generator now has `varbinary` / `binary` columns and uuid / binary comparisons (issue #639's
+shapes); its binary trailing-zero case comes out of `qdiff`, its uuid range case has not yet.
+
+Status of the first three bugs on 6ddbcea5: the collation filter (#635) and the duplicate ORDER BY
+key (#637) are fixed, their reproducers pass. The MERGE bit assignment (#636) still fails.
+
+Three more, each with a reproducer in `repro/` that fails on 6ddbcea5 and behaves the same on 4128e1ac:
+
+4. **After an UPDATE of every row, a UTF-8 `char(n)` column is read back padded with spaces for the
+   rest of the session** (`char_padded_after_pushed_update.test`): `'b    '`, length 5, and
+   `c0 = 'b'` is false. A new session reads `'b'`.
+5. **LIKE on an `nchar(n)` column matches the padded value** (`like_on_nchar_padding.test`):
+   `nc LIKE '%b'` finds no row for `'ab'`, with remote pushdown on and off.
+6. **A filter adding two `smallmoney` columns fails with error 8115** (`smallmoney_sum_in_filter.test`),
+   where the same sum as a result column works.
+
+No issue was found or filed for these three.

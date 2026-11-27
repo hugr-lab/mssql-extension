@@ -72,3 +72,31 @@ Push rate of qdiff's queries: 9 of ~525 pushed whole before the pushable mode, 3
     EPH_DB=ephyra2 cargo test --test dmldiff -- --test-threads=1
     # EPHYRA_TESTS / EPHYRA_SEED / EPHYRA_REPLAY as in ephyra's README; details of each
     # failure land in .ephyra/findings/<signature>.txt, refused writes in .ephyra/refusals/
+
+## 2026-11-27: uuid / binary comparisons added; rerun on main 6ddbcea5
+
+Generator: `varbinary(8)` and `binary(4)` columns (class Bin), uuid values the server orders the other way
+round, uuid / binary comparisons, IN and BETWEEN in the pushable mode too. Row signatures are split
+(`rows:<variant>:uuid` / `:blob`).
+
+Reproducers on 6ddbcea5: `filter_two_collations` (#635) and `order_pushdown_duplicate_key` (#637) pass;
+`merge_set_bit_boolean_expression` (#636) still fails.
+
+Runs (shrink steps capped, `EPHYRA_SHRINK_MAX_STEPS=300`): qdiff 1500, roundtrip 2000 (clean), dmldiff 2000.
+
+- `rows:a` `binary(4) = '\x02'::BLOB` matching `0x02000000` (run on 4128e1ac): issue #639's trailing-zero case.
+  The uuid range case of #639 has not come out under its own signature yet.
+- **BUG 4** `dml:update:*:rows` and others: after an UPDATE of every row of a table (pushed whole through
+  `mssql_dml`), a UTF-8 `char(5)` column is read back as `'b    '` (length 5, `c0 = 'b'` false) for the rest of
+  the session; a new session reads `'b'`. Same on 4128e1ac. `repro/char_padded_after_pushed_update.test`.
+- **BUG 5** `rows:a` `nc LIKE '%b'` on `nchar(5)`: no row, with remote pushdown on and off; `LIKE 'a_'` misses
+  `'ab'` and `LIKE 'ab___'` matches it. The server matches the padded value, DuckDB reads it trimmed.
+  Same on 4128e1ac. `repro/like_on_nchar_padding.test`.
+- **BUG 6** `err:a:only:…arithmetic_overflow`: `WHERE (sm + sm) >= c` on `smallmoney` fails with 8115; the same
+  sum as a result column works (DuckDB adds DECIMAL(10,4) wider). Same on 4128e1ac.
+  `repro/smallmoney_sum_in_filter.test`. `dml:insert_select:*:server_error:…overflow…money` is the DML side:
+  `money + 3` at the type's maximum, where a local DECIMAL(19,4) column holds the result (model limit, not a bug).
+- `err:*:could_not_convert_timestamp_to_higher`: **DuckDB's own** — whether a TIMESTAMP constant past 2262 is cast
+  to TIMESTAMP_NS depends on the plan; a local table errors too. Masked.
+- A 500-case qdiff run spun for 25 hours inside ephyra's runner with no property call (CPU-bound, during
+  shrinking). Not reproduced; runs since cap the shrink steps.

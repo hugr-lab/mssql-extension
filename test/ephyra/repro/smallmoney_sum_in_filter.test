@@ -1,0 +1,32 @@
+# name: test/ephyra/repro/smallmoney_sum_in_filter.test
+# description: a filter adding two smallmoney columns fails with SQL Server error 8115 where the same sum as a result column works (found with ephyra, property qdiff)
+# group: [catalog]
+
+# Expected: DuckDB reads smallmoney as DECIMAL(10,4) and adds it in a wider DECIMAL, so the
+# filter keeps k = 0 (the projection below returns 429496.7294).
+# Actual (6ddbcea5): "SQL Server error [8115, severity 16]: Arithmetic overflow error
+# converting expression to data type smallmoney." -- the pushed sum is computed in smallmoney.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ephs (TYPE mssql, remote_pushdown false);
+
+statement ok
+SELECT mssql_exec('ephs', 'DROP TABLE IF EXISTS dbo.eph_sm; CREATE TABLE dbo.eph_sm (k int NOT NULL PRIMARY KEY, sm smallmoney); INSERT INTO dbo.eph_sm VALUES (0, 214748.3647), (1, 1)');
+
+query IT
+SELECT k, (sm + sm)::VARCHAR FROM ephs.dbo.eph_sm ORDER BY k;
+----
+0	429496.7294
+1	2.0000
+
+query I
+SELECT k FROM ephs.dbo.eph_sm WHERE (sm + sm) >= 300000;
+----
+0
+
+statement ok
+SELECT mssql_exec('ephs', 'DROP TABLE dbo.eph_sm');

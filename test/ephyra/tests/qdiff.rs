@@ -84,6 +84,12 @@ fn check_case(c: &Case) {
                     }
                     continue;
                 },
+                // DuckDB's own: whether a TIMESTAMP constant past 2262 is cast to TIMESTAMP_NS depends
+                // on the plan (a local table errors too in the simple forms)
+                (None, Some((_, msg))) | (Some((_, msg)), None) if msg.contains("Could not convert Timestamp to higher precision") => {
+                    ephyra::classify(true, "ns cast");
+                    continue;
+                },
                 (None, Some((ty, msg))) => {
                     fail(format!("err:{name}:only:{ty}:{}", words(msg, 6)), format!("{msg}\n{sql}\nreference rows: {:?}\n{}", reference.rows, out.script))
                 },
@@ -99,7 +105,15 @@ fn check_case(c: &Case) {
                 have.sort();
             }
             if want != have {
-                fail(format!("rows:{name}"), format!("{sql}\n  want ({}): {want:?}\n  have ({}): {have:?}\n{}", want.len(), have.len(), out.script));
+                // one signature per kind of value the query compares, so one known cause does not hide another
+                let kind = if sql.contains("::UUID") {
+                    ":uuid"
+                } else if sql.contains("::BLOB") {
+                    ":blob"
+                } else {
+                    ""
+                };
+                fail(format!("rows:{name}{kind}"), format!("{sql}\n  want ({}): {want:?}\n  have ({}): {have:?}\n{}", want.len(), have.len(), out.script));
             }
             if out.sections[ld].rows != out.sections[d].rows {
                 fail(

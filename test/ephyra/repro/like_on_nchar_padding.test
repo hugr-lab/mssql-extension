@@ -1,0 +1,50 @@
+# name: test/ephyra/repro/like_on_nchar_padding.test
+# description: LIKE with a pattern that ends in a literal finds no row on an nchar(n) column: the server matches the padded value (found with ephyra, property qdiff)
+# group: [catalog]
+
+# Expected: the column is read trimmed ('ab'), so nc LIKE '%b' matches it, as DuckDB answers
+# over the rows read; a filter the server answers differently stays in DuckDB.
+# Actual (6ddbcea5): no row, with remote pushdown on and off.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ephl (TYPE mssql, remote_pushdown false);
+
+statement ok
+SELECT mssql_exec('ephl', 'DROP TABLE IF EXISTS dbo.eph_nc; CREATE TABLE dbo.eph_nc (k int NOT NULL PRIMARY KEY, nc nchar(5) COLLATE Latin1_General_100_BIN2); INSERT INTO dbo.eph_nc VALUES (0, N''ab''), (1, N''a'')');
+
+query IT
+SELECT k, nc || '|' FROM ephl.dbo.eph_nc ORDER BY k;
+----
+0	ab|
+1	a|
+
+query I
+SELECT k FROM ephl.dbo.eph_nc WHERE nc LIKE '%b';
+----
+0
+
+# 'ab' is two characters: 'a_' matches it, 'ab___' does not
+query I
+SELECT k FROM ephl.dbo.eph_nc WHERE nc LIKE 'a_';
+----
+0
+
+query I
+SELECT k FROM ephl.dbo.eph_nc WHERE nc LIKE 'ab___';
+----
+
+# the same through remote pushdown (the statement goes whole: EXPLAIN shows [nc] LIKE @p0)
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ephl2 (TYPE mssql);
+
+query I
+SELECT k FROM ephl2.dbo.eph_nc WHERE nc LIKE '%b' ORDER BY k LIMIT 3;
+----
+0
+
+statement ok
+SELECT mssql_exec('ephl', 'DROP TABLE dbo.eph_nc');

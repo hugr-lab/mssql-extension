@@ -33,6 +33,10 @@ pub enum Ty {
     SmallDateTime,
     Char,
     NChar,
+    /// varbinary(8)
+    VarBinary,
+    /// binary(4): stored padded with 0x00
+    Binary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -47,6 +51,7 @@ pub enum Class {
     Uuid,
     Time,
     Tz,
+    Bin,
 }
 
 impl Ty {
@@ -57,6 +62,7 @@ impl Ty {
             Ty::Dec(..) | Ty::Money | Ty::SmallMoney => Class::Dec,
             Ty::Float | Ty::Real => Class::Float,
             Ty::Time7 => Class::Time,
+            Ty::VarBinary | Ty::Binary => Class::Bin,
             Ty::Dto7 => Class::Tz,
             Ty::Date => Class::Date,
             Ty::DateTime2 | Ty::DateTime | Ty::DateTime27 | Ty::SmallDateTime => Class::Ts,
@@ -90,12 +96,16 @@ impl Ty {
             Ty::SmallDateTime => "smalldatetime".into(),
             Ty::Char => "char(5) COLLATE Latin1_General_100_BIN2_UTF8".into(),
             Ty::NChar => "nchar(5) COLLATE Latin1_General_100_BIN2".into(),
+            Ty::VarBinary => "varbinary(8)".into(),
+            Ty::Binary => "binary(4)".into(),
         }
     }
     /// A raw value as a T-SQL literal.
     pub fn tsql(&self, v: &str) -> String {
         match self.class() {
             Class::Int | Class::Dec | Class::Float | Class::Bool => v.to_string(),
+            // a binary value is kept as its hex digits
+            Class::Bin => format!("0x{v}"),
             _ if *self == Ty::NVarChar => format!("N'{}'", v.replace('\'', "''")),
             _ => format!("'{}'", v.replace('\'', "''")),
         }
@@ -317,12 +327,22 @@ const TS7: &[&str] = &[
     "1677-09-22 00:00:00",
     "2021-03-04 05:06:07.123456",
 ];
+/// Pairs the server orders the other way round are in here: it compares the last six bytes
+/// first, DuckDB the text (issue #639).
 const UUIDS: &[&str] = &[
     "00000000-0000-0000-0000-000000000000",
     "6f9619ff-8b86-d011-b42d-00c04fc964ff",
     "ffffffff-ffff-ffff-ffff-ffffffffffff",
     "01020304-0506-0708-090a-0b0c0d0e0f10",
+    "00000000-0000-0000-0000-000000000001",
+    "10000000-0000-0000-0000-000000000000",
+    "00000000-0000-0000-0001-000000000000",
+    "00000000-0001-0000-0000-000000000000",
+    "00000001-0000-0000-0000-0000000000ff",
 ];
+/// Hex digits. Values that differ only in trailing 0x00 bytes are equal to the server (issue #639).
+const BINS: &[&str] = &["", "00", "01", "0100", "010000", "02", "FF", "0101", "00FF"];
+
 const FLOATS: &[&str] = &["0", "0.25", "-1.5", "2", "1e10", "0.1", "7"];
 
 fn dec_value(g: &mut Source, p: u8, s: u8) -> String {
@@ -379,11 +399,17 @@ fn value(g: &mut Source, ty: &Ty) -> Option<String> {
         ]).to_string(),
         Ty::SmallDateTime => g.pick(&["2020-01-01 00:00:00", "2021-03-04 05:06:00", "1900-01-01 00:00:00", "2079-06-06 23:59:00"]).to_string(),
         Ty::Char | Ty::NChar => g.pick(&["", "a", "ab", "A", "abcde", "b", "é"]).to_string(),
+        Ty::VarBinary => g.pick(BINS).to_string(),
+        // four bytes: the server would pad a shorter one, and the local copy is of what is read
+        Ty::Binary => g.pick(&["01000000", "01000001", "00000000", "02000000", "FFFFFFFF", "00000001"]).to_string(),
     })
 }
 
 fn ty(g: &mut Source) -> Ty {
-    match g.int(0u32..=28) {
+    match g.int(0u32..=32) {
+        29 | 30 => Ty::VarBinary,
+        31 => Ty::Binary,
+        32 => Ty::Uuid,
         20 => Ty::Real,
         21 => Ty::Money,
         22 => Ty::SmallMoney,
@@ -458,6 +484,11 @@ pub fn lit(g: &mut Source, c: Class) -> E {
         Class::Date => format!("DATE '{}'", g.pick(DATES)),
         Class::Ts => format!("TIMESTAMP '{}'", match g.int(0u32..=2) { 0 => g.pick(TS6), 1 => g.pick(TS3), _ => g.pick(TS7) }),
         Class::Uuid => format!("'{}'::UUID", g.pick(UUIDS)),
+        Class::Bin => {
+            let hex = *g.pick(BINS);
+            let bytes: String = (0..hex.len() / 2).map(|i| format!("\\x{}", &hex[2 * i..2 * i + 2])).collect();
+            format!("'{bytes}'::BLOB")
+        },
         Class::Time => format!("TIME '{}'", g.pick(&["00:00:00", "12:34:56", "23:59:59.999999", "12:34:56.123456", "12:34:56.123457"])),
         Class::Tz => format!(
             "TIMESTAMPTZ '{}'",
@@ -516,10 +547,10 @@ pub fn expr(g: &mut Source, sc: &mut Scope, c: Class, depth: usize) -> E {
             2 => E::Fn("substr", vec![expr(g, sc, c, d), lit(g, Class::Int), lit(g, Class::Int)]),
             _ => E::Fn("coalesce", vec![expr(g, sc, c, d), lit(g, c)]),
         },
-        Class::Date | Class::Ts | Class::Uuid | Class::Time | Class::Tz => E::Fn("coalesce", vec![expr(g, sc, c, d), lit(g, c)]),
+        Class::Date | Class::Ts | Class::Uuid | Class::Time | Class::Tz | Class::Bin => E::Fn("coalesce", vec![expr(g, sc, c, d), lit(g, c)]),
         Class::Bool => match g.int(0u32..=11) {
             0..=3 => {
-                let cc = *g.pick(&[Class::Int, Class::Int, Class::Dec, Class::Float, Class::Str, Class::Str, Class::Date, Class::Ts, Class::Ts, Class::Uuid, Class::Time, Class::Tz]);
+                let cc = *g.pick(&[Class::Int, Class::Int, Class::Dec, Class::Float, Class::Str, Class::Str, Class::Date, Class::Ts, Class::Ts, Class::Uuid, Class::Uuid, Class::Bin, Class::Bin, Class::Time, Class::Tz]);
                 let rc = if cc == Class::Int && g.bool_with(0.2) { Class::Dec } else { cc };
                 E::Bin(g.pick(&["=", "<>", "<", "<=", ">", ">="]), bx(expr(g, sc, cc, d)), bx(expr(g, sc, rc, d)))
             },
@@ -530,12 +561,12 @@ pub fn expr(g: &mut Source, sc: &mut Scope, c: Class, depth: usize) -> E {
                 E::IsNull(bx(expr(g, sc, cc, d)), g.bool())
             },
             8 => {
-                let cc = *g.pick(&[Class::Int, Class::Dec, Class::Str, Class::Date, Class::Ts, Class::Time, Class::Tz]);
+                let cc = *g.pick(&[Class::Int, Class::Dec, Class::Str, Class::Date, Class::Ts, Class::Time, Class::Tz, Class::Uuid, Class::Bin]);
                 let n = g.int(1usize..=3);
                 E::In(bx(expr(g, sc, cc, d)), (0..n).map(|_| lit(g, cc)).collect(), g.bool_with(0.3))
             },
             9 => {
-                let cc = *g.pick(&[Class::Int, Class::Dec, Class::Str, Class::Date, Class::Ts, Class::Time, Class::Tz]);
+                let cc = *g.pick(&[Class::Int, Class::Dec, Class::Str, Class::Date, Class::Ts, Class::Time, Class::Tz, Class::Uuid, Class::Bin]);
                 E::Between(bx(expr(g, sc, cc, d)), bx(lit(g, cc)), bx(lit(g, cc)))
             },
             10 => E::Bin(
@@ -564,8 +595,8 @@ fn pushable_expr(g: &mut Source, sc: &mut Scope, c: Class, d: usize) -> E {
         },
         Class::Bool => match g.int(0u32..=11) {
             0..=4 => {
-                let cc = *g.pick(&[Class::Int, Class::Int, Class::Dec, Class::Str, Class::Date]);
-                let l = if cc == Class::Str || cc == Class::Date { leaf(g, sc, cc) } else { expr(g, sc, cc, d) };
+                let cc = *g.pick(&[Class::Int, Class::Int, Class::Dec, Class::Str, Class::Date, Class::Uuid, Class::Bin]);
+                let l = if matches!(cc, Class::Int | Class::Dec) { expr(g, sc, cc, d) } else { leaf(g, sc, cc) };
                 let r = if g.bool_with(0.6) { lit(g, cc) } else { leaf(g, sc, cc) };
                 E::Bin(g.pick(&["=", "<>", "<", "<=", ">", ">="]), bx(l), bx(r))
             },
@@ -576,7 +607,7 @@ fn pushable_expr(g: &mut Source, sc: &mut Scope, c: Class, d: usize) -> E {
                 E::IsNull(bx(leaf(g, sc, cc)), g.bool())
             },
             9 => {
-                let cc = *g.pick(&[Class::Int, Class::Dec, Class::Str, Class::Date]);
+                let cc = *g.pick(&[Class::Int, Class::Dec, Class::Str, Class::Date, Class::Uuid, Class::Bin]);
                 let n = g.int(1usize..=3);
                 if g.bool() {
                     E::In(bx(leaf(g, sc, cc)), (0..n).map(|_| lit(g, cc)).collect(), g.bool_with(0.3))
@@ -639,14 +670,14 @@ fn agg(g: &mut Source, sc: &mut Scope) -> E {
             E::Agg(g.pick(&["sum", "sum", "avg"]), g.bool_with(0.15), Some(bx(expr(g, sc, cc, 1))))
         },
         _ => {
-            let cc = *g.pick(&[Class::Int, Class::Dec, Class::Float, Class::Str, Class::Date, Class::Ts, Class::Uuid, Class::Time, Class::Tz]);
+            let cc = *g.pick(&[Class::Int, Class::Dec, Class::Float, Class::Str, Class::Date, Class::Ts, Class::Uuid, Class::Time, Class::Tz, Class::Bin]);
             E::Agg(g.pick(&["min", "max"]), false, Some(bx(expr(g, sc, cc, 1))))
         },
     }
 }
 
 fn any_class(g: &mut Source) -> Class {
-    *g.pick(&[Class::Int, Class::Int, Class::Dec, Class::Float, Class::Bool, Class::Str, Class::Date, Class::Ts, Class::Uuid, Class::Time, Class::Tz])
+    *g.pick(&[Class::Int, Class::Int, Class::Dec, Class::Float, Class::Bool, Class::Str, Class::Date, Class::Ts, Class::Uuid, Class::Time, Class::Tz, Class::Bin])
 }
 
 /// A window function whose order is total: it ends with every `k` in scope.
