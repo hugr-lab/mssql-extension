@@ -1735,8 +1735,8 @@ flowchart LR
   measured in E21). A complex column's in-row bytes are told apart by their length: 16 a pointer to
   a root record (text / ntext / image with `text in row` off, and a MAX type under `large value types
   out of row`; with `text in row` on, a long value takes an in-row root), 24 of kind 2 a row-overflow pointer to one DATA
-  fragment in the rowset's ROW_OVERFLOW_DATA unit, 12 + 12n of kind 4 or 5 an in-row root over up to
-  five links. `WalkLob` follows the tree over `PageStore`'s live pages and checks every node as it
+  fragment in the rowset's ROW_OVERFLOW_DATA unit, 12 + 12n of kind 4 an in-row root over up to
+  five links (kind 5 is the sparse vector's tag, E24, and is refused as a value). `WalkLob` follows the tree over `PageStore`'s live pages and checks every node as it
   reads it: a node's bytes are what its parent claims (but the DATA fragment of a node's last link,
   which a truncating `.WRITE` leaves with a stale tail), its level agrees with its children, its page
   is of the form's unit, each fragment is referenced once, a NULL root (a text value updated to NULL
