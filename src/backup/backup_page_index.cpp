@@ -1631,8 +1631,18 @@ bool PageIndex::ReadPage(uint16_t file, uint32_t page, std::vector<uint8_t> &out
 void PageIndex::DecryptPage(std::vector<uint8_t> &page) const {
 	// The 96-byte header stays in clear: version 1, its flag saying the rest is encrypted; a zero unit
 	// (version 0) is no page.
-	if (!page_key_ || page[0] != PAGE_HEADER_VERSION || !(page[PAGE_FLAG_BITS_HIGH] & PAGE_FLAG_ENCRYPTED_HIGH)) {
+	if (page[0] != PAGE_HEADER_VERSION || !(page[PAGE_FLAG_BITS_HIGH] & PAGE_FLAG_ENCRYPTED_HIGH)) {
 		return;
+	}
+	if (!page_key_) {
+		// Review of 087: never ciphertext read as a page -- a TDE backup whose DEK the reader did not find (its
+		// SFIN and boot page in a layout it does not know, another version's) is refused by name.
+		const uint32_t id = static_cast<uint32_t>(page[32]) | static_cast<uint32_t>(page[33]) << 8 |
+							static_cast<uint32_t>(page[34]) << 16 | static_cast<uint32_t>(page[35]) << 24;
+		const uint32_t file = static_cast<uint32_t>(page[36]) | static_cast<uint32_t>(page[37]) << 8;
+		throw FormatError("page (" + std::to_string(file) + ":" + std::to_string(id) +
+						  ") is encrypted (TDE, its header's flag 0x0800) and the reader found no DEK for the "
+						  "backup: neither its data files' SFIN nor its boot page names one in a form it knows");
 	}
 	uint8_t iv[16] = {};
 	std::memcpy(iv, page.data() + 32, 4);	   // m_pageId's page number
@@ -1743,12 +1753,12 @@ static bool MapOrSearchPass(const FamilyStream &family_stream, const MtfStream &
 	const uint32_t number = pass.number;
 	const bool first_of_full = number == 0 && options.full_backup;
 	bool mapped = false;
-	if (first_of_full && single_family && !family_stream.container) {
+	if (first_of_full && single_family && !family_stream.container && !options.encrypted_pages) {
 		// One plain family: its pass 1 from its allocation pages (E12); a rank that fails is
 		// searched instead.
 		mapped = BuildRankedPassMap(stream, data.data_offset, data.length, pass.map);
 	}
-	if (number == 0 && !options.full_backup && single_family) {
+	if (number == 0 && !options.full_backup && single_family && !options.encrypted_pages) {
 		// A differential's pass 1, one family: from its own allocation and DCM pages, ranked as a full's
 		// (DQ-41 revisited: a large differential is not read through to map it; its "absent" as sure as the
 		// full's ranks, checked the same way); a rank that fails maps it by its headers. A compressed one's
@@ -1760,7 +1770,7 @@ static bool MapOrSearchPass(const FamilyStream &family_stream, const MtfStream &
 		pass.search = SearchFor(family_stream, data, bounds, options.trust_layout, pass.by_block);
 		mapped = true;
 	}
-	if (number == 0 && !options.full_backup && !single_family) {
+	if (number == 0 && !options.full_backup && !single_family && !options.encrypted_pages) {
 		// A striped differential's pass 1: searched, its extents the families' DCM set (StripedDcmBuilder,
 		// once every family is added); mapped by its headers when the set does not hold.
 		pass.search = SearchFor(family_stream, data, bounds, options.trust_layout, pass.by_block);
@@ -1848,13 +1858,14 @@ PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, const PageIn
 	PageIndex index;
 	index.families_ = families;
 	index.mapper_ = options.mapper;
+	index.page_key_ = options.page_key;
 	for (uint32_t f = 0; f < families.size(); f++) {
 		AddFamilyPasses(families[f], f, families.size() == 1, options, index.passes_);
 	}
 	// By pass number, so Locate meets the later pass first going backwards.
 	std::stable_sort(index.passes_.begin(), index.passes_.end(),
 					 [](const IndexedPass &a, const IndexedPass &b) { return a.number < b.number; });
-	if (!options.full_backup && families.size() > 1) {
+	if (!options.full_backup && families.size() > 1 && !options.encrypted_pages) {
 		bool built = false;
 		try {
 			built = StripedDcmBuilder::Build(index, options);

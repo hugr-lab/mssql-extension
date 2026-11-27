@@ -229,6 +229,11 @@ public:
 	const shared_ptr<OpenedBackup> &Base() const {
 		return base_;
 	}
+	//! Spec 087 D4: every key this entry has unwrapped -- its containers' (the backup's key, a compressed TDE
+	//! backup's DEK) and, once its pages are built, an uncompressed TDE backup's DEK -- still held by the secret
+	//! D3 selects, else refused by name. Asked by every statement that opens the entry (from the opened-file
+	//! cache, as an attached backup); its base is asked by the base's own open.
+	void RequireKeysHeld(ClientContext &context) const;
 	//! Stage 5 (D11, task 27): what the backup's log tail says, read now when it is not -- family 1's
 	//! MQTL streams (the tail is in that family only, E2§6), through the statement's files bound to the
 	//! thread -- and kept. Read outside the entry's locks; a second statement waits for the first's read in
@@ -283,6 +288,10 @@ private:
 	//! older, smaller measure last, the entry charged for less than it held).
 	std::mutex weigh_lock_;
 	std::atomic<size_t> estimate_{0};
+	//! The certificate that wraps an uncompressed TDE backup's DEK, set by the build that unwrapped it (before
+	//! tde_dek_held_, released; read after it, acquired).
+	Thumbprint tde_dek_thumbprint_{};
+	std::atomic<bool> tde_dek_held_{false};
 };
 
 //! `backup` put in the instance's ObjectCache under `key`, its estimate measured first when it still holds

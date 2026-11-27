@@ -418,32 +418,39 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		return_types.push_back(column.type);
 	}
 	try {
-		// D10: a backup whose key no secret holds is described by what it says in clear, with a WARNING; an
-		// attached name and a version are opened as before (their keys were selected when they were read).
-		if (!data->at.IsSet() &&
-			!(data->paths.size() == 1 && FindAttachedBackup(context, data->paths.front(), data->at))) {
+		// The headers are what the opened-file cache holds first (D9): a later call on the same files
+		// takes them, and so does a catalog call after this one. D10: a backup whose key no secret holds
+		// (MissingBackupKey) is described by what it says in clear, with a WARNING -- read only then, so a
+		// backup that needs no key costs what it did (review of 087).
+		OpenedForStatement opened;
+		try {
+			opened = OpenBackup(context, std::vector<std::string>(data->paths.begin(), data->paths.end()),
+								std::vector<std::string>(), data->at);
+		} catch (MissingBackupKey &) {
+			// An attached name and a version are refused as any call on them is: their files are not this
+			// call's to describe in clear.
+			if (data->at.IsSet() ||
+				(data->paths.size() == 1 && FindAttachedBackup(context, data->paths.front(), data->at))) {
+				throw;
+			}
 			const auto clear = ReadClearHeaders(context, data->paths);
 			const auto missing = MissingKeys(context, clear);
-			if (!missing.empty()) {
-				std::string list;
-				for (const auto &m : missing) {
-					list += (list.empty() ? "" : ", ") + m;
-				}
-				DUCKDB_LOG_WARNING(
-					context,
-					"mssql_backup_info: \"%s\": no mssql_backup_key secret whose scope matches holds the "
-					"key of the certificate %s: the columns its header gives in clear are shown, every "
-					"other one NULL; CREATE SECRET (TYPE mssql_backup_key, CERTIFICATE ..., PRIVATE_KEY "
-					"..., PASSWORD ..., SCOPE ...) with it reads the rest",
-					clear.front().path, list);
-				data->row = ClearRow(clear.front());
-				return std::move(data);
+			if (missing.empty()) {
+				throw;
 			}
+			std::string list;
+			for (const auto &m : missing) {
+				list += (list.empty() ? "" : ", ") + m;
+			}
+			DUCKDB_LOG_WARNING(context,
+							   "mssql_backup_info: \"%s\": no mssql_backup_key secret whose scope matches holds the "
+							   "key of the certificate %s: the columns its header gives in clear are shown, every "
+							   "other one NULL; CREATE SECRET (TYPE mssql_backup_key, CERTIFICATE ..., PRIVATE_KEY "
+							   "..., PASSWORD ..., SCOPE ...) with it reads the rest",
+							   clear.front().path, list);
+			data->row = ClearRow(clear.front());
+			return std::move(data);
 		}
-		// The headers are what the opened-file cache holds first (D9): a later call on the same files
-		// takes them, and so does a catalog call after this one.
-		auto opened = OpenBackup(context, std::vector<std::string>(data->paths.begin(), data->paths.end()),
-								 std::vector<std::string>(), data->at);
 		// D11's database level from the log tail (stage 5): a data backup's only, read at init.
 		data->has_tail = opened.backup->Headers().Set().kind != BackupKind::Log;
 		data->set_guid = opened.backup->Headers().Set().backup_set_guid.ToString();

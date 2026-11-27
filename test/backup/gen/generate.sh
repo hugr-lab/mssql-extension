@@ -48,7 +48,7 @@
 # second certificate, a differential; TDE under AES_256 / AES_128, uncompressed and compressed (E4c), an encrypted
 # backup of a TDE database, the DEK rotated; a tiny TDE database three ways -- with the certificates exported
 # (<name>.cer / .pvk, enc_cert.pfx where the version writes one) and the PVK password in pvk_password (0600; this
-# run's own, for the reader's secrets; not run by default: compare_info / compare_rows take no secret yet);
+# run's own, for the reader's secrets; not run by default: compare_info --keys reads it, compare_rows takes no secret yet);
 # encryption_samples.sql, the committed ones (spec 087 task 9: enc_sample, tde_sample, tde_sample_xpress,
 # tde_sample_enc, by test-only certificates committed with their keys and password; not run by default;
 # committed under test/data/backup/encryption, made by its generate.sh);

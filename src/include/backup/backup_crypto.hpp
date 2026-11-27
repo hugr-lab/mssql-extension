@@ -5,10 +5,12 @@
 //
 // Spec 087: the cryptography an encrypted or TDE backup needs, through the statically linked OpenSSL
 // (D6): a certificate's thumbprint, its private key from a PVK (RC4 of our own, D6), a PFX or a PEM,
-// the backup's wrapped key unwrapped (RSA-OAEP / SHA-256 / MGF1-SHA-256 over the reversed blob, E4; PKCS#1
-// v1.5 the fallback, D7) into a CryptoAPI PLAINTEXTKEYBLOB, and a block or a page decrypted (AES-CBC or
-// 3DES-CBC, padding off). Key bytes live in a holder that zeroises them (OPENSSL_cleanse); nothing here
-// logs, prints or puts a key, an IV or a password in an error. DuckDB-free.
+// the backup's wrapped key unwrapped (RSA-OAEP / SHA-256 / MGF1-SHA-256 over the reversed blob, E4; no PKCS#1
+// v1.5, review of 087) into a CryptoAPI PLAINTEXTKEYBLOB, and a block or a page decrypted (AES-CBC or 3DES-CBC,
+// padding off). An unwrapped key lives in a holder that zeroises it (OPENSSL_cleanse), and the copies made on
+// the way -- the key container, its password, OpenSSL's RSA parameters -- are wiped when dropped (WipeOnExit);
+// the secret itself is DuckDB's, held in its secret map in clear. Nothing here logs, prints or puts a key, an
+// IV or a password in an error. DuckDB-free.
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -28,6 +30,30 @@ using Thumbprint = std::array<uint8_t, 20>;
 
 //! The thumbprint in upper-case hex, as RESTORE HEADERONLY and sys.certificates show it.
 std::string ThumbprintHex(const Thumbprint &thumbprint);
+
+//! `size` bytes at `data` zeroised, in a way the compiler keeps (OPENSSL_cleanse).
+void Wipe(void *data, size_t size);
+
+//! Wipes the containers it names when the scope ends: the transient copies of key material (a key file's bytes,
+//! a password) a caller holds while it reads a key.
+class WipeOnExit {
+public:
+	WipeOnExit(std::vector<uint8_t> *bytes, std::string *text = nullptr) : bytes_(bytes), text_(text) {}
+	~WipeOnExit() {
+		if (bytes_ && !bytes_->empty()) {
+			Wipe(bytes_->data(), bytes_->size());
+		}
+		if (text_ && !text_->empty()) {
+			Wipe(&(*text_)[0], text_->size());
+		}
+	}
+	WipeOnExit(const WipeOnExit &) = delete;
+	WipeOnExit &operator=(const WipeOnExit &) = delete;
+
+private:
+	std::vector<uint8_t> *bytes_;
+	std::string *text_;
+};
 
 //! Bytes zeroised when the holder goes (or is reassigned). Not copyable: a key has one owner.
 class SecretBytes {

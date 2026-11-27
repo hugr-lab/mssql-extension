@@ -131,7 +131,7 @@ CREATE SECRET backup_key (
     CERTIFICATE '/keys/backup_cert.cer',
     PRIVATE_KEY '/keys/backup_cert.pvk',  -- a PVK; or a PFX (.pfx, PKCS#12) or a PEM private key
     PASSWORD '…',
-    SCOPE '/backups/'                       -- the backups it is for: a path or URL prefix
+    SCOPE '/backups/'                       -- the backups it is for: a path or URL prefix (end it with /)
 );
 SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'dbo', 'orders');
 ```
@@ -145,15 +145,21 @@ SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'dbo', 'orders');
   the longest scope; among them, the one whose certificate is the file's (by its thumbprint). A file none
   of them holds the key of is refused by name — the thumbprint it needs, the secrets that match its path,
   and the form of the secret that would read it — never decrypted with a secret of another scope.
-- **On every call**: a backup opened before is kept decrypted in DuckDB's cache, but each statement chooses
-  its secret again, so a `DROP SECRET` takes effect at the next statement.
+- **On every call**: a backup opened before is kept decrypted in DuckDB's cache, and an attached one by its
+  catalog, but each statement asks again that a secret of its scope holds the certificate's key, so a
+  `DROP SECRET` takes effect at the next statement.
+- **A scope is a prefix** of the path as written (`'/backups/'`, not `'/backups'`, which would also match
+  `/backups_old/`); a relative path and an absolute one are different prefixes.
 - The password and the key are redacted in `duckdb_secrets()`; the thumbprint is shown. A `PERSISTENT`
   secret keeps them on disk, unencrypted, as DuckDB stores every persistent secret.
 
-Every form is read: `WITH ENCRYPTION` under any algorithm, uncompressed or compressed (`MS_XPRESS`, `ZSTD`);
-a TDE database's backup uncompressed (each page decrypted with its database encryption key) or compressed;
-a TDE database's backup `WITH ENCRYPTION` too (two keys: one secret for each certificate); a database
-encryption key rotated to another certificate (the new certificate's secret reads it).
+Every form measured is read: `WITH ENCRYPTION` under any algorithm, uncompressed or compressed (`MS_XPRESS`,
+`ZSTD`); a TDE database's backup uncompressed (each page decrypted with its database encryption key) or
+compressed; a TDE database's backup `WITH ENCRYPTION` too, under `MS_XPRESS` (two keys: one secret for each
+certificate; the same under `ZSTD` has not been seen and is refused by name); a database encryption key
+rotated to another certificate (the new certificate's secret reads it). The backup's key is unwrapped with
+RSA-OAEP, as every version measured wraps it; one wrapped with PKCS#1 v1.5 (`EncryptorType` `CERTIFICATE`)
+is refused by name.
 
 **Without the key**, `mssql_backup_info` still answers, with what the file says in clear: for an encrypted
 or a compressed TDE backup, `compressed`, `compression_algorithm`, `encrypted`, `encryptor_thumbprint`,

@@ -118,6 +118,29 @@ CREATE SECRET tde_key (TYPE mssql_backup_key, CERTIFICATE 'test/data/backup/encr
 
 # --- with the keys --------------------------------------------------------------------------------------------
 
+# The key in other containers (review of 087), made from sample_enc_cert's by OpenSSL: a PKCS#8 PEM under AES-256
+# (`openssl pkcs8 -topk8 -v2 aes-256-cbc`), selected by its longer scope (D3); a PFX under RC2 (an old Windows
+# export, `-keypbe PBE-SHA1-RC2-40`), refused at CREATE SECRET with the re-export hint.
+statement ok
+CREATE SECRET pem_key (TYPE mssql_backup_key, CERTIFICATE 'test/data/backup/encryption/sample_enc_cert.cer',
+    PRIVATE_KEY 'test/data/backup/encryption/sample_enc_cert.pem', PASSWORD 'test-only sample key 087!',
+    SCOPE 'test/data/backup/encryption/enc_sample.bak');
+
+query I
+SELECT count(*) > 0 FROM mssql_backup_scan('test/data/backup/encryption/enc_sample.bak', 'dbo', 't');
+----
+true
+
+statement ok
+DROP SECRET pem_key;
+
+statement error
+CREATE SECRET rc2_key (TYPE mssql_backup_key, PRIVATE_KEY 'test/data/backup/encryption/sample_enc_cert_rc2.pfx',
+    PASSWORD 'test-only sample key 087!');
+----
+the PFX is protected by a cipher this build does not carry
+
+
 query IIIII
 SELECT encrypted, key_algorithm, tde, database_name, backup_type
 FROM mssql_backup_info('test/data/backup/encryption/enc_sample.bak');
@@ -191,9 +214,52 @@ SELECT consistent IS NOT NULL FROM mssql_backup_info('test/data/backup/encryptio
 ----
 true
 
+# D4 (review of 087): the keys are asked again by every statement -- of an attached backup, and of an uncompressed
+# TDE backup whose DEK its page index holds -- not only by a call over files.
+statement ok
+ATTACH 'test/data/backup/encryption/enc_sample.bak' AS es_d4 (TYPE mssql_backup);
+
+statement ok
+ATTACH 'test/data/backup/encryption/tde_sample.bak' AS tde_d4 (TYPE mssql_backup, fuzzy 'ignore');
+
+query II
+SELECT (SELECT count(*) > 0 FROM es_d4.dbo.t), (SELECT count(*) > 0 FROM tde_d4.dbo.t);
+----
+true	true
+
+# The uncompressed TDE backup read over files once, so its cached entry holds the DEK.
+query I
+SELECT count(*) > 0 FROM mssql_backup_scan('test/data/backup/encryption/tde_sample.bak', 'dbo', 't', fuzzy := 'ignore');
+----
+true
+
+statement ok
+DROP SECRET tde_key;
+
+statement error
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/encryption/tde_sample.bak', 'dbo', 't', fuzzy := 'ignore');
+----
+is a backup of a TDE database, its DEK encrypted by the certificate with thumbprint
+
+statement error
+SELECT count(*) FROM tde_d4.dbo.t;
+----
+is a backup of a TDE database, its DEK encrypted by the certificate with thumbprint
+
+statement ok
+DETACH tde_d4;
+
 # D4: the secret dropped, the cached backup is refused at once.
 statement ok
 DROP SECRET enc_key;
+
+statement error
+SELECT count(*) FROM es_d4.dbo.t;
+----
+no mssql_backup_key secret whose scope matches the path holds its key
+
+statement ok
+DETACH es_d4;
 
 statement error
 SELECT * FROM mssql_backup_scan('test/data/backup/encryption/enc_sample.bak', 'dbo', 't');

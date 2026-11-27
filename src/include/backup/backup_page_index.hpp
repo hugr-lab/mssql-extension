@@ -303,6 +303,12 @@ struct PageIndexOptions {
 	PassMapper mapper;
 	//! The backup's data files (SFIN), by id (a differential's: what a striped one's DCM set is built over).
 	std::vector<uint16_t> data_files;
+	//! Spec 087: an uncompressed TDE backup's pages are encrypted past their 96-byte header (E4), its GAM / DCM
+	//! bitmaps included, so its passes are never ranked from them (searched, or mapped by their headers; review
+	//! of 087: the ranks read ciphertext as bitmaps and relied on their checks to reject it). `page_key`, its
+	//! DEK when known before the build (its data files' SFIN, D10), is the index's from the start.
+	bool encrypted_pages = false;
+	std::shared_ptr<const ContentKey> page_key;
 };
 
 //! One pass of the index: mapped (ranked or by headers) or searched.

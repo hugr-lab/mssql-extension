@@ -391,6 +391,9 @@ std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &, const OpenedHeader
 //! before the allocation map reads its GAM / PFS / IAM pages, encrypted too (E4§3).
 static void ApplyTde(PageIndex &index, const OpenPagesOptions &options, const std::string &path) {
 	static constexpr size_t FCB_FILE_DEK = 912;
+	if (index.Encrypted()) {
+		return;	 // its DEK from the SFIN, before the index was built
+	}
 	std::vector<uint8_t> boot;
 	if (!index.ReadPage(1, 9, boot, true) || boot.size() != PAGE_SIZE || boot[0] != TDE_PAGE_VERSION ||
 		boot[1] != TDE_PAGE_BOOT) {
@@ -478,6 +481,24 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 	// By id, as a pass orders its extents.
 	index_options.data_files = data_files;
 	std::sort(index_options.data_files.begin(), index_options.data_files.end());
+	// Spec 087: an uncompressed TDE backup -- a data file's SFIN names its DEK (D10), and no family is a
+	// container (the server decrypts pages before it compresses them, E4c) -- is indexed with its DEK from the
+	// start, and never from its encrypted allocation bitmaps (review of 087).
+	const bool any_container =
+		std::any_of(pages->streams.begin(), pages->streams.end(), [](const FamilyStream &s) { return s.container; });
+	for (const auto &file : set.files) {
+		if (file.type == 'D' && file.tde && !any_container) {
+			index_options.encrypted_pages = true;
+			if (!options.tde_key) {
+				throw FormatError("backup file \"" + first +
+								  "\" is of a TDE database (its DEK wrapped by the certificate " +
+								  ThumbprintHex(file.tde_thumbprint) +
+								  "): its pages need the certificate's key, a mssql_backup_key secret");
+			}
+			index_options.page_key = options.tde_key(file.tde_thumbprint, file.wrapped_dek);
+			break;
+		}
+	}
 	try {
 		pages->index = BuildPageIndex(pages->streams, index_options);
 		// D12: a page the differential does not carry is its full's; liveness is then the overlaid
@@ -547,8 +568,11 @@ bool OpenedBackup::EnsureTables(ClientContext &context) {
 			options.base = &base_->Pages().index;
 		}
 		const std::string path = headers_->Path(headers_->families.front()->file);
-		options.tde_key = [&context, path](const Thumbprint &thumbprint, const std::vector<uint8_t> &wrapped) {
-			return SelectContentKey(context, path, thumbprint, wrapped, "a backup of a TDE database, its DEK");
+		options.tde_key = [this, &context, path](const Thumbprint &thumbprint, const std::vector<uint8_t> &wrapped) {
+			auto key = SelectContentKey(context, path, thumbprint, wrapped, "a backup of a TDE database, its DEK");
+			tde_dek_thumbprint_ = thumbprint;
+			tde_dek_held_.store(true, std::memory_order_release);
+			return key;
 		};
 		pages = OpenBackupPages(*headers_, options);
 		try {
@@ -872,6 +896,8 @@ static OpenedForStatement OpenHeld(ClientContext &context, const shared_ptr<Open
 				key.path, name, name);
 		}
 	}
+	// D4: a DROP SECRET takes effect at the next statement on an attached backup too.
+	backup->RequireKeysHeld(context);
 	opened.backup = backup;
 	// Re-measured and put again by the statement (OpenBackupCatalog) only while the cache is on.
 	opened.cache_key = BackupCacheOn(context) ? cache_key : std::string();
@@ -1069,18 +1095,21 @@ OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::str
 	return OpenBackupFiles(context, paths, diff);
 }
 
-//! Spec 087 D4: a cached entry's encrypted families selected again, every call: a `DROP SECRET` (or a
-//! changed scope) takes effect at once, the cached key used only while a secret still holds it.
-static void SelectKeysAgain(ClientContext &context, const OpenedHeaders &headers) {
+void OpenedBackup::RequireKeysHeld(ClientContext &context) const {
+	const OpenedHeaders &headers = *headers_;
 	for (const auto &f : headers.families) {
 		if (f->keys.backup) {
-			SelectContentKey(context, headers.Path(f->file), f->container_header.encryptor_thumbprint,
-							 f->container_header.wrapped_key, "a backup");
+			RequireBackupKeySecret(context, headers.Path(f->file), f->container_header.encryptor_thumbprint,
+								   "a backup");
 		}
 		if (f->keys.dek) {
-			SelectContentKey(context, headers.Path(f->file), f->container_header.tde_thumbprint,
-							 f->container_header.wrapped_dek, "a backup of a TDE database, its DEK");
+			RequireBackupKeySecret(context, headers.Path(f->file), f->container_header.tde_thumbprint,
+								   "a backup of a TDE database, its DEK");
 		}
+	}
+	if (tde_dek_held_.load(std::memory_order_acquire)) {
+		RequireBackupKeySecret(context, headers.Path(headers.families.front()->file), tde_dek_thumbprint_,
+							   "a backup of a TDE database, its DEK");
 	}
 }
 
@@ -1097,7 +1126,7 @@ static OpenedForStatement OpenOverlay(ClientContext &context, OpenedForStatement
 		opened.cache_key = "mssql_backup_overlay:" + full.cache_key + '\x1d' + diff_key;
 		opened.backup = cache.Get<OpenedBackup>(opened.cache_key);
 		if (opened.backup) {
-			SelectKeysAgain(context, opened.backup->Headers());
+			opened.backup->RequireKeysHeld(context);
 		}
 	}
 	if (opened.backup && opened.backup->Base() != full.backup) {
@@ -1143,7 +1172,7 @@ static OpenedForStatement OpenBackupFiles(ClientContext &context, const std::vec
 		opened.cache_key = CacheKey(*opened.files);
 		opened.backup = cache.Get<OpenedBackup>(opened.cache_key);
 		if (opened.backup) {
-			SelectKeysAgain(context, opened.backup->Headers());
+			opened.backup->RequireKeysHeld(context);
 		}
 	}
 	if (!opened.backup) {

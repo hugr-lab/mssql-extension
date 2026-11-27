@@ -318,12 +318,11 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &block, BackupS
 			f.max_size_bytes = record.U64(86);
 			f.create_lsn = ReadLsn(record, 138);
 			f.unique_id = ReadGuid(record, 186);
-			if (length >= SFIN_TDE_AT + 28 && record.U32(SFIN_TDE_AT) == 20) {
-				const uint32_t wrapped = record.U32(SFIN_TDE_AT + 24);
-				if (wrapped < 128 || wrapped > 1024 || SFIN_TDE_AT + 28 + wrapped > length) {
-					record.Fail(SFIN_TDE_AT + 24, "file " + std::to_string(f.file_id) + "'s wrapped DEK of " +
-													  std::to_string(wrapped) + " bytes, outside its SFIN record");
-				}
+			// The DEK at +452 was measured on 2025 only (D10): a record that does not hold one in that form is
+			// read as naming none (review of 087), never refused -- the boot page names the DEK too (ApplyTde).
+			const uint32_t wrapped = length >= SFIN_TDE_AT + 28 ? record.U32(SFIN_TDE_AT + 24) : 0;
+			if (length >= SFIN_TDE_AT + 28 && record.U32(SFIN_TDE_AT) == 20 && wrapped >= 128 && wrapped <= 1024 &&
+				SFIN_TDE_AT + 28 + wrapped <= length) {
 				f.tde = true;
 				std::memcpy(f.tde_thumbprint.data(), record.Bytes(SFIN_TDE_AT + 4, 20), 20);
 				const uint8_t *blob = record.Bytes(SFIN_TDE_AT + 28, wrapped);

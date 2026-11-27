@@ -2,6 +2,8 @@
 
 #include "backup/backup_key_secret.hpp"
 
+#include "duckdb/common/string_util.hpp"
+
 #include "backup/backup_bytes.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/exception.hpp"
@@ -43,7 +45,8 @@ std::vector<uint8_t> ReadKeyFile(ClientContext &context, const std::string &path
 
 std::vector<uint8_t> FromBase64(const std::string &text, const char *what) {
 	try {
-		const std::string decoded = Blob::FromBase64(string_t(text));
+		std::string decoded = Blob::FromBase64(string_t(text));
+		WipeOnExit wipe(nullptr, &decoded);
 		return std::vector<uint8_t>(decoded.begin(), decoded.end());
 	} catch (std::exception &) {
 		throw InvalidInputException("CREATE SECRET (TYPE %s): %s is not base64", TYPE, what);
@@ -102,7 +105,8 @@ unique_ptr<BaseSecret> CreateBackupKeySecret(ClientContext &context, CreateSecre
 	std::vector<uint8_t> certificate_bytes;
 	std::vector<uint8_t> container;
 	Material(context, input, certificate_bytes, container);
-	const std::string password = Option(input, PASSWORD);
+	std::string password = Option(input, PASSWORD);
+	WipeOnExit wipe(&container, &password);
 	Certificate certificate;
 	try {
 		std::vector<uint8_t> pfx_certificate;
@@ -206,6 +210,35 @@ static const Candidate *Chosen(const std::vector<Candidate> &candidates, const s
 	return nullptr;
 }
 
+//! D10 (owner, 2026-11-27): reading the data needs the key -- named before any row: the thumbprint, the secrets of
+//! the type that match the path, and the form of the secret that would read it.
+[[noreturn]] static void RefuseNoKey(const std::string &path, const std::string &what, const std::string &wanted,
+									 const std::vector<Candidate> &candidates, size_t matching,
+									 const std::string &names) {
+	throw MissingBackupKey(StringUtil::Format(
+		"mssql backup: \"%s\" is %s encrypted by the certificate with thumbprint %s, and no %s secret whose "
+		"scope matches the path holds its key (%s): CREATE SECRET (TYPE %s, CERTIFICATE '<that certificate, "
+		".cer>', PRIVATE_KEY '<its key, .pvk / .pfx / .pem>', PASSWORD '...', SCOPE '<a prefix of the path>'); "
+		"mssql_backup_info reads what the file says in clear without it",
+		path, what, wanted, TYPE,
+		matching == 0 ? std::string("none matches")
+					  : std::to_string(matching) + " match: " + names +
+							(candidates.empty() ? "" : "; D3 takes the longest scope's, none of which is it"),
+		TYPE));
+}
+
+void RequireBackupKeySecret(ClientContext &context, const std::string &path, const Thumbprint &thumbprint,
+							const std::string &what) {
+	const std::string wanted = ThumbprintHex(thumbprint);
+	std::vector<Candidate> candidates;
+	size_t matching = 0;
+	std::string names;
+	FindCandidates(context, path, candidates, matching, names);
+	if (!Chosen(candidates, wanted)) {
+		RefuseNoKey(path, what, wanted, candidates, matching, names);
+	}
+}
+
 bool HasBackupKeySecret(ClientContext &context, const std::string &path, const Thumbprint &thumbprint) {
 	std::vector<Candidate> candidates;
 	size_t matching = 0;
@@ -224,23 +257,12 @@ std::shared_ptr<const ContentKey> SelectContentKey(ClientContext &context, const
 	FindCandidates(context, path, candidates, matching, names);
 	const Candidate *chosen = Chosen(candidates, wanted);
 	if (!chosen) {
-		// D10 (owner, 2026-11-27): reading the data needs the key -- named before any row: the thumbprint,
-		// the secrets of the type that match the path, and the form of the secret that would read it.
-		throw InvalidInputException(
-			"mssql backup: \"%s\" is %s encrypted by the certificate with thumbprint %s, and no %s secret whose "
-			"scope matches the path holds its key (%s): CREATE SECRET (TYPE %s, CERTIFICATE '<that certificate, "
-			".cer>', PRIVATE_KEY '<its key, .pvk / .pfx / .pem>', PASSWORD '...', SCOPE '<a prefix of the path>'); "
-			"mssql_backup_info reads what the file says in clear without it",
-			path, what, wanted, TYPE,
-			matching == 0 ? std::string("none matches")
-						  : std::to_string(matching) + " match: " + names +
-								(candidates.empty() ? "" : "; D3 takes the longest scope's, none of which is it"),
-			TYPE);
+		RefuseNoKey(path, what, wanted, candidates, matching, names);
 	}
 	const auto &kv = dynamic_cast<const KeyValueSecret &>(*chosen->secret);
-	const std::vector<uint8_t> container = FromBase64(kv.TryGetValue(PRIVATE_KEY).ToString(), PRIVATE_KEY);
-	const std::string password =
-		kv.TryGetValue(PASSWORD).IsNull() ? std::string() : kv.TryGetValue(PASSWORD).ToString();
+	std::vector<uint8_t> container = FromBase64(kv.TryGetValue(PRIVATE_KEY).ToString(), PRIVATE_KEY);
+	std::string password = kv.TryGetValue(PASSWORD).IsNull() ? std::string() : kv.TryGetValue(PASSWORD).ToString();
+	WipeOnExit wipe(&container, &password);
 	try {
 		PrivateKey key = ReadPrivateKey(container, password, "secret " + chosen->name + "'s private key");
 		return std::make_shared<const ContentKey>(

@@ -35,7 +35,9 @@ salt length 16, key length 1,748 (an RSA-3072 `PRIVATEKEYBLOB`); the 8-byte `BLO
 `FORMAT = 'PFX'` was refused by this build's `BACKUP CERTIFICATE`.
 
 Not established: AES-128 / 192 and TRIPLE_DES_3KEY; the `CERTIFICATE` (non-OAEP) encryptor type of
-older versions; ZSTD with encryption; the exact offset of `FCBFileDEK` (the prototype finds it by its
+older versions (refused, its message naming it: no PKCS#1 v1.5 fallback -- the review of the build found that one
+would be a Bleichenbacher oracle on the user's key; a fixture that needs it brings it back with implicit
+rejection on); ZSTD with encryption; the exact offset of `FCBFileDEK` (the prototype finds it by its
 pattern in boot-page bytes 600–1200); the 4 KB region at 0x1000 of an uncompressed encrypted
 container; TDE page type 21; a database mid-way through an encryption scan or a DEK rotation; the
 **log tail of a TDE backup** (the log is encrypted per VLF, W§5; E4 did not look); EKM keys, which can

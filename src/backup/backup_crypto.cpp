@@ -15,6 +15,7 @@
 #include <openssl/x509.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace duckdb {
@@ -76,7 +77,10 @@ PrivateKey PrivateKeyBlob(const uint8_t *body, size_t size, const std::string &w
 	}
 	size_t o = 12;
 	Bn e(BN_new());
-	BN_set_word(e.get(), U32(body + 8));
+	if (!e || BN_set_word(e.get(), U32(body + 8)) != 1) {
+		DropErrors();
+		throw FormatError(what + ": OpenSSL could not hold the RSA public exponent");
+	}
 	Bn n = LittleEndian(body + o, n8);
 	o += n8;
 	Bn p = LittleEndian(body + o, n16);
@@ -105,6 +109,13 @@ PrivateKey PrivateKeyBlob(const uint8_t *body, size_t size, const std::string &w
 	EVP_PKEY *pkey = nullptr;
 	ok = ctx && EVP_PKEY_fromdata_init(ctx) == 1 && EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEYPAIR, params) == 1;
 	EVP_PKEY_CTX_free(ctx);
+	// The params hold copies of d, p, q, dp, dq and qi: wiped before they are freed (OSSL_PARAM_clear_free is not
+	// in every OpenSSL 3 this builds with).
+	for (OSSL_PARAM *param = params; param && param->key; param++) {
+		if (param->data && param->data_size) {
+			OPENSSL_cleanse(param->data, param->data_size);
+		}
+	}
 	OSSL_PARAM_free(params);
 	OSSL_PARAM_BLD_free(bld);
 	if (!ok) {
@@ -173,12 +184,15 @@ PrivateKey ReadPfx(const std::vector<uint8_t> &bytes, const std::string &passwor
 	const int ok = PKCS12_parse(p12, password.c_str(), &pkey, &cert, nullptr);
 	PKCS12_free(p12);
 	if (ok != 1 || !pkey) {
-		const unsigned long err = ERR_peek_last_error();
-		DropErrors();
+		// The whole queue is asked (review of 087): the last error is PKCS12's own (a parse or PBE error); the
+		// cipher's "unsupported", from EVP or a provider, lies deeper.
+		bool unsupported = false;
+		for (unsigned long err = ERR_get_error(); err != 0; err = ERR_get_error()) {
+			unsupported = unsupported || ERR_GET_REASON(err) == EVP_R_UNSUPPORTED_ALGORITHM ||
+						  ERR_GET_REASON(err) == ERR_R_UNSUPPORTED || ERR_GET_LIB(err) == ERR_LIB_PROV;
+		}
 		X509_free(cert);
 		EVP_PKEY_free(pkey);
-		const bool unsupported = ERR_GET_REASON(err) == EVP_R_UNSUPPORTED_ALGORITHM ||
-								 ERR_GET_REASON(err) == ERR_R_UNSUPPORTED || ERR_GET_LIB(err) == ERR_LIB_PROV;
 		throw FormatError(what + (unsupported
 									  ? ": the PFX is protected by a cipher this build does not carry (RC2 / RC4, an "
 										"old Windows export): re-export it, e.g. `openssl pkcs12 -export -keypbe "
@@ -228,12 +242,27 @@ bool StartsWith(const std::vector<uint8_t> &bytes, const char *text) {
 	return bytes.size() >= n && std::memcmp(bytes.data(), text, n) == 0;
 }
 
+//! Whether the first 4 KB of `bytes` hold `text`, searched in place: no copy of a key container (an unencrypted
+//! PEM is the private key's text) is made.
 bool HoldsText(const std::vector<uint8_t> &bytes, const char *text) {
-	const std::string s(bytes.begin(), bytes.begin() + std::min<size_t>(bytes.size(), 4096));
-	return s.find(text) != std::string::npos;
+	const size_t n = std::strlen(text);
+	const size_t end = std::min<size_t>(bytes.size(), 4096);
+	if (n == 0 || n > end) {
+		return n == 0;
+	}
+	for (size_t i = 0; i + n <= end; i++) {
+		if (std::memcmp(bytes.data() + i, text, n) == 0) {
+			return true;
+		}
+	}
+	return false;
 }
 
 }  // namespace
+
+void Wipe(void *data, size_t size) {
+	OPENSSL_cleanse(data, size);
+}
 
 std::string ThumbprintHex(const Thumbprint &thumbprint) {
 	static const char *const HEX = "0123456789ABCDEF";
@@ -404,22 +433,17 @@ ContentKey UnwrapContentKey(const PrivateKey &key, const uint8_t *blob, size_t b
 	std::vector<uint8_t> reversed(blob, blob + blob_size);
 	std::reverse(reversed.begin(), reversed.end());	 // CryptoAPI is little-endian (E4)
 	auto *pkey = static_cast<EVP_PKEY *>(key.Native());
+	// RSA-OAEP with SHA-256 / MGF1-SHA-256 only: every encryptor E4 / E4b measured wraps so (SQL Server's
+	// CERTIFICATE_OAEP_256). No PKCS#1 v1.5 fallback (review of 087): with implicit rejection off and distinct
+	// failures after it, a crafted backup naming a user's certificate under a matching scope would make the
+	// error text a Bleichenbacher oracle on the user's RSA key.
 	SecretBytes plain;
-	for (int attempt = 0; attempt < 2 && plain.empty(); attempt++) {
+	{
 		EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, nullptr);
-		bool ok = ctx && EVP_PKEY_decrypt_init(ctx) == 1;
-		if (ok && attempt == 0) {
-			ok = EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) == 1 &&
-				 EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) == 1 &&
-				 EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) == 1;
-		} else if (ok) {
-			// OpenSSL 3.2+ answers a bad PKCS#1 v1.5 padding with random bytes (implicit rejection, against
-			// Bleichenbacher's oracle); here an error is wanted, the key being the user's own.
-			ok = EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) == 1;
-			if (ok) {
-				EVP_PKEY_CTX_ctrl_str(ctx, "rsa_pkcs1_implicit_rejection", "0");
-			}
-		}
+		bool ok = ctx && EVP_PKEY_decrypt_init(ctx) == 1 &&
+				  EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) == 1 &&
+				  EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) == 1 &&
+				  EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) == 1;
 		size_t out_size = 0;
 		ok = ok && EVP_PKEY_decrypt(ctx, nullptr, &out_size, reversed.data(), reversed.size()) == 1;
 		if (ok) {
@@ -433,8 +457,9 @@ ContentKey UnwrapContentKey(const PrivateKey &key, const uint8_t *blob, size_t b
 	}
 	if (plain.empty()) {
 		throw FormatError(what +
-						  ": the key does not unwrap with the secret's private key (not the certificate the "
-						  "backup was encrypted with)");
+						  ": the key does not unwrap with the secret's private key under RSA-OAEP / SHA-256 (not "
+						  "the certificate the backup was encrypted with, or a backup whose EncryptorType is "
+						  "CERTIFICATE -- PKCS#1 v1.5, not read)");
 	}
 	return ReadPlaintextKeyBlob(plain.data(), plain.size(), what);
 }
@@ -442,11 +467,13 @@ ContentKey UnwrapContentKey(const PrivateKey &key, const uint8_t *blob, size_t b
 ContentKey ReadPlaintextKeyBlob(const uint8_t *p, size_t size, const std::string &what) {
 	// PLAINTEXTKEYBLOB: bType 8, bVersion 2, reserved, aiKeyAlg, then u32 the key's length and the key (E4b: 44
 	// bytes whatever the key's length, the rest zeros).
+	// One message for every blob this reader does not take, naming none of its bytes (review of 087): what an
+	// RSA unwrap gave is never echoed.
+	const std::string not_a_key = what +
+								  ": the unwrapped key is not a key blob this reader knows (an AES-128 / "
+								  "192 / 256 or TRIPLE_DES_3KEY PLAINTEXTKEYBLOB)";
 	if (size < 12 || p[0] != 8 || p[1] != 2) {
-		// OAEP checks its own padding; a PKCS#1 v1.5 result that is no key blob is the wrong key too (D7).
-		throw FormatError(what +
-						  ": the key does not unwrap with the secret's private key (not the certificate the "
-						  "backup was encrypted with)");
+		throw FormatError(not_a_key);
 	}
 	const uint32_t alg = U32(p + 4);
 	const uint32_t length = U32(p + 8);
@@ -469,15 +496,11 @@ ContentKey ReadPlaintextKeyBlob(const uint8_t *p, size_t size, const std::string
 		content.algorithm = KeyAlgorithm::TripleDes;
 		expected = 24;
 		break;
-	default: {
-		char word[16];
-		snprintf(word, sizeof(word), "0x%X", alg);
-		throw FormatError(what + ": the backup's key algorithm " + word + " is not one this reader knows");
-	}
+	default:
+		throw FormatError(not_a_key);
 	}
 	if (length != expected || size < 12 + length) {
-		throw FormatError(what + ": the unwrapped key's length (" + std::to_string(length) + ") is not " +
-						  KeyAlgorithmName(content.algorithm) + "'s");
+		throw FormatError(not_a_key);
 	}
 	content.key = SecretBytes(p + 12, length);
 	return content;
@@ -498,6 +521,11 @@ void DecryptCbc(const ContentKey &key, const uint8_t *iv, uint8_t *data, size_t 
 	case KeyAlgorithm::TripleDes:
 		cipher = EVP_des_ede3_cbc();
 		break;
+	}
+	if (!cipher || key.key.size() != static_cast<size_t>(EVP_CIPHER_get_key_length(cipher))) {
+		// A ContentKey is a public struct (a fuzz harness builds one): never a key shorter than its cipher reads.
+		throw FormatError("backup: a " + std::to_string(key.key.size()) + "-byte key for " +
+						  KeyAlgorithmName(key.algorithm) + ", not its cipher's length");
 	}
 	if (size % key.BlockSize() != 0) {
 		throw FormatError("backup: " + std::to_string(size) + " encrypted bytes, not a whole number of " +
