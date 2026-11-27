@@ -184,6 +184,214 @@ std::string DeclarationOfValueOrEmpty(const Value &value, const LogicalType &typ
 	}
 }
 
+// --- DeclarationForColumn, by the column's type family -------------------------------------------
+//
+// A constant compared with a column is declared from the COLUMN's type, never narrower than the
+// constant. Each family below takes the column's lowercased type name: false when the type is not
+// the family's (the next is asked; the names are disjoint, so the order decides nothing), else true
+// with `out` the declaration -- empty for a constant the family leaves a literal.
+
+//! A column, its lowercased type name, and the constant compared with it.
+struct ColumnConstant {
+	const MSSQLColumnInfo &column;
+	const std::string &t;
+	const Value &value;
+	const LogicalType &type;
+
+	bool TypeIs(std::initializer_list<const char *> names) const {
+		for (const char *name : names) {
+			if (t == name) {
+				return true;
+			}
+		}
+		return false;
+	}
+	//! The constant's own declaration, for a constant of another kind than the column: DuckDB compared
+	//! in the constant's type, so it is declared that way.
+	std::string OfValue() const {
+		return DeclarationOfValueOrEmpty(value, type);
+	}
+};
+
+//! `name(k)`, at least 1, or `name(max)` for a MAX column or a length past the type's bound.
+std::string SizedOrMax(const char *name, size_t k, bool is_max, size_t bound) {
+	if (is_max || k > bound) {
+		return std::string(name) + "(max)";
+	}
+	return std::string(name) + "(" + std::to_string(k == 0 ? 1 : k) + ")";
+}
+
+//! bit / tinyint / smallint / int / bigint: the wider of the column and the constant.
+bool DeclareInteger(const ColumnConstant &c, std::string &out) {
+	const int col_rank = IntegerRankOfColumn(c.t);
+	if (col_rank < 0) {
+		return false;
+	}
+	const int value_rank = IntegerRankOfValue(c.type);
+	if (value_rank < 0) {
+		// A DECIMAL or DOUBLE constant against an integer column: DuckDB
+		// compared in the constant's type, so declare it that way.
+		out = c.OfValue();
+	} else if (value_rank == 6) {
+		// HUGEINT / UHUGEINT: decimal(38,0) holds +/-(10^38 - 1) and the
+		// constant may not fit. DeclarationForValue applies the shared range
+		// check and names the parameter; the server's bare "Arithmetic
+		// overflow" is what this replaces (review of #345).
+		out = mssql::DeclarationForValue("p", c.type, c.value);
+	} else {
+		out = IntegerNameOfRank(col_rank > value_rank ? col_rank : value_rank);
+	}
+	return true;
+}
+
+//! decimal / numeric.
+bool DeclareDecimal(const ColumnConstant &c, std::string &out) {
+	if (!c.TypeIs({"decimal", "numeric"})) {
+		return false;
+	}
+	if (c.type.id() != LogicalTypeId::DECIMAL) {
+		out = c.OfValue();
+		return true;
+	}
+	// Never narrower than either side in BOTH dimensions: the wider scale,
+	// and enough precision for the wider INTEGER part on top of it. Taking
+	// the two maxima independently lost integer digits -- decimal(10,8)
+	// against a DECIMAL(11,1) constant gave decimal(11,8), three digits for
+	// a constant that needs ten (review of #345).
+	const int col_int = c.column.precision - c.column.scale;
+	const int val_int = DecimalType::GetWidth(c.type) - DecimalType::GetScale(c.type);
+	const int scale = c.column.scale > DecimalType::GetScale(c.type) ? c.column.scale : DecimalType::GetScale(c.type);
+	int precision = (col_int > val_int ? col_int : val_int) + scale;
+	if (precision > 38) {
+		precision = 38;
+	}
+	out = "decimal(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
+	return true;
+}
+
+//! money / smallmoney, and the types declared from the constant alone: float / real (declaring a
+//! DOUBLE constant as real would round it and turn a DuckDB "not equal" into an "equal") and
+//! datetime / smalldatetime (as the literal form, a CAST to datetime2, always was).
+bool DeclareMoneyOrByValue(const ColumnConstant &c, std::string &out) {
+	if (c.TypeIs({"money", "smallmoney"})) {
+		out = c.type.id() == LogicalTypeId::DECIMAL ? c.t : c.OfValue();
+		return true;
+	}
+	if (c.TypeIs({"float", "real", "datetime", "smalldatetime"})) {
+		out = c.OfValue();
+		return true;
+	}
+	return false;
+}
+
+//! Can the constant go as a varchar parameter? A varchar VARIABLE takes the DATABASE's code page and
+//! the comparison converts it to the COLUMN's, so only when both pages can hold every character of it.
+bool BothPagesHold(const MSSQLColumnInfo &column, const std::string &text) {
+	return mssql::CodePageCanEncode(column.code_page, text) &&
+		   mssql::CodePageCanEncode(column.database_code_page, text);
+}
+
+//! text / ntext.
+bool DeclareLegacyText(const ColumnConstant &c, std::string &out) {
+	if (c.t == "ntext") {
+		out = c.type.id() == LogicalTypeId::VARCHAR ? "nvarchar(max)" : c.OfValue();
+		return true;
+	}
+	if (c.t != "text") {
+		return false;
+	}
+	if (c.type.id() != LogicalTypeId::VARCHAR) {
+		out = c.OfValue();
+		return true;
+	}
+	// The same two-page rule as varchar below: a text column cannot carry a
+	// UTF-8 collation, so a constant the database's page cannot hold went
+	// as '?' in a varchar(max) parameter and `LIKE 'ы%'` matched '?…' rows.
+	out = BothPagesHold(c.column, StringValue::Get(c.value)) ? "varchar(max)" : "nvarchar(max)";
+	return true;
+}
+
+//! char / varchar / nchar / nvarchar / sysname.
+bool DeclareString(const ColumnConstant &c, std::string &out) {
+	if (!c.TypeIs({"char", "varchar", "nchar", "nvarchar", "sysname"})) {
+		return false;
+	}
+	if (c.type.id() != LogicalTypeId::VARCHAR) {
+		out = c.OfValue();
+		return true;
+	}
+	const MSSQLColumnInfo &column = c.column;
+	const std::string &text = StringValue::Get(c.value);
+	const bool is_max = column.max_length < 0;
+	// varchar keeps the column's kind -- that is what keeps an index on it
+	// seekable: on a SQL_ collation an nvarchar parameter puts a
+	// CONVERT_IMPLICIT on the column and the seek becomes a scan (#361).
+	// A varchar VARIABLE takes the DATABASE's code page and the comparison
+	// converts it to the COLUMN's, so a non-ASCII constant may go as
+	// varchar only when both pages can hold every character of it;
+	// otherwise nvarchar, as the N'...' literal always did -- which is how
+	// `@p varchar(max) = N'ы...'` against a UTF-8 column on a 1252 database
+	// stopped arriving as '?' (annotated_max_string.test, #321).
+	if (column.is_unicode || !BothPagesHold(column, text)) {
+		// max_length is bytes; nvarchar counts UTF-16 units.
+		size_t k = is_max ? 0 : static_cast<size_t>(column.max_length) / (column.is_unicode ? 2 : 1);
+		const size_t units = Utf16Units(text);
+		out = SizedOrMax("nvarchar", units > k ? units : k, is_max, 4000);
+		return true;
+	}
+	const size_t k = is_max ? 0 : static_cast<size_t>(column.max_length);
+	out = SizedOrMax("varchar", text.size() > k ? text.size() : k, is_max, 8000);
+	return true;
+}
+
+//! date, time / datetime2 / datetimeoffset (the wider scale of the column and the constant) and
+//! uniqueidentifier.
+bool DeclareTemporalOrGuid(const ColumnConstant &c, std::string &out) {
+	if (c.t == "date") {
+		out = c.type.id() == LogicalTypeId::DATE ? "date" : c.OfValue();
+		return true;
+	}
+	if (c.t == "uniqueidentifier") {
+		out = c.type.id() == LogicalTypeId::UUID ? "uniqueidentifier" : c.OfValue();
+		return true;
+	}
+	if (!c.TypeIs({"time", "datetime2", "datetimeoffset"})) {
+		return false;
+	}
+	const int value_scale = TemporalScaleOfValue(c.type);
+	if (value_scale < 0) {
+		out = c.OfValue();
+		return true;
+	}
+	const int scale = c.column.scale > value_scale ? c.column.scale : value_scale;
+	out = c.t + "(" + std::to_string(scale) + ")";
+	return true;
+}
+
+//! binary / varbinary / image / timestamp / rowversion.
+bool DeclareBinary(const ColumnConstant &c, std::string &out) {
+	if (!c.TypeIs({"binary", "varbinary", "image", "timestamp", "rowversion"})) {
+		return false;
+	}
+	if (c.type.id() != LogicalTypeId::BLOB) {
+		out = c.OfValue();
+		return true;
+	}
+	const bool is_max = c.t == "image" || c.column.max_length < 0;
+	const size_t k = is_max ? 0 : static_cast<size_t>(c.column.max_length);
+	const size_t bytes = StringValue::Get(c.value).size();
+	out = SizedOrMax("varbinary", bytes > k ? bytes : k, is_max, 8000);
+	return true;
+}
+
+bool DeclareNumeric(const ColumnConstant &c, std::string &out) {
+	return DeclareInteger(c, out) || DeclareDecimal(c, out) || DeclareMoneyOrByValue(c, out);
+}
+
+bool DeclareTextOrBytes(const ColumnConstant &c, std::string &out) {
+	return DeclareLegacyText(c, out) || DeclareString(c, out) || DeclareBinary(c, out);
+}
+
 }  // namespace
 
 std::string ExpressionVocabulary::DeclarationForColumn(const MSSQLColumnInfo &column, const Value &value,
@@ -192,134 +400,13 @@ std::string ExpressionVocabulary::DeclarationForColumn(const MSSQLColumnInfo &co
 		return "";
 	}
 	const std::string t = StringUtil::Lower(column.sql_type_name);
-	const int col_rank = IntegerRankOfColumn(t);
-	if (col_rank >= 0) {
-		const int value_rank = IntegerRankOfValue(type);
-		if (value_rank < 0) {
-			// A DECIMAL or DOUBLE constant against an integer column: DuckDB
-			// compared in the constant's type, so declare it that way.
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		if (value_rank == 6) {
-			// HUGEINT / UHUGEINT: decimal(38,0) holds +/-(10^38 - 1) and the
-			// constant may not fit. DeclarationForValue applies the shared range
-			// check and names the parameter; the server's bare "Arithmetic
-			// overflow" is what this replaces (review of #345).
-			return mssql::DeclarationForValue("p", type, value);
-		}
-		return IntegerNameOfRank(col_rank > value_rank ? col_rank : value_rank);
-	}
-	if (t == "decimal" || t == "numeric") {
-		if (type.id() != LogicalTypeId::DECIMAL) {
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		// Never narrower than either side in BOTH dimensions: the wider scale,
-		// and enough precision for the wider INTEGER part on top of it. Taking
-		// the two maxima independently lost integer digits -- decimal(10,8)
-		// against a DECIMAL(11,1) constant gave decimal(11,8), three digits for
-		// a constant that needs ten (review of #345).
-		const int col_int = column.precision - column.scale;
-		const int val_int = DecimalType::GetWidth(type) - DecimalType::GetScale(type);
-		const int scale = column.scale > DecimalType::GetScale(type) ? column.scale : DecimalType::GetScale(type);
-		int precision = (col_int > val_int ? col_int : val_int) + scale;
-		if (precision > 38) {
-			precision = 38;
-		}
-		return "decimal(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
-	}
-	if (t == "money" || t == "smallmoney") {
-		return type.id() == LogicalTypeId::DECIMAL ? t : DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "float" || t == "real") {
-		// Value-driven: declaring a DOUBLE constant as real would round it and
-		// turn a DuckDB "not equal" into an "equal".
-		return DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "text") {
-		if (type.id() != LogicalTypeId::VARCHAR) {
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		// The same two-page rule as varchar below: a text column cannot carry a
-		// UTF-8 collation, so a constant the database's page cannot hold went
-		// as '?' in a varchar(max) parameter and `LIKE 'ы%'` matched '?…' rows.
-		const std::string &text = StringValue::Get(value);
-		const bool fits = mssql::CodePageCanEncode(column.code_page, text) &&
-						  mssql::CodePageCanEncode(column.database_code_page, text);
-		return fits ? "varchar(max)" : "nvarchar(max)";
-	}
-	if (t == "ntext") {
-		return type.id() == LogicalTypeId::VARCHAR ? "nvarchar(max)" : DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "char" || t == "varchar" || t == "nchar" || t == "nvarchar" || t == "sysname") {
-		if (type.id() != LogicalTypeId::VARCHAR) {
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		const std::string &text = StringValue::Get(value);
-		// varchar keeps the column's kind -- that is what keeps an index on it
-		// seekable: on a SQL_ collation an nvarchar parameter puts a
-		// CONVERT_IMPLICIT on the column and the seek becomes a scan (#361).
-		// A varchar VARIABLE takes the DATABASE's code page and the comparison
-		// converts it to the COLUMN's, so a non-ASCII constant may go as
-		// varchar only when both pages can hold every character of it;
-		// otherwise nvarchar, as the N'...' literal always did -- which is how
-		// `@p varchar(max) = N'ы...'` against a UTF-8 column on a 1252 database
-		// stopped arriving as '?' (annotated_max_string.test, #321).
-		const bool unicode = column.is_unicode || !(mssql::CodePageCanEncode(column.code_page, text) &&
-													mssql::CodePageCanEncode(column.database_code_page, text));
-		if (unicode) {
-			// max_length is bytes; nvarchar counts UTF-16 units.
-			size_t k = column.max_length < 0 ? 0 : static_cast<size_t>(column.max_length) / (column.is_unicode ? 2 : 1);
-			const size_t units = Utf16Units(text);
-			if (units > k) {
-				k = units;
-			}
-			if (column.max_length < 0 || k > 4000) {
-				return "nvarchar(max)";
-			}
-			return "nvarchar(" + std::to_string(k == 0 ? 1 : k) + ")";
-		}
-		size_t k = column.max_length < 0 ? 0 : static_cast<size_t>(column.max_length);
-		if (text.size() > k) {
-			k = text.size();
-		}
-		if (column.max_length < 0 || k > 8000) {
-			return "varchar(max)";
-		}
-		return "varchar(" + std::to_string(k == 0 ? 1 : k) + ")";
-	}
-	if (t == "date") {
-		return type.id() == LogicalTypeId::DATE ? "date" : DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "time" || t == "datetime2" || t == "datetimeoffset") {
-		const int value_scale = TemporalScaleOfValue(type);
-		if (value_scale < 0) {
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		const int scale = column.scale > value_scale ? column.scale : value_scale;
-		return t + "(" + std::to_string(scale) + ")";
-	}
-	if (t == "datetime" || t == "smalldatetime") {
-		// Value-driven, as the literal form (a CAST to datetime2) always was.
-		return DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "uniqueidentifier") {
-		return type.id() == LogicalTypeId::UUID ? "uniqueidentifier" : DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "binary" || t == "varbinary" || t == "image" || t == "timestamp" || t == "rowversion") {
-		if (type.id() != LogicalTypeId::BLOB) {
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		size_t k = (t == "image" || column.max_length < 0) ? 0 : static_cast<size_t>(column.max_length);
-		const size_t bytes = StringValue::Get(value).size();
-		if (bytes > k) {
-			k = bytes;
-		}
-		if (t == "image" || column.max_length < 0 || k > 8000) {
-			return "varbinary(max)";
-		}
-		return "varbinary(" + std::to_string(k == 0 ? 1 : k) + ")";
-	}
-	return "";
+	const ColumnConstant constant{column, t, value, type};
+	// A type of no family (xml, sql_variant, a CLR or alias type) has no declaration: the constant
+	// stays a literal.
+	std::string declaration;
+	(void)(DeclareNumeric(constant, declaration) || DeclareTemporalOrGuid(constant, declaration) ||
+		   DeclareTextOrBytes(constant, declaration));
+	return declaration;
 }
 
 std::string ExpressionVocabulary::Constant(const Value &value, const LogicalType &type, SqlParamSet *params,
@@ -507,6 +594,120 @@ bool ExpressionVocabulary::IsNaiveTimestampCast(const LogicalType &source, const
 	return IsNaiveTimestampType(target.id()) && IsNaiveTimestampType(source.id());
 }
 
+namespace {
+
+// --- FunctionFor's gates -----------------------------------------------------------------------
+//
+// Each answers whether the function is REFUSED for these arguments, with the reason in `why`. They
+// are asked in FunctionFor's order, and the first to refuse words the answer.
+
+//! Do the two arguments form a pair of DECIMALs?
+bool BothDecimal(const std::vector<LogicalType> &arg_types) {
+	return arg_types.size() == 2 && arg_types[0].id() == LogicalTypeId::DECIMAL &&
+		   arg_types[1].id() == LogicalTypeId::DECIMAL;
+}
+
+//! Modulo: push only for exact integer operands. T-SQL's `%` rejects float,
+//! real AND money (8117), and money is indistinguishable from decimal here.
+bool ModuloRefused(const std::vector<LogicalType> &arg_types, bool division_by_zero_errors, std::string &why) {
+	// `error_on_division_by_zero = false` makes DuckDB answer NULL for
+	// `x % 0`; the server answers error 8134, and an encoded predicate is
+	// erased from the DuckDB plan, so the statement fails where DuckDB
+	// alone would simply not return the row. The gate lives here, not in
+	// one walker, because a construct both paths take must answer the same
+	// whichever takes it (roborev 1819 finding 3: the writer declined and
+	// the scan path did not).
+	if (!division_by_zero_errors) {
+		why = "% with error_on_division_by_zero = false (DuckDB gives NULL, the server error 8134)";
+		return true;
+	}
+	for (const auto &type : arg_types) {
+		if (!IsExactIntegerForModulo(type.id())) {
+			why = "% on " + type.ToString() + " not pushed (T-SQL modulo takes exact integers only)";
+			return true;
+		}
+	}
+	return false;
+}
+
+//! `+ - *` on an operand that is not a number, or on a float.
+bool ArithmeticOperandRefused(const std::string &name, const std::vector<LogicalType> &arg_types, std::string &why) {
+	for (const auto &type : arg_types) {
+		// Numbers only: DuckDB's `date + 1` is a date, T-SQL's `+` refuses
+		// a date and an int (206) -- the bound tree reaches the scan's
+		// encoder with the DATE operand, the parsed one the writer with it.
+		if (!type.IsNumeric()) {
+			why = name + " on " + type.ToString() + " not pushed (T-SQL's operator is numeric)";
+			return true;
+		}
+	}
+	for (const auto &type : arg_types) {
+		// SQL Server's float cannot represent Inf, so an overflow is an
+		// error -- 8115 on the server, for every row WHERE passes, TOP's
+		// discards included -- where DuckDB gives inf (spec 079 PR D full
+		// review). A PRODUCT reaches it near 1e154; `+` and `-` need about
+		// 1.8e308, a narrower window but the same divergence, and an
+		// encoded predicate is erased from the DuckDB plan so the whole
+		// query fails rather than falling back to the client-side net.
+		// Hence all three, not the product alone (roborev 1819 finding 2).
+		if (type.id() == LogicalTypeId::DOUBLE || type.id() == LogicalTypeId::FLOAT) {
+			why = name + " on " + type.ToString() + " not pushed (overflows on the server where DuckDB says inf)";
+			return true;
+		}
+	}
+	return false;
+}
+
+//! `+ - *` of two DECIMALs whose result DuckDB and the server do not hold alike.
+bool DecimalArithmeticRefused(const std::string &name, const std::vector<LogicalType> &arg_types, std::string &why) {
+	if (!BothDecimal(arg_types)) {
+		return false;
+	}
+	const auto w1 = DecimalType::GetWidth(arg_types[0]);
+	const auto w2 = DecimalType::GetWidth(arg_types[1]);
+	const auto s1 = DecimalType::GetScale(arg_types[0]);
+	const auto s2 = DecimalType::GetScale(arg_types[1]);
+	// DuckDB types DECIMAL(w1,s1) * DECIMAL(w2,s2) as DECIMAL(w1 + w2,
+	// s1 + s2), but CAPS it at 18 when both factors fit 18 and the
+	// scale does too -- then raising an overflow where the server holds
+	// the value (99999999.99 squared in decimal(10,2)).
+	if (name == "*" && w1 <= 18 && w2 <= 18 && w1 + w2 > 18 && s1 + s2 < 18) {
+		why = "a decimal product DuckDB types as DECIMAL(18) not pushed (it overflows there first)";
+		return true;
+	}
+	// Past 38 digits the server reduces the result's SCALE, rounding the
+	// value, where DuckDB keeps it exact: decimal(19,4) * decimal(19,4) is
+	// decimal(38,7) there, DECIMAL(38,8) here (measured, PR C); the server's
+	// precision is p1 + p2 + 1 for *, max(s) + max(p - s) + 1 for + and -.
+	const auto server_precision = name == "*" ? w1 + w2 + 1 : std::max(s1, s2) + std::max(w1 - s1, w2 - s2) + 1;
+	if (server_precision > 38) {
+		why = name + " of " + arg_types[0].ToString() + " and " + arg_types[1].ToString() +
+			  " not pushed (past 38 digits the server rounds the scale)";
+		return true;
+	}
+	return false;
+}
+
+//! A date part of a datetimeoffset is taken in the value's own offset by the
+//! server and in the session TimeZone by DuckDB (measured: HOUR of 12:00
+//! +05:00 is 12 there, 7 in UTC here), so a pushed `hour(dto) = 12` would
+//! match other rows than DuckDB's (review of #387).
+bool DatePartOfTimestampTzRefused(const std::string &name, const std::vector<LogicalType> &arg_types,
+								  std::string &why) {
+	if (!IsDatePartName(name)) {
+		return false;
+	}
+	for (const auto &type : arg_types) {
+		if (type.id() == LogicalTypeId::TIMESTAMP_TZ) {
+			why = name + " of a TIMESTAMP WITH TIME ZONE not pushed";
+			return true;
+		}
+	}
+	return false;
+}
+
+}  // namespace
+
 const FunctionMapping *ExpressionVocabulary::FunctionFor(const std::string &name,
 														 const std::vector<LogicalType> &arg_types, std::string &why,
 														 bool division_by_zero_errors) {
@@ -515,101 +716,21 @@ const FunctionMapping *ExpressionVocabulary::FunctionFor(const std::string &name
 		why = "function " + name + " not supported";
 		return nullptr;
 	}
-	// Modulo: push only for exact integer operands. T-SQL's `%` rejects float,
-	// real AND money (8117), and money is indistinguishable from decimal here.
-	if (name == "%") {
-		// `error_on_division_by_zero = false` makes DuckDB answer NULL for
-		// `x % 0`; the server answers error 8134, and an encoded predicate is
-		// erased from the DuckDB plan, so the statement fails where DuckDB
-		// alone would simply not return the row. The gate lives here, not in
-		// one walker, because a construct both paths take must answer the same
-		// whichever takes it (roborev 1819 finding 3: the writer declined and
-		// the scan path did not).
-		if (!division_by_zero_errors) {
-			why = "% with error_on_division_by_zero = false (DuckDB gives NULL, the server error 8134)";
-			return nullptr;
-		}
-		for (const auto &type : arg_types) {
-			if (!IsExactIntegerForModulo(type.id())) {
-				why = "% on " + type.ToString() + " not pushed (T-SQL modulo takes exact integers only)";
-				return nullptr;
-			}
-		}
+	if (name == "%" && ModuloRefused(arg_types, division_by_zero_errors, why)) {
+		return nullptr;
 	}
-	if (name == "+" || name == "-" || name == "*") {
-		for (const auto &type : arg_types) {
-			// Numbers only: DuckDB's `date + 1` is a date, T-SQL's `+` refuses
-			// a date and an int (206) -- the bound tree reaches the scan's
-			// encoder with the DATE operand, the parsed one the writer with it.
-			if (!type.IsNumeric()) {
-				why = name + " on " + type.ToString() + " not pushed (T-SQL's operator is numeric)";
-				return nullptr;
-			}
-		}
-		for (const auto &type : arg_types) {
-			// SQL Server's float cannot represent Inf, so an overflow is an
-			// error -- 8115 on the server, for every row WHERE passes, TOP's
-			// discards included -- where DuckDB gives inf (spec 079 PR D full
-			// review). A PRODUCT reaches it near 1e154; `+` and `-` need about
-			// 1.8e308, a narrower window but the same divergence, and an
-			// encoded predicate is erased from the DuckDB plan so the whole
-			// query fails rather than falling back to the client-side net.
-			// Hence all three, not the product alone (roborev 1819 finding 2).
-			if (type.id() == LogicalTypeId::DOUBLE || type.id() == LogicalTypeId::FLOAT) {
-				why = name + " on " + type.ToString() + " not pushed (overflows on the server where DuckDB says inf)";
-				return nullptr;
-			}
-		}
-		if (name == "*" && arg_types.size() == 2) {
-			// DuckDB types DECIMAL(w1,s1) * DECIMAL(w2,s2) as DECIMAL(w1 + w2,
-			// s1 + s2), but CAPS it at 18 when both factors fit 18 and the
-			// scale does too -- then raising an overflow where the server holds
-			// the value (99999999.99 squared in decimal(10,2)).
-			if (arg_types[0].id() == LogicalTypeId::DECIMAL && arg_types[1].id() == LogicalTypeId::DECIMAL) {
-				const auto w1 = DecimalType::GetWidth(arg_types[0]);
-				const auto w2 = DecimalType::GetWidth(arg_types[1]);
-				const auto s1 = DecimalType::GetScale(arg_types[0]);
-				const auto s2 = DecimalType::GetScale(arg_types[1]);
-				if (w1 <= 18 && w2 <= 18 && w1 + w2 > 18 && s1 + s2 < 18) {
-					why = "a decimal product DuckDB types as DECIMAL(18) not pushed (it overflows there first)";
-					return nullptr;
-				}
-			}
-		}
-		// Past 38 digits the server reduces the result's SCALE, rounding the
-		// value, where DuckDB keeps it exact: decimal(19,4) * decimal(19,4) is
-		// decimal(38,7) there, DECIMAL(38,8) here (measured, PR C); the server's
-		// precision is p1 + p2 + 1 for *, max(s) + max(p - s) + 1 for + and -.
-		if (arg_types.size() == 2 && arg_types[0].id() == LogicalTypeId::DECIMAL &&
-			arg_types[1].id() == LogicalTypeId::DECIMAL) {
-			const auto w1 = DecimalType::GetWidth(arg_types[0]);
-			const auto w2 = DecimalType::GetWidth(arg_types[1]);
-			const auto s1 = DecimalType::GetScale(arg_types[0]);
-			const auto s2 = DecimalType::GetScale(arg_types[1]);
-			const auto server_precision = name == "*" ? w1 + w2 + 1 : std::max(s1, s2) + std::max(w1 - s1, w2 - s2) + 1;
-			if (server_precision > 38) {
-				why = name + " of " + arg_types[0].ToString() + " and " + arg_types[1].ToString() +
-					  " not pushed (past 38 digits the server rounds the scale)";
-				return nullptr;
-			}
-		}
+	const bool arithmetic = name == "+" || name == "-" || name == "*";
+	if (arithmetic &&
+		(ArithmeticOperandRefused(name, arg_types, why) || DecimalArithmeticRefused(name, arg_types, why))) {
+		return nullptr;
 	}
 	if (mapping->expected_args != static_cast<int>(arg_types.size())) {
 		why = name + " expects " + std::to_string(mapping->expected_args) + " args, got " +
 			  std::to_string(arg_types.size());
 		return nullptr;
 	}
-	// A date part of a datetimeoffset is taken in the value's own offset by the
-	// server and in the session TimeZone by DuckDB (measured: HOUR of 12:00
-	// +05:00 is 12 there, 7 in UTC here), so a pushed `hour(dto) = 12` would
-	// match other rows than DuckDB's (review of #387).
-	if (IsDatePartName(name)) {
-		for (const auto &type : arg_types) {
-			if (type.id() == LogicalTypeId::TIMESTAMP_TZ) {
-				why = name + " of a TIMESTAMP WITH TIME ZONE not pushed";
-				return nullptr;
-			}
-		}
+	if (DatePartOfTimestampTzRefused(name, arg_types, why)) {
+		return nullptr;
 	}
 	return mapping;
 }
