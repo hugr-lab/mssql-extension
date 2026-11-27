@@ -37,49 +37,98 @@ namespace duckdb {
 namespace mssql {
 namespace node_writer {
 
-int NodeWriter::FindColumn(const ColumnRefExpression &ref, idx_t &out) const {
-	if (relations_.empty()) {
-		// A set operation's writer: no relation of its own to name.
-		return 0;
+namespace {
+
+bool IsSemiJoin(JoinType type) {
+	return type == JoinType::SEMI || type == JoinType::ANTI;
+}
+
+// The join types the writer has a form for: a keyword, or EXISTS / NOT EXISTS.
+bool IsWrittenJoinType(JoinType type) {
+	return type == JoinType::INNER || type == JoinType::LEFT || type == JoinType::RIGHT || type == JoinType::OUTER ||
+		   IsSemiJoin(type);
+}
+
+// The NULL-supplying sides of an outer join.
+bool RightSideIsNullable(JoinType type) {
+	return type == JoinType::LEFT || type == JoinType::OUTER;
+}
+
+bool LeftSideIsNullable(JoinType type) {
+	return type == JoinType::RIGHT || type == JoinType::OUTER;
+}
+
+bool HasJoinDecorations(const JoinRef &join) {
+	return !join.alias.empty() || !join.column_name_alias.empty() || !join.duplicate_eliminated_columns.empty() ||
+		   join.sample;
+}
+
+const char *JoinKeyword(JoinType type) {
+	return type == JoinType::INNER	 ? " INNER JOIN "
+		   : type == JoinType::LEFT	 ? " LEFT JOIN "
+		   : type == JoinType::RIGHT ? " RIGHT JOIN "
+									 : " FULL JOIN ";
+}
+
+bool OrdersWithoutLimit(const QueryNode &node) {
+	bool ordered = false;
+	bool limited = false;
+	for (auto &modifier : node.modifiers) {
+		ordered = ordered || modifier->type == ResultModifierType::ORDER_MODIFIER;
+		limited = limited || modifier->type == ResultModifierType::LIMIT_MODIFIER;
 	}
-	auto &names = ref.ColumnNames();
-	if (names.size() > 2) {
-		return -1;
-	}
-	const auto &name = names.back().GetIdentifierName();
+	return ordered && !limited;
+}
+
+}  // namespace
+
+idx_t NodeWriter::FindRelation(const std::string &name) const {
 	idx_t relation = DConstants::INVALID_INDEX;
-	if (names.size() == 2) {
-		for (idx_t r = 0; r < relations_.size(); r++) {
-			if (StringUtil::CIEquals(names[0].GetIdentifierName(), relations_[r].name)) {
-				relation = r;
-			}
-		}
-		if (relation == DConstants::INVALID_INDEX) {
-			return -1;
-		}
-	} else {
-		// An unqualified USING column is the merged one DuckDB's binder makes.
-		for (auto &merged : using_columns_) {
-			if (StringUtil::CIEquals(merged.first, name)) {
-				out = merged.second;
-				return 1;
-			}
+	for (idx_t r = 0; r < relations_.size(); r++) {
+		if (StringUtil::CIEquals(name, relations_[r].name)) {
+			relation = r;
 		}
 	}
-	if (relation != DConstants::INVALID_INDEX && ((visible_ != DConstants::INVALID_INDEX && relation >= visible_) ||
-												  (relations_[relation].semi && relation != semi_scope_))) {
-		return -1;
+	return relation;
+}
+
+bool NodeWriter::IsOutOfScope(idx_t relation) const {
+	return (visible_ != DConstants::INVALID_INDEX && relation >= visible_) ||
+		   (relations_[relation].semi && relation != semi_scope_);
+}
+
+bool NodeWriter::IsMergeForbidden(idx_t relation) const {
+	return merge_forbidden_first_ != DConstants::INVALID_INDEX && relation >= merge_forbidden_first_ &&
+		   relation < merge_forbidden_last_;
+}
+
+bool NodeWriter::FindUsingColumn(const std::string &name, idx_t &out) const {
+	for (auto &merged : using_columns_) {
+		if (StringUtil::CIEquals(merged.first, name)) {
+			out = merged.second;
+			return true;
+		}
 	}
+	return false;
+}
+
+bool NodeWriter::ColumnAnswers(idx_t index, idx_t relation, const std::string &name) const {
+	const auto owner = relation_of_[index];
+	if (IsOutOfScope(owner)) {
+		return false;
+	}
+	// An unqualified name in a MERGE action is looked up on the side its
+	// rows have, as DuckDB binds it (spec 080 PR 4a).
+	if (relation != DConstants::INVALID_INDEX ? owner != relation : IsMergeForbidden(owner)) {
+		return false;
+	}
+	return StringUtil::CIEquals(columns_[index].DuckDBName(), name);
+}
+
+int NodeWriter::FindColumnIn(idx_t relation, const std::string &name, idx_t &out) const {
 	bool found = false;
 	for (idx_t i = 0; i < columns_.size(); i++) {
-		if ((visible_ != DConstants::INVALID_INDEX && relation_of_[i] >= visible_) ||
-			(relations_[relation_of_[i]].semi && relation_of_[i] != semi_scope_) ||
-			(relation != DConstants::INVALID_INDEX && relation_of_[i] != relation) ||
-			// An unqualified name in a MERGE action is looked up on the side its
-			// rows have, as DuckDB binds it (spec 080 PR 4a).
-			(relation == DConstants::INVALID_INDEX && merge_forbidden_first_ != DConstants::INVALID_INDEX &&
-			 relation_of_[i] >= merge_forbidden_first_ && relation_of_[i] < merge_forbidden_last_) ||
-			!StringUtil::CIEquals(columns_[i].DuckDBName(), name)) {
+		if (!ColumnAnswers(i, relation, name)) {
 			continue;
 		}
 		if (found) {
@@ -93,20 +142,68 @@ int NodeWriter::FindColumn(const ColumnRefExpression &ref, idx_t &out) const {
 	return found ? 1 : 0;
 }
 
-bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
-	auto &names = ref.ColumnNames();
-	const int found = FindColumn(ref, out);
-	bool alias = names.size() == 1 && StringUtil::CIEquals(names[0].GetIdentifierName(), "rowid");
-	for (auto &name : select_aliases_) {
-		alias = alias || (names.size() == 1 && StringUtil::CIEquals(names[0].GetIdentifierName(), name));
+int NodeWriter::FindColumn(const ColumnRefExpression &ref, idx_t &out) const {
+	if (relations_.empty()) {
+		// A set operation's writer: no relation of its own to name.
+		return 0;
 	}
-	if (found != 1 && !HasOuterRelations() && !alias && MayBeOuter(ref, found)) {
+	auto &names = ref.ColumnNames();
+	if (names.size() > 2) {
+		return -1;
+	}
+	const auto &name = names.back().GetIdentifierName();
+	idx_t relation = DConstants::INVALID_INDEX;
+	if (names.size() == 2) {
+		relation = FindRelation(names[0].GetIdentifierName());
+		if (relation == DConstants::INVALID_INDEX || IsOutOfScope(relation)) {
+			return -1;
+		}
+	} else if (FindUsingColumn(name, out)) {
+		// An unqualified USING column is the merged one DuckDB's binder makes.
+		return 1;
+	}
+	return FindColumnIn(relation, name, out);
+}
+
+bool NodeWriter::IsSelectAliasOrRowid(const ColumnRefExpression &ref) const {
+	auto &names = ref.ColumnNames();
+	if (names.size() != 1) {
+		return false;
+	}
+	bool alias = StringUtil::CIEquals(names[0].GetIdentifierName(), "rowid");
+	for (auto &name : select_aliases_) {
+		alias = alias || StringUtil::CIEquals(names[0].GetIdentifierName(), name);
+	}
+	return alias;
+}
+
+bool NodeWriter::VetoUnanswered(const ColumnRefExpression &ref) {
+	auto &names = ref.ColumnNames();
+	if (names.size() > 2) {
+		return Veto("column reference " + ref.ToString() + " has more than two parts");
+	}
+	if (names.size() == 2) {
+		if (FindRelation(names[0].GetIdentifierName()) == DConstants::INVALID_INDEX) {
+			return Veto("column reference " + ref.ToString() + " names another relation");
+		}
+		for (auto &relation : relations_) {
+			if (relation.semi && StringUtil::CIEquals(names[0].GetIdentifierName(), relation.name)) {
+				return Veto("column reference " + ref.ToString() +
+							" names a SEMI / ANTI join's table, which only its condition sees");
+			}
+		}
+	}
+	return Veto("column name " + names.back().GetIdentifierName() + " matches more than one column");
+}
+
+bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
+	const int found = FindColumn(ref, out);
+	if (found != 1 && !HasOuterRelations() && !IsSelectAliasOrRowid(ref) && MayBeOuter(ref, found)) {
 		out_.refers_outside = true;
 	}
 	switch (found) {
 	case 1:
-		if (merge_forbidden_first_ != DConstants::INVALID_INDEX && relation_of_[out] >= merge_forbidden_first_ &&
-			relation_of_[out] < merge_forbidden_last_) {
+		if (IsMergeForbidden(relation_of_[out])) {
 			// A MERGE action naming the side its rows do not have.
 			return Veto("column " + ref.ToString() + " of the " +
 						(merge_forbidden_first_ == 0 ? "target in WHEN NOT MATCHED BY TARGET"
@@ -114,27 +211,10 @@ bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
 		}
 		return true;
 	case 0:
-		return Veto("column " + names.back().GetIdentifierName() + " is not a column of the query's tables");
+		return Veto("column " + ref.ColumnNames().back().GetIdentifierName() +
+					" is not a column of the query's tables");
 	default:
-		if (names.size() > 2) {
-			return Veto("column reference " + ref.ToString() + " has more than two parts");
-		}
-		if (names.size() == 2) {
-			bool known = false;
-			for (auto &relation : relations_) {
-				known = known || StringUtil::CIEquals(names[0].GetIdentifierName(), relation.name);
-			}
-			if (!known) {
-				return Veto("column reference " + ref.ToString() + " names another relation");
-			}
-			for (auto &relation : relations_) {
-				if (relation.semi && StringUtil::CIEquals(names[0].GetIdentifierName(), relation.name)) {
-					return Veto("column reference " + ref.ToString() +
-								" names a SEMI / ANTI join's table, which only its condition sees");
-				}
-			}
-		}
-		return Veto("column name " + names.back().GetIdentifierName() + " matches more than one column");
+		return VetoUnanswered(ref);
 	}
 }
 
@@ -147,84 +227,92 @@ bool NodeWriter::IsHiddenUsingColumn(idx_t index) const {
 	return false;
 }
 
-bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &members) {
-	if (ref.type == TableReferenceType::BASE_TABLE) {
-		auto &base = ref.Cast<BaseTableRef>();
-		if (base.sample || !base.column_name_alias.empty() || base.at_clause) {
-			return Veto("TABLESAMPLE / column aliases / AT on a table");
+bool NodeWriter::CheckRelationName(const std::string &name) {
+	for (auto &other : relations_) {
+		if (StringUtil::CIEquals(other.name, name)) {
+			// A self-join without aliases, or two schemas' tables of one name --
+			// which the rewriter's strip would also merge (`db.s1.t.c` -> `t.c`).
+			return Veto("two tables named " + name);
 		}
-		NodeWriter *owner = nullptr;
-		idx_t index = 0;
-		auto cte = IsWrittenUnqualified(base) ? FindCte(base.Table().GetIdentifierName(), owner, index) : nullptr;
-		if (cte) {
-			// Evaluated per row of a node around it: a subquery expression between
-			// this reference and the CTE's WITH (or around a CTE reading it).
-			bool per_row = false;
-			for (auto writer = this; writer && writer != owner; writer = writer->cte_parent_) {
-				per_row = per_row || writer->in_expression_;
-			}
-			bool picks_rows = false;
-			if (!CollectDerivedNode(*cte->body, base.alias.empty() ? cte->name : base.alias.GetIdentifierName(), false,
-									owner, index, per_row, &picks_rows, members)) {
-				return false;
-			}
-			// A body that picks rows anywhere in it (a LIMIT among ties) differs
-			// between evaluations; DuckDB evaluates it once. Deterministic bodies
-			// are inlined as often as referenced -- each a read of its own, which
-			// under concurrent writes can see other committed rows.
-			if (++cte->uses > 1 && picks_rows) {
-				return Veto("a CTE with a LIMIT referenced more than once");
-			}
-			if (picks_rows && per_row) {
-				return Veto("a CTE with a LIMIT under a subquery expression");
-			}
-			return true;
-		}
-		Relation relation;
-		if (!resolver_(base, relation.table) || !relation.table.columns) {
-			return Veto("table " + base.Table().GetIdentifierName() + " does not resolve in this catalog");
-		}
-		relation.name = base.alias.empty() ? relation.table.name : base.alias.GetIdentifierName();
-		for (auto &other : relations_) {
-			if (StringUtil::CIEquals(other.name, relation.name)) {
-				// A self-join without aliases, or two schemas' tables of one name --
-				// which the rewriter's strip would also merge (`db.s1.t.c` -> `t.c`).
-				return Veto("two tables named " + relation.name);
-			}
-		}
-		const auto &columns = *relation.table.columns;
-		for (idx_t i = 0; i < columns.size(); i++) {
-			columns_.push_back(columns[i]);
-			types_.push_back(relation.table.types ? (*relation.table.types)[i] : columns[i].NativeDuckDBType());
-			relation_of_.push_back(relations_.size());
-			cast_of_.push_back(LogicalType::INVALID);
-			already_read_.push_back(false);
-			divergent_of_.push_back(false);
-		}
-		members.push_back(relations_.size());
-		relations_.push_back(std::move(relation));
-		return true;
 	}
-	if (ref.type == TableReferenceType::SUBQUERY) {
-		return CollectDerived(ref.Cast<SubqueryRef>(), members);
+	return true;
+}
+
+bool NodeWriter::CollectTable(const BaseTableRef &base, std::vector<idx_t> &members) {
+	Relation relation;
+	if (!resolver_(base, relation.table) || !relation.table.columns) {
+		return Veto("table " + base.Table().GetIdentifierName() + " does not resolve in this catalog");
 	}
-	if (ref.type != TableReferenceType::JOIN) {
-		return Veto("FROM holds a table function, VALUES or another non-table");
+	relation.name = base.alias.empty() ? relation.table.name : base.alias.GetIdentifierName();
+	if (!CheckRelationName(relation.name)) {
+		return false;
 	}
-	auto &join = ref.Cast<JoinRef>();
-	if (!join.alias.empty() || !join.column_name_alias.empty() || !join.duplicate_eliminated_columns.empty() ||
-		join.sample) {
+	const auto &columns = *relation.table.columns;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		columns_.push_back(columns[i]);
+		types_.push_back(relation.table.types ? (*relation.table.types)[i] : columns[i].NativeDuckDBType());
+		relation_of_.push_back(relations_.size());
+		cast_of_.push_back(LogicalType::INVALID);
+		already_read_.push_back(false);
+		divergent_of_.push_back(false);
+	}
+	members.push_back(relations_.size());
+	relations_.push_back(std::move(relation));
+	return true;
+}
+
+bool NodeWriter::IsEvaluatedPerRow(const NodeWriter *owner) const {
+	bool per_row = false;
+	for (auto writer = this; writer && writer != owner; writer = writer->cte_parent_) {
+		per_row = per_row || writer->in_expression_;
+	}
+	return per_row;
+}
+
+bool NodeWriter::CollectCteReference(const BaseTableRef &base, CteEntry &cte, NodeWriter *owner, idx_t index,
+									 std::vector<idx_t> &members) {
+	// Evaluated per row of a node around it: a subquery expression between
+	// this reference and the CTE's WITH (or around a CTE reading it).
+	const bool per_row = IsEvaluatedPerRow(owner);
+	bool picks_rows = false;
+	if (!CollectDerivedNode(*cte.body, base.alias.empty() ? cte.name : base.alias.GetIdentifierName(), false, owner,
+							index, per_row, &picks_rows, members)) {
+		return false;
+	}
+	// A body that picks rows anywhere in it (a LIMIT among ties) differs
+	// between evaluations; DuckDB evaluates it once. Deterministic bodies
+	// are inlined as often as referenced -- each a read of its own, which
+	// under concurrent writes can see other committed rows.
+	if (++cte.uses > 1 && picks_rows) {
+		return Veto("a CTE with a LIMIT referenced more than once");
+	}
+	if (picks_rows && per_row) {
+		return Veto("a CTE with a LIMIT under a subquery expression");
+	}
+	return true;
+}
+
+bool NodeWriter::CollectBaseTable(const BaseTableRef &base, std::vector<idx_t> &members) {
+	if (base.sample || !base.column_name_alias.empty() || base.at_clause) {
+		return Veto("TABLESAMPLE / column aliases / AT on a table");
+	}
+	NodeWriter *owner = nullptr;
+	idx_t index = 0;
+	auto cte = IsWrittenUnqualified(base) ? FindCte(base.Table().GetIdentifierName(), owner, index) : nullptr;
+	return cte ? CollectCteReference(base, *cte, owner, index, members) : CollectTable(base, members);
+}
+
+bool NodeWriter::CheckJoinShape(const JoinRef &join) {
+	if (HasJoinDecorations(join)) {
 		return Veto("an alias, sample or column aliases on a join");
 	}
 	if (join.ref_type != JoinRefType::REGULAR && join.ref_type != JoinRefType::CROSS) {
 		return Veto("a NATURAL / POSITIONAL / ASOF / LATERAL / NEAREST join");
 	}
-	const bool semi = join.type == JoinType::SEMI || join.type == JoinType::ANTI;
-	if (join.type != JoinType::INNER && join.type != JoinType::LEFT && join.type != JoinType::RIGHT &&
-		join.type != JoinType::OUTER && !semi) {
+	if (!IsWrittenJoinType(join.type)) {
 		return Veto("a MARK / SINGLE join");
 	}
-	if (semi && join.ref_type == JoinRefType::CROSS) {
+	if (IsSemiJoin(join.type) && join.ref_type == JoinRefType::CROSS) {
 		return Veto("a SEMI / ANTI join without a condition");
 	}
 	if (join.right->type != TableReferenceType::BASE_TABLE && join.right->type != TableReferenceType::SUBQUERY) {
@@ -232,21 +320,39 @@ bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &membe
 		// the nullability of a nested outer join.
 		return Veto("a join whose right side is not a table or a subquery");
 	}
+	return true;
+}
+
+bool NodeWriter::AnySemi(const std::vector<idx_t> &members) const {
+	bool semi = false;
+	for (auto r : members) {
+		semi = semi || relations_[r].semi;
+	}
+	return semi;
+}
+
+void NodeWriter::MarkNullable(const std::vector<idx_t> &members) {
+	for (auto r : members) {
+		relations_[r].nullable = true;
+	}
+}
+
+bool NodeWriter::CollectJoin(const JoinRef &join, std::vector<idx_t> &members) {
+	if (!CheckJoinShape(join)) {
+		return false;
+	}
 	std::vector<idx_t> left;
 	std::vector<idx_t> right;
 	if (!CollectRelations(*join.left, left) || !CollectRelations(*join.right, right)) {
 		return false;
 	}
-	bool semi_on_left = false;
-	for (auto r : left) {
-		semi_on_left = semi_on_left || relations_[r].semi;
-	}
-	if (semi) {
+	const bool semi_on_left = AnySemi(left);
+	if (IsSemiJoin(join.type)) {
 		for (auto r : right) {
 			relations_[r].semi = true;
 		}
 	}
-	if (semi_on_left && (join.type == JoinType::RIGHT || join.type == JoinType::OUTER)) {
+	if (semi_on_left && LeftSideIsNullable(join.type)) {
 		// A SEMI join's EXISTS is ANDed to WHERE, after every join. That is
 		// exact for the rows its left side produces, which later INNER and LEFT
 		// joins keep, and whatever joins came before it -- but a later RIGHT /
@@ -255,19 +361,28 @@ bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &membe
 		return Veto("a RIGHT / FULL join over a SEMI / ANTI join");
 	}
 	// The NULL-supplying side: its columns can be NULL whatever they declare.
-	if (join.type == JoinType::LEFT || join.type == JoinType::OUTER) {
-		for (auto r : right) {
-			relations_[r].nullable = true;
-		}
+	if (RightSideIsNullable(join.type)) {
+		MarkNullable(right);
 	}
-	if (join.type == JoinType::RIGHT || join.type == JoinType::OUTER) {
-		for (auto r : left) {
-			relations_[r].nullable = true;
-		}
+	if (LeftSideIsNullable(join.type)) {
+		MarkNullable(left);
 	}
 	members.insert(members.end(), left.begin(), left.end());
 	members.insert(members.end(), right.begin(), right.end());
 	return true;
+}
+
+bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &members) {
+	if (ref.type == TableReferenceType::BASE_TABLE) {
+		return CollectBaseTable(ref.Cast<BaseTableRef>(), members);
+	}
+	if (ref.type == TableReferenceType::SUBQUERY) {
+		return CollectDerived(ref.Cast<SubqueryRef>(), members);
+	}
+	if (ref.type != TableReferenceType::JOIN) {
+		return Veto("FROM holds a table function, VALUES or another non-table");
+	}
+	return CollectJoin(ref.Cast<JoinRef>(), members);
 }
 
 void NodeWriter::CollectEqualities(const ParsedExpression &condition) {
@@ -374,22 +489,8 @@ bool NodeWriter::CollectDerived(const SubqueryRef &ref, std::vector<idx_t> &memb
 							  &ref == synthetic_ref_, nullptr, 0, false, nullptr, members);
 }
 
-bool NodeWriter::CollectDerivedNode(const QueryNode &node, const std::string &name, bool synthetic,
-									NodeWriter *cte_owner, idx_t cte_index, bool per_row, bool *picks_rows,
-									std::vector<idx_t> &members) {
-	bool ordered = false;
-	bool limited = false;
-	for (auto &modifier : node.modifiers) {
-		ordered = ordered || modifier->type == ResultModifierType::ORDER_MODIFIER;
-		limited = limited || modifier->type == ResultModifierType::LIMIT_MODIFIER;
-	}
-	if (ordered && !limited) {
-		// T-SQL refuses an ORDER BY in a derived table without TOP / OFFSET
-		// (1033); DuckDB promises no order there either.
-		return Veto("an ORDER BY without LIMIT in a subquery");
-	}
-	WrittenQuery inner_out;
-	NodeWriter inner(*this, inner_out);
+void NodeWriter::PrepareDerivedWriter(NodeWriter &inner, bool synthetic, NodeWriter *cte_owner, idx_t cte_index,
+									  bool per_row) const {
 	if (synthetic) {
 		// The set operation of a wrapper this writer stands in for: correlated
 		// as the wrapper is, its members aliased past the nodes around it.
@@ -405,23 +506,45 @@ bool NodeWriter::CollectDerivedNode(const QueryNode &node, const std::string &na
 		inner.qualifying_ = true;
 		inner.qualify_names_ = qualify_names_;
 	}
-	if (synthetic ? (synthetic_select_ ? !inner.Write(*synthetic_select_) : !inner.WriteSetOperation(*synthetic_setop_))
-				  : !inner.WriteQueryNode(node)) {
-		out_.refers_outside = out_.refers_outside || inner_out.refers_outside;
-		return false;
+}
+
+bool NodeWriter::WriteDerivedBody(NodeWriter &inner, const QueryNode &node, bool synthetic) const {
+	if (!synthetic) {
+		return inner.WriteQueryNode(node);
 	}
-	correlated_ = correlated_ || inner.correlated_;
-	out_.picks_rows = out_.picks_rows || inner_out.picks_rows;
-	// Its joins' gain is this node's to settle (review of E1: a many-to-many
-	// join wrapped in a derived table or a CTE skipped the check).
-	derived_uncertain_ = derived_uncertain_ || inner_out.gain_uncertain;
-	if (picks_rows) {
-		*picks_rows = inner_out.picks_rows;
+	return synthetic_select_ ? inner.Write(*synthetic_select_) : inner.WriteSetOperation(*synthetic_setop_);
+}
+
+std::vector<std::string> NodeWriter::GroupKeyNames(const NodeWriter &inner) {
+	std::vector<std::string> names;
+	for (auto key : inner.group_keys_) {
+		for (auto &output : inner.Outputs()) {
+			if (output.column_index == key && output.plain_read) {
+				names.push_back(output.name);
+				break;
+			}
+		}
 	}
-	if (inner_out.statement.size() > MAX_DERIVED_SQL) {
-		// A CTE read twice by a CTE read twice ... doubles per level.
-		return Veto("a derived table or inlined CTE past " + std::to_string(MAX_DERIVED_SQL) + " bytes of T-SQL");
+	if (names.size() != inner.group_keys_.size()) {
+		names.clear();
 	}
+	return names;
+}
+
+std::vector<std::string> NodeWriter::DerivedUniqueKey(const NodeWriter &inner) {
+	if (inner.aggregated_ && !inner.group_keys_.empty()) {
+		return GroupKeyNames(inner);
+	}
+	std::vector<std::string> unique_key;
+	if (inner.distinct_ && !inner.aggregated_) {
+		for (auto &output : inner.Outputs()) {
+			unique_key.push_back(output.name);
+		}
+	}
+	return unique_key;
+}
+
+Relation NodeWriter::DerivedRelation(const std::string &name, const NodeWriter &inner, const WrittenQuery &inner_out) {
 	Relation relation;
 	relation.derived = true;
 	relation.derived_sql = inner_out.statement;
@@ -434,53 +557,73 @@ bool NodeWriter::CollectDerivedNode(const QueryNode &node, const std::string &na
 	relation.total_unknown = inner_out.total_size_unknown;
 	// Its GROUP BY columns (or all of them under DISTINCT) are a unique key,
 	// when every one of them is a result column.
-	if (inner.aggregated_ && !inner.group_keys_.empty()) {
-		for (auto key : inner.group_keys_) {
-			for (auto &output : inner.Outputs()) {
-				if (output.column_index == key && output.plain_read) {
-					relation.table.unique_key.push_back(output.name);
-					break;
-				}
-			}
-		}
-		if (relation.table.unique_key.size() != inner.group_keys_.size()) {
-			relation.table.unique_key.clear();
-		}
-	} else if (inner.distinct_ && !inner.aggregated_) {
-		for (auto &output : inner.Outputs()) {
-			relation.table.unique_key.push_back(output.name);
-		}
+	relation.table.unique_key = DerivedUniqueKey(inner);
+	return relation;
+}
+
+void NodeWriter::NoteDerivedFacts(const NodeWriter &inner, const WrittenQuery &inner_out) {
+	correlated_ = correlated_ || inner.correlated_;
+	out_.picks_rows = out_.picks_rows || inner_out.picks_rows;
+	// Its joins' gain is this node's to settle (review of E1: a many-to-many
+	// join wrapped in a derived table or a CTE skipped the check).
+	derived_uncertain_ = derived_uncertain_ || inner_out.gain_uncertain;
+}
+
+void NodeWriter::AppendDerivedColumn(const NodeWriter &inner, const OutputColumn &output) {
+	const bool computed = output.column_index == DConstants::INVALID_INDEX;
+	const bool diverges = output.value.division || output.value.approximate;
+	if (!computed && output.plain_read) {
+		auto column = inner.FlatColumn(output.column_index);
+		column.name = output.name;	// the derived table's column, named by its output on both sides
+		column.duckdb_name = output.name;
+		columns_.push_back(std::move(column));
+	} else {
+		// The operand type the server's value has (an integer SUM is
+		// decimal(38,0) there); computed values of unknown type are opaque.
+		// So is a division or a floating-point aggregate: its divergence
+		// (NULL for inf, the last bits) is recorded for a VALUE only, and
+		// outside its node it would be compared, ordered, grouped or
+		// COALESCEd as a plain float (review of E1: rows differed).
+		const bool opaque = !computed || diverges;
+		columns_.push_back(DerivedColumn(output.name, opaque ? LogicalType::INVALID : output.value.type));
 	}
-	for (auto &other : relations_) {
-		if (StringUtil::CIEquals(other.name, relation.name)) {
-			return Veto("two tables named " + relation.name);
-		}
+	already_read_.push_back(true);
+	divergent_of_.push_back(computed && diverges);
+	relation_of_.push_back(relations_.size());
+}
+
+bool NodeWriter::CollectDerivedNode(const QueryNode &node, const std::string &name, bool synthetic,
+									NodeWriter *cte_owner, idx_t cte_index, bool per_row, bool *picks_rows,
+									std::vector<idx_t> &members) {
+	if (OrdersWithoutLimit(node)) {
+		// T-SQL refuses an ORDER BY in a derived table without TOP / OFFSET
+		// (1033); DuckDB promises no order there either.
+		return Veto("an ORDER BY without LIMIT in a subquery");
+	}
+	WrittenQuery inner_out;
+	NodeWriter inner(*this, inner_out);
+	PrepareDerivedWriter(inner, synthetic, cte_owner, cte_index, per_row);
+	if (!WriteDerivedBody(inner, node, synthetic)) {
+		out_.refers_outside = out_.refers_outside || inner_out.refers_outside;
+		return false;
+	}
+	NoteDerivedFacts(inner, inner_out);
+	if (picks_rows) {
+		*picks_rows = inner_out.picks_rows;
+	}
+	if (inner_out.statement.size() > MAX_DERIVED_SQL) {
+		// A CTE read twice by a CTE read twice ... doubles per level.
+		return Veto("a derived table or inlined CTE past " + std::to_string(MAX_DERIVED_SQL) + " bytes of T-SQL");
+	}
+	auto relation = DerivedRelation(name, inner, inner_out);
+	if (!CheckRelationName(relation.name)) {
+		return false;
 	}
 	auto &outputs = inner.Outputs();
 	for (idx_t i = 0; i < outputs.size(); i++) {
-		auto &output = outputs[i];
-		if (output.column_index != DConstants::INVALID_INDEX && output.plain_read) {
-			auto column = inner.FlatColumn(output.column_index);
-			column.name = output.name;	// the derived table's column, named by its output on both sides
-			column.duckdb_name = output.name;
-			columns_.push_back(std::move(column));
-		} else {
-			// The operand type the server's value has (an integer SUM is
-			// decimal(38,0) there); computed values of unknown type are opaque.
-			// So is a division or a floating-point aggregate: its divergence
-			// (NULL for inf, the last bits) is recorded for a VALUE only, and
-			// outside its node it would be compared, ordered, grouped or
-			// COALESCEd as a plain float (review of E1: rows differed).
-			const bool opaque =
-				output.column_index != DConstants::INVALID_INDEX || output.value.division || output.value.approximate;
-			columns_.push_back(DerivedColumn(output.name, opaque ? LogicalType::INVALID : output.value.type));
-		}
+		AppendDerivedColumn(inner, outputs[i]);
 		types_.push_back(inner_out.column_types[i]);
 		cast_of_.push_back(inner_out.cast_types[i]);
-		already_read_.push_back(true);
-		divergent_of_.push_back(output.column_index == DConstants::INVALID_INDEX &&
-								(output.value.division || output.value.approximate));
-		relation_of_.push_back(relations_.size());
 	}
 	members.push_back(relations_.size());
 	relations_.push_back(std::move(relation));
@@ -504,7 +647,93 @@ bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 		}
 		return true;
 	}
-	auto &join = ref.Cast<JoinRef>();
+	return WriteJoin(ref.Cast<JoinRef>(), sql);
+}
+
+bool NodeWriter::FindUsingSides(const std::string &name, idx_t left_first, idx_t right_relation, idx_t &left_column,
+								idx_t &right_column) {
+	left_column = DConstants::INVALID_INDEX;
+	right_column = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < columns_.size(); i++) {
+		if (!StringUtil::CIEquals(columns_[i].DuckDBName(), name)) {
+			continue;
+		}
+		// A SEMI / ANTI join's table is not on the left: it left no columns.
+		if (relation_of_[i] >= left_first && relation_of_[i] < right_relation && !relations_[relation_of_[i]].semi) {
+			if (left_column != DConstants::INVALID_INDEX) {
+				return Veto("USING column " + name + " is in more than one table on the left");
+			}
+			left_column = i;
+		} else if (relation_of_[i] == right_relation) {
+			right_column = i;  // one: a relation's columns have names apart in DuckDB (issue #572)
+		}
+	}
+	if (left_column == DConstants::INVALID_INDEX || right_column == DConstants::INVALID_INDEX) {
+		return Veto("USING column " + name + " is not on both sides");
+	}
+	return true;
+}
+
+Operand NodeWriter::ColumnOperand(idx_t index) const {
+	Operand operand;
+	operand.sql = ColumnSql(index);
+	operand.type = columns_[index].duckdb_type;
+	operand.kind = KindOf(columns_[index]);
+	operand.column = &columns_[index];
+	return operand;
+}
+
+bool NodeWriter::WriteUsing(const JoinRef &join, idx_t left_first, idx_t right_relation, std::string &condition) {
+	if (LeftSideIsNullable(join.type)) {
+		// The merged column is the right side's, or COALESCE of both: its
+		// place in `*` and its value are not the left column's.
+		return Veto("USING in a RIGHT / FULL join");
+	}
+	std::vector<std::string> parts;
+	for (auto &using_name : join.using_columns) {
+		const auto &name = using_name.GetIdentifierName();
+		idx_t left_column;
+		idx_t right_column;
+		if (!FindUsingSides(name, left_first, right_relation, left_column, right_column)) {
+			return false;
+		}
+		auto l = ColumnOperand(left_column);
+		auto r = ColumnOperand(right_column);
+		if (!BindPair(l, r, "USING (" + name + ")")) {
+			return false;
+		}
+		parts.push_back(ExpressionVocabulary::Comparison(" = ", l.sql, r.sql));
+		using_columns_.emplace_back(name, left_column);
+		hidden_using_.push_back(right_column);
+		link_equalities_.emplace_back(left_column, right_column);
+	}
+	condition = ExpressionVocabulary::Conjunction(parts, true);
+	return true;
+}
+
+bool NodeWriter::WriteJoinCondition(const JoinRef &join, idx_t left_first, idx_t right_relation,
+									std::string &condition) {
+	if (!join.using_columns.empty()) {
+		return WriteUsing(join, left_first, right_relation, condition);
+	}
+	if (!join.condition) {
+		return Veto("a join without a condition");
+	}
+	// ON sees the tables joined so far -- a later one is DuckDB's binder
+	// error, not a statement for the server.
+	if (!WritePredicate(*join.condition, condition)) {
+		return false;
+	}
+	CollectEqualities(*join.condition);
+	return true;
+}
+
+bool NodeWriter::LinkIsBounded(idx_t left_first, idx_t right_relation) const {
+	return KeyCovered(right_relation, left_first, right_relation) ||
+		   (right_relation - left_first == 1 && KeyCovered(left_first, right_relation, right_relation + 1));
+}
+
+bool NodeWriter::WriteJoin(const JoinRef &join, std::string &sql) {
 	const idx_t left_first = visible_;
 	std::string left;
 	std::string right;
@@ -521,79 +750,19 @@ bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 		return true;
 	}
 	link_equalities_.clear();
-	const bool semi = join.type == JoinType::SEMI || join.type == JoinType::ANTI;
+	const bool semi = IsSemiJoin(join.type);
 	if (semi) {
 		// Its columns are named in its condition only.
 		semi_scope_ = right_relation;
 	}
-	const char *keyword = join.type == JoinType::INNER	 ? " INNER JOIN "
-						  : join.type == JoinType::LEFT	 ? " LEFT JOIN "
-						  : join.type == JoinType::RIGHT ? " RIGHT JOIN "
-														 : " FULL JOIN ";
 	std::string condition;
-	if (!join.using_columns.empty()) {
-		if (join.type == JoinType::RIGHT || join.type == JoinType::OUTER) {
-			// The merged column is the right side's, or COALESCE of both: its
-			// place in `*` and its value are not the left column's.
-			return Veto("USING in a RIGHT / FULL join");
-		}
-		std::vector<std::string> parts;
-		for (auto &using_name : join.using_columns) {
-			const auto &name = using_name.GetIdentifierName();
-			idx_t left_column = DConstants::INVALID_INDEX;
-			idx_t right_column = DConstants::INVALID_INDEX;
-			for (idx_t i = 0; i < columns_.size(); i++) {
-				if (!StringUtil::CIEquals(columns_[i].DuckDBName(), name)) {
-					continue;
-				}
-				// A SEMI / ANTI join's table is not on the left: it left no columns.
-				if (relation_of_[i] >= left_first && relation_of_[i] < right_relation &&
-					!relations_[relation_of_[i]].semi) {
-					if (left_column != DConstants::INVALID_INDEX) {
-						return Veto("USING column " + name + " is in more than one table on the left");
-					}
-					left_column = i;
-				} else if (relation_of_[i] == right_relation) {
-					right_column = i;  // one: a relation's columns have names apart in DuckDB (issue #572)
-				}
-			}
-			if (left_column == DConstants::INVALID_INDEX || right_column == DConstants::INVALID_INDEX) {
-				return Veto("USING column " + name + " is not on both sides");
-			}
-			Operand l;
-			Operand r;
-			for (auto side : {std::make_pair(left_column, &l), std::make_pair(right_column, &r)}) {
-				auto &operand = *side.second;
-				operand.sql = ColumnSql(side.first);
-				operand.type = columns_[side.first].duckdb_type;
-				operand.kind = KindOf(columns_[side.first]);
-				operand.column = &columns_[side.first];
-			}
-			if (!BindPair(l, r, "USING (" + name + ")")) {
-				return false;
-			}
-			parts.push_back(ExpressionVocabulary::Comparison(" = ", l.sql, r.sql));
-			using_columns_.emplace_back(name, left_column);
-			hidden_using_.push_back(right_column);
-			link_equalities_.emplace_back(left_column, right_column);
-		}
-		condition = ExpressionVocabulary::Conjunction(parts, true);
-	} else {
-		if (!join.condition) {
-			return Veto("a join without a condition");
-		}
-		// ON sees the tables joined so far -- a later one is DuckDB's binder
-		// error, not a statement for the server.
-		if (!WritePredicate(*join.condition, condition)) {
-			return false;
-		}
-		CollectEqualities(*join.condition);
+	if (!WriteJoinCondition(join, left_first, right_relation, condition)) {
+		return false;
 	}
 	// The gain check (PR E1): a link that equates a unique key of one side
 	// with the other cannot send more rows than the other side has -- FK to
 	// PK. A SEMI / ANTI link never sends more than its left side.
-	if (!semi && !KeyCovered(right_relation, left_first, right_relation) &&
-		!(right_relation - left_first == 1 && KeyCovered(left_first, right_relation, right_relation + 1))) {
+	if (!semi && !LinkIsBounded(left_first, right_relation)) {
 		unbounded_links_++;
 	}
 	if (semi) {
@@ -607,7 +776,7 @@ bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 		sql = left;
 		return true;
 	}
-	sql = left + keyword + right + " ON " + condition;
+	sql = left + JoinKeyword(join.type) + right + " ON " + condition;
 	return true;
 }
 
