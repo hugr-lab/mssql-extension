@@ -115,8 +115,9 @@ class ContainerPassMedium : public PassMedium {
 public:
 	//! The pass whose blocks start at physical `begin` (a block's header) and end before `end`;
 	//! `chain_end` bounds the headers a resync may read.
+	//! `keys` (spec 087): an encrypted container's content keys.
 	ContainerPassMedium(const RandomAccess &file, uint64_t begin, uint64_t end, uint64_t chain_end,
-						BlockDecoder decoder);
+						BlockDecoder decoder, ContainerKeys keys = ContainerKeys());
 	uint64_t Begin() const override {
 		return begin_;
 	}
@@ -137,8 +138,19 @@ private:
 	void WindowChecked(uint64_t from, uint64_t limit, std::vector<PassSample> &out) const;
 	struct Block {
 		uint8_t kind = 0;
-		uint32_t payload = 0;
+		uint32_t payload = 0;  // on disk
+		uint32_t plain = 0;	   // the payload's plaintext length (spec 087: an encrypted block's is shorter)
+		uint8_t iv[16] = {};
+		bool Encrypted() const {
+			return (kind & 0x50) != 0;
+		}
+		bool Stored() const {
+			return (kind & 0x0F) == 0x03;
+		}
 	};
+	//! `block`'s payload `data` as plaintext: decrypted into `scratch` when it is encrypted.
+	const uint8_t *Plaintext(const Block &block, const uint8_t *data, uint64_t position,
+							 std::vector<uint8_t> &scratch) const;
 	//! The header at `at` of the bytes `bytes` (file offset `base`) if it is a plausible block
 	//! header whose payload ends inside the chain.
 	bool Plausible(const uint8_t *bytes, uint64_t base, uint64_t at, Block &block) const;
@@ -156,6 +168,7 @@ private:
 	uint64_t end_;
 	uint64_t chain_end_;
 	BlockDecoder decoder_;
+	ContainerKeys keys_;
 };
 
 //! The search over one pass, its samples kept between calls; safe from several threads (the

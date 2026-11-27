@@ -185,6 +185,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_cd_record.cpp
     src/backup/backup_collation.cpp
     src/backup/backup_container.cpp
+    src/backup/backup_crypto.cpp
     src/backup/backup_function_common.cpp
     src/backup/backup_type_forms.cpp
     src/backup/backup_history.cpp
@@ -192,6 +193,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_lob.cpp
     src/backup/backup_lob_map.cpp
     src/backup/backup_info_function.cpp
+    src/backup/backup_key_secret.cpp
     src/backup/backup_mtf.cpp
     src/backup/backup_files.cpp
     src/backup/backup_fuzzy.cpp

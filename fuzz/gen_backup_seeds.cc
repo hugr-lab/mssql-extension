@@ -6,8 +6,9 @@
 //       src/backup/backup_mtf.cpp src/backup/backup_page_index.cpp src/backup/backup_pass_search.cpp \
 //       src/backup/backup_allocation.cpp src/backup/backup_record.cpp src/backup/backup_page.cpp \
 //       src/backup/backup_container.cpp src/backup/backup_xpress.cpp src/backup/backup_system_tables.cpp \
-//       src/backup/backup_iam.cpp src/backup/backup_cd_record.cpp -o /tmp/gen_backup_seeds && /tmp/gen_backup_seeds
-//       fuzz/corpus   # from the root
+//       src/backup/backup_iam.cpp src/backup/backup_cd_record.cpp src/backup/backup_crypto.cpp \
+//       -I<openssl>/include <openssl>/lib/libcrypto.a -o /tmp/gen_backup_seeds && /tmp/gen_backup_seeds
+//       fuzz/corpus   # from the root (OpenSSL: a release build's build/release/vcpkg_installed/<triplet>)
 //
 // backup_mtf: the builder's image as a full, a log, a differential, a forked and an ANSI-string backup.
 // backup_container: a full backup whose pass is real pages, in an MSSQLBAK container laid out as E13
@@ -23,6 +24,12 @@
 // backup_lob (fuzz_backup_lob's format): every off-row form over synthetic text pages -- an in-row root
 // over an INTERNAL node, a last leaf holding more than claimed, row-overflow, root pointers to a LARGE_ROOT,
 // a SMALL_ROOT and a NULL root -- and a map.
+// Spec 087 (task 8): backup_enc_chain -- the backup_container seed in each encrypted form (flags 0x87: blocks
+// 0x31 under the harness's backup key; 0xAB: a TDE database's compressed backup, blocks 0x61 under its DEK, the
+// DEK's fields at 0x214, the label at 0x438; 0x2F: blocks 0x71 under both), and one whose data pages are TDE
+// pages (flag 0x0800, [96:8192] under the DEK). backup_keyblob: a PLAINTEXTKEYBLOB of each algorithm.
+// backup_pvk: a 1024-bit RSA key generated here as a PVK (after its magic, which the harness writes), not
+// encrypted and encrypted under "password" -- a new key on every run of this program.
 
 #include <array>
 #include <cstdint>
@@ -36,11 +43,18 @@
 #include <vector>
 
 #include "backup/backup_bytes.hpp"
+#include "backup/backup_crypto.hpp"
 #include "backup/backup_mtf.hpp"
 #include "backup/backup_page.hpp"
 #include "backup/backup_page_index.hpp"
 #include "backup/backup_system_tables.hpp"
 #include "mtf_builder.hpp"
+
+#include <openssl/bn.h>
+#include <openssl/core_names.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/rsa.h>
 
 using namespace duckdb::mssql::backup;
 using namespace mtf_builder;
@@ -87,7 +101,12 @@ static Bytes RealPage(uint32_t page, uint32_t size) {
 //! an MSSQLBAK container laid out as E13 found them: the pass's units on a block boundary, one
 //! 64 KB block per extent group, seek index entries at the pass's end and at MSLS, the media label
 //! at 0x1E0 and the tail.
-static Bytes Container(const std::vector<uint32_t> &extents) {
+static void EncryptCbc(const Bytes &key, const uint8_t *iv, uint8_t *data, size_t size);
+static Bytes Aes256Key(uint8_t byte);
+
+//! `tde_pages` (spec 087): its data pages as a TDE database's (fuzz_backup_enc_chain's page key): m_flagBits
+//! 0x0800 and [96:8192] under the DEK, IV = the page id, its file id, zeros.
+static Bytes Container(const std::vector<uint32_t> &extents, bool tde_pages = false) {
 	Options o;
 	o.align_blocks = true;
 	o.mqda_bytes = 2 + extents.size() * 65536;
@@ -108,6 +127,13 @@ static Bytes Container(const std::vector<uint32_t> &extents) {
 	for (uint32_t e : extents) {
 		for (uint32_t k = 0; k < 8; k++) {
 			Bytes page = e == 0xFFFFFFFFu ? Bytes(8192, 0) : RealPage(e * 8 + k, size);
+			if (tde_pages && page[0] == 1 && page[1] == 1) {
+				uint8_t iv[16] = {};
+				std::memcpy(iv, &page[32], 4);
+				std::memcpy(iv + 4, &page[36], 2);
+				page[5] |= 0x08;
+				EncryptCbc(Aes256Key(0x22), iv, &page[96], 8192 - 96);
+			}
 			o.mqda_content.insert(o.mqda_content.end(), page.begin(), page.end());
 		}
 	}
@@ -176,6 +202,169 @@ static Bytes Container(const std::vector<uint32_t> &extents) {
 	file.insert(file.end(), eset.begin(), eset.end());
 	file.insert(file.end(), sfmb.begin(), sfmb.end());
 	return file;
+}
+
+// Spec 087: the keys fuzz_backup_enc_chain decrypts with (AES-256: 32 bytes of 0x11 for the backup's, of 0x22
+// for the DEK).
+static Bytes Aes256Key(uint8_t byte) {
+	return Bytes(32, byte);
+}
+
+//! `size` bytes at `data` encrypted in place, AES-256-CBC, no padding (the inverse of DecryptCbc).
+static void EncryptCbc(const Bytes &key, const uint8_t *iv, uint8_t *data, size_t size) {
+	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+	int n = 0;
+	if (!ctx || EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key.data(), iv) != 1 ||
+		EVP_CIPHER_CTX_set_padding(ctx, 0) != 1 ||
+		EVP_EncryptUpdate(ctx, data, &n, data, static_cast<int>(size)) != 1 || static_cast<size_t>(n) != size) {
+		std::fprintf(stderr, "EncryptCbc failed\n");
+		std::exit(1);
+	}
+	EVP_CIPHER_CTX_free(ctx);
+}
+
+//! A block's payload (`at`, after its header) encrypted as a container's encrypted kinds are: its IV at the
+//! header's [4:20], its length on disk at [20:24] (the plaintext rounded up to 16, the caller's padding),
+//! under the DEK first and the backup's key outside it.
+static void EncryptBlock(Bytes &file, size_t header, size_t disk, bool backup_layer, bool dek_layer, uint32_t n) {
+	for (size_t i = 0; i < 16; i++) {
+		file[header + 4 + i] = static_cast<uint8_t>(0x40 + i + n * 7);
+	}
+	Put32(file, header + 20, static_cast<uint32_t>(disk));
+	if (dek_layer) {
+		EncryptCbc(Aes256Key(0x22), &file[header + 4], &file[header + 28], disk);
+	}
+	if (backup_layer) {
+		EncryptCbc(Aes256Key(0x11), &file[header + 4], &file[header + 28], disk);
+	}
+}
+
+//! Container()'s file in an encrypted form (spec 087): `flags` 0x87 (BACKUP … WITH ENCRYPTION, ZSTD: the
+//! harness's copying decoder), 0xAB (a TDE database's compressed backup, ZSTD) or 0x2F (both; MS_XPRESS by its
+//! flags, the harness copies whatever the algorithm). Its stored blocks become "compressed" ones of the same
+//! bytes (every cut of Container() is on a 512-byte boundary, so each block's output is its payload), each
+//! encrypted; the encryptor's fields at 0x14 and the DEK's at 0x214 hold fixed bytes (the harness does not
+//! unwrap: its keys are fixed).
+static Bytes EncryptedContainer(Bytes file, uint32_t flags) {
+	const bool backup_layer = (flags & 0x4) != 0;
+	const bool tde = (flags & 0x28) == 0x28;
+	const uint8_t kind = backup_layer && tde ? 0x71 : tde ? 0x61 : 0x31;
+	Put32(file, 0x0C, flags);
+	// The media label: its block at 0x1E0, moved to 0x438 for TDE (the DEK's fields take 0x214 .. 0x3B0).
+	const size_t tape_bytes = file[0x1E0 + 2] | (file[0x1E0 + 3] << 8);
+	Bytes label(file.begin() + 0x1E0 + 28, file.begin() + 0x1E0 + 28 + tape_bytes);
+	std::fill(file.begin() + 0x1E0, file.begin() + 0x1E0 + 28 + tape_bytes, 0);
+	const size_t label_at = tde ? 0x438 : 0x1E0;
+	const size_t label_disk = (tape_bytes + 15) / 16 * 16;
+	if (label_at + 28 + label_disk > 4096) {
+		std::fprintf(stderr, "EncryptedContainer: the label does not fit the header\n");
+		std::exit(1);
+	}
+	Header(file, label_at, kind, 4096, tape_bytes);
+	std::copy(label.begin(), label.end(), file.begin() + label_at + 28);
+	EncryptBlock(file, label_at, label_disk, backup_layer, tde, 0);
+	if (backup_layer) {
+		Put32(file, 0x14, 20);
+		std::fill(file.begin() + 0x18, file.begin() + 0x2C, 0xAB);
+		Put32(file, 0x2C, 384);
+		std::fill(file.begin() + 0x30, file.begin() + 0x30 + 384, 0xCD);
+	}
+	if (tde) {
+		Put32(file, 0x214, 20);
+		std::fill(file.begin() + 0x218, file.begin() + 0x22C, 0xEF);
+		Put32(file, 0x22C, 384);
+		std::fill(file.begin() + 0x230, file.begin() + 0x230 + 384, 0x5A);
+	}
+	// The chain: every stored block from 0x2000 to the seek index (whose first byte, 44, is no kind).
+	size_t at = 0x2000;
+	for (uint32_t n = 1; file[at] == 0x23; n++) {
+		const size_t payload = file[at + 2] | (file[at + 3] << 8) ? (file[at + 2] | (file[at + 3] << 8)) : 65536;
+		if (payload % 512 != 0) {
+			std::fprintf(stderr, "EncryptedContainer: a block of %zu bytes, not whole 512-byte units\n", payload);
+			std::exit(1);
+		}
+		Header(file, at, kind, payload, payload);
+		EncryptBlock(file, at, payload, backup_layer, tde, n);
+		at += 28 + payload;
+	}
+	return file;
+}
+
+//! A PLAINTEXTKEYBLOB (E4b: 44 bytes): bType 8, version 2, aiKeyAlg, u32 the key's length, the key, zeros.
+static Bytes KeyBlob(uint32_t algorithm, uint32_t length) {
+	Bytes b(44, 0);
+	b[0] = 8;
+	b[1] = 2;
+	Put32(b, 4, algorithm);
+	Put32(b, 8, length);
+	for (uint32_t i = 0; i < length; i++) {
+		b[12 + i] = static_cast<uint8_t>(0x30 + i);
+	}
+	return b;
+}
+
+static void PutBn(Bytes &out, const BIGNUM *bn, size_t size) {
+	const size_t at = out.size();
+	out.resize(at + size);
+	BN_bn2lebinpad(bn, &out[at], static_cast<int>(size));
+}
+
+//! A generated 1024-bit RSA key as a PVK, its bytes after the magic (fuzz_backup_pvk writes it): reserved,
+//! key type 1 (KEYEXCHANGE), encrypted, the salt's and the key's lengths, the salt, then the BLOBHEADER
+//! (PRIVATEKEYBLOB, version 2, CALG_RSA_KEYX) and, RC4-encrypted under SHA1(salt || password)[:16] when
+//! `password` is not empty, "RSA2", the bit length, the exponent, and the components little-endian.
+static Bytes PvkSeed(const std::string &password) {
+	EVP_PKEY *pkey = EVP_RSA_gen(1024);
+	BIGNUM *n = nullptr, *e = nullptr, *d = nullptr, *p = nullptr, *q = nullptr, *dp = nullptr, *dq = nullptr,
+		   *qi = nullptr;
+	if (!pkey || !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_N, &n) ||
+		!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_E, &e) ||
+		!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_D, &d) ||
+		!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR1, &p) ||
+		!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR2, &q) ||
+		!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_EXPONENT1, &dp) ||
+		!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_EXPONENT2, &dq) ||
+		!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_COEFFICIENT1, &qi)) {
+		std::fprintf(stderr, "PvkSeed: no RSA key\n");
+		std::exit(1);
+	}
+	Bytes blob = {7, 2, 0, 0, 0, 0xA4, 0, 0};  // BLOBHEADER: PRIVATEKEYBLOB, 2, reserved, CALG_RSA_KEYX
+	Bytes body = {'R', 'S', 'A', '2'};
+	Bytes word(4, 0);
+	Put32(word, 0, 1024);
+	body.insert(body.end(), word.begin(), word.end());
+	Put32(word, 0, static_cast<uint32_t>(BN_get_word(e)));
+	body.insert(body.end(), word.begin(), word.end());
+	PutBn(body, n, 128);
+	PutBn(body, p, 64);
+	PutBn(body, q, 64);
+	PutBn(body, dp, 64);
+	PutBn(body, dq, 64);
+	PutBn(body, qi, 64);
+	PutBn(body, d, 128);
+	Bytes salt(password.empty() ? 0 : 16);
+	if (!salt.empty()) {
+		RAND_bytes(salt.data(), static_cast<int>(salt.size()));
+		Bytes material(salt);
+		material.insert(material.end(), password.begin(), password.end());
+		uint8_t digest[20];
+		unsigned int size = 0;
+		EVP_Digest(material.data(), material.size(), digest, &size, EVP_sha1(), nullptr);
+		Rc4(digest, 16, body.data(), body.size());
+	}
+	blob.insert(blob.end(), body.begin(), body.end());
+	Bytes pvk(20, 0);  // after the magic: reserved, key type, encrypted, salt length, key length
+	Put32(pvk, 4, 1);
+	Put32(pvk, 8, password.empty() ? 0 : 1);
+	Put32(pvk, 12, static_cast<uint32_t>(salt.size()));
+	Put32(pvk, 16, static_cast<uint32_t>(blob.size()));
+	pvk.insert(pvk.end(), salt.begin(), salt.end());
+	pvk.insert(pvk.end(), blob.begin(), blob.end());
+	for (BIGNUM *b : {n, e, d, p, q, dp, dq, qi}) {
+		BN_clear_free(b);
+	}
+	EVP_PKEY_free(pkey);
+	return pvk;
 }
 
 static Bytes Xpress(size_t literals) {
@@ -520,7 +709,20 @@ int main(int argc, char **argv) {
 	ansi.string_type = 1;
 	Write("backup_mtf", "ansi.mtf", BuildImage(ansi));
 
-	Write("backup_container", "pages.container", Container({0, 1, 2, 3, 0xFFFFFFFFu, 5}));
+	const Bytes container = Container({0, 1, 2, 3, 0xFFFFFFFFu, 5});
+	Write("backup_container", "pages.container", container);
+	// Spec 087 (task 8).
+	Write("backup_enc_chain", "encrypted_zstd.container", EncryptedContainer(container, 0x87));
+	Write("backup_enc_chain", "tde_zstd.container", EncryptedContainer(container, 0xAB));
+	Write("backup_enc_chain", "tde_encrypted.container", EncryptedContainer(container, 0x2F));
+	Write("backup_enc_chain", "tde_pages.container",
+		  EncryptedContainer(Container({0, 1, 2, 3, 0xFFFFFFFFu, 5}, true), 0xAB));
+	Write("backup_keyblob", "aes_128", KeyBlob(0x660E, 16));
+	Write("backup_keyblob", "aes_192", KeyBlob(0x660F, 24));
+	Write("backup_keyblob", "aes_256", KeyBlob(0x6610, 32));
+	Write("backup_keyblob", "triple_des_3key", KeyBlob(0x6603, 24));
+	Write("backup_pvk", "rsa1024_plain", PvkSeed(""));
+	Write("backup_pvk", "rsa1024_password", PvkSeed("password"));
 
 	Write("backup_xpress", "literals_300", Xpress(300));
 	Write("backup_xpress", "literals_4096", Xpress(4096));

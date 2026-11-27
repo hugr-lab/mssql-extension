@@ -13,6 +13,12 @@ static constexpr size_t BLOCK_HEADER = 28;
 static constexpr uint32_t BLOCK_OUTPUT = 65536;
 static constexpr uint8_t KIND_COMPRESSED = 0x21;
 static constexpr uint8_t KIND_STORED = 0x23;
+// Spec 087 (E4b): an encrypted container's blocks, the ciphertext's length at 20, the IV at 4.
+static constexpr uint8_t KIND_ENCRYPTED_COMPRESSED = 0x31;
+static constexpr uint8_t KIND_ENCRYPTED_STORED = 0x33;
+// E4c: a TDE database's compressed backup (the DEK's ciphertext; and the backup's key's too).
+static constexpr uint8_t KIND_TDE_COMPRESSED = 0x61;
+static constexpr uint8_t KIND_TDE_ENCRYPTED_COMPRESSED = 0x71;
 // A resync takes the fourth of four chained plausible headers: a false start meets the true chain
 // within a header or two, and the fourth was a true block in 3.6 M probes (E13).
 static constexpr int RESYNC_HEADERS = 4;
@@ -86,8 +92,13 @@ void FilePassMedium::Window(uint64_t from, uint64_t limit, std::vector<PassSampl
 //===--------------------------------------------------------------------===//
 
 ContainerPassMedium::ContainerPassMedium(const RandomAccess &file, uint64_t begin, uint64_t end, uint64_t chain_end,
-										 BlockDecoder decoder)
-	: file_(file), begin_(begin), end_(end), chain_end_(chain_end), decoder_(std::move(decoder)) {
+										 BlockDecoder decoder, ContainerKeys keys)
+	: file_(file),
+	  begin_(begin),
+	  end_(end),
+	  chain_end_(chain_end),
+	  decoder_(std::move(decoder)),
+	  keys_(std::move(keys)) {
 	if (begin > end || end > chain_end || chain_end > file.Size()) {
 		throw FormatError(WhereIn(file.Name(), begin) + ": a data pass that does not fit the container's chain");
 	}
@@ -114,13 +125,24 @@ bool ContainerPassMedium::Plausible(const uint8_t *bytes, uint64_t base, uint64_
 	const uint8_t *h = bytes + (at - base);
 	const uint8_t kind = h[0];
 	const uint32_t units = h[1];
-	if ((kind != KIND_COMPRESSED && kind != KIND_STORED) || units == 0 || units > BLOCK_OUTPUT / 512) {
+	if ((kind != KIND_COMPRESSED && kind != KIND_STORED && kind != KIND_ENCRYPTED_COMPRESSED &&
+		 kind != KIND_ENCRYPTED_STORED && kind != KIND_TDE_COMPRESSED && kind != KIND_TDE_ENCRYPTED_COMPRESSED) ||
+		units == 0 || units > BLOCK_OUTPUT / 512) {
 		return false;
 	}
 	const uint32_t length = static_cast<uint32_t>(h[2]) | (static_cast<uint32_t>(h[3]) << 8);
 	block.kind = kind;
-	block.payload = length == 0 ? BLOCK_OUTPUT : length;
-	if (kind == KIND_STORED && block.payload != units * 512) {
+	block.plain = length == 0 ? BLOCK_OUTPUT : length;
+	block.payload = block.plain;
+	if (block.Encrypted()) {
+		block.payload = static_cast<uint32_t>(h[20]) | (static_cast<uint32_t>(h[21]) << 8) |
+						(static_cast<uint32_t>(h[22]) << 16) | (static_cast<uint32_t>(h[23]) << 24);
+		if (block.payload != (block.plain + 15) / 16 * 16) {
+			return false;
+		}
+		std::memcpy(block.iv, h + 4, 16);
+	}
+	if (block.Stored() && block.plain != units * 512) {
 		return false;
 	}
 	return block.payload <= chain_end_ - at - BLOCK_HEADER;
@@ -158,13 +180,36 @@ void ContainerPassMedium::DecodeGroup(uint64_t position, std::vector<uint8_t> &o
 		throw FormatError(WhereIn(Name(), position) + ": a block's payload past the container's chain");
 	}
 	out.resize(BLOCK_OUTPUT);
-	if (block.kind == KIND_STORED) {
-		std::memcpy(out.data(), payload.data(), BLOCK_OUTPUT);
+	std::vector<uint8_t> scratch;
+	const uint8_t *plain = Plaintext(block, payload.data(), position, scratch);
+	if (block.Stored()) {
+		std::memcpy(out.data(), plain, BLOCK_OUTPUT);
 	} else if (!decoder_) {
 		throw FormatError(WhereIn(Name(), position) + ": a compressed block, and no decoder for this container");
 	} else {
-		decoder_(payload.data(), payload.size(), out.data(), BLOCK_OUTPUT);
+		decoder_(plain, block.plain, out.data(), BLOCK_OUTPUT);
 	}
+}
+
+const uint8_t *ContainerPassMedium::Plaintext(const Block &block, const uint8_t *data, uint64_t position,
+											  std::vector<uint8_t> &scratch) const {
+	if (!block.Encrypted()) {
+		return data;
+	}
+	const bool backup_layer = (block.kind & 0x10) != 0;
+	const bool dek_layer = (block.kind & 0x40) != 0;
+	if ((backup_layer && !keys_.backup) || (dek_layer && !keys_.dek)) {
+		throw FormatError(WhereIn(Name(), position) + ": an encrypted block, and no key to decrypt it");
+	}
+	scratch.assign(data, data + block.payload);
+	// The backup's layer outside, then the DEK's (E4c), each with the header's IV.
+	if (backup_layer) {
+		DecryptCbc(*keys_.backup, block.iv, scratch.data(), scratch.size());
+	}
+	if (dek_layer) {
+		DecryptCbc(*keys_.dek, block.iv, scratch.data(), scratch.size());
+	}
+	return scratch.data();
 }
 
 bool ContainerPassMedium::GroupOf(const std::vector<uint8_t> &bytes, uint64_t base, uint64_t position,
@@ -183,13 +228,15 @@ bool ContainerPassMedium::GroupOf(const std::vector<uint8_t> &bytes, uint64_t ba
 		data = payload.data();
 	}
 	static thread_local std::vector<uint8_t> group;
+	static thread_local std::vector<uint8_t> scratch;
 	group.resize(BLOCK_OUTPUT);
-	if (block.kind == KIND_STORED) {
-		std::memcpy(group.data(), data, BLOCK_OUTPUT);
+	const uint8_t *plain = Plaintext(block, data, position, scratch);
+	if (block.Stored()) {
+		std::memcpy(group.data(), plain, BLOCK_OUTPUT);
 	} else if (!decoder_) {
 		throw FormatError(WhereIn(Name(), position) + ": a compressed block, and no decoder for this container");
 	} else {
-		decoder_(data, block.payload, group.data(), BLOCK_OUTPUT);
+		decoder_(plain, block.plain, group.data(), BLOCK_OUTPUT);
 	}
 	std::vector<GroupHeader> header;
 	// The units' "offsets" in errors are the block's file offset: their data-set offset is unknown.

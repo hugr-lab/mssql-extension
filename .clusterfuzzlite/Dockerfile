@@ -5,7 +5,7 @@
 FROM gcr.io/oss-fuzz-base/base-builder:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl unzip zip && rm -rf /var/lib/apt/lists/*
+        curl unzip zip libssl-dev pkg-config && rm -rf /var/lib/apt/lists/*
 
 COPY . $SRC/mssql-extension
 WORKDIR $SRC/mssql-extension

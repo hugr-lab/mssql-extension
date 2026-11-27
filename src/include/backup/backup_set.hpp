@@ -82,6 +82,13 @@ struct DatabaseFile {
 	//! (READ_WRITE_FILEGROUPS), lack it on the files they leave out (diff_layouts fixture, 2022:
 	//! BackupType 6 with its other filegroups' files at 0x0).
 	bool present = true;
+	//! Spec 087 D10: FILELISTONLY's TDEThumbprint -- an SFIN of a TDE database's data file carries its DEK as the
+	//! boot page does (E4c, 2025): u32 20 at +452, the certificate's thumbprint at +456, u32 the wrapped length
+	//! at +476, the wrapped DEK from +480. Read in clear in an uncompressed backup (a compressed one's SFIN is
+	//! inside the DEK's ciphertext; its container header names it). Empty otherwise (a log file, no TDE).
+	bool tde = false;
+	std::array<uint8_t, 20> tde_thumbprint{};
+	std::vector<uint8_t> wrapped_dek;
 };
 
 struct BackupSetHeader {

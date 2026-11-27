@@ -456,6 +456,10 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 				state->tail = &StatementTail(context, state->catalog ? state->catalog->opened : state->opened);
 			}
 			const auto &family = *state->headers->families.front();
+			const std::string tde = state->headers->TdeLogRefusal();
+			if (!tde.empty()) {
+				throw FormatError(tde);	 // D9: no record of ciphertext listed
+			}
 			state->cursor_memory.reset(new ReservedBytes(BufferManager::GetBufferManager(context),
 														 std::string(RECORDS) + ": the log's reader"));
 			state->cursor_memory->Hold(LOG_CURSOR_BYTES);

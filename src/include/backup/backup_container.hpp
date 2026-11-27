@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "backup/backup_crypto.hpp"
 #include "backup/backup_mtf.hpp"
 
 #include <array>
@@ -45,7 +46,27 @@ struct ContainerHeader {
 	CompressionAlgorithm algorithm = CompressionAlgorithm::None;
 	//! An encrypted backup's encryptor thumbprint (20 bytes at 0x18, E4); zeros otherwise.
 	std::array<uint8_t, 20> encryptor_thumbprint{};
+	//! Spec 087: an encrypted backup's wrapped key (u32 length after the thumbprint, then the blob: the
+	//! certificate's modulus size, 384 for RSA-3072, E4); empty otherwise.
+	std::vector<uint8_t> wrapped_key;
+	//! Spec 087 E4c: a TDE database's compressed backup (flag bits 0x8 | 0x20): its blocks are encrypted under the
+	//! database's DEK, which the header keeps wrapped at 0x214 (u32 20, the TDE certificate's thumbprint, u32 the
+	//! wrapped length, the blob); the pages in its data set are in clear.
+	bool tde = false;
+	std::array<uint8_t, 20> tde_thumbprint{};
+	std::vector<uint8_t> wrapped_dek;
 };
+
+//! Spec 087: a container's content keys -- the backup's own (BACKUP ... WITH ENCRYPTION) and, for a TDE
+//! database's compressed backup (E4c), the DEK -- each null when the container has no such layer.
+struct ContainerKeys {
+	std::shared_ptr<const ContentKey> backup;
+	std::shared_ptr<const ContentKey> dek;
+};
+
+//! Where a container's chain starts (after its plain SFMB): 0x3000 for an encrypted, stored one (E4b),
+//! else 0x2000.
+uint64_t ChainStart(const ContainerHeader &header);
 
 //! True when `file` starts with the container's magic (and so is not plain MTF).
 bool IsContainer(const RandomAccess &file);
@@ -55,13 +76,25 @@ ContainerHeader ReadContainerHeader(const RandomAccess &file);
 
 //! One block of the chain, as its 28-byte header describes it.
 struct ChainBlock {
-	uint8_t kind = 0;		// 0x21 compressed, 0x23 stored
+	uint8_t kind = 0;		// 0x21 compressed, 0x23 stored; encrypted (spec 087): 0x31, 0x33; TDE (E4c): 0x61, 0x71
 	uint64_t physical = 0;	// its header's file offset
-	uint32_t payload = 0;	// payload bytes after the header
+	uint32_t payload = 0;	// payload bytes after the header, on disk
+	uint32_t plain = 0;		// the payload's plaintext length (an encrypted block's ciphertext is longer)
 	uint32_t output = 0;	// decompressed bytes: unit × 512
 	uint64_t logical = 0;	// where its output starts in the data set
 	bool Stored() const {
-		return kind == 0x23;
+		return (kind & 0x0F) == 0x03;
+	}
+	//! Spec 087: its payload is ciphertext -- of the backup's key (bit 0x10), of a TDE database's DEK (bit 0x40,
+	//! E4c), or of both: the backup's layer outside. The IV of either is the header's [4:20].
+	bool Encrypted() const {
+		return (kind & 0x50) != 0;
+	}
+	bool BackupLayer() const {
+		return (kind & 0x10) != 0;
+	}
+	bool DekLayer() const {
+		return (kind & 0x40) != 0;
 	}
 };
 
@@ -82,7 +115,7 @@ struct BlockChain {
 //! The chain of `file` from 8 KB, walked header by header (the payloads are skipped, not read).
 //! Ends at the first header whose kind is neither 0x21 nor 0x23. Every length is checked against
 //! the file and the 64 KB block limit.
-BlockChain WalkChain(const RandomAccess &file);
+BlockChain WalkChain(const RandomAccess &file, uint64_t start = 0x2000);
 
 //! One entry of the seek index after the chain: a block that starts at `logical`.
 struct SeekEntry {
@@ -98,7 +131,8 @@ struct SeekEntry {
 //! read that walks up to an entry checks it lands there (ContainerStream), the MTF walk of the data
 //! set reads a DBLK at each entry (the pass boundaries) and checks it, and a page read checks the
 //! page's header names it (D4).
-bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<SeekEntry> &seek);
+bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<SeekEntry> &seek,
+					   uint64_t start = 0x2000);
 
 //! The block holding logical offset `logical`, found from its checkpoint by walking headers.
 ChainBlock FindBlock(const RandomAccess &file, const BlockChain &chain, uint64_t logical);
@@ -115,7 +149,10 @@ using BlockDecoder =
 //! The container's media label: the TAPE block (with its RAID stream: the media set, its family
 //! count and this file's number) that a compressed backup keeps in its header, as a chain block at
 //! 0x1E0 (E13 follow-up, 16 of 16 containers), decoded. Throws when it is not there.
-std::vector<uint8_t> ReadContainerTape(const RandomAccess &file, const BlockDecoder &decoder);
+//! An encrypted container's (spec 087) is decrypted with `keys` first; a TDE database's compressed backup
+//! (`header.tde`, E4c) keeps its label at 0x438.
+std::vector<uint8_t> ReadContainerTape(const RandomAccess &file, const BlockDecoder &decoder,
+									   const ContainerKeys &keys = ContainerKeys(), bool tde = false);
 
 //! The data set as a RandomAccess over the container: a read finds its blocks through the chain
 //! and decodes them (stored blocks are copied; compressed ones go to `decoder`, which may be
@@ -132,7 +169,9 @@ std::vector<uint8_t> ReadContainerTape(const RandomAccess &file, const BlockDeco
 //! each with its own buffer (task 7).
 class ContainerStream : public RandomAccess {
 public:
-	ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder);
+	//! `keys` (spec 087): an encrypted container's content keys, its blocks decrypted before they are decoded.
+	ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder,
+					ContainerKeys keys = ContainerKeys());
 
 	uint64_t Size() const override {
 		return chain_.logical_size;
@@ -206,6 +245,7 @@ private:
 	const RandomAccess &file_;
 	const BlockChain chain_;
 	BlockDecoder decoder_;
+	ContainerKeys keys_;
 	std::string name_;
 	//! This stream among every one made, so a thread's last block (ReadAt) is never another
 	//! stream's, even one at a reused address.

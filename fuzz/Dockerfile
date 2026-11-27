@@ -7,7 +7,7 @@
 FROM aflplusplus/aflplusplus:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl unzip zip ca-certificates \
+        curl unzip zip ca-certificates libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /repo

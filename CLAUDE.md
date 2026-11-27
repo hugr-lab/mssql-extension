@@ -24,6 +24,8 @@ src/
                         # _iam / _system_tables / _sql_variant / _lob / _catalog_model / _reservation (PageStore,
                         # records, the boot page, IAM chains, the base tables, the catalog model; PR 2b; D17's reservations, PR 2e),
                         # backup_hash (XXH64 / SHA-256 digests of the row changes, PR 4c-3),
+                        # backup_crypto (spec 087: PVK / PFX / PEM keys, the unwrap, AES / 3DES CBC; OpenSSL) +
+                        # backup_key_secret [DuckDB] (the mssql_backup_key secret, D3's selection),
                         # backup_log_tail (the MQTL tail's blocks and records, PR 5) + backup_fuzzy (D11's
                         # status: FuzzySummary, TableFuzziness) + backup_transactions_function (the log's
                         # transactions and records),
@@ -103,7 +105,8 @@ test/
   data/backup/          # Synthetic backup samples + golden RESTORE HEADERONLY/LABELONLY/FILELISTONLY,
                         # made by generate.sh on a throwaway container. Never commit a backup of
                         # any other instance (spec 085 T4); .gitignore admits only this directory's .bak and its switch_in/, lob_changes/,
-                        # open_tail/, history_break/, clr/, clr_types/, sparse/, tail_window/ and variant/ (databases of their own)
+                        # open_tail/, history_break/, clr/, clr_types/, sparse/, tail_window/, variant/ and encryption/ (databases of their own;
+                        # encryption/ holds spec 087's test-only certificates, their PVKs and their public password)
 docs/                   # Architecture documentation (see docs/architecture.md)
 docker/                 # SQL Server container and Linux CI build
 tools/

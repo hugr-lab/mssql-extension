@@ -328,7 +328,7 @@ std::string CompressionOf(const CatalogTable &t) {
 }
 
 std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, const PageStore &pages,
-							FuzzinessMemo &memo, const TypeForms &forms) {
+							FuzzinessMemo &memo, const TypeForms &forms, bool tde) {
 	const std::string compression = CompressionOf(t);
 	vector<Value> columns, units;
 	for (const auto &c : t.columns) {
@@ -360,7 +360,9 @@ std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, con
 		row.push_back(Value::INTEGER(static_cast<int32_t>(fuzzy.open_transactions)));
 		row.push_back(Value::INTEGER(static_cast<int32_t>(fuzzy.stale_transactions)));
 	} else {
-		row.push_back(Value(LogicalType::VARCHAR));	 // the tail not read: TailOrWarn said why
+		// The tail not read: TailOrWarn said why. A TDE database's is never read (spec 087 D9: its log is
+		// encrypted, E10): every table's status is 'unknown', which fuzzy := 'error' refuses.
+		row.push_back(tde ? Value("unknown") : Value(LogicalType::VARCHAR));
 		row.push_back(Value(LogicalType::INTEGER));
 		row.push_back(Value(LogicalType::INTEGER));
 	}
@@ -775,7 +777,8 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		const std::vector<Value> row =
 			data.listing == Listing::Tables
 				? TableRow(model.tables[state.next], Fuzzy(context, data, state), *state.catalog->pages->store,
-						   state.catalog->opened.backup->Fuzziness(), data.forms)
+						   state.catalog->opened.backup->Fuzziness(), data.forms,
+						   state.catalog->opened.backup->Headers().Tde())
 			: data.listing == Listing::Views
 				? ViewRow(*state.catalog->pages->store, model, model.views[state.next], state.off_row_bytes)
 				: SchemaRow(model, model.schemas[state.next]);

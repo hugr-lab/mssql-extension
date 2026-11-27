@@ -19,6 +19,15 @@ namespace backup {
 static constexpr uint64_t GROUP_BYTES = static_cast<uint64_t>(PAGE_SIZE) * PAGES_PER_EXTENT;
 static constexpr uint8_t PAGE_HEADER_VERSION = 1;
 static constexpr uint8_t PAGE_TYPE_PAD = 101;
+// Spec 087 (TDE): the 96-byte header every page keeps in clear; m_flagBits (u16 @4) bit 0x0800 marks a
+// page TDE encrypted (every page but the boot page and the file header, 376 of 376 pages of tde_small;
+// E4c); the checksum of the page as stored @60, of the page in clear @64 (E4c: a TDE database's
+// compressed backup holds its pages in clear, flag clear, that checksum @60 and zero @64).
+static constexpr size_t PAGE_CLEAR_HEADER = 96;
+static constexpr size_t PAGE_FLAG_BITS_HIGH = 5;
+static constexpr uint8_t PAGE_FLAG_ENCRYPTED_HIGH = 0x08;
+static constexpr size_t PAGE_CHECKSUM_AT = 60;
+static constexpr size_t PAGE_CLEAR_CHECKSUM_AT = 64;
 // The fields of a page header the map reads: version @0, m_type @1, m_pageId @32, m_fileId @36.
 static constexpr size_t HEADER_READ = 40;
 // Bits per directory entry: one count per 8 words (512 extents).
@@ -1598,6 +1607,7 @@ bool PageIndex::ReadPage(uint16_t file, uint32_t page, std::vector<uint8_t> &out
 	out.resize(PAGE_SIZE);
 	if (at.block == PageLocation::NO_BLOCK) {
 		families_[at.family].stream->ReadAt(at.offset, out.data(), PAGE_SIZE);
+		DecryptPage(out);
 		return true;
 	}
 	// A block a resync found (trust_layout): decode its group, take the page's unit.
@@ -1614,7 +1624,25 @@ bool PageIndex::ReadPage(uint16_t file, uint32_t page, std::vector<uint8_t> &out
 	std::vector<uint8_t> group;
 	static_cast<const ContainerPassMedium &>(pass->search->Medium()).DecodeGroup(at.block, group);
 	std::memcpy(out.data(), group.data() + static_cast<size_t>(page % PAGES_PER_EXTENT) * PAGE_SIZE, PAGE_SIZE);
+	DecryptPage(out);
 	return true;
+}
+
+void PageIndex::DecryptPage(std::vector<uint8_t> &page) const {
+	// The 96-byte header stays in clear: version 1, its flag saying the rest is encrypted; a zero unit
+	// (version 0) is no page.
+	if (!page_key_ || page[0] != PAGE_HEADER_VERSION || !(page[PAGE_FLAG_BITS_HIGH] & PAGE_FLAG_ENCRYPTED_HIGH)) {
+		return;
+	}
+	uint8_t iv[16] = {};
+	std::memcpy(iv, page.data() + 32, 4);	   // m_pageId's page number
+	std::memcpy(iv + 4, page.data() + 36, 2);  // and its file id
+	DecryptCbc(*page_key_, iv, page.data() + PAGE_CLEAR_HEADER, PAGE_SIZE - PAGE_CLEAR_HEADER);
+	// Then the header as the server writes a page it decrypted (E4c): so a page reads the same from either
+	// form of backup.
+	page[PAGE_FLAG_BITS_HIGH] &= static_cast<uint8_t>(~PAGE_FLAG_ENCRYPTED_HIGH);
+	std::memcpy(page.data() + PAGE_CHECKSUM_AT, page.data() + PAGE_CLEAR_CHECKSUM_AT, 4);
+	std::memset(page.data() + PAGE_CLEAR_CHECKSUM_AT, 0, 4);
 }
 
 size_t PageIndex::MemoryBytes() const {
@@ -1670,7 +1698,7 @@ static std::unique_ptr<PassSearch> SearchFor(const FamilyStream &family, const M
 	}
 	std::unique_ptr<PassMedium> medium;
 	try {
-		medium.reset(new ContainerPassMedium(*c.file, first.physical, end_physical, c.chain_end, c.decoder));
+		medium.reset(new ContainerPassMedium(*c.file, first.physical, end_physical, c.chain_end, c.decoder, c.keys));
 	} catch (FormatError &) {
 		// A seek entry that does not bound the pass's blocks: not E13's layout, walk the chain.
 		return std::unique_ptr<PassSearch>(new PassSearch(

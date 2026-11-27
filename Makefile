@@ -679,6 +679,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_cd.cpp \
     test/cpp/backup/test_backup_page_ci.cpp \
     test/cpp/backup/test_backup_container.cpp \
+    test/cpp/backup/test_backup_crypto.cpp \
     test/cpp/backup/test_backup_hash.cpp \
     test/cpp/backup/test_backup_history.cpp \
     test/cpp/backup/test_backup_iam.cpp \
@@ -1456,10 +1457,13 @@ fuzz-encode-replay: release
 # so no release build is needed. Discovery is fuzz/run.sh's; this is the regression run, and the
 # Linux leak-check lane replays the same corpora under ASan + LSan. The corpora are synthetic
 # (fuzz/gen_backup_seeds.cc): no backup of a server whose data is not ours (spec 085 T4).
+# OpenSSL for the backup harnesses (spec 087): a release build's vcpkg install when there is one, else
+# fuzz/build.sh asks pkg-config.
+FUZZ_OPENSSL_PREFIX ?= $(patsubst %/lib/libcrypto.a,%,$(firstword $(wildcard $(PROJ_DIR)build/release/vcpkg_installed/*/lib/libcrypto.a)))
 fuzz-backup-replay:
-	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci variant_envelope vector hierarchyid ssclrt" \
+	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) OPENSSL_PREFIX="$(FUZZ_OPENSSL_PREFIX)" TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci backup_pvk backup_keyblob backup_enc_chain variant_envelope vector hierarchyid ssclrt" \
 	    $(PROJ_DIR)fuzz/build.sh
-	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci variant_envelope vector hierarchyid ssclrt; do \
+	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci backup_pvk backup_keyblob backup_enc_chain variant_envelope vector hierarchyid ssclrt; do \
 	    $(PROJ_DIR)fuzz/out/fuzz_$$t $(PROJ_DIR)fuzz/corpus/$$t || exit 1; \
 	done
 # Spec 085 acceptance 2 over the committed samples: mssql_backup_info against the golden RESTORE
@@ -1478,6 +1482,7 @@ test-backup-golden:
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 60 $(PROJ_DIR)test/data/backup/tail_window
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 $(PROJ_DIR)test/data/backup/variant
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 $(PROJ_DIR)test/data/backup/sparse
+	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 --keys $(PROJ_DIR)test/data/backup/encryption
 # Spec 085 PR 2a: the release build the backup oracle lane tests with -- httpfs linked in
 # statically (test/backup/httpfs_extension_config.cmake, at the duckdb pin's own httpfs commit), so
 # the lane reads its backups from R2 through s3://. Like bench-build, a later plain `make`
