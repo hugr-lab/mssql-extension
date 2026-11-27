@@ -3,10 +3,11 @@
 // The input is a rowset layout and a page. Byte 0 is the column count (at most 32); each column is 10
 // bytes: its xtype, three bytes of sysrscols.ti above it (SetTypeInfo: a length, or a decimal's
 // precision and scale, or a time type's scale), a signed u16 offset (> 0 fixed, -n the n-th variable
-// column), a u16 null bit, a bit position, and a flag byte (bit 0 dropped, bit 1 the uniquifier, bit 2
-// the default status, bit 3 a default given, whose length is the high nibble). The rest is the page,
-// padded with zeros to 8 KB; its slot count is its own header's. Every slot goes through ReadSlot and,
-// for a primary or forwarded record, RowVarCount, ForwardedFrom, LocateValue for every column (each
+// column), a u16 null bit, a bit position (its bit 7: the column is sparse, spec 086 PR 3, its hbcolid its
+// rscolid), and a flag byte (bit 0 dropped, bit 1 the uniquifier, bit 2 the default status, bit 3 a default
+// given, whose length is the high nibble). The rest is the page, padded with zeros to 8 KB; its slot count is
+// its own header's. Every slot goes through ReadSlot and, for a primary or forwarded record, RowVarCount,
+// ForwardedFrom, FindSparseVector (every entry's bytes read), LocateValue for every column (each
 // byte a ValueRef names is read here, and it must lie in the page or in the layout's default) and
 // DecodeRecord, with FixedLength and KnownFixedXtype on every column; then the page's record spans and the
 // records it shares with itself and with a copy whose last byte before the slot array is changed
@@ -66,17 +67,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 		SetTypeInfo(c, ti);
 		c.name = "c" + std::to_string(i);
 		c.rscolid = static_cast<int32_t>(i + 1);
+		c.hbcolid = c.rscolid;
 		c.offset = static_cast<int16_t>(d[4] | (d[5] << 8));
 		c.null_bit = static_cast<uint16_t>(d[6] | (d[7] << 8));
-		c.bit_position = d[8];
+		c.bit_position = d[8] & 0x7F;
 		const uint8_t flags = d[9];
-		c.status = (flags & 1 ? 0x2u : 0u) | (flags & 2 ? 0x10u : 0u) | (flags & 4 ? 0x200u : 0u);
+		c.status = (flags & 1 ? 0x2u : 0u) | (flags & 2 ? 0x10u : 0u) | (flags & 4 ? 0x200u : 0u) |
+				   (d[8] & 0x80 ? 0x100u : 0u);
 		if (flags & 8) {
 			c.has_default = true;
 			c.default_bytes.assign(flags >> 4, '\xA5');
 		}
 		layout.columns.push_back(std::move(c));
 	}
+	IndexSparse(layout);
 	for (const auto &c : layout.columns) {
 		g_sink += KnownFixedXtype(c.xtype);
 		try {
@@ -112,9 +116,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 			} catch (const FormatError &) {
 			}
 		}
+		SparseVector sparse;
+		try {
+			sparse = FindSparseVector(r, vars, layout);
+		} catch (const FormatError &) {
+		}
+		for (int32_t id = 0; sparse.data && id <= static_cast<int32_t>(MAX_COLUMNS); id++) {
+			Touch(sparse.Find(id), page, PhysicalColumn());
+		}
+		// Every entry by its own id, whatever it is (review of #626: ids past MAX_COLUMNS were never read).
+		for (uint16_t i = 0; sparse.data && i < sparse.count; i++) {
+			const size_t at = 4 + 2 * static_cast<size_t>(i);
+			Touch(sparse.Find(static_cast<int32_t>(sparse.data[at] | (sparse.data[at + 1] << 8))), page,
+				  PhysicalColumn());
+		}
+		if (sparse.data) {
+			vars--;	 // as RowRecord::Fixed counts it: the vector is not a regular variable column
+		}
 		for (size_t k = 0; k < layout.columns.size(); k++) {
 			try {
-				Touch(LocateValue(r, vars, layout, k), page, layout.columns[k]);
+				Touch(LocateValue(r, vars, sparse, layout, k), page, layout.columns[k]);
 			} catch (const FormatError &) {
 			}
 		}

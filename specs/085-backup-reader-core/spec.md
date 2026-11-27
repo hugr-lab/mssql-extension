@@ -1049,8 +1049,8 @@ offsets above are in its fixed part.
     the RID of one DATA fragment +16, on the rowset's ROW_OVERFLOW_DATA unit;
   - 12 + 12n bytes of kind 4, an **in-row root**: a 12-byte header (byte 2 the level: 0, the links name
     DATA fragments; above, INTERNAL nodes; u32 update counter `ts` +4), then up to 5 links `u32
-    cumulative size, u32 page, u16 file, u16 slot`, on the LOB_DATA unit (kind 5, never seen in row, is
-    accepted as the catalog reader accepts it);
+    cumulative size, u32 page, u16 file, u16 slot`, on the LOB_DATA unit (kind 5, never seen as a value, is the sparse vector: spec 086 E24,
+    refused here since the review of #626);
   - 16 bytes, a **pointer to a root record**: u64 blob id (the root's own @4), u32 page, u16 file, u16
     slot, on the LOB_DATA unit. `text` / `ntext` / `image` with text in row off use it for every value,
     an empty one included; MAX columns with `large value types out of row` = 1 too, for values written

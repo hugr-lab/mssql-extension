@@ -1,0 +1,3 @@
+MediaName|MediaSetId|FamilyCount|FamilySequenceNumber|MediaFamilyId|MediaSequenceNumber|MediaLabelPresent|MediaDescription|SoftwareName|SoftwareVendorId|MediaDate|MirrorCount|IsCompressed
+---------|----------|-----------|--------------------|-------------|-------------------|-----------------|----------------|------------|----------------|---------|-----------|------------
+NULL|A4DE8D6D-0388-4E9C-9956-42FAB2195AA1|1|1|86F665CB-0000-0000-0000-000000000000|1|0|NULL|Microsoft SQL Server|4608|2026-11-26 09:59:21.000|1|1

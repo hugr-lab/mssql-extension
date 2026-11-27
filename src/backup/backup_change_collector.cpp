@@ -154,7 +154,9 @@ struct OffRowCheck {
 
 //! How rows are compared by their values rather than their record bytes (spec 086 PR 2): every row of the
 //! table when a rowset of either state is PAGE-compressed (`by_value`: a PAGE record's bytes are its page's,
-//! and a rowset rebuilt between ROW / none and PAGE holds the same rows in other bytes), in the newer
+//! and a rowset rebuilt between ROW / none and PAGE holds the same rows in other bytes) or has a sparse column
+//! (spec 086 PR 3, E24: ALTER COLUMN … ADD / DROP SPARSE rewrites every row with its values the same, and a
+//! vector keeps a dropped column's entries), in the newer
 //! state's columns as OffRowCheck's lists say (none: every column of the row's own layout).
 struct ValueForm {
 	bool by_value = false;
@@ -383,7 +385,7 @@ private:
 		if (fixed.Type() == RECORD_FORWARDED) {
 			at = ForwardedFrom(fixed, layout.table);
 		}
-		row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
+		row = RowRecord::Fixed(fixed, layout);
 		record_end = fixed.End();
 		return true;
 	}
@@ -516,7 +518,7 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 		throw FormatError("backup: page " + page.header.page_id.ToString() + " has " + std::to_string(slots) +
 						  " slots, more than an 8 KB page holds");
 	}
-	const bool by_value = layout.compression == 2 || (form && form->by_value);
+	const bool by_value = layout.compression == 2 || layout.sparse || (form && form->by_value);
 	std::vector<bool> needed = NeededColumns(layout, cursor, check != nullptr || by_value);
 	const std::vector<uint16_t> &bound = RecordBounds(page, slots);
 	SlotReader reader(data, layout, page, std::move(needed));
@@ -1085,7 +1087,8 @@ public:
 		form_.older_columns = &older_columns_;
 		for (const ChangeSide *side : {&now, before}) {
 			for (const auto &cursor : side->cursors) {
-				form_.by_value = form_.by_value || side->data.entry->Layout(*cursor.partition).compression == 2;
+				const RowsetLayout &layout = side->data.entry->Layout(*cursor.partition);
+				form_.by_value = form_.by_value || layout.compression == 2 || layout.sparse;
 			}
 		}
 		checkpoint_ = data.states.old_checkpoint;

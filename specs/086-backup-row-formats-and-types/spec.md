@@ -102,8 +102,9 @@ and page-dictionary records (090's follow-up).
   as stated (DQ-20).
 
 - **D7 — the column set.** Sparse columns are decoded individually. A `COLUMN_SET` column (an `xml`
-  computed over the sparse values, not stored) is generated in the server's text form only if the
-  oracle confirms it byte for byte; otherwise it is refused when projected.
+  computed over the sparse values, not stored) is read as a computed column that is not persisted:
+  `not_stored`, left out of `SELECT *`, refused by name when named (owner, 2026-11-24: decision A; the
+  server's text form, with its XML serialisation of every type, is not generated).
 
 - **D8 — `json` is a research task with a gate.** A spike (E9, below) decodes controlled values and
   compares them with `CAST(j AS nvarchar(max))`. The decoder ships only when every value of the
@@ -204,9 +205,11 @@ D9); their facts below are kept for the record and are 093's starting point.*
 ### Sparse columns
 
 The sparse vector is the trailing complex variable column whose first u16 is 5 (X§4): u16 kind, u16
-n, n × u16 column id (`syscolpars.colid`), n × u16 end offset, then the values in their FixedVar
-on-disk form. A sparse column absent from the vector is NULL. Sparse columns are never data-compressed
-(W§6), so a sparse table is FixedVar.
+n, n × u16 column id (`sysrscols.hbcolid`, E24: not `syscolpars.colid`), n × u16 end offset, then the
+values in their FixedVar on-disk form. A sparse column absent from the vector is NULL. Sparse columns are
+never data-compressed (W§6; E24: refused, 10622 / 11418), so a sparse table is FixedVar. E24
+(`measured/E24-sparse.md`) has the rest: where the vector lies, bit 15 of an entry's end, and what ALTER
+leaves in rows written before.
 
 ### `json`: the research spike (E9)
 
@@ -375,6 +378,31 @@ text. What it found:
 8. – 10., 12. (Moved to spec 093, 2026-11-13: `sql_variant`, `vector`, `hierarchyid` and their fuzz
     harnesses and fixtures.)
 11. (Moved to 085 PR 2d: the double-byte code pages, D9.)
+
+*PR 3 as built (2026-11-24).* E24 first (`measured/E24-sparse.md`): nine tables on SQL Server 2019 and 2025,
+DBCC PAGE, D1's clean room; every sparse value of every record placed where the server says. What it found
+beyond X§4:
+- **Where:** the last variable column, after the regular ones stored (their NULL and empty trailing ones are
+  left out first, so it can be variable column 0), or before a forwarded record's back pointer; a uniquifier of
+  0 is not stored either, so the vector can take its index. Its tag decides, not the null bitmap (review of
+  #626: an empty value's null bit is clear).
+- **The ids** are `sysrscols.hbcolid`: after `ALTER COLUMN … ADD SPARSE` a column's value is under a new one,
+  and after `DROP SPARSE` or a dropped column the old entries stay under the dropped column's.
+- **Bit 15** of an entry's end marks an off-row value: an in-row LOB root, a row-overflow pointer.
+- **A sparse column** has status `0x100`, offset 0 and no null bit in `sysrscols`, and no bit in the record's
+  null bitmap; it takes no DEFAULT (1791).
+
+`backup_system_tables`: `IndexSparse` (the layout's `sparse` flag, the null bit at each variable index),
+`FindSparseVector` (every part bounded; once per record, in `RowRecord::Fixed`, which then counts the vector out
+of the regular columns), `SparseVector::Find` (a binary search on the ids) and `LocateValue`'s sparse arm (a
+fixed type's entry checked to be its width). The stager maps a sparse column of a variable type into
+`_mssql_lob`; the change listing compares a sparse table's rows by their values (`ValueForm::by_value`), so a
+rewrite by `ALTER` is no change. Also found and fixed: a nullable char / binary under ANSI_PADDING OFF holding
+`''` / `0x` is one pad byte (DATALENGTH 1), which the reader trimmed to none. Tests: `test_backup_rows` (E24's
+records, the refusals), `fuzz_backup_record` (a sparse bit in the layout, E24's seed), the fixture `sparse.sql`
+(+ `sparse_changes.sql`, committed under `test/data/backup/sparse`, `mssql_backup_sparse.test`); against
+RESTORE on 2025: `compare_rows` 10 tables, 5,648 rows, the overlay 5,907, 0 failures; `compare_catalog` 17,599
+fields, 0 differences; the change listing equal to the two scans' differences on every table.
 
 **PR 4 — `xml`**
 

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "backup/backup_cd_record.hpp"
 #include "backup/backup_record.hpp"
 #include "backup/backup_system_tables.hpp"
 
@@ -125,8 +126,9 @@ int main() {
 		for (uint16_t slot = 0; slot < 2; slot++) {
 			const RecordView r = Slot(page, slot);
 			const size_t vars = RowVarCount(r, layout.table);
-			const ValueRef id = LocateValue(r, vars, layout, 0), v = LocateValue(r, vars, layout, 1),
-						   s = LocateValue(r, vars, layout, 2);
+			const ValueRef id = LocateValue(r, vars, SparseVector(), layout, 0),
+						   v = LocateValue(r, vars, SparseVector(), layout, 1),
+						   s = LocateValue(r, vars, SparseVector(), layout, 2);
 			const int32_t want_id = slot == 0 ? 1 : 4, want_v = slot == 0 ? 1 : 1004;
 			Check(r.HasVersionTag() && r.Type() == RECORD_PRIMARY && I32(id) == want_id && I32(v) == want_v &&
 					  Text(s) == (slot == 0 ? "v1" : "v4"),
@@ -145,8 +147,10 @@ int main() {
 		const Page first = PageOf({Hex(UNIQ_FIRST)});
 		const RecordView r = Slot(first, 0);
 		const size_t vars = RowVarCount(r, layout.table);
-		const ValueRef u = LocateValue(r, vars, layout, 0), k = LocateValue(r, vars, layout, 1),
-					   v = LocateValue(r, vars, layout, 2), n = LocateValue(r, vars, layout, 3);
+		const ValueRef u = LocateValue(r, vars, SparseVector(), layout, 0),
+					   k = LocateValue(r, vars, SparseVector(), layout, 1),
+					   v = LocateValue(r, vars, SparseVector(), layout, 2),
+					   n = LocateValue(r, vars, SparseVector(), layout, 3);
 		Check(u.state == ValueState::Inline && u.size == 0 && I32(k) == 0 && Text(v) == "u10" && I32(n) == 10,
 			  "the first row of a key: an empty uniquifier, then the table's columns");
 		// The same record with uniquifier 3 (4 bytes before "u10").
@@ -156,8 +160,8 @@ int main() {
 		second.insert(second.begin() + 21, {0x03, 0x00, 0x00, 0x00});
 		const Page next = PageOf({second});
 		const RecordView r2 = Slot(next, 0);
-		const ValueRef u2 = LocateValue(r2, RowVarCount(r2, layout.table), layout, 0);
-		const ValueRef v2 = LocateValue(r2, RowVarCount(r2, layout.table), layout, 2);
+		const ValueRef u2 = LocateValue(r2, RowVarCount(r2, layout.table), SparseVector(), layout, 0);
+		const ValueRef v2 = LocateValue(r2, RowVarCount(r2, layout.table), SparseVector(), layout, 2);
 		Check(u2.size == 4 && I32(u2) == 3 && Text(v2) == "u10", "a later row of the key: its uniquifier an int");
 		const std::vector<SystemValue> decoded = DecodeRecord(r2, layout);
 		Check(decoded[0].is_null && ValueText(layout, 2, decoded[2]) == "u10",
@@ -246,7 +250,7 @@ int main() {
 		Check(r.Type() == RECORD_FORWARDED && RowVarCount(r, layout.table) == 1 && from.page.page == 0x151 &&
 				  from.page.file == 1 && from.slot == 0xa6,
 			  "a forwarded record: one variable column of its own, and where it came from");
-		Check(Text(LocateValue(r, 1, layout, 1)) == "ab", "its own column reads");
+		Check(Text(LocateValue(r, 1, SparseVector(), layout, 1)) == "ab", "its own column reads");
 		Check(
 			ErrorOf([&]() { ForwardedFrom(Slot(page, 1), "ver"); }).find("not a forwarded record") != std::string::npos,
 			"a primary record has no place it came from");
@@ -278,16 +282,17 @@ int main() {
 		const Page page = PageOf({record});
 		const RecordView r = Slot(page, 0);
 		const size_t vars = RowVarCount(r, layout.table);
-		Check(LocateValue(r, vars, layout, 1).state == ValueState::Null, "a dropped column: Null");
-		const ValueRef v = LocateValue(r, vars, layout, 2);
+		Check(LocateValue(r, vars, SparseVector(), layout, 1).state == ValueState::Null, "a dropped column: Null");
+		const ValueRef v = LocateValue(r, vars, SparseVector(), layout, 2);
 		Check(v.state == ValueState::OffRow && v.size == 24 && v.data[0] == 2,
 			  "a complex column: OffRow, its in-row pointer");
-		const ValueRef w = LocateValue(r, vars, layout, 3);
+		const ValueRef w = LocateValue(r, vars, SparseVector(), layout, 3);
 		Check(w.state == ValueState::Inline && w.size == 0, "a variable column past the record's count: empty");
-		const ValueRef added = LocateValue(r, vars, layout, 4);
+		const ValueRef added = LocateValue(r, vars, SparseVector(), layout, 4);
 		Check(added.state == ValueState::Default && I32(added) == 42,
 			  "a column added after the record: its default, not the dropped column's bytes in its place");
-		Check(LocateValue(r, vars, layout, 5).state == ValueState::Null, "added without a default: Null");
+		Check(LocateValue(r, vars, SparseVector(), layout, 5).state == ValueState::Null,
+			  "added without a default: Null");
 	}
 
 	// sysrscols.ti: the length, a decimal's precision and scale, a time type's scale, MAX as 0.
@@ -328,6 +333,201 @@ int main() {
 		SetTypeInfo(c, (0x08u << 8) | XTYPE_TIME);
 		Check(ErrorOf([&]() { c.FixedLength("t"); }).find("past 7") != std::string::npos,
 			  "a time of scale 8 is refused by name");
+	}
+
+	// Spec 086 PR 3: the sparse vector, on E24's records (SQL Server 2025). dbo.t_types (id int, r1 varchar(10),
+	// sparse columns of hbcolid 3 - 32, r2 nvarchar(10)): the vector is the last variable column, after the
+	// regular ones holding a value -- with r1 and r2 NULL, variable column 0.
+	{
+		auto sparse = [](const char *name, uint8_t xtype, int32_t hbcolid, uint16_t length = 0) {
+			PhysicalColumn c = Column(name, xtype, 0, 0, 0x100);
+			c.hbcolid = hbcolid;
+			c.length = length;
+			return c;
+		};
+		RowsetLayout types;
+		types.table = "t_types";
+		types.columns = {Column("id", XTYPE_INT, 4, 1, 0x80),	Column("r1", XTYPE_VARCHAR, -1, 2),
+						 sparse("s_bit", XTYPE_BIT, 3),			sparse("s_int", XTYPE_INT, 6),
+						 sparse("s_char", XTYPE_CHAR, 22, 6),	sparse("s_vc", XTYPE_VARCHAR, 23),
+						 sparse("s_nvc", XTYPE_NVARCHAR, 25),	sparse("s_bin", XTYPE_BINARY, 26, 5),
+						 sparse("s_vbin", XTYPE_VARBINARY, 27), sparse("s_vcmax", XTYPE_VARCHAR, 28),
+						 Column("r2", XTYPE_NVARCHAR, -2, 3)};
+		IndexSparse(types);
+		Check(types.sparse && types.var_null_bits == std::vector<uint16_t>({2, 3}),
+			  "a layout with a sparse column: its variable columns' null bits indexed");
+		// Row 3: s_int = 7 alone.
+		const char *ONE = "300008000300000003003601001b800500010006000c0007000000";
+		// Row 4: '' / N'' / 0x and a char(6), a binary(5) padded: entries of length 0 beside full ones.
+		const char *EMPTY =
+			"300008000400000003000601003280050005001600170019001a001b001e001e001e0023002300202020202020"
+			"0000000000";
+		// Row 6: a varchar(max) of 10,000 bytes, its entry an in-row LOB root (bit 15 of its end).
+		const char *OFF_ROW =
+			"300008000600000003007e01003b80050001001c002c80040000a001000000e14a0000681f0000790100000100"
+			"0000102700007801000001000000";
+		const Page page = PageOf({Hex(ONE), Hex(EMPTY), Hex(OFF_ROW)});
+		auto locate = [&](const RowsetLayout &layout, uint16_t slot, size_t k) {
+			const RecordView r = Slot(page, slot);
+			const size_t vars = RowVarCount(r, layout.table);
+			return LocateValue(r, vars, FindSparseVector(r, vars, layout), layout, k);
+		};
+		const RecordView one = Slot(page, 0);
+		const SparseVector v = FindSparseVector(one, RowVarCount(one, "t"), types);
+		Check(v.data && v.count == 1 && v.size == 12, "a vector of one entry at variable column 0");
+		Check(I32(locate(types, 0, 3)) == 7 && locate(types, 0, 2).state == ValueState::Null &&
+				  locate(types, 0, 1).state == ValueState::Null && locate(types, 0, 10).state == ValueState::Null,
+			  "s_int read from its entry; a sparse column with none and the regular NULLs are NULL");
+		Check(Text(locate(types, 1, 4)) == "      " && locate(types, 1, 5).state == ValueState::Inline &&
+				  locate(types, 1, 5).size == 0 && locate(types, 1, 6).size == 0 && locate(types, 1, 7).size == 5 &&
+				  locate(types, 1, 8).state == ValueState::Inline && locate(types, 1, 8).size == 0 &&
+				  locate(types, 1, 3).state == ValueState::Null,
+			  "an empty value is an entry of length 0, not NULL; a char / binary entry padded to its width");
+		const ValueRef lob = locate(types, 2, 9);
+		Check(lob.state == ValueState::OffRow && lob.size == 36 && lob.data[0] == 4,
+			  "an off-row value inside the vector: OffRow, its 36-byte in-row root");
+
+		// The uniquifier is not stored when 0: the vector at its index is the vector, the uniquifier empty.
+		RowsetLayout uniq = types;
+		uniq.columns[1] = Column("", XTYPE_INT, -1, 2, 0x10);
+		IndexSparse(uniq);
+		const RecordView r = Slot(page, 0);
+		const RowRecord row = RowRecord::Fixed(r, uniq);
+		Check(row.sparse.data && row.var_count == 0 && row.Locate(uniq, 1).size == 0 && I32(row.Locate(uniq, 3)) == 7,
+			  "a uniquifier of 0 beside the vector: not stored, and the vector at its index read");
+
+		// An empty r1 ('', its null bit clear) closing the regular columns is not stored: the vector takes its index,
+		// and r1 reads empty (review of #626, fixture sparse.sql). Where a tagged column there is no whole vector,
+		// it is r1's value only as a LOB root pointer's 16 bytes; any other size is refused.
+		std::vector<uint8_t> empty_r1 = Hex(ONE);
+		empty_r1[10] = 0x34;  // r1's null bit cleared
+		std::vector<uint8_t> broken_r1 = empty_r1;
+		broken_r1[21] = 0x40;  // the vector's one value ends past it
+		const Page empties = PageOf({empty_r1, broken_r1});
+		const RecordView e0 = Slot(empties, 0), e1 = Slot(empties, 1);
+		const RowRecord erow = RowRecord::Fixed(e0, types);
+		const ValueRef r1 = erow.Locate(types, 1);
+		Check(erow.sparse.data && erow.sparse.count == 1 && erow.var_count == 0 && r1.state == ValueState::Inline &&
+				  r1.size == 0 && I32(erow.Locate(types, 3)) == 7,
+			  "an empty regular column before the vector: not stored, the vector at its index, the column empty");
+		Check(ErrorOf([&]() {
+				  FindSparseVector(e1, RowVarCount(e1, "t"), types);
+			  }).find("has a sparse vector whose value") != std::string::npos,
+			  "a tagged column of 12 bytes that is no whole vector where the bitmap says a regular value: refused");
+		// 16 bytes, as a root pointer whose blob id begins 05 00: that column (its values end at 12, not 16).
+		const Page root_like = PageOf({Hex("300008000300000003003401001f800500010006000c000700000000000000")});
+		const RecordView rl = Slot(root_like, 0);
+		Check(FindSparseVector(rl, RowVarCount(rl, "t"), types).data == nullptr,
+			  "a tagged 16-byte column that is no whole vector beside a regular value: that value (a root pointer)");
+		// There, an id that is no sparse column's: refused too; with r1 NULL the same vector is read.
+		std::vector<uint8_t> foreign_id = empty_r1;
+		foreign_id[19] = 0x2a;	// the entry's id, 6 -> 42
+		std::vector<uint8_t> foreign_null = Hex(ONE);
+		foreign_null[19] = 0x2a;
+		const Page foreigns = PageOf({foreign_id, foreign_null});
+		const RecordView f0 = Slot(foreigns, 0), f1 = Slot(foreigns, 1);
+		Check(ErrorOf([&]() { FindSparseVector(f0, RowVarCount(f0, "t"), types); }).find("is no sparse column's") !=
+					  std::string::npos &&
+				  FindSparseVector(f1, RowVarCount(f1, "t"), types).data != nullptr,
+			  "an id of no sparse column beside a regular value: refused; beside its NULL, the vector");
+
+		// No regular variable column: the last one must be the vector. With its tag changed it is refused by
+		// name; beside a regular column's NULL it is that column, kept (no vector).
+		RowsetLayout bare = types;
+		bare.columns = {types.columns[0], types.columns[3]};
+		IndexSparse(bare);
+		std::vector<uint8_t> untagged = Hex(ONE);
+		untagged[15] = 0x06;
+		const Page bad = PageOf({untagged});
+		const RecordView b = Slot(bad, 0);
+		Check(ErrorOf([&]() { FindSparseVector(b, RowVarCount(b, "t"), bare); }).find("not a sparse vector") !=
+				  std::string::npos,
+			  "a variable column past the table's that is not a vector is refused by name");
+		Check(FindSparseVector(b, RowVarCount(b, "t"), types).data == nullptr,
+			  "an untagged column at a regular column's index is that column (its NULL), no vector");
+		// A vector whose ids do not ascend, and one whose value ends past it.
+		std::vector<uint8_t> unordered = Hex(EMPTY);
+		unordered[19] = 0x30;  // the first id, 22, past the second (23)
+		std::vector<uint8_t> past = Hex(ONE);
+		past[21] = 0x40;  // the end of its one value, past the vector
+		const Page broken = PageOf({unordered, past});
+		const RecordView b0 = Slot(broken, 0), b1 = Slot(broken, 1);
+		Check(ErrorOf([&]() { FindSparseVector(b0, RowVarCount(b0, "t"), types); }).find("do not ascend") !=
+					  std::string::npos &&
+				  ErrorOf([&]() { FindSparseVector(b1, RowVarCount(b1, "t"), types); }).find("ends at 64") !=
+					  std::string::npos,
+			  "a vector's ids that do not ascend and a value past its end are refused by name");
+		// A fixed type's entry of another width (an int's 4 bytes declared bigint) is refused, not read short.
+		RowsetLayout wide = types;
+		wide.columns[3].xtype = XTYPE_BIGINT;
+		Check(ErrorOf([&]() { locate(wide, 0, 3); }).find("sparse entry is 4 bytes, where its type takes 8") !=
+				  std::string::npos,
+			  "a fixed type's entry of another width is refused by name");
+		// A vector of 16 bytes -- one bigint entry: 4 + 2 + 2 + 8 --, the length of a text / ntext / image root
+		// pointer (OrcaMDF takes every 16-byte complex column for one and loses such a vector: the tag decides
+		// here), beside r1 NULL and beside an empty r1 (its null bit clear).
+		const char *SIXTEEN = "300008000300000003003601001f8005000100060010000807060504030201";
+		std::vector<uint8_t> sixteen = Hex(SIXTEEN);
+		std::vector<uint8_t> sixteen_empty_r1 = sixteen;
+		sixteen_empty_r1[10] = 0x34;
+		const Page sixteens = PageOf({sixteen, sixteen_empty_r1});
+		for (uint16_t slot = 0; slot < 2; slot++) {
+			const RecordView r16 = Slot(sixteens, slot);
+			const RowRecord row16 = RowRecord::Fixed(r16, wide);
+			const ValueRef big = row16.Locate(wide, 3);
+			uint64_t value = 0;
+			for (int b = 7; big.size == 8 && b >= 0; b--) {
+				value = value << 8 | big.data[b];
+			}
+			Check(row16.sparse.data && row16.sparse.size == 16 && row16.var_count == 0 && big.size == 8 &&
+					  value == 0x0102030405060708ULL,
+				  slot == 0 ? "a 16-byte vector beside a NULL r1: the vector, its bigint read"
+							: "a 16-byte vector beside an empty r1: the vector, its bigint read");
+		}
+	}
+	// After ALTER (E24): DROP SPARSE moves y into the fixed part (hbcolid 4) and keeps the old entry under the dropped
+	// column's hbcolid 2; ADD SPARSE moves x into the vector under a new hbcolid (5), the old fixed x dropped.
+	{
+		const char *UNSPARSE = "30000c00010000000100000002000001002680050002000200030010001300010000006f6e65";
+		const char *ALTERED = "30000c00010000000a00000003000002001b0027806265666f72650500010005000c000a000000";
+		const Page page = PageOf({Hex(UNSPARSE), Hex(ALTERED)});
+		PhysicalColumn w = Column("w", XTYPE_VARCHAR, 0, 0, 0x100), old_y = Column("", XTYPE_INT, 0, 0, 0x102);
+		w.hbcolid = 3;
+		old_y.hbcolid = 2;
+		PhysicalColumn y = Column("y", XTYPE_INT, 8, 2);
+		y.hbcolid = 4;
+		RowsetLayout unsparse;
+		unsparse.table = "t_unsparse";
+		unsparse.columns = {Column("id", XTYPE_INT, 4, 1, 0x80), y, w, old_y};
+		IndexSparse(unsparse);
+		const RecordView r0 = Slot(page, 0);
+		const RowRecord row0 = RowRecord::Fixed(r0, unsparse);
+		Check(I32(row0.Locate(unsparse, 1)) == 1 && Text(row0.Locate(unsparse, 2)) == "one" &&
+				  row0.Locate(unsparse, 3).state == ValueState::Null,
+			  "DROP SPARSE: y from the fixed part, the dropped column's entry passed over");
+		PhysicalColumn old_x = Column("", XTYPE_INT, 8, 2, 0x2), v = Column("v", XTYPE_VARCHAR, -1, 3);
+		PhysicalColumn sp = Column("sp", XTYPE_INT, 0, 0, 0x100), x = Column("x", XTYPE_INT, 0, 0, 0x100);
+		old_x.hbcolid = 2;
+		v.hbcolid = 3;
+		sp.hbcolid = 4;
+		x.hbcolid = 5;
+		RowsetLayout altered;
+		altered.table = "t_alter";
+		altered.columns = {Column("id", XTYPE_INT, 4, 1, 0x80), x, v, sp, old_x};
+		IndexSparse(altered);
+		const RecordView r1 = Slot(page, 1);
+		const RowRecord row1 = RowRecord::Fixed(r1, altered);
+		Check(I32(row1.Locate(altered, 1)) == 10 && Text(row1.Locate(altered, 2)) == "before" &&
+				  row1.Locate(altered, 3).state == ValueState::Null && row1.var_count == 1,
+			  "ADD SPARSE: x from the vector under its new hbcolid, after v");
+	}
+	// ANSI_PADDING OFF: '' and 0x read as one space / one zero byte, as the server reads them (DATALENGTH 1).
+	{
+		PhysicalColumn c = Column("c", XTYPE_CHAR, 4, 1);
+		c.unpadded = true;
+		const uint8_t spaces[] = {' ', ' ', ' ', ' '}, ab[] = {'a', 'b', ' ', ' '};
+		Check(c.Unpadded(spaces, 4) == 1 && c.Unpadded(ab, 4) == 2,
+			  "an unpadded char: trailing spaces left out, one kept for ''");
 	}
 
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;

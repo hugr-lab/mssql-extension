@@ -1,0 +1,2 @@
+sparse_full|sparse_full.bak
+sparse_diff|sparse_diff.bak

@@ -1,0 +1,4 @@
+LogicalName|PhysicalName|Type|FileGroupName|Size|MaxSize|FileId|CreateLSN|DropLSN|UniqueId|ReadOnlyLSN|ReadWriteLSN|BackupSizeInBytes|SourceBlockSize|FileGroupId|LogGroupGUID|DifferentialBaseLSN|DifferentialBaseGUID|IsReadOnly|IsPresent|TDEThumbprint|SnapshotUrl
+-----------|------------|----|-------------|----|-------|------|---------|-------|--------|-----------|------------|-----------------|---------------|-----------|------------|-------------------|--------------------|----------|---------|-------------|-----------
+bak_sparse|/var/opt/mssql/data/bak_sparse.mdf|D|PRIMARY|8388608|35184372080640|1|0|0|31B813AA-2581-4B24-84A3-A2ACB2B68E81|0|0|6619136|4096|1|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL
+bak_sparse_log|/var/opt/mssql/data/bak_sparse_log.ldf|L|NULL|8388608|2199023255552|2|0|0|F390E023-886B-44F9-B936-D0B7AEAFF8AD|0|0|0|4096|0|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL

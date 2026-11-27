@@ -28,6 +28,8 @@ OUT="${HERE}/history_break" VERSION="${VERSION}" FIXTURES=history_break "${HERE}
 OUT="${HERE}/clr" VERSION="${VERSION}" FIXTURES=clr "${HERE}/../../backup/gen/generate.sh"
 # The CLR system types in every storage form, read by the TDS path's kernels (spec 093 T8).
 OUT="${HERE}/clr_types" VERSION="${VERSION}" FIXTURES=clr_types "${HERE}/../../backup/gen/generate.sh"
+# Sparse columns: the record's sparse vector, every type, ALTER ... ADD / DROP SPARSE, a column set (spec 086 PR 3).
+OUT="${HERE}/sparse" VERSION="${VERSION}" FIXTURES=sparse "${HERE}/../../backup/gen/generate.sh"
 # Changes at known points of a backup's copy, the backup written into a FIFO (review of #591: D11's status).
 # Committed, so it must have caught its window (the lane's, regenerated, is compared as fuzzy whatever it
 # caught): generate.sh fails rather than write one that did not.

@@ -6,7 +6,8 @@
 //       src/backup/backup_mtf.cpp src/backup/backup_page_index.cpp src/backup/backup_pass_search.cpp \
 //       src/backup/backup_allocation.cpp src/backup/backup_record.cpp src/backup/backup_page.cpp \
 //       src/backup/backup_container.cpp src/backup/backup_xpress.cpp src/backup/backup_system_tables.cpp \
-//       src/backup/backup_iam.cpp src/backup/backup_cd_record.cpp -o /tmp/gen_backup_seeds && /tmp/gen_backup_seeds fuzz/corpus   # from the root
+//       src/backup/backup_iam.cpp src/backup/backup_cd_record.cpp -o /tmp/gen_backup_seeds && /tmp/gen_backup_seeds
+//       fuzz/corpus   # from the root
 //
 // backup_mtf: the builder's image as a full, a log, a differential, a forked and an ANSI-string backup.
 // backup_container: a full backup whose pass is real pages, in an MSSQLBAK container laid out as E13
@@ -423,10 +424,10 @@ static Bytes LeafPage() {
 	return TextPage(100, {Fragment(3, HELLO), Fragment(3, ABC)});
 }
 
-//! An in-row root (kind 5) of `level` whose links (cumulative, page, slot) name file 1.
+//! An in-row root (kind 4) of `level` whose links (cumulative, page, slot) name file 1.
 static Bytes InRowRoot(uint8_t level, const std::vector<std::array<uint32_t, 3>> &links) {
 	Bytes root(12 + 12 * links.size(), 0);
-	root[0] = 5;
+	root[0] = 4;
 	root[2] = level;
 	for (size_t i = 0; i < links.size(); i++) {
 		Put32(root, 12 + 12 * i, links[i][0]);
@@ -623,6 +624,34 @@ int main(int argc, char **argv) {
 	RecordColumn added = {56, 0, 10, 11};
 	added.flags = 4 | 8 | (4 << 4);	 // added after the records, with a 4-byte default
 	bits.push_back(added);
+	// Spec 086 PR 3, E24's records (2025): sparse columns of hbcolid 3 - 28 (bit 7 of the bit byte) between r1
+	// (variable column 0) and r2 (1); a vector of one entry, one of empty values and padded ones, one holding an
+	// in-row LOB root.
+	std::vector<RecordColumn> sparse = {{56, 0, 4, 1}, {167, 10, -1, 2}};
+	for (int32_t id = 3; id <= 28; id++) {
+		RecordColumn c = {56, 0, 0, 0, 0x80};
+		if (id == 3) {
+			c.xtype = 104;
+		} else if (id == 22) {
+			c = {175, 6, 0, 0, 0x80};
+		} else if (id == 23 || id == 28) {
+			c = {167, id == 23 ? 20u : 0u, 0, 0, 0x80};
+		} else if (id == 25) {
+			c = {231, 40, 0, 0, 0x80};
+		} else if (id == 26) {
+			c = {173, 5, 0, 0, 0x80};
+		} else if (id == 27) {
+			c = {165, 20, 0, 0, 0x80};
+		}
+		sparse.push_back(c);
+	}
+	sparse.push_back({231, 20, -2, 3});
+	Write("backup_record", "sparse",
+		  RecordInput(sparse, RecordPage({Hex("300008000300000003003601001b800500010006000c0007000000"),
+										  Hex("300008000400000003000601003280050005001600170019001a001b001e001e001e"
+											  "00230023002020202020200000000000"),
+										  Hex("300008000600000003007e01003b80050001001c002c80040000a001000000e14a"
+											  "0000681f00007901000001000000102700007801000001000000")})));
 	Write("backup_record", "bits_added",
 		  RecordInput(bits, RecordPage({Hex("50000a005505000000010a0000000000000000000000e20300000000"),
 										Hex("50000a00aa05000000000a0005000000000000000000e20300000000")})));

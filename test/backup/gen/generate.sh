@@ -7,7 +7,7 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types tail_window variant"): samples.sql, the database of the
+# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant"): samples.sql, the database of the
 # committed samples; catalog.sql, the catalog fixture (spec 085 PR 2b); partition.sql, E7's partitioning
 # database and more boundary types (PR 2c); files.sql, two data files and a second
 # filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
@@ -16,7 +16,8 @@
 # 530000 by default); rows.sql, the record forms of user tables (E20: version tags, forwarding, the
 # uniquifier, ghosts, row-overflow, added columns of a partitioned table); dbcs.sql, varchar under the
 # double-byte code pages (PR 2d); lob.sql, values stored off row in every form (PR 3: lob_full plain,
-# lob_xpress compressed); cd.sql, ROW-compressed tables (spec 086 PR 1: cd_full plain, cd_xpress compressed); page.sql, PAGE-compressed ones (spec 086 PR 2: page_full, page_xpress); names.sql, a
+# lob_xpress compressed); cd.sql, ROW-compressed tables (spec 086 PR 1: cd_full plain, cd_xpress compressed); page.sql, PAGE-compressed ones (spec 086 PR 2: page_full, page_xpress); sparse.sql, sparse columns (spec 086 PR 3, E24: sparse_full, then sparse_changes.sql's sparse_diff, both
+# compressed, paired as sparse_over; also committed under test/data/backup/sparse, made by its generate.sh); names.sql, a
 # case-sensitive database whose tables differ only in case, and names with spaces, quotes, ] and dots (spec 085 PR 4b);
 # fuzzy.sql, E3's controls under load (spec 085 PR 5: fuzzy_base, then fuzzy_full, fuzzy_xpress and fuzzy_diff
 # taken while three sessions commit and one transaction stays open; fuzzy_over pairs the last with the first);
@@ -60,7 +61,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page names diffs clr_types tail_window variant}"
+FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -361,6 +362,14 @@ for fixture in ${FIXTURES}; do
 		run_sql page_changes.sql
 		sets+=("page_full|page_full.bak" "page_xpress|page_xpress.bak" "page_diff|page_diff.bak")
 		overlays+=("page_over|page_full|page_diff")
+		;;
+	sparse)
+		# Sparse columns (spec 086 PR 3: the record's sparse vector, E24), compressed; then sparse_changes.sql's
+		# changes and differential, as page's.
+		golden bak_sparse sparse_full
+		run_sql sparse_changes.sql
+		sets+=("sparse_full|sparse_full.bak" "sparse_diff|sparse_diff.bak")
+		overlays+=("sparse_over|sparse_full|sparse_diff")
 		;;
 	names)
 		# Names DuckDB holds otherwise (spec 085 PR 4b): a case-sensitive database, spaces, quotes.

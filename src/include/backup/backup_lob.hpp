@@ -43,7 +43,7 @@ typedef std::function<void(const PagePointer &at, Page &out)> LobPageFetch;
 //! The in-row form of an off-row value (E21).
 enum class OffRowForm : uint8_t {
 	RowOverflow = 1,  // 24 bytes, kind 2
-	InRowRoot = 2,	  // 12 + 12n bytes, kind 4 or 5
+	InRowRoot = 2,	  // 12 + 12n bytes, kind 4
 	RootPointer = 3,  // 16 bytes
 };
 

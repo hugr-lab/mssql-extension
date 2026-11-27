@@ -379,8 +379,15 @@ void RecordStager::UseLayout(const RowsetLayout &layout) {
 		// fixed one of that width, and a default given for it the same width, so no value needs a test.
 		const uint32_t width = col.arm == StageArm::Bit ? 1u : col.ops.stride;
 		// A ROW-compressed rowset's values are put in that width as they are read (CdRow), whatever
-		// their CD index.
-		if (fixed_arm && layout.compression == 0 && (p.offset <= 0 || p.FixedLength(layout.table) != width)) {
+		// their CD index; a sparse column's entry is checked to be its type's width as it is located (LocateValue),
+		// which must be the arm's.
+		if (fixed_arm && layout.compression == 0 && p.Sparse() && p.FixedLength(layout.table) != width) {
+			throw FormatError("backup: " + col.name + " is a sparse column of " +
+							  std::to_string(p.FixedLength(layout.table)) + " bytes, where its type takes " +
+							  std::to_string(width) + " fixed bytes");
+		}
+		if (fixed_arm && layout.compression == 0 && !p.Sparse() &&
+			(p.offset <= 0 || p.FixedLength(layout.table) != width)) {
 			throw FormatError("backup: " + col.name + " is stored " +
 							  (p.offset <= 0 ? std::string("as a variable column")
 											 : std::to_string(p.FixedLength(layout.table)) + " bytes wide") +
@@ -396,11 +403,14 @@ void RecordStager::UseLayout(const RowsetLayout &layout) {
 		columns_[i].layout_index = places[i].first;
 		columns_[i].bit_position = places[i].second;
 	}
-	// The map's columns: every variable column of the rowset, projected or not (DQ-46), by catalog id.
+	// The map's columns: every variable column of the rowset, projected or not (DQ-46), by catalog id; a
+	// sparse one of any type not fixed too, whose entry can be off row (E24), as LocateValue reads it (review of
+	// #626: a type of neither list was left out).
 	map_columns_.clear();
 	for (size_t k = 0; k < layout.columns.size(); k++) {
 		const PhysicalColumn &p = layout.columns[k];
-		if (p.offset < 0 && !p.Dropped() && !p.Uniquifier()) {
+		const bool variable = p.offset < 0 || (p.Sparse() && !KnownFixedXtype(p.xtype));
+		if (variable && !p.Dropped() && !p.Uniquifier()) {
 			map_columns_.push_back(MapColumn{k, p.rscolid, table_ + "." + p.name});
 		}
 	}
@@ -430,7 +440,7 @@ OffRowNeed RecordStager::PrepareRow(const RecordView &record) {
 	if (!layout_) {
 		throw InternalException("backup: RecordStager::PrepareRow with no layout");
 	}
-	return PrepareRow(RowRecord::Fixed(record, RowVarCount(record, layout_->table)));
+	return PrepareRow(RowRecord::Fixed(record, *layout_));
 }
 
 template <class WALK>
@@ -787,7 +797,7 @@ void RecordStager::Append(const RecordView &record) {
 	if (!layout_) {
 		throw InternalException("backup: RecordStager::Append with no layout");
 	}
-	Append(RowRecord::Fixed(record, RowVarCount(record, layout_->table)));
+	Append(RowRecord::Fixed(record, *layout_));
 }
 
 void RecordStager::Append(const RowRecord &row) {

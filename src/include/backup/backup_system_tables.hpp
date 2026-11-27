@@ -89,9 +89,9 @@ struct PhysicalColumn {
 	uint8_t precision = 0;
 	uint8_t scale = 0;
 	uint32_t collation = 0;	 // a CollationId
-	uint32_t status = 0;	 // 0x2 dropped, 0x10 uniquifier, 0x80 NOT NULL, 0x200 has a default
-	int16_t offset = 0;		 // > 0 a fixed offset in the record, -n the n-th variable column
-	uint16_t null_bit = 0;	 // 1-based, in the null bitmap
+	uint32_t status = 0;	 // 0x2 dropped, 0x10 uniquifier, 0x80 NOT NULL, 0x100 sparse, 0x200 has a default
+	int16_t offset = 0;		 // > 0 a fixed offset in the record, -n the n-th variable column; 0 sparse
+	uint16_t null_bit = 0;	 // 1-based, in the null bitmap; 0 for a sparse column (E24)
 	uint8_t bit_position = 0;
 	int16_t ordkey = 0;	 // its place in the clustered index key, 1-based; 0 when not a key column
 	//! A nullable char / binary declared under ANSI_PADDING OFF (syscolpars.status lacks 0x2): read as
@@ -111,12 +111,18 @@ struct PhysicalColumn {
 	bool HasDefaultStatus() const {
 		return (status & 0x200) != 0;
 	}
+	//! A sparse column (spec 086 PR 3, E24): its value is the entry of its hbcolid in the record's sparse
+	//! vector, not in the fixed part or a variable column of its own.
+	bool Sparse() const {
+		return (status & 0x100) != 0;
+	}
 	//! `size` bytes of this column's value without the padding an `unpadded` column's server leaves out
-	//! (trailing spaces of a char, zero bytes of a binary); `size` as it is otherwise.
+	//! (trailing spaces of a char, zero bytes of a binary), one byte kept: the server reads '' and 0x as one
+	//! space / one zero byte (measured 2026-11-24, DATALENGTH 1, sparse or not); `size` as it is otherwise.
 	uint32_t Unpadded(const uint8_t *data, uint32_t size) const {
 		if (unpadded) {
 			const uint8_t pad = xtype == XTYPE_CHAR ? 0x20 : 0x00;
-			while (size > 0 && data[size - 1] == pad) {
+			while (size > 1 && data[size - 1] == pad) {
 				size--;
 			}
 		}
@@ -145,12 +151,23 @@ struct RowsetLayout {
 	//! -offset - 1; spec 086 PR 1).
 	uint8_t compression = 0;
 	std::vector<PhysicalColumn> columns;
+	//! Spec 086 PR 3 (E24), set by IndexSparse: a column of the layout is sparse, live or dropped, so a
+	//! record may end in a sparse vector; and the null bit of the column at each variable index (0 for the uniquifier,
+	//! none), which says whether a tagged column there could still be a regular column (FindSparseVector).
+	bool sparse = false;
+	std::vector<uint16_t> var_null_bits;
+	//! The hbcolids of its sparse columns, live or dropped, ascending.
+	std::vector<int32_t> sparse_hbcolids;
 
 	//! The column named `name`, or null.
 	const PhysicalColumn *Find(const std::string &name) const;
 	//! Its index in `columns`; a FormatError naming it when the layout has none.
 	size_t IndexOf(const std::string &name) const;
 };
+
+//! Sets `layout.sparse`, `layout.var_null_bits` and `layout.sparse_hbcolids` from its columns (LayoutOf's last step; a
+//! layout built by hand calls it when it has a sparse column).
+void IndexSparse(RowsetLayout &layout);
 
 //! One column's value in a decoded record.
 struct SystemValue {
@@ -191,15 +208,39 @@ struct RowLocation {
 };
 RowLocation ForwardedFrom(const RecordView &record, const std::string &table);
 
+//! A record's sparse vector (spec 086 PR 3, E24): u16 0x0005, u16 n, n ascending hbcolids, n ascending
+//! u16 end offsets from the vector's start (bit 15: the value is an off-row pointer), the values from
+//! 4 + 4n. An absent column is NULL; an entry of length 0 an empty value.
+struct SparseVector {
+	const uint8_t *data = nullptr;	// the vector's first byte, in its page; null for a record without one
+	uint16_t size = 0;
+	uint16_t count = 0;
+
+	//! The entry of `hbcolid`: Inline / OffRow, or Null when the vector has none.
+	ValueRef Find(int32_t hbcolid) const;
+};
+
+//! The sparse vector of `record`, whose table variable columns are `var_count` (RowVarCount): its last
+//! one, when `layout` has a sparse column and that column is complex and starts with 0x0005 (the vector follows
+//! the regular variable columns stored; trailing NULL and empty ones are left out before it), whatever the null
+//! bitmap says (review of #626). Past every regular column it must be one. Every part checked: a FormatError
+//! naming the table and the record's offset -- except where the bitmap says the regular column at that index
+//! holds a value: the vector must then also pass stricter checks (every id a sparse column's, the last value
+//! ending at its end), else it is that column when it has a LOB root pointer's 16 bytes, and
+//! a FormatError otherwise. None (data null) otherwise.
+SparseVector FindSparseVector(const RecordView &record, size_t var_count, const RowsetLayout &layout);
+
 //! Column `k` of `layout` in `record`, whose table variable columns are `var_count`
-//! (RowVarCount), by spec 085 § Rules, records, in its order: dropped -> Null; null bit past the
+//! (RowVarCount), by spec 085 § Rules, records, in its order: dropped -> Null; a sparse column -> its
+//! entry in `sparse` (FindSparseVector; spec 086 PR 3), Null without one; null bit past the
 //! record's column count -> Default when the layout gives one (a FormatError when the column has
 //! the default status and none was given, which would read NULL where the server reads the
 //! default; else Null); NULL bit -> Null; a fixed offset -> Inline, bounded by the fixed part (a bit
 //! column's whole byte; its bit is `bit_position`; an `unpadded` char / binary without its trailing
 //! spaces / zero bytes); a variable column -> Inline / OffRow, empty past
 //! the record's count. The uniquifier is a variable column like the others (empty = 0).
-ValueRef LocateValue(const RecordView &record, size_t var_count, const RowsetLayout &layout, size_t k);
+ValueRef LocateValue(const RecordView &record, size_t var_count, const SparseVector &sparse, const RowsetLayout &layout,
+					 size_t k);
 
 //! The record `record` through `layout`: one value per column (dropped and uniquifier columns NULL,
 //! a bit as one byte 0 / 1, LocateValue's rules and errors).

@@ -875,7 +875,14 @@ CD_INLINE void CdRow::StageBytes(const Staging &s) {
 			if (s.size > s.c.length) {
 				RefusePast(s.layout.table, s.c.name, s.size, s.c.length);
 			}
-			StoreAsIs(s);  // nullable, under ANSI_PADDING OFF: stored and read as given (E22)
+			if (s.size == 0) {
+				// '' / 0x stored with no bytes, read as the server reads it: one space / zero byte (DATALENGTH
+				// 1; review of #626, the cd fixture's padoff_row against RESTORE), as Unpadded leaves the
+				// uncompressed record's padded value
+				StorePadded(s, s.c.xtype == XTYPE_CHAR ? 0x20 : 0, 1);
+			} else {
+				StoreAsIs(s);  // nullable, under ANSI_PADDING OFF: stored and read as given (E22)
+			}
 		} else {
 			StorePadded(s, s.c.xtype == XTYPE_CHAR ? 0x20 : 0, s.c.length);
 		}

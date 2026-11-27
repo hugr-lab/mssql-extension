@@ -178,7 +178,10 @@ GO
 SET ANSI_PADDING ON;
 GO
 INSERT INTO dbo.padoff_row VALUES (1, 'abc', 0x01, N'жук', 'x', 0x02), (2, 'abc   ', 0x0100, N'ab  ', 'yy  ', 0x0300),
-	(3, NULL, NULL, NULL, '', 0x);
+	(3, NULL, NULL, NULL, '', 0x),
+	-- '' and 0x in the nullable ones: the server reads them as one space / one zero byte (DATALENGTH 1),
+	-- from either record (review of #626).
+	(4, '', 0x, N'', 'z', 0x04);
 INSERT INTO dbo.padoff_plain SELECT * FROM dbo.padoff_row;
 GO
 -- 11. rowversion (big-endian, its leading zero bytes left out), and the types a ROW record keeps as stored --

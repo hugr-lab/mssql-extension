@@ -285,13 +285,16 @@ bool CheckStorageForm(const PhysicalColumn &physical, const CatalogColumn &c, bo
 		return false;
 	}
 	// A fixed char / nchar / binary is as wide as its declaration: a sysrscols width that disagrees
-	// with syscolpars' would read the neighbouring columns as its value (review of #552).
-	if (padded && physical.offset > 0 && physical.length != c.max_length) {
+	// with syscolpars' would read the neighbouring columns as its value (review of #552). A sparse column of a
+	// fixed type is checked too: its entry must have that width (LocateValue), so a disagreement found here
+	// refuses the table by name rather than its scan at the first value (review of #626).
+	const bool fixed_width = physical.offset > 0 || (physical.Sparse() && KnownFixedXtype(physical.xtype));
+	if (padded && fixed_width && physical.length != c.max_length) {
 		why = "column " + c.name + " is stored as " + std::to_string(physical.length) + " bytes, declared " +
 			  std::to_string(c.max_length);
 		return false;
 	}
-	if (physical.offset > 0) {
+	if (fixed_width) {
 		try {
 			(void)physical.FixedLength(table);
 		} catch (FormatError &e) {
@@ -333,6 +336,12 @@ bool CheckLiveColumn(const std::map<int32_t, const CatalogColumn *> &by_id, cons
 	// ANSI_PADDING status and its trailing zero bytes are its value's (fixture test/data/backup/clr).
 	if ((c.system_type_id == XTYPE_CHAR || c.system_type_id == XTYPE_BINARY) && c.is_nullable && !c.is_ansi_padded) {
 		physical.unpadded = true;
+	}
+	// Sparse by sysrscols (status 0x100) and by syscolpars alike, or a value would be looked for where it is not.
+	if (physical.Sparse() != c.is_sparse) {
+		why = "column " + c.name + " is " + (c.is_sparse ? "" : "not ") + "sparse in syscolpars, and " +
+			  (physical.Sparse() ? "" : "not ") + "sparse in sysrscols";
+		return false;
 	}
 	return CheckStorageForm(physical, c, cd, t.name, why);
 }
@@ -425,8 +434,8 @@ void DecideDecodable(const BootstrapTables &tables, const AddedDefaults &default
 		}
 	}
 	std::map<int32_t, const CatalogColumn *> by_id;
-	// A sparse column (and the column set over them) is not readable, the narrowest refusal (D13): its
-	// value is in the row's sparse vector, a storage format of 086's; the table's other columns are.
+	// A sparse column has no place of its own (sysrscols offset 0, no null bit): its value is its entry in the
+	// row's sparse vector (spec 086 PR 3, E24), so its storage form is not checked here.
 	for (const auto &c : t.columns) {
 		by_id[c.column_id] = &c;
 	}

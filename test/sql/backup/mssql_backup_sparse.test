@@ -1,0 +1,244 @@
+# name: test/sql/backup/mssql_backup_sparse.test
+# description: sparse columns read from the record's sparse vector (spec 086 PR 3, E24); the column set not stored
+# group: [mssql]
+#
+# test/data/backup/sparse (test/backup/gen/sparse.sql and sparse_changes.sql, SQL Server 2025, both backups
+# compressed): every type a sparse column can have at its edges and over 3000 rows, values off row and
+# row-overflow inside the vector, 1000 sparse columns, a column set, ALTER COLUMN ... ADD / DROP SPARSE (rows
+# rewritten, the old entries kept under a dropped hbcolid), a dropped sparse column, a heap's forwarded rows, a
+# non-unique clustered index (a uniquifier of 0 is not stored, so the vector takes its index), a partitioned
+# table, char / binary under ANSI_PADDING OFF, a text column before the vector, an empty column beside a dropped
+# column's entry and row versioning; then a differential. The values below are the scan's, which the oracle lane
+# compares with RESTORE (compare_rows.sh: 13 tables, 0 failures on 2025). No SQL
+# Server is needed.
+
+require mssql
+
+statement ok
+SET VARIABLE f = 'test/data/backup/sparse/sparse_full.bak';
+
+statement ok
+SET VARIABLE d = 'test/data/backup/sparse/sparse_diff.bak';
+
+query TT
+SELECT table_name, decodable FROM mssql_backup_tables(getvariable('f')) WHERE schema_name = 'dbo' ORDER BY 1;
+----
+alter_sparse	true
+ansi_sparse	true
+colset_sparse	true
+dropped_sparse	true
+heap_sparse	true
+ovf_sparse	true
+part_sparse	true
+text_sparse	true
+types_sparse	true
+uniq_sparse	true
+unsparsed	true
+ver_sparse	true
+wide_sparse	true
+
+# A sparse column is converted; the column set is computed from them, not stored (owner, 2026-11-24).
+query TTT
+SELECT column_name, state, reason FROM mssql_backup_columns(getvariable('f'), 'dbo', 'colset_sparse') ORDER BY column_id;
+----
+id	converted	NULL
+a	converted	NULL
+b	converted	NULL
+c	converted	NULL
+d	converted	NULL
+e	converted	NULL
+f	converted	NULL
+g	converted	NULL
+h	converted	NULL
+cs	not_stored	a column set is computed from the sparse columns, not stored; they are read one by one
+
+# Every type at its edges.
+query IIIIIIIIIIIII
+SELECT id, s_bit, s_tiny, s_small, s_int, s_big, s_dec, s_dec38, s_num, s_money, s_smoney, s_real, s_float
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'types_sparse') WHERE id IN (2, 3) ORDER BY id;
+----
+2	true	255	32767	2147483647	9223372036854775807	9999999.99	9999999999999999999999999999.9999999999	999999999999999999	922337203685477.5807	214748.3647	3.4e+38	1.79e+308
+3	false	0	-32768	-2147483648	-9223372036854775808	-9999999.99	-9999999999999999999999999999.9999999999	-999999999999999999	-922337203685477.5808	-214748.3648	-3.4e+38	-1.79e+308
+
+query IIIIIIIII
+SELECT id, s_date, s_time, s_time0, s_dt, s_sdt, s_dt2, epoch_us(s_dto), s_guid
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'types_sparse') WHERE id IN (2, 3) ORDER BY id;
+----
+2	9999-12-31	23:59:59.999999	23:59:59	9999-12-31 23:59:59.996666	2079-06-06 23:59:00	9999-12-31 23:59:59.999	253402250399999000	ffffffff-ffff-ffff-ffff-ffffffffffff
+3	0001-01-01	00:00:00	00:00:00	1753-01-01 00:00:00	1900-01-01 00:00:00	0001-01-01 00:00:00	-62135546400000000	00000000-0000-0000-0000-000000000000
+
+# Strings and binaries; row 4's empty values are entries of length 0, not NULL (a char(6) and a binary(5) padded).
+query IIIIIIIIIII
+SELECT id, '[' || s_char || ']', s_vc, '[' || s_nchar || ']', s_nvc, s_bin, s_vbin, s_vcmax, s_nvcmax, s_vbmax, r2
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'types_sparse') WHERE id IN (2, 3, 4) ORDER BY id;
+----
+2	[zzzzzz]	zzzzzzzzzzzzzzzzzzzz	[яяяя]	яяяяяяяяяяяяяяяяяяяя	\xFF\xFF\xFF\xFF\xFF	zzzzzzzzzzzzzzzzzzzz	max in row	макс	\xCA\xFE	end
+3	[a]	a	[ж]	ж	\x00\x00\x00\x00\x00	\x00	m	м	\x00	a
+4	[]	(empty)	NULL	(empty)	\x00\x00\x00\x00\x00	(empty)	(empty)	(empty)	(empty)	NULL
+
+# Values off row inside the vector (an in-row LOB root under bit 15 of its entry's end) and before it; each
+# row's _mssql_lob maps them.
+query IIIIIT
+SELECT id, length(s_vcmax), length(s_nvcmax), octet_length(s_vbmax), length(rmax), _mssql_lob IS NOT NULL
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'types_sparse') WHERE id BETWEEN 5 AND 7 ORDER BY id;
+----
+5	10000	NULL	NULL	9000	true
+6	NULL	5000	90000	NULL	true
+7	NULL	NULL	NULL	9000	true
+
+query IIIIIIIIIIII
+SELECT count(*), count(s_bit), sum(s_bit::INT), count(s_int), sum(s_int), count(s_big), sum(s_big), count(s_vc),
+	count(s_vcmax), sum(length(s_vcmax)), count(s_guid), count(r1)
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'types_sparse');
+----
+3011	1003	502	604	901516	431	642643927935	1504	106	61456	178	2256
+
+# An empty value, not NULL, closing the regular variable columns: not stored, the vector at its index (review
+# of #626).
+query IIIIIIII
+SELECT id, r1, r2, rmax, s_bit, s_int, s_big, s_vc FROM mssql_backup_scan(getvariable('f'), 'dbo', 'types_sparse')
+WHERE id BETWEEN 8 AND 11 ORDER BY id;
+----
+8	NULL	NULL	(empty)	NULL	8	NULL	NULL
+9	NULL	(empty)	NULL	NULL	9	NULL	nine
+10	(empty)	NULL	NULL	NULL	NULL	10	NULL
+11	(empty)	(empty)	(empty)	true	NULL	NULL	NULL
+
+# 1000 sparse columns: hbcolids past 255.
+query IIIIII
+SELECT count(*), sum(w1), sum(w500), sum(w1000), count(w777), count(tail) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'wide_sparse');
+----
+400	914005	908500	847000	4	400
+
+# The column set: its columns read one by one, written through it or through them; SELECT * leaves it out and
+# naming it is refused by name.
+query IITTRTTTT
+SELECT * FROM mssql_backup_scan(getvariable('f'), 'dbo', 'colset_sparse') WHERE id IN (1, 2, 3) ORDER BY id;
+----
+1	5	x<&>	2024-01-02 03:04:05.678	0.1	\x0A\x0B	юни	-1.500	true
+2	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+3	9	q	NULL	NULL	NULL	NULL	NULL	false
+
+statement error
+SELECT cs FROM mssql_backup_scan(getvariable('f'), 'dbo', 'colset_sparse');
+----
+dbo.colset_sparse.cs is not read: a column set is computed from the sparse columns
+
+# ALTER COLUMN x ADD SPARSE (x from the vector under a new hbcolid), y DROP SPARSE (from the fixed part, the old
+# entry passed over), a sparse column dropped, one added after the rows (NULL in them: a sparse column takes no
+# DEFAULT).
+query IIIIII
+SELECT count(*), sum(x), sum(y), count(v), count(keep), count(added) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'alter_sparse');
+----
+301	30001	-33748	301	61	1
+
+query IIITTI
+SELECT * FROM mssql_backup_scan(getvariable('f'), 'dbo', 'alter_sparse') WHERE id IN (1, 4, 5, 1001) ORDER BY id;
+----
+1	1	-1	v1	NULL	NULL
+4	4	NULL	v4	NULL	NULL
+5	5	-5	v5	k5	NULL
+1001	1	2	after	k	3
+
+# A heap's forwarded rows (the vector before the back pointer); a non-unique clustered index (the uniquifier).
+# Rows 1001-1040 hold an empty pad before the vector, ten of them forwarded (review of #626).
+query IIIII
+SELECT count(*), count(s), sum(length(s)), count(n), count(*) FILTER (WHERE pad = '' AND n = id)
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'heap_sparse');
+----
+440	20	70000	240	40
+
+query IIIII
+SELECT count(*), count(DISTINCT _mssql_rid), count(s1), count(s2), count(*) FILTER (WHERE v = '' AND s1 IN (55, 56))
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'uniq_sparse');
+----
+602	602	202	121	2
+
+# A vector past the row: row-overflow pointers and an in-row LOB root inside it.
+query IIIIII
+SELECT id, length(a), length(b), length(c), length(m), d FROM mssql_backup_scan(getvariable('f'), 'dbo', 'ovf_sparse') ORDER BY id;
+----
+1	4000	4000	3000	6000	4
+2	1	NULL	NULL	NULL	NULL
+3	3000	3000	1500	1	NULL
+
+query III
+SELECT count(*), sum(s), count(t) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'part_sparse');
+----
+300	22650	100
+
+# ANSI_PADDING OFF: trailing zero bytes left out, one kept for 0x (the server's DATALENGTH 1); a char is read
+# trimmed either way.
+query ITT
+SELECT id, '[' || c || ']', b FROM mssql_backup_scan(getvariable('f'), 'dbo', 'ansi_sparse') ORDER BY id;
+----
+1	[ab]	\x01\x02
+2	[]	\x00
+3	[abcdefgh]	\x01\x02\x03\x04\x05\x06
+4	NULL	NULL
+5	[a]	\x01
+
+# A text column the last regular variable column (its 16-byte root pointer, the regular complex form that can
+# begin with the vector's tag), set or NULL beside the sparse column set or NULL (review of #626).
+query ITI
+SELECT id, t, s FROM mssql_backup_scan(getvariable('f'), 'dbo', 'text_sparse') ORDER BY id;
+----
+1	some text	11
+2	more text	NULL
+3	NULL	33
+4	NULL	NULL
+5	(empty)	55
+
+# An empty last regular column ('', not stored: the vector takes its index) beside a vector that still holds the
+# dropped column a's entry (review of #626).
+query ITI
+SELECT id, v, b FROM mssql_backup_scan(getvariable('f'), 'dbo', 'dropped_sparse') ORDER BY id;
+----
+1	(empty)	10
+2	x	20
+3	(empty)	NULL
+4	NULL	40
+
+# The same beside y's entry after ALTER COLUMN y DROP SPARSE (the rows rewritten, y now a regular column).
+query ITII
+SELECT id, v, y, z FROM mssql_backup_scan(getvariable('f'), 'dbo', 'unsparsed') ORDER BY id;
+----
+1	(empty)	1	10
+2	x	2	20
+3	(empty)	NULL	30
+4	(empty)	4	NULL
+
+query III
+SELECT count(*), sum(v), count(s) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'ver_sparse');
+----
+429	32350	200
+
+# The differential: values set, changed and cleared inside the vectors; the change listing compares a sparse
+# table's rows by their values, so ALTER COLUMN v ADD SPARSE, which rewrote every row of alter_sparse, is no change.
+query TI
+SELECT change_type, count(*) FROM mssql_backup_table_changes(getvariable('f'), 'dbo', 'types_sparse', diff := getvariable('d'))
+GROUP BY ALL ORDER BY 1;
+----
+delete	41
+insert	300
+update_postimage	62
+update_preimage	62
+
+query I
+SELECT count(*) FROM mssql_backup_table_changes(getvariable('f'), 'dbo', 'alter_sparse', diff := getvariable('d'));
+----
+0
+
+query III
+SELECT count(*), count(s_int), sum(s_int) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'types_sparse', diff := getvariable('d'));
+----
+3270	654	805723
+
+# The attached backup reads them the same.
+statement ok
+ATTACH 'test/data/backup/sparse/sparse_full.bak' AS sp (TYPE mssql_backup);
+
+query II
+SELECT count(*), count(s_nvc) FROM sp.dbo.types_sparse;
+----
+3011	133

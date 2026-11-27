@@ -205,14 +205,20 @@ public:
 				reason = "a record of type " + std::to_string(view.Type()) + ", not a row";
 				return false;
 			}
-			// The table's own variable columns only: a forwarded record's last one is its back pointer, complex too.
-			const size_t var_count = std::min<size_t>(RowVarCount(view, layout.table), view.var_count);
-			for (size_t i = 0; i < var_count; i++) {
-				const uint16_t end = static_cast<uint16_t>(view.var_ends[2 * i] | (view.var_ends[2 * i + 1] << 8));
-				if (end & 0x8000) {
-					reason = "a value stored off row: its pages are the backup's, not the record's";
-					return false;
-				}
+			// The table's own variable columns only: a forwarded record's last one is its back pointer, complex too,
+			// and a sparse vector is complex whatever it holds: its entries say whether a value is off row.
+			const RowRecord row = RowRecord::Fixed(view, layout);
+			bool off_row = false;
+			for (size_t i = 0; i < row.var_count; i++) {
+				off_row = off_row || view.VarComplex(i);
+			}
+			for (const auto &c : layout.columns) {
+				off_row =
+					off_row || (c.Sparse() && !c.Dropped() && row.sparse.Find(c.hbcolid).state == ValueState::OffRow);
+			}
+			if (off_row) {
+				reason = "a value stored off row: its pages are the backup's, not the record's";
+				return false;
 			}
 			if (layout_ != &layout) {
 				stager_->UseLayout(layout);
@@ -220,7 +226,6 @@ public:
 			}
 			chunk_.Reset();
 			stager_->BeginChunk(chunk_);
-			const RowRecord row = RowRecord::Fixed(view, RowVarCount(view, layout.table));
 			stager_->PrepareRow(row);
 			stager_->Append(row);
 			const idx_t unread = Unreadable();

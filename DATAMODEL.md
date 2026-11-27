@@ -1709,8 +1709,11 @@ flowchart LR
   through spec 091's kernels on the client --, the CLR system types and `sql_variant` the TDS path's
   kernels (spec 093 T8a / T8b, `backup_type_forms`); one whose conversion is still to come (`xml`, a user
   CLR type, `vector`, `json`, a type the reader does not know) is its stored bytes, a `BLOB`.
-  Not readable, named: a computed column not persisted (no stored value), a sparse column (the sparse
-  vector, 086). The scan registers these as virtual columns, so `SELECT *` leaves them out and naming one is refused with its
+  Not readable, named: a computed column not persisted (no stored value), a column set (computed from
+  the sparse columns, not stored). A sparse column is read from the record's sparse vector (spec 086 PR 3,
+  E24: the last variable column, after the regular ones stored (trailing NULL and empty ones are not) -- or
+  before a forwarded record's back pointer -- tagged `0x0005` (the tag decides, not the null bitmap), its entries by `sysrscols.hbcolid`; `FindSparseVector` once per record,
+  in `RowRecord::Fixed`, `LocateValue` the entry; an off-row entry under bit 15 walked as any). The scan registers these as virtual columns, so `SELECT *` leaves them out and naming one is refused with its
   reason. `mssql_backup_tables.columns` and the scan take this one answer.
 - **Rows** (PR 2d). A record (`RecordView`, allocation-free) is split by its header alone; types 2-7
   (stubs, index and LOB records, ghosts, version ghosts) are not rows, a forwarded record's last

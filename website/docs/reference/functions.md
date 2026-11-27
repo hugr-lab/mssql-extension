@@ -277,7 +277,7 @@ SELECT schema_name, table_count FROM mssql_backup_schemas('/backups/sales_full.b
 ### mssql_backup_columns()
 
 Every column of every table in a SQL Server full backup (those of schema `sys` included), one row each, with its state at a
-glance (`converted`, `stored_bytes`, `not_stored`, `storage_format`) and why;
+glance (`converted`, `stored_bytes`, `not_stored`) and why;
 optionally one schema's or one table's. See [Backup Files](../reading/backups.md#tables-and-views).
 
 **Signature:** `mssql_backup_columns(path VARCHAR | VARCHAR[] [, schema VARCHAR [, table VARCHAR]]) -> TABLE(schema_name VARCHAR, table_name VARCHAR, column_id INTEGER, column_name VARCHAR, sql_type VARCHAR, system_type VARCHAR, duckdb_type VARCHAR, state VARCHAR, reason VARCHAR)`

@@ -69,7 +69,7 @@ public:
 	static constexpr uint32_t IN_ROW_BYTES = 8060;
 	//! The columns `column_ids` of `table`, in that order, read as ReadingOf says: converted to D6's
 	//! type, or a type still to be converted as its stored bytes (BLOB). A column that is not readable
-	//! (no stored value, a sparse column), one not in the table, or one the codec would stage another
+	//! (no stored value, a column set), one not in the table, or one the codec would stage another
 	//! way than its type says is an InvalidInputException naming it. `forms`: how a column of a kernel's
 	//! type is read (backup_type_forms), as the caller typed its output.
 	RecordStager(const CatalogTable &table, const std::vector<int32_t> &column_ids, const TypeForms &forms);

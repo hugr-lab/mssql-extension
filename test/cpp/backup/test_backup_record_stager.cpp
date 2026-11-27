@@ -514,18 +514,18 @@ int main() {
 		Check(two.size() == 1 && two.GetValue(1, 0) == Value::UTINYINT(200), "a projection without it reads the row");
 
 		// No refusal by type: a type still to be converted is its stored bytes; only what has no stored
-		// value (or keeps it in the sparse vector) is refused, by name.
+		// value (a computed column not persisted, a column set: spec 086 PR 3) is refused, by name.
 		CatalogTable refused = t;
 		refused.columns.push_back(Col(22, "computed", XTYPE_INT, "int", 4));
 		refused.columns.back().is_computed = true;
-		refused.columns.push_back(Col(23, "sp", XTYPE_INT, "int", 4));
-		refused.columns.back().is_sparse = true;
-		Check(
-			ErrorOf([&]() {
-				RecordStager(refused, {22}, TypeForms());
-			}).find("dbo.synthetic.computed: a computed column") != std::string::npos &&
-				ErrorOf([&]() { RecordStager(refused, {23}, TypeForms()); }).find("sparse vector") != std::string::npos,
-			"a computed column that is not persisted and a sparse column are not readable, by name");
+		refused.columns.push_back(Col(23, "cs", XTYPE_XML, "xml", -1));
+		refused.columns.back().is_column_set = true;
+		Check(ErrorOf([&]() {
+				  RecordStager(refused, {22}, TypeForms());
+			  }).find("dbo.synthetic.computed: a computed column") != std::string::npos &&
+				  ErrorOf([&]() { RecordStager(refused, {23}, TypeForms()); }).find("a column set is computed") !=
+					  std::string::npos,
+			  "a computed column that is not persisted and a column set are not readable, by name");
 		const std::vector<std::pair<CatalogColumn, std::string>> raws = {
 			{Col(31, "doc", XTYPE_XML, "xml", -1), "binary XML"},
 			{Col(32, "point", XTYPE_CLR, "", 9), "a user CLR type"},

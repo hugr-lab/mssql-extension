@@ -543,7 +543,7 @@ struct ChangeRowReader {
 		if (fixed.Type() == RECORD_FORWARDED) {
 			at = ForwardedFrom(fixed, layout.table);
 		}
-		row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
+		row = RowRecord::Fixed(fixed, layout);
 	}
 
 	const ChangeSide &side;
