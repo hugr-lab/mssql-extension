@@ -68,7 +68,9 @@ def sql_string(s):
 class DuckDB:
     def __init__(self, binary, base):
         self.binary = binary
-        self.preamble = ""
+        # The shell prints a statement's WARNINGs on stdout, inside its JSON (spec 087 D9: a TDE backup's
+        # D11 columns say their tail is not read): only errors are logged.
+        self.preamble = "SET logging_level = 'error';\n"
         self.secrets = []
         self.base = base
         if base.startswith("s3://"):
@@ -83,7 +85,7 @@ class DuckDB:
             endpoint = url.split("://", 1)[-1].rstrip("/")
             # Its result row goes nowhere, so stdout holds only the statement's JSON. One option a
             # line: DuckDB's parser error echoes the line it stopped on, which is then not the key's.
-            self.preamble = (".output /dev/null\n"
+            self.preamble += (".output /dev/null\n"
                              "CREATE SECRET backup_oracle (TYPE s3,\n"
                              f"KEY_ID {sql_string(key)},\n"
                              f"SECRET {sql_string(secret)},\n"

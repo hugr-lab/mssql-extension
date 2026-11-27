@@ -30,13 +30,13 @@ true	false	true	true	true
 # file's SFIN (FILELISTONLY's TDEThumbprint), the log file's NULL.
 query IIIIII
 SELECT compressed, encrypted, tde, database_name, list_count(files),
-       list_count(list_filter(files, f -> f.tde_thumbprint IS NOT NULL))
+       list_count(list_filter(files, lambda f: f.tde_thumbprint IS NOT NULL))
 FROM mssql_backup_info('test/data/backup/encryption/tde_sample.bak');
 ----
 false	false	true	bak_tde_sample	2	1
 
 query I
-SELECT tde_thumbprint = (list_filter(files, f -> f.type = 'data'))[1].tde_thumbprint
+SELECT tde_thumbprint = (list_filter(files, lambda f: f.type = 'data'))[1].tde_thumbprint
 FROM mssql_backup_info('test/data/backup/encryption/tde_sample.bak');
 ----
 true

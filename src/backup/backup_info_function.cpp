@@ -178,6 +178,16 @@ void PutTail(std::vector<Value> &row, const FuzzySummary *tail) {
 	row[at + 3] = tail ? Value::INTEGER(static_cast<int32_t>(tail->rolled_back_after_checkpoint)) : no_int;
 }
 
+//! HEADERONLY's CompressionAlgorithm: NULL for a backup with no container, and for one in a container whose blocks
+//! are stored (an encrypted backup WITHOUT COMPRESSION: RESTORE says Compressed 1, CompressionAlgorithm NULL; measured
+//! on 2025, spec 087's matrix).
+static Value AlgorithmValue(bool compressed, CompressionAlgorithm algorithm) {
+	if (!compressed || algorithm == CompressionAlgorithm::None) {
+		return Value(LogicalType::VARCHAR);
+	}
+	return Value(CompressionAlgorithmName(algorithm));
+}
+
 //! The row of the backup set the files of `opened` hold, D11's columns NULL (PutTail).
 std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	const auto &set = opened.Set();
@@ -258,8 +268,7 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	// One family's number when one family was given; a whole set has no one number.
 	row.push_back(single ? Value::INTEGER(static_cast<int32_t>(set.family_sequence_number)) : no_int);
 	row.push_back(Value::BOOLEAN(opened.Compressed()));
-	row.push_back(opened.Compressed() ? Value(CompressionAlgorithmName(first.container_header.algorithm))
-									  : Value(LogicalType::VARCHAR));
+	row.push_back(AlgorithmValue(opened.Compressed(), first.container_header.algorithm));
 	// Spec 087: an encrypted backup (its key unwrapped by the secret D3 selected) and its encryptor's
 	// thumbprint, as HEADERONLY's EncryptorThumbprint.
 	const bool encrypted = first.container && first.container_header.encrypted;
@@ -306,9 +315,10 @@ std::vector<Value> ClearRow(const ClearFileHeader &file) {
 	}
 	const auto &h = file.header;
 	row[ColumnIndex("position")] = Value::INTEGER(1);
-	row[ColumnIndex("compressed")] = Value::BOOLEAN(h.compressed);
-	row[ColumnIndex("compression_algorithm")] =
-		h.compressed ? Value(CompressionAlgorithmName(h.algorithm)) : Value(LogicalType::VARCHAR);
+	// HEADERONLY's Compressed is the container's (1 for an encrypted backup stored in one, as with the key:
+	// OpenedBackup::Compressed), the algorithm its blocks'.
+	row[ColumnIndex("compressed")] = Value::BOOLEAN(file.container);
+	row[ColumnIndex("compression_algorithm")] = AlgorithmValue(file.container, h.algorithm);
 	row[ColumnIndex("encrypted")] = Value::BOOLEAN(h.encrypted);
 	if (h.encrypted) {
 		row[ColumnIndex("encryptor_thumbprint")] =
