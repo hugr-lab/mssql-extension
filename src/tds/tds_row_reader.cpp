@@ -443,12 +443,24 @@ size_t RowReader::ReadValue(const uint8_t *data, size_t length, size_t col_idx, 
 	if (col.type_id == TDS_TYPE_UNIQUEIDENTIFIER) {
 		return ReadGuidType(data, length, value, is_null);
 	}
+	// The two forms most values have are read here, the 1-byte prefix (every nullable fixed type) first;
+	// the rest by ReadFramed. Through ReadFramed alone a 1-byte-prefixed value read 15-17% slower than
+	// the per-type switch before #648, and here no slower (an A/B of the two builds, interleaved).
+	const ValueFraming framing = LEGACY_FRAMINGS.Of(col.type_id);
+	if (framing.kind == FramingKind::BYTE_PREFIX) {
+		return ReadBytePrefixed(data, length, value, is_null, true);
+	}
+	if (framing.kind == FramingKind::FIXED) {
+		return ReadFixed(data, length, framing.width, value);
+	}
 	return ReadFramed(data, length, col, value, is_null, false);
 }
 
 //! One value by its type's framing, for a ROW or (`nbc`) for a column an NBCROW's bitmap says is
 //! present. The two differ in one thing: a 1-byte prefix of 0 is NULL in a ROW and an empty value in
-//! an NBCROW, where the bitmap alone says NULL.
+//! an NBCROW, where the bitmap alone says NULL. ReadValue / ReadValueNBC read the fixed and 1-byte
+//! forms before calling this, through the same ReadFixed / ReadBytePrefixed; the arms stay here so
+//! this reads every form (and measured: without them the 2-byte form read 5% slower, by code layout).
 size_t RowReader::ReadFramed(const uint8_t *data, size_t length, const ColumnMetadata &col, std::vector<uint8_t> &value,
 							 bool &is_null, bool nbc) {
 	const ValueFraming framing = LEGACY_FRAMINGS.Of(col.type_id);
@@ -729,7 +741,16 @@ size_t RowReader::SkipPLPType(const uint8_t *data, size_t length) {
 size_t RowReader::ReadValueNBC(const uint8_t *data, size_t length, size_t col_idx, std::vector<uint8_t> &value,
 							   bool &is_null) {
 	is_null = false;  // NBC rows don't include data for NULL columns
-	return ReadFramed(data, length, columns_[col_idx], value, is_null, true);
+	// As ReadValue: the two common forms here, the rest by ReadFramed.
+	const ColumnMetadata &col = columns_[col_idx];
+	const ValueFraming framing = LEGACY_FRAMINGS.Of(col.type_id);
+	if (framing.kind == FramingKind::BYTE_PREFIX) {
+		return ReadBytePrefixed(data, length, value, is_null, false);
+	}
+	if (framing.kind == FramingKind::FIXED) {
+		return ReadFixed(data, length, framing.width, value);
+	}
+	return ReadFramed(data, length, col, value, is_null, true);
 }
 
 size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_idx) {
