@@ -104,6 +104,21 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 	comparison_differs = ComparisonDiffersFor(sql_type_name);
 }
 
+namespace {
+
+//! Whether a type name, already in lower case, is one of a list's.
+template <size_t N>
+bool IsOneOf(const string &lower_type, const char *const (&type_names)[N]) {
+	for (auto type_name : type_names) {
+		if (lower_type == type_name) {
+			return true;
+		}
+	}
+	return false;
+}
+
+}  // namespace
+
 MSSQLReadForm MSSQLColumnInfo::ReadFormFor(const string &sql_type_name) {
 	// Geometry / geography (spec 093 T5, D6): read bare (UDT 0xF0), the stored MS-SSCLRT bytes, and decoded
 	// on the client into ISO WKB (or kept as they are, geometry_as 'native'); the server's .STAsBinary(),
@@ -135,13 +150,17 @@ bool MSSQLColumnInfo::ComparisonDiffersFor(const string &sql_type_name) {
 	// Nor, since spec 093 T5, geometry / geography: the server has no comparison of them a pushed filter
 	// could use, and read as a BLOB (geometry_as 'wkb' / 'native') their bytes are not what the server
 	// would compare a varbinary constant with. IsSpatial() names them where it always did.
-	const string t = StringUtil::Lower(sql_type_name);
-	return !(t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" || t == "real" ||
-			 t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "char" ||
-			 t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" || t == "date" ||
-			 t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" || t == "datetimeoffset" ||
-			 t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" || t == "timestamp" ||
-			 t == "rowversion" || t == "xml");
+	static const char *const COMPARED_LIKE_DUCKDB[] = {"bit",			"tinyint",		  "smallint",
+													   "int",			"bigint",		  "real",
+													   "float",			"decimal",		  "numeric",
+													   "money",			"smallmoney",	  "char",
+													   "varchar",		"text",			  "nchar",
+													   "nvarchar",		"ntext",		  "date",
+													   "time",			"datetime",		  "datetime2",
+													   "smalldatetime", "datetimeoffset", "binary",
+													   "varbinary",		"image",		  "uniqueidentifier",
+													   "timestamp",		"rowversion",	  "xml"};
+	return !IsOneOf(StringUtil::Lower(sql_type_name), COMPARED_LIKE_DUCKDB);
 }
 
 bool MSSQLColumnInfo::BulkWireTakesType(const string &sql_type_name) {
@@ -153,15 +172,14 @@ bool MSSQLColumnInfo::BulkWireTakesType(const string &sql_type_name) {
 	// the statement path sends a string literal the server parses, the bulk wire would not. sql_variant's
 	// write is T2's (refused until then).
 	// vector (spec 093 T3): its bytes as varbinary under a declared vector(n), measured V6.
-	const string t = StringUtil::Lower(sql_type_name);
-	return t == "vector" || t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" ||
-		   t == "real" || t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" ||
-		   t == "char" || t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" ||
-		   t == "date" || t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" ||
-		   t == "datetimeoffset" || t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" ||
-		   t == "timestamp" || t == "rowversion" || t == "json" || t == "xml" ||
-		   // Spec 093 T2: SSVARIANT envelopes (S2: INSERT BULK takes them, base type and value kept).
-		   t == "sql_variant";
+	static const char *const BULK_WIRE_TYPES[] = {
+		"vector", "bit", "tinyint", "smallint", "int", "bigint", "real", "float", "decimal", "numeric", "money",
+		"smallmoney", "char", "varchar", "text", "nchar", "nvarchar", "ntext", "date", "time", "datetime", "datetime2",
+		"smalldatetime", "datetimeoffset", "binary", "varbinary", "image", "uniqueidentifier", "timestamp",
+		"rowversion", "json", "xml",
+		// Spec 093 T2: SSVARIANT envelopes (S2: INSERT BULK takes them, base type and value kept).
+		"sql_variant"};
+	return IsOneOf(StringUtil::Lower(sql_type_name), BULK_WIRE_TYPES);
 }
 
 //===----------------------------------------------------------------------===//
@@ -296,6 +314,163 @@ bool MSSQLColumnInfo::IsUTF8Collation(const string &collation_name) {
 // Type Mapping
 //===----------------------------------------------------------------------===//
 
+namespace {
+
+//! What a type's DuckDB type is computed from, where the name alone does not give it.
+struct ColumnShape {
+	int16_t max_length;
+	uint8_t precision;
+	uint8_t scale;
+	MSSQLDatetime2Read datetime2_read;
+};
+
+LogicalType DecimalType(const ColumnShape &shape) {
+	return LogicalType::DECIMAL(shape.precision, shape.scale);
+}
+
+LogicalType MoneyType(const ColumnShape &) {
+	return LogicalType::DECIMAL(19, 4);
+}
+
+LogicalType SmallMoneyType(const ColumnShape &) {
+	return LogicalType::DECIMAL(10, 4);
+}
+
+LogicalType Datetime2Type(const ColumnShape &shape) {
+	// Pick the narrowest DuckDB TIMESTAMP variant that can losslessly hold
+	// the column's wire precision (spec 045 — type round-trip transparency).
+	// scale 0       → TIMESTAMP_S  (seconds)
+	// scale 1-3     → TIMESTAMP_MS (milliseconds)
+	// scale 4-6     → TIMESTAMP    (microseconds — DuckDB native)
+	// scale 7       → TIMESTAMP_NS (DuckDB ns can hold 100-ns wire ticks losslessly, within
+	//                 1677-2262), or TIMESTAMP when the catalog reads datetime2(7) in
+	//                 microseconds (spec 093 D8: the whole range, the 100 ns digit truncated)
+	if (shape.scale == 0) {
+		return LogicalType::TIMESTAMP_S;
+	}
+	if (shape.scale <= 3) {
+		return LogicalType::TIMESTAMP_MS;
+	}
+	if (shape.scale <= 6 || shape.datetime2_read == MSSQLDatetime2Read::Microseconds) {
+		return LogicalType::TIMESTAMP;
+	}
+	return LogicalType::TIMESTAMP_NS;
+}
+
+// The native JSON type of SQL Server 2025, reported as DuckDB's JSON (spec 093 D7): a VARCHAR
+// by its id, so it reads as one. On the wire it is plain varchar(max) under a UTF-8 BIN2
+// collation — `sp_describe_first_result_set` answers system_type_name `varchar(max)`, tds_type_id
+// 167; JSONSUPPORT (0x0D) is not requested, it would change the describe only — so the bytes are
+// already what the vector wants. A raw scan, typed by the describe, reads VARCHAR.
+LogicalType JsonType(const ColumnShape &) {
+	return LogicalType::JSON();
+}
+
+// vector(n) (SQL Server 2025, spec 093 D4): FLOAT[n], float16 elements widened exactly. sys.columns
+// gives the element type in scale (0 float32, 1 float16) and 8 + n x element size in max_length (V5).
+LogicalType VectorType(const ColumnShape &shape) {
+	const int element = shape.scale == 1 ? 2 : 4;
+	const int dimensions = shape.max_length > 8 ? (shape.max_length - 8) / element : 1;
+	return LogicalType::ARRAY(LogicalType::FLOAT, static_cast<idx_t>(dimensions));
+}
+
+// sql_variant (spec 093 T1, D3): read bare off the wire, each value a VARIANT of its base type.
+LogicalType VariantType(const ColumnShape &) {
+	return LogicalType::VARIANT();
+}
+
+// Spatial types (spec 093 T5, DQ-45): read bare and decoded on the client into ISO WKB, the bytes
+// DuckDB's GEOMETRY holds. geography is GEOMETRY('OGC:CRS84') for the whole column, whatever SRID a
+// value carries (WGS 84, longitude first, built in: spec 093 § Why OGC:CRS84); geometry is a GEOMETRY
+// with no CRS (a column declares no SRID). The catalog's geometry_as may make either a BLOB
+// (MSSQLColumnInfo's constructor).
+LogicalType GeographyType(const ColumnShape &) {
+	return LogicalType::GEOMETRY("OGC:CRS84");
+}
+
+LogicalType GeometryType(const ColumnShape &) {
+	return LogicalType::GEOMETRY();
+}
+
+//! The DuckDB type of one SQL Server type name: `id` itself, or what `compute` makes of the column.
+struct TypeMapping {
+	const char *sql_type_name;
+	LogicalTypeId id;
+	LogicalType (*compute)(const ColumnShape &);
+};
+
+// Every type MapSQLServerTypeToDuckDB names, in lower case; a name not here is read as VARCHAR.
+const TypeMapping TYPE_MAPPINGS[] = {
+	// Integer types
+	{"bit", LogicalTypeId::BOOLEAN, nullptr},
+	{"tinyint", LogicalTypeId::UTINYINT, nullptr},
+	{"smallint", LogicalTypeId::SMALLINT, nullptr},
+	{"int", LogicalTypeId::INTEGER, nullptr},
+	{"bigint", LogicalTypeId::BIGINT, nullptr},
+
+	// Floating point types
+	{"real", LogicalTypeId::FLOAT, nullptr},
+	{"float", LogicalTypeId::DOUBLE, nullptr},
+
+	// Decimal/numeric types
+	{"decimal", LogicalTypeId::DECIMAL, DecimalType},
+	{"numeric", LogicalTypeId::DECIMAL, DecimalType},
+	{"money", LogicalTypeId::DECIMAL, MoneyType},
+	{"smallmoney", LogicalTypeId::DECIMAL, SmallMoneyType},
+
+	// Character types
+	{"char", LogicalTypeId::VARCHAR, nullptr},
+	{"varchar", LogicalTypeId::VARCHAR, nullptr},
+	{"text", LogicalTypeId::VARCHAR, nullptr},
+	// Unicode also maps to VARCHAR in DuckDB
+	{"nchar", LogicalTypeId::VARCHAR, nullptr},
+	{"nvarchar", LogicalTypeId::VARCHAR, nullptr},
+	{"ntext", LogicalTypeId::VARCHAR, nullptr},
+
+	// Date/time types
+	{"date", LogicalTypeId::DATE, nullptr},
+	{"time", LogicalTypeId::TIME, nullptr},
+	// Fixed wire precision (~3 ms for DATETIME, 1 min for SMALLDATETIME) —
+	// always fits in DuckDB's µs TIMESTAMP.
+	{"datetime", LogicalTypeId::TIMESTAMP, nullptr},
+	{"smalldatetime", LogicalTypeId::TIMESTAMP, nullptr},
+	{"datetime2", LogicalTypeId::TIMESTAMP, Datetime2Type},
+	// DuckDB has no nanosecond-precision time-zone-aware type; collapse to
+	// µs TIMESTAMP_TZ regardless of source scale (lossless for ≤6, drops
+	// the trailing digit for scale 7).
+	{"datetimeoffset", LogicalTypeId::TIMESTAMP_TZ, nullptr},
+
+	// Binary types
+	{"binary", LogicalTypeId::BLOB, nullptr},
+	{"varbinary", LogicalTypeId::BLOB, nullptr},
+	{"image", LogicalTypeId::BLOB, nullptr},
+
+	// rowversion, whose type name in sys.types is the misleading `timestamp`:
+	// nothing to do with time, an 8-byte counter the server bumps on every
+	// write (issue #296). It arrives as BIGBINARY(8) — `sp_describe_first_result_set`
+	// reports tds_type_id 173, length 8, and the describe path in
+	// mssql_functions.cpp has always mapped it that way — so the binary codec
+	// decodes it with no help. Until it was named here it fell through to the VARCHAR
+	// default and was therefore CAST, which SQL Server refuses outright:
+	// `[529] Explicit conversion from data type timestamp to nvarchar(max) is
+	// not allowed`, making every table with such a column unreadable. Both
+	// spellings are accepted because a user writes ROWVERSION and sys.types
+	// answers timestamp.
+	{"timestamp", LogicalTypeId::BLOB, nullptr},
+	{"rowversion", LogicalTypeId::BLOB, nullptr},
+
+	{"json", LogicalTypeId::VARCHAR, JsonType},
+	{"vector", LogicalTypeId::ARRAY, VectorType},
+
+	// Special types
+	{"uniqueidentifier", LogicalTypeId::UUID, nullptr},
+	{"sql_variant", LogicalTypeId::VARIANT, VariantType},
+	{"geography", LogicalTypeId::GEOMETRY, GeographyType},
+	{"geometry", LogicalTypeId::GEOMETRY, GeometryType},
+};
+
+}  // namespace
+
 LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_name, int16_t max_length,
 													  uint8_t precision, uint8_t scale,
 													  MSSQLDatetime2Read datetime2_read) {
@@ -304,145 +479,14 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
 				   [](unsigned char c) { return std::tolower(c); });
 
-	// Integer types
-	if (lower_type == "bit") {
-		return LogicalType::BOOLEAN;
-	}
-	if (lower_type == "tinyint") {
-		return LogicalType::UTINYINT;
-	}
-	if (lower_type == "smallint") {
-		return LogicalType::SMALLINT;
-	}
-	if (lower_type == "int") {
-		return LogicalType::INTEGER;
-	}
-	if (lower_type == "bigint") {
-		return LogicalType::BIGINT;
-	}
-
-	// Floating point types
-	if (lower_type == "real") {
-		return LogicalType::FLOAT;
-	}
-	if (lower_type == "float") {
-		return LogicalType::DOUBLE;
-	}
-
-	// Decimal/numeric types
-	if (lower_type == "decimal" || lower_type == "numeric") {
-		return LogicalType::DECIMAL(precision, scale);
-	}
-	if (lower_type == "money") {
-		return LogicalType::DECIMAL(19, 4);
-	}
-	if (lower_type == "smallmoney") {
-		return LogicalType::DECIMAL(10, 4);
-	}
-
-	// Character types
-	if (lower_type == "char" || lower_type == "varchar" || lower_type == "text") {
-		return LogicalType::VARCHAR;
-	}
-	if (lower_type == "nchar" || lower_type == "nvarchar" || lower_type == "ntext") {
-		return LogicalType::VARCHAR;  // Unicode also maps to VARCHAR in DuckDB
-	}
-
-	// Date/time types
-	if (lower_type == "date") {
-		return LogicalType::DATE;
-	}
-	if (lower_type == "time") {
-		return LogicalType::TIME;
-	}
-	if (lower_type == "datetime" || lower_type == "smalldatetime") {
-		// Fixed wire precision (~3 ms for DATETIME, 1 min for SMALLDATETIME) —
-		// always fits in DuckDB's µs TIMESTAMP.
-		return LogicalType::TIMESTAMP;
-	}
-	if (lower_type == "datetime2") {
-		// Pick the narrowest DuckDB TIMESTAMP variant that can losslessly hold
-		// the column's wire precision (spec 045 — type round-trip transparency).
-		// scale 0       → TIMESTAMP_S  (seconds)
-		// scale 1-3     → TIMESTAMP_MS (milliseconds)
-		// scale 4-6     → TIMESTAMP    (microseconds — DuckDB native)
-		// scale 7       → TIMESTAMP_NS (DuckDB ns can hold 100-ns wire ticks losslessly, within
-		//                 1677-2262), or TIMESTAMP when the catalog reads datetime2(7) in
-		//                 microseconds (spec 093 D8: the whole range, the 100 ns digit truncated)
-		if (scale == 0) {
-			return LogicalType::TIMESTAMP_S;
+	for (const auto &mapping : TYPE_MAPPINGS) {
+		if (lower_type != mapping.sql_type_name) {
+			continue;
 		}
-		if (scale <= 3) {
-			return LogicalType::TIMESTAMP_MS;
+		if (!mapping.compute) {
+			return LogicalType(mapping.id);
 		}
-		if (scale <= 6 || datetime2_read == MSSQLDatetime2Read::Microseconds) {
-			return LogicalType::TIMESTAMP;
-		}
-		return LogicalType::TIMESTAMP_NS;
-	}
-	if (lower_type == "datetimeoffset") {
-		// DuckDB has no nanosecond-precision time-zone-aware type; collapse to
-		// µs TIMESTAMP_TZ regardless of source scale (lossless for ≤6, drops
-		// the trailing digit for scale 7).
-		return LogicalType::TIMESTAMP_TZ;
-	}
-
-	// Binary types
-	if (lower_type == "binary" || lower_type == "varbinary" || lower_type == "image") {
-		return LogicalType::BLOB;
-	}
-
-	// rowversion, whose type name in sys.types is the misleading `timestamp`:
-	// nothing to do with time, an 8-byte counter the server bumps on every
-	// write (issue #296). It arrives as BIGBINARY(8) — `sp_describe_first_result_set`
-	// reports tds_type_id 173, length 8, and the describe path in
-	// mssql_functions.cpp has always mapped it that way — so the binary codec
-	// decodes it with no help. Until this line it fell through to the VARCHAR
-	// default below and was therefore CAST, which SQL Server refuses outright:
-	// `[529] Explicit conversion from data type timestamp to nvarchar(max) is
-	// not allowed`, making every table with such a column unreadable. Both
-	// spellings are accepted because a user writes ROWVERSION and sys.types
-	// answers timestamp.
-	if (lower_type == "timestamp" || lower_type == "rowversion") {
-		return LogicalType::BLOB;
-	}
-
-	// The native JSON type of SQL Server 2025, reported as DuckDB's JSON (spec 093 D7): a VARCHAR
-	// by its id, so it reads as one. On the wire it is plain varchar(max) under a UTF-8 BIN2
-	// collation — `sp_describe_first_result_set` answers system_type_name `varchar(max)`, tds_type_id
-	// 167; JSONSUPPORT (0x0D) is not requested, it would change the describe only — so the bytes are
-	// already what the vector wants. A raw scan, typed by the describe, reads VARCHAR.
-	if (lower_type == "json") {
-		return LogicalType::JSON();
-	}
-
-	// vector(n) (SQL Server 2025, spec 093 D4): FLOAT[n], float16 elements widened exactly. sys.columns
-	// gives the element type in scale (0 float32, 1 float16) and 8 + n x element size in max_length (V5).
-	if (lower_type == "vector") {
-		const int element = scale == 1 ? 2 : 4;
-		const int dimensions = max_length > 8 ? (max_length - 8) / element : 1;
-		return LogicalType::ARRAY(LogicalType::FLOAT, static_cast<idx_t>(dimensions));
-	}
-
-	// Special types
-	if (lower_type == "uniqueidentifier") {
-		return LogicalType::UUID;
-	}
-	// sql_variant (spec 093 T1, D3): read bare off the wire, each value a VARIANT of its base type.
-	if (lower_type == "sql_variant") {
-		return LogicalType::VARIANT();
-	}
-
-	// Spatial types (spec 093 T5, DQ-45): read bare and decoded on the client into ISO WKB, the bytes
-	// DuckDB's GEOMETRY holds. geography is GEOMETRY('OGC:CRS84') for the whole column, whatever SRID a
-	// value carries (WGS 84, longitude first, built in: spec 093 § Why OGC:CRS84); geometry is a GEOMETRY
-	// with no CRS (a column declares no SRID). The catalog's geometry_as may make either a BLOB
-	// (MSSQLColumnInfo's constructor).
-	if (lower_type == "geography") {
-		return LogicalType::GEOMETRY("OGC:CRS84");
-	}
-	if (lower_type == "geometry") {
-		return LogicalType::GEOMETRY();
+		return mapping.compute(ColumnShape{max_length, precision, scale, datetime2_read});
 	}
 
 	// Default to VARCHAR for unknown types
@@ -507,23 +551,19 @@ bool MSSQLColumnInfo::IsKnownSQLServerType(const string &sql_type_name) {
 				   [](unsigned char c) { return std::tolower(c); });
 
 	// All types explicitly handled in MapSQLServerTypeToDuckDB
-	return lower_type == "bit" || lower_type == "tinyint" || lower_type == "smallint" || lower_type == "int" ||
-		   lower_type == "bigint" || lower_type == "real" || lower_type == "float" || lower_type == "decimal" ||
-		   lower_type == "numeric" || lower_type == "money" || lower_type == "smallmoney" || lower_type == "char" ||
-		   lower_type == "varchar" || lower_type == "text" || lower_type == "nchar" || lower_type == "nvarchar" ||
-		   lower_type == "ntext" || lower_type == "date" || lower_type == "time" || lower_type == "datetime" ||
-		   lower_type == "datetime2" || lower_type == "smalldatetime" || lower_type == "datetimeoffset" ||
-		   lower_type == "binary" || lower_type == "varbinary" || lower_type == "image" ||
-		   lower_type == "uniqueidentifier" ||
-		   // rowversion: BIGBINARY(8) on the wire, and CASTing it is not merely
-		   // wasteful but rejected by the server with error 529 (issue #296).
-		   lower_type == "timestamp" || lower_type == "rowversion" ||
-		   // The 2025 JSON type: varchar(max) with a UTF-8 collation on the wire.
-		   lower_type == "json" ||
-		   // XML has dedicated TDS-level support (0xF1) and works without CAST
-		   lower_type == "xml" ||
-		   // Spatial UDTs: read bare and decoded on the client (spec 093 T5).
-		   IsSpatialType(lower_type);
+	static const char *const KNOWN_TYPES[] = {
+		"bit", "tinyint", "smallint", "int", "bigint", "real", "float", "decimal", "numeric", "money", "smallmoney",
+		"char", "varchar", "text", "nchar", "nvarchar", "ntext", "date", "time", "datetime", "datetime2",
+		"smalldatetime", "datetimeoffset", "binary", "varbinary", "image", "uniqueidentifier",
+		// rowversion: BIGBINARY(8) on the wire, and CASTing it is not merely
+		// wasteful but rejected by the server with error 529 (issue #296).
+		"timestamp", "rowversion",
+		// The 2025 JSON type: varchar(max) with a UTF-8 collation on the wire.
+		"json",
+		// XML has dedicated TDS-level support (0xF1) and works without CAST
+		"xml"};
+	// Spatial UDTs: read bare and decoded on the client (spec 093 T5).
+	return IsOneOf(lower_type, KNOWN_TYPES) || IsSpatialType(lower_type);
 }
 
 bool MSSQLColumnInfo::IsTextType(const string &sql_type_name) {
