@@ -474,167 +474,183 @@ void ScatterDateAsDt2(POS pos, bool all_valid, idx_t row_begin, idx_t rows, cons
 	}
 }
 
+// The rows of one call and where each is written: what every kernel takes,
+// whatever the column's type.
+template <class POS>
+struct ScatterRows {
+	POS pos;
+	bool all_valid;
+	idx_t row_begin;
+	idx_t rows;
+	const UnifiedVectorFormat &fmt;
+};
+
+// A scaled time field's column constants: the direction and factor between the
+// source's unit and the target scale's tick, the half tick a narrowing rounds
+// by, the two day lengths and the field's width. Resolved once per call.
+struct TimeScale {
+	int64_t source_per_day;
+	int64_t factor;
+	int64_t half;
+	int64_t target_per_day;
+	uint8_t time_size;
+	bool upscale;
+};
+
+TimeScale TimeScaleFor(int64_t source_per_sec, uint8_t scale) {
+	const int64_t target_per_sec = Pow10(scale);
+	TimeScale result;
+	result.upscale = target_per_sec >= source_per_sec;
+	result.factor = result.upscale ? target_per_sec / source_per_sec : source_per_sec / target_per_sec;
+	result.half = result.upscale ? 0 : result.factor / 2;
+	result.source_per_day = source_per_sec * SECONDS_PER_DAY;
+	result.target_per_day = target_per_sec * SECONDS_PER_DAY;
+	result.time_size = tds::encoding::BCPRowEncoder::GetTimeByteSize(scale);
+	return result;
+}
+
+// The scaled kernels take the direction and the time field's width as template
+// parameters, so each of the six combinations is its own instantiation with
+// nothing decided in its loop. `arm` names the kernel; this picks the
+// instantiation, once per call.
+template <class ARM>
+void RunScaledArm(const TimeScale &scale, const ARM &arm) {
+	if (scale.upscale) {
+		switch (scale.time_size) {
+		case 3:
+			arm.template Run<true, 3>();
+			return;
+		case 4:
+			arm.template Run<true, 4>();
+			return;
+		default:
+			arm.template Run<true, 5>();
+			return;
+		}
+	}
+	switch (scale.time_size) {
+	case 3:
+		arm.template Run<false, 3>();
+		return;
+	case 4:
+		arm.template Run<false, 4>();
+		return;
+	default:
+		arm.template Run<false, 5>();
+		return;
+	}
+}
+
+template <class POS>
+struct TimeArm {
+	const ScatterRows<POS> &chunk;
+	const TimeScale &scale;
+
+	template <bool UPSCALE, int TIME_BYTES>
+	void Run() const {
+		if (chunk.fmt.sel->IsSet()) {
+			ScatterTime<TIME_BYTES, UPSCALE, true>(chunk.pos, chunk.all_valid, chunk.row_begin, chunk.rows, chunk.fmt,
+												   scale.factor, scale.half, scale.target_per_day);
+		} else {
+			ScatterTime<TIME_BYTES, UPSCALE, false>(chunk.pos, chunk.all_valid, chunk.row_begin, chunk.rows, chunk.fmt,
+													scale.factor, scale.half, scale.target_per_day);
+		}
+	}
+};
+
+template <class POS>
+struct DtOffsetArm {
+	const ScatterRows<POS> &chunk;
+	const TimeScale &scale;
+
+	template <bool UPSCALE, int TIME_BYTES>
+	void Run() const {
+		const uint8_t total = static_cast<uint8_t>(scale.time_size + 3 + 2);
+		if (chunk.fmt.sel->IsSet()) {
+			ScatterDtOffset<UPSCALE, TIME_BYTES, true>(chunk.pos, chunk.all_valid, chunk.row_begin, chunk.rows,
+													   chunk.fmt, scale.source_per_day, scale.factor, scale.half,
+													   scale.target_per_day, total);
+		} else {
+			ScatterDtOffset<UPSCALE, TIME_BYTES, false>(chunk.pos, chunk.all_valid, chunk.row_begin, chunk.rows,
+														chunk.fmt, scale.source_per_day, scale.factor, scale.half,
+														scale.target_per_day, total);
+		}
+	}
+};
+
+template <class POS>
+struct Dt2Arm {
+	const ScatterRows<POS> &chunk;
+	const TimeScale &scale;
+
+	template <bool UPSCALE, int TIME_BYTES>
+	void Run() const {
+		const uint8_t total = static_cast<uint8_t>(scale.time_size + 3);
+		ScatterDt2Sel<UPSCALE, TIME_BYTES>(chunk.pos, chunk.all_valid, chunk.row_begin, chunk.rows, chunk.fmt,
+										   scale.source_per_day, scale.factor, scale.half, scale.target_per_day, total);
+	}
+};
+
+template <class POS>
+void ScatterDateRows(const ScatterRows<POS> &chunk) {
+	if (chunk.fmt.sel->IsSet()) {
+		ScatterDate<true>(chunk.pos, chunk.all_valid, chunk.row_begin, chunk.rows, chunk.fmt);
+	} else {
+		ScatterDate<false>(chunk.pos, chunk.all_valid, chunk.row_begin, chunk.rows, chunk.fmt);
+	}
+}
+
+template <int TIMESIZE, class POS>
+void ScatterDateAsDt2Sel(const ScatterRows<POS> &chunk) {
+	if (chunk.fmt.sel->IsSet()) {
+		ScatterDateAsDt2<TIMESIZE, true>(chunk.pos, chunk.all_valid, chunk.row_begin, chunk.rows, chunk.fmt);
+	} else {
+		ScatterDateAsDt2<TIMESIZE, false>(chunk.pos, chunk.all_valid, chunk.row_begin, chunk.rows, chunk.fmt);
+	}
+}
+
+template <class POS>
+void ScatterDateAsDt2Rows(const ScatterRows<POS> &chunk, uint8_t time_size) {
+	if (time_size == 3) {
+		ScatterDateAsDt2Sel<3>(chunk);
+	} else if (time_size == 4) {
+		ScatterDateAsDt2Sel<4>(chunk);
+	} else {
+		ScatterDateAsDt2Sel<5>(chunk);
+	}
+}
+
 }  // namespace
 
+// One column's rows into the row buffers: the target column's type picks the
+// wire form, the source vector's type the unit its values are counted in.
 template <class POS>
 static void ScatterChunkPos(POS pos, bool all_valid, idx_t row_begin, idx_t rows, Vector &in,
 							const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col) {
-	if (col.duckdb_type.id() == LogicalTypeId::DATE) {
-		if (fmt.sel->IsSet()) {
-			ScatterDate<true>(pos, all_valid, row_begin, rows, fmt);
-		} else {
-			ScatterDate<false>(pos, all_valid, row_begin, rows, fmt);
-		}
+	const ScatterRows<POS> chunk{pos, all_valid, row_begin, rows, fmt};
+	const LogicalTypeId target = col.duckdb_type.id();
+	if (target == LogicalTypeId::DATE) {
+		ScatterDateRows(chunk);
 		return;
 	}
-
-	if (col.duckdb_type.id() == LogicalTypeId::TIME) {
+	if (target == LogicalTypeId::TIME) {
 		// dtime_t is microseconds; the target's scale decides the tick unit.
-		const int64_t target_per_sec = Pow10(col.scale);
-		const bool up = target_per_sec >= 1000000;
-		const int64_t f = up ? target_per_sec / 1000000 : 1000000 / target_per_sec;
-		const int64_t h = up ? 0 : f / 2;
-		const int64_t per_day = target_per_sec * SECONDS_PER_DAY;
-		const uint8_t tb = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
-		const bool has_sel = fmt.sel->IsSet();
-		if (tb == 3) {
-			if (up && has_sel) {
-				ScatterTime<3, true, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			} else if (up) {
-				ScatterTime<3, true, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			} else if (has_sel) {
-				ScatterTime<3, false, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			} else {
-				ScatterTime<3, false, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			}
-		} else if (tb == 4) {
-			if (up && has_sel) {
-				ScatterTime<4, true, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			} else if (up) {
-				ScatterTime<4, true, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			} else if (has_sel) {
-				ScatterTime<4, false, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			} else {
-				ScatterTime<4, false, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			}
-		} else {
-			if (up && has_sel) {
-				ScatterTime<5, true, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			} else if (up) {
-				ScatterTime<5, true, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			} else if (has_sel) {
-				ScatterTime<5, false, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			} else {
-				ScatterTime<5, false, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
-			}
-		}
+		const TimeScale scale = TimeScaleFor(1000000, col.scale);
+		RunScaledArm(scale, TimeArm<POS>{chunk, scale});
 		return;
 	}
-
 	if (in.GetType().id() == LogicalTypeId::DATE) {
 		// See ScatterDateAsDt2. Handled before TicksPerSecondFor, which has no
 		// answer for a DATE and would throw.
-		const uint8_t tsz = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
-		const bool sel_set = fmt.sel->IsSet();
-		if (tsz == 3) {
-			sel_set ? ScatterDateAsDt2<3, true>(pos, all_valid, row_begin, rows, fmt)
-					: ScatterDateAsDt2<3, false>(pos, all_valid, row_begin, rows, fmt);
-		} else if (tsz == 4) {
-			sel_set ? ScatterDateAsDt2<4, true>(pos, all_valid, row_begin, rows, fmt)
-					: ScatterDateAsDt2<4, false>(pos, all_valid, row_begin, rows, fmt);
-		} else {
-			sel_set ? ScatterDateAsDt2<5, true>(pos, all_valid, row_begin, rows, fmt)
-					: ScatterDateAsDt2<5, false>(pos, all_valid, row_begin, rows, fmt);
-		}
+		ScatterDateAsDt2Rows(chunk, tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale));
 		return;
 	}
-
-	const int64_t source_per_sec = TicksPerSecondFor(in.GetType().id());
-	const int64_t per_day = source_per_sec * SECONDS_PER_DAY;
-	const int64_t target_per_sec = Pow10(col.scale);
-	const bool upscale = target_per_sec >= source_per_sec;
-	const int64_t factor = upscale ? target_per_sec / source_per_sec : source_per_sec / target_per_sec;
-	const int64_t half = upscale ? 0 : factor / 2;
-	const int64_t per_day_target = target_per_sec * SECONDS_PER_DAY;
-	const uint8_t time_size = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
-	const uint8_t total = static_cast<uint8_t>(time_size + 3);
-
-	if (col.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ) {
-		const uint8_t dto_total = static_cast<uint8_t>(time_size + 3 + 2);
-		const bool has_sel = fmt.sel->IsSet();
-		if (time_size == 3) {
-			if (upscale && has_sel) {
-				ScatterDtOffset<true, 3, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-											   per_day_target, dto_total);
-			} else if (upscale) {
-				ScatterDtOffset<true, 3, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-												per_day_target, dto_total);
-			} else if (has_sel) {
-				ScatterDtOffset<false, 3, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-												per_day_target, dto_total);
-			} else {
-				ScatterDtOffset<false, 3, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-												 per_day_target, dto_total);
-			}
-		} else if (time_size == 4) {
-			if (upscale && has_sel) {
-				ScatterDtOffset<true, 4, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-											   per_day_target, dto_total);
-			} else if (upscale) {
-				ScatterDtOffset<true, 4, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-												per_day_target, dto_total);
-			} else if (has_sel) {
-				ScatterDtOffset<false, 4, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-												per_day_target, dto_total);
-			} else {
-				ScatterDtOffset<false, 4, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-												 per_day_target, dto_total);
-			}
-		} else {
-			if (upscale && has_sel) {
-				ScatterDtOffset<true, 5, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-											   per_day_target, dto_total);
-			} else if (upscale) {
-				ScatterDtOffset<true, 5, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-												per_day_target, dto_total);
-			} else if (has_sel) {
-				ScatterDtOffset<false, 5, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-												per_day_target, dto_total);
-			} else {
-				ScatterDtOffset<false, 5, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
-												 per_day_target, dto_total);
-			}
-		}
+	const TimeScale scale = TimeScaleFor(TicksPerSecondFor(in.GetType().id()), col.scale);
+	if (target == LogicalTypeId::TIMESTAMP_TZ) {
+		RunScaledArm(scale, DtOffsetArm<POS>{chunk, scale});
 		return;
 	}
-
-#define MSSQL_DT2_ARM(up, tb) \
-	ScatterDt2Sel<up, tb>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half, per_day_target, total)
-	if (upscale) {
-		switch (time_size) {
-		case 3:
-			MSSQL_DT2_ARM(true, 3);
-			return;
-		case 4:
-			MSSQL_DT2_ARM(true, 4);
-			return;
-		default:
-			MSSQL_DT2_ARM(true, 5);
-			return;
-		}
-	}
-	switch (time_size) {
-	case 3:
-		MSSQL_DT2_ARM(false, 3);
-		return;
-	case 4:
-		MSSQL_DT2_ARM(false, 4);
-		return;
-	default:
-		MSSQL_DT2_ARM(false, 5);
-		return;
-	}
-#undef MSSQL_DT2_ARM
+	RunScaledArm(scale, Dt2Arm<POS>{chunk, scale});
 }
 
 // Issue #447: a value the server cannot hold is refused by the encoders,
@@ -758,7 +774,7 @@ static size_t FixedTemporalReadLen(const tds::ColumnMetadata &col) {
 // issue-#89 string fallback -- did not, using `size` solely to tell DATETIMEN's
 // 4 bytes from its 8. A server-declared 1-byte DATE therefore reached
 // ConvertDate, which reads three bytes whatever it is handed, for a read a few
-// bytes past the value buffer. RowReader::ReadDateType does not catch it either:
+// bytes past the value buffer. RowReader's ReadBytePrefixed does not catch it either:
 // it checks that the declared length is BUFFERED, not that it is the type's
 // width. Found by the q2 query in joern/ ("byte-buffer method that indexes
 // without comparing anything"), which flagged every one of these kernels; the
@@ -845,16 +861,12 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 // DecodeChunkFromStaging — one kernel per column, no dispatch in the row loop
 //===----------------------------------------------------------------------===//
 
-void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col,
-							Vector &out) {
-	const uint8_t *const base = st.buffer.data();
-	const uint32_t stride = st.stride;
-
-	// Each row is read as `base + row * stride`, but the kernels below read a
-	// type-fixed number of bytes; if the staged stride is narrower than that the
-	// last row over-reads the buffer. A conforming stream never stages such a
-	// stride (ResolveAppend sizes it from FixedWireWidth), so this catches a
-	// corrupt one once per chunk rather than per row.
+// Each row is read as `base + row * stride`, but the kernels below read a
+// type-fixed number of bytes; if the staged stride is narrower than that the
+// last row over-reads the buffer. A conforming stream never stages such a
+// stride (ResolveAppend sizes it from FixedWireWidth), so this catches a
+// corrupt one once per chunk rather than per row.
+static void RequireStagedTemporalWidth(uint32_t stride, const tds::ColumnMetadata &col) {
 	const size_t need = FixedTemporalReadLen(col);
 	if (need != 0 && stride < need) {
 		throw InvalidInputException(
@@ -862,78 +874,86 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 			"0x%02X). The TDS stream is malformed.",
 			stride, need, col.type_id);
 	}
+}
+
+// The loop of every temporal kernel that is total: each row's bytes through
+// `convert` into its slot, NULL rows included (their slot is not read).
+// `convert` is a template parameter so the loop holds the call itself.
+template <class T, class CONVERT>
+static void DecodeStagedRows(const staging::ColumnStaging &st, idx_t count, Vector &out, CONVERT convert) {
+	const uint8_t *const base = st.buffer.data();
+	const uint32_t stride = st.stride;
+	T *result = FlatVector::GetDataMutable<T>(out);
+	for (idx_t row = 0; row < count; row++) {
+		result[row] = convert(base + row * stride);
+	}
+}
+
+// The one temporal kernel that is not total: a datetime2 beyond the
+// target variant's range becomes SQL NULL (issue #168), so this loop has
+// to know which rows carry real values rather than a stale slot.
+static void DecodeStagedDatetime2(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col,
+								  Vector &out) {
+	const uint8_t *const base = st.buffer.data();
+	const uint32_t stride = st.stride;
+	timestamp_t *result = FlatVector::GetDataMutable<timestamp_t>(out);
+	const size_t time_len = Datetime2TimeByteLen(col.scale);
+	const LogicalTypeId target = out.GetType().id();
+	for (idx_t row = 0; row < count; row++) {
+		if (!st.IsValid(row)) {
+			continue;
+		}
+		int64_t native;
+		if (!Datetime2WireToNativeUnit(base + row * stride, time_len, col.scale, target, native)) {
+			FlatVector::SetNull(out, row, true);
+			continue;
+		}
+		result[row] = timestamp_t(native);
+	}
+}
+
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col,
+							Vector &out) {
+	using tds::encoding::DateTimeEncoding;
+	RequireStagedTemporalWidth(st.stride, col);
+	const uint8_t scale = col.scale;
 
 	switch (col.type_id) {
-	case TDS_TYPE_DATE: {
-		date_t *result = FlatVector::GetDataMutable<date_t>(out);
-		for (idx_t row = 0; row < count; row++) {
-			result[row] = tds::encoding::DateTimeEncoding::ConvertDate(base + row * stride);
-		}
+	case TDS_TYPE_DATE:
+		DecodeStagedRows<date_t>(st, count, out,
+								 [](const uint8_t *data) { return DateTimeEncoding::ConvertDate(data); });
 		return;
-	}
-	case TDS_TYPE_TIME: {
-		dtime_t *result = FlatVector::GetDataMutable<dtime_t>(out);
-		for (idx_t row = 0; row < count; row++) {
-			result[row] = tds::encoding::DateTimeEncoding::ConvertTime(base + row * stride, col.scale);
-		}
+	case TDS_TYPE_TIME:
+		DecodeStagedRows<dtime_t>(st, count, out,
+								  [scale](const uint8_t *data) { return DateTimeEncoding::ConvertTime(data, scale); });
 		return;
-	}
-	case TDS_TYPE_DATETIME: {
-		timestamp_t *result = FlatVector::GetDataMutable<timestamp_t>(out);
-		for (idx_t row = 0; row < count; row++) {
-			result[row] = tds::encoding::DateTimeEncoding::ConvertDatetime(base + row * stride);
-		}
+	case TDS_TYPE_DATETIME:
+		DecodeStagedRows<timestamp_t>(st, count, out,
+									  [](const uint8_t *data) { return DateTimeEncoding::ConvertDatetime(data); });
 		return;
-	}
-	case TDS_TYPE_SMALLDATETIME: {
-		timestamp_t *result = FlatVector::GetDataMutable<timestamp_t>(out);
-		for (idx_t row = 0; row < count; row++) {
-			result[row] = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(base + row * stride);
-		}
+	case TDS_TYPE_SMALLDATETIME:
+		DecodeStagedRows<timestamp_t>(st, count, out,
+									  [](const uint8_t *data) { return DateTimeEncoding::ConvertSmallDatetime(data); });
 		return;
-	}
-	case TDS_TYPE_DATETIMEN: {
+	case TDS_TYPE_DATETIMEN:
 		// Length-dispatched in the per-value path, but the width is a property of
 		// the COLUMN, so the choice is made once here instead of per value.
-		timestamp_t *result = FlatVector::GetDataMutable<timestamp_t>(out);
-		if (stride == 8) {
-			for (idx_t row = 0; row < count; row++) {
-				result[row] = tds::encoding::DateTimeEncoding::ConvertDatetime(base + row * stride);
-			}
+		if (st.stride == 8) {
+			DecodeStagedRows<timestamp_t>(st, count, out,
+										  [](const uint8_t *data) { return DateTimeEncoding::ConvertDatetime(data); });
 		} else {
-			for (idx_t row = 0; row < count; row++) {
-				result[row] = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(base + row * stride);
-			}
+			DecodeStagedRows<timestamp_t>(
+				st, count, out, [](const uint8_t *data) { return DateTimeEncoding::ConvertSmallDatetime(data); });
 		}
 		return;
-	}
-	case TDS_TYPE_DATETIME2: {
-		// The one temporal kernel that is not total: a datetime2 beyond the
-		// target variant's range becomes SQL NULL (issue #168), so this loop has
-		// to know which rows carry real values rather than a stale slot.
-		timestamp_t *result = FlatVector::GetDataMutable<timestamp_t>(out);
-		const size_t time_len = Datetime2TimeByteLen(col.scale);
-		const LogicalTypeId target = out.GetType().id();
-		for (idx_t row = 0; row < count; row++) {
-			if (!st.IsValid(row)) {
-				continue;
-			}
-			int64_t native;
-			if (!Datetime2WireToNativeUnit(base + row * stride, time_len, col.scale, target, native)) {
-				FlatVector::SetNull(out, row, true);
-				continue;
-			}
-			result[row] = timestamp_t(native);
-		}
+	case TDS_TYPE_DATETIME2:
+		DecodeStagedDatetime2(st, count, col, out);
 		return;
-	}
-	case TDS_TYPE_DATETIMEOFFSET: {
-		timestamp_t *result = FlatVector::GetDataMutable<timestamp_t>(out);
-		for (idx_t row = 0; row < count; row++) {
-			result[row] = tds::encoding::DateTimeEncoding::ConvertDatetimeOffset(base + row * stride, col.scale);
-		}
+	case TDS_TYPE_DATETIMEOFFSET:
+		DecodeStagedRows<timestamp_t>(st, count, out, [scale](const uint8_t *data) {
+			return DateTimeEncoding::ConvertDatetimeOffset(data, scale);
+		});
 		return;
-	}
 	default:
 		throw InvalidInputException("codec::datetime::DecodeChunkFromStaging: unexpected TDS type 0x%02X", col.type_id);
 	}

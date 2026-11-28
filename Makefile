@@ -35,7 +35,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-backup-xpress bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay fuzz-backup-replay test-backup-golden backup-oracle-build check-credential-logging leak-check help
+.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-backup-xpress bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-reader-values test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay fuzz-backup-replay test-backup-golden backup-oracle-build check-credential-logging leak-check help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -531,6 +531,25 @@ test-skip-form-equivalence: debug
 	    -o build/test/test_skip_form_equivalence
 	@echo ""
 	build/test/test_skip_form_equivalence
+
+# RowReader's per-value readers (review of #648): ReadValue / ReadValueNBC read a value in the bytes
+# the skip walks skip it in, for every TDS type, and the two row forms differ only where they should
+# (a 1-byte length of 0, a ROW's GUID). TDS-only: no libduckdb.
+test-row-reader-values: debug
+	@echo "Building RowReader value-reader unit test (review of #648)..."
+	@mkdir -p build/test
+	@if [ -z "$(LOGIN7_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(LOGIN7_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(LOGIN7_TEST_FLAGS) $(LOGIN7_TEST_INCLUDES) \
+	    test/cpp/test_row_reader_values.cpp \
+	    src/tds/tds_row_reader.cpp src/tds/tds_column_metadata.cpp \
+	    src/tds/tds_types.cpp src/tds/tds_token_parser.cpp src/tds/encoding/utf16.cpp \
+	    $(LOGIN7_TEST_LIBS) \
+	    -o build/test/test_row_reader_values
+	@echo ""
+	build/test/test_row_reader_values
 
 # Spec 053 (#161): lazy GSSAPI/krb5 runtime loader unit test.
 # Pure in-memory — does NOT need SQL Server or a KDC. On Linux it links only
@@ -1459,6 +1478,7 @@ test-backup-golden:
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 60 $(PROJ_DIR)test/data/backup/tail_window
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 $(PROJ_DIR)test/data/backup/variant
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 $(PROJ_DIR)test/data/backup/sparse
+	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 $(PROJ_DIR)test/data/backup/datetime2
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 $(PROJ_DIR)test/data/backup/vector
 # Spec 085 PR 2a: the release build the backup oracle lane tests with -- httpfs linked in
 # statically (test/backup/httpfs_extension_config.cmake, at the duckdb pin's own httpfs commit), so

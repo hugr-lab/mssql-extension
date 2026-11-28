@@ -303,6 +303,10 @@ public:
 	 * is legal.
 	 */
 	static ExpressionEncodeResult EncodeSearchCondition(const Expression &expr, const ExpressionEncodeContext &ctx);
+	//! A value to assign (issue #636: a staged MERGE's SET and INSERT values): EncodeExpression, but a search condition
+	//! -- `t.n < 0`, `t.n IS NULL`, `a AND b` -- written as the bit value DuckDB gives it
+	//! (ExpressionVocabulary::AsValue), where T-SQL refuses a predicate (102 / 156).
+	static ExpressionEncodeResult EncodeValue(const Expression &expr, const ExpressionEncodeContext &ctx);
 
 private:
 	//--------------------------------------------------------------------------

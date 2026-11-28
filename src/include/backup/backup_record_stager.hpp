@@ -187,11 +187,15 @@ public:
 	//! statement.
 	struct TypeNote {
 		std::string name;
-		std::string type;  // geometry / geography / hierarchyid / sql_variant / vector
+		std::string type;  // geometry / geography / hierarchyid / sql_variant / datetime2(7) / vector
 		codec::spatial::SpatialColumnNotes spatial;
 		codec::hierarchyid::HierarchyIdColumnNotes hierarchyid;
 		codec::variant::VariantColumnNotes variant;
 		codec::sql_vector::VectorColumnNotes vector;
+		//! Spec 093 T8c: datetime2(7) values read as NULL for not fitting TIMESTAMP_NS (1677-2262), as TYPE
+		//! mssql's D8 counts them; their rows read. Not Unreadable(): the value is sound, its type is the
+		//! choice (datetime2_7_as 'timestamp' reads it).
+		idx_t out_of_range = 0;
 		//! Values the column's kernel read as NULL, its rows read.
 		idx_t Unreadable() const {
 			return spatial.malformed + hierarchyid.malformed + variant.malformed + vector.malformed;
@@ -217,6 +221,9 @@ private:
 		codec::hierarchyid::HierarchyIdColumnNotes hierarchyid_notes;  // the HierarchyId kernel's, across chunks
 		codec::variant::VariantColumnNotes variant_notes;			   // the Variant kernel's, across chunks
 		codec::sql_vector::VectorColumnNotes vector_notes;			   // the Vector kernel's, across chunks
+		//! A datetime2 read as TIMESTAMP_NS (spec 093 T8c): its values that did not fit, across chunks.
+		bool counts_out_of_range = false;
+		idx_t out_of_range = 0;
 	};
 
 	//! The constructor's steps: a projected column resolved to its staging (its arm chosen by ArmOf and

@@ -53,7 +53,7 @@ virtual_column_map_t ScanVirtualColumns(const std::vector<UnreadColumn> &unread)
 TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &entry,
 								   std::shared_ptr<const AttachedBackup> attached, const std::string &key,
 								   const std::string &schema, const std::string &table, const std::string &fuzzy,
-								   const std::string &geometry_as, unique_ptr<FunctionData> &bind_data);
+								   const TypeFormOptions &form_options, unique_ptr<FunctionData> &bind_data);
 
 void RegisterBackupScanFunction(ExtensionLoader &loader);
 

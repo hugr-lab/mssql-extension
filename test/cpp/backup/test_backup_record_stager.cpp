@@ -800,6 +800,53 @@ int main() {
 			  }).find("dbo.more.n_odd holds 3 bytes, not a whole number of UTF-16 units") != std::string::npos,
 			  "an odd UTF-16 length is refused naming the column");
 	}
+	// Spec 093 T8c: a datetime2(7) outside TIMESTAMP_NS's range is NULL and counted for the scan's WARNING (as
+	// TYPE mssql's D8), a NULL is not counted; under datetime2_7_as 'timestamp' it is read, nothing counted.
+	{
+		CatalogTable t;
+		t.schema_name = "dbo";
+		t.name = "periods";
+		t.columns = {Col(1, "valid_to", XTYPE_DATETIME2, "datetime2", 8, 27, 7)};
+		RowsetLayout layout;
+		layout.table = "periods";
+		layout.rowset_id = 3;
+		layout.columns = {Phys(1, XTYPE_DATETIME2, 4, 1, 0, 0, 7)};
+		std::vector<uint8_t> inside;
+		Put(inside, 1234567, 5);  // 0.1234567 s
+		Put(inside, static_cast<uint64_t>(Days0001(2026, 1, 1)), 3);
+		std::vector<uint8_t> end_of_time;
+		Put(end_of_time, 863999999999ull, 5);  // 23:59:59.9999999
+		Put(end_of_time, static_cast<uint64_t>(Days0001(9999, 12, 31)), 3);
+		const Page page = PageOf({Record(inside, 1, 0, {}), Record(end_of_time, 1, 0, {}), Record(inside, 1, 1, {})});
+		auto read = [&](const TypeForms &forms, DataChunk &chunk) {
+			RecordStager stager(t, {1}, forms);
+			stager.UseLayout(layout);
+			chunk.Initialize(Allocator::DefaultAllocator(), stager.Types());
+			stager.BeginChunk(chunk);
+			for (uint16_t s = 0; s < 3; s++) {
+				stager.Append(ReadSlot(page.bytes.data(), PAGE_SIZE, 3, s, "the test"));
+			}
+			stager.FinalizeChunk(chunk);
+			return stager.TypeNotes();
+		};
+		DataChunk ns;
+		const auto ns_notes = read(TypeForms(), ns);
+		Check(ns.data[0].GetType().id() == LogicalTypeId::TIMESTAMP_NS &&
+				  ns.GetValue(0, 0).ToString() == "2026-01-01 00:00:00.1234567" && ns.GetValue(0, 1).IsNull() &&
+				  ns.GetValue(0, 2).IsNull() && ns_notes.size() == 1 && ns_notes[0].type == "datetime2(7)" &&
+				  ns_notes[0].out_of_range == 1 && ns_notes[0].Unreadable() == 0,
+			  "datetime2(7) as TIMESTAMP_NS: 9999-12-31 NULL and counted once, a NULL not counted");
+		TypeForms microseconds;
+		microseconds.datetime2_read = MSSQLDatetime2Read::Microseconds;
+		DataChunk us;
+		const auto us_notes = read(microseconds, us);
+		Check(us.data[0].GetType().id() == LogicalTypeId::TIMESTAMP &&
+				  us.GetValue(0, 0).ToString() == "2026-01-01 00:00:00.123456" &&
+				  us.GetValue(0, 1).ToString() == "9999-12-31 23:59:59.999999" && us.GetValue(0, 2).IsNull() &&
+				  us_notes.empty(),
+			  "datetime2_7_as 'timestamp': TIMESTAMP, 9999-12-31 read with its 100 ns digit truncated: " +
+				  us.GetValue(0, 1).ToString());
+	}
 
 	// The double-byte pages, decoded on the client like any other: a backup has no server to convert
 	// them (where the TDS path keeps the server's cast for them, only because it is faster there).

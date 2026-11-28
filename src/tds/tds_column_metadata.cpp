@@ -354,10 +354,13 @@ void CheckVector(const ColumnMetadata &column) {
 				  "vector element type " + std::to_string(column.vector_element_type) + " (0 float32, 1 float16).");
 	}
 	const uint16_t element = VectorElementBytes(column.vector_element_type);
+	// #644: the limit is the element type's -- a float16 vector holds up to 3996 dimensions.
+	const uint16_t max_dimensions = VectorMaxDimensions(column.vector_element_type);
 	if (column.max_length <= VECTOR_HEADER_BYTES || (column.max_length - VECTOR_HEADER_BYTES) % element != 0 ||
-		(column.max_length - VECTOR_HEADER_BYTES) / element > VECTOR_MAX_DIMENSIONS) {
-		Malformed(column, "a vector's maximum length as " + std::to_string(column.max_length) +
-							  " bytes, which no vector(1..1998) has.");
+		(column.max_length - VECTOR_HEADER_BYTES) / element > max_dimensions) {
+		Malformed(column, "a vector's maximum length as " + std::to_string(column.max_length) + " bytes, which no " +
+							  (column.vector_element_type == VECTOR_ELEMENT_FLOAT16 ? "float16" : "float32") +
+							  " vector(1.." + std::to_string(max_dimensions) + ") has.");
 	}
 }
 

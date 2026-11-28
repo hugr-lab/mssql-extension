@@ -52,7 +52,7 @@ def tsql_ident(s):
 
 
 class Session:
-    def __init__(self, binary, port, password, database, geometry_as=""):
+    def __init__(self, binary, port, password, database, geometry_as="", datetime2_7_as=""):
         self.binary = binary
         self.password = password
         dsn = (f"Server=localhost,{port};Database={database};User Id=sa;Password={password};"
@@ -61,7 +61,8 @@ class Session:
         self.preamble = (".output /dev/null\n"
                          "SET enable_logging = false;\n"
                          f"ATTACH {sql_string(dsn)} AS srv (TYPE mssql, native_types false"
-                         f"{', geometry_as ' + sql_string(geometry_as) if geometry_as else ''});\n"
+                         f"{', geometry_as ' + sql_string(geometry_as) if geometry_as else ''}"
+                         f"{', datetime2_7_as ' + sql_string(datetime2_7_as) if datetime2_7_as else ''});\n"
                          ".output\n")
 
     def mask(self, text):
@@ -170,6 +171,9 @@ def main():
     parser.add_argument("--geometry-as", default="",
                         help="read geometry / geography as this on both sides (spec 093 T8: 'native' compares the "
                              "stored bytes, the curves included, with the server's own)")
+    parser.add_argument("--datetime2-7-as", default="",
+                        help="read datetime2(7) as this on both sides (spec 093 T8c: 'timestamp' compares the values "
+                             "TIMESTAMP_NS cannot hold, NULL on both under the default)")
     parser.add_argument("--fuzzy", action="store_true",
                         help="a backup taken under load: check each table's fuzzy_status against whether it differs")
     parser.add_argument("--flagged-equal", default="",
@@ -177,7 +181,7 @@ def main():
     args = parser.parse_args()
     try:
         session = Session(args.duckdb, os.environ["MSSQL_ROWS_PORT"], os.environ["MSSQL_ROWS_PASSWORD"],
-                          os.environ["MSSQL_ROWS_DATABASE"], args.geometry_as)
+                          os.environ["MSSQL_ROWS_DATABASE"], args.geometry_as, args.datetime2_7_as)
     except KeyError as e:
         sys.exit(f"compare_rows: set {e.args[0]}")
     files = [f for f in args.backup.split(",") if f]
@@ -189,6 +193,8 @@ def main():
     scan_opts = opts + (", fuzzy := 'ignore'" if args.fuzzy else "")
     if args.geometry_as:
         scan_opts += f", geometry_as := {sql_string(args.geometry_as)}"
+    if args.datetime2_7_as:
+        scan_opts += f", datetime2_7_as := {sql_string(args.datetime2_7_as)}"
 
     if args.log:
         sys.exit(compare_log(session, args, paths))

@@ -8,8 +8,9 @@
 // at 24 bytes the first byte tells row-overflow (2) from an in-row root of one link (4):
 //   - 24 bytes of kind 2, row-overflow: the value's length at +12 and the RID of one DATA fragment at
 //     +16, on the rowset's ROW_OVERFLOW_DATA unit;
-//   - 12 + 12n bytes of kind 4 (or 5), an in-row root: byte 2 its level, then n 12-byte links (u32
-//     cumulative size, u32 page, u16 file, u16 slot), on the LOB_DATA unit;
+//   - 12 + 12n bytes of kind 4, an in-row root: byte 2 its level, then n 12-byte links (u32
+//     cumulative size, u32 page, u16 file, u16 slot), on the LOB_DATA unit. Kind 5 is the sparse
+//     vector's tag (E24), refused as a value;
 //   - 16 bytes, a pointer to a root record (u64 blob id, u32 page, u16 file, u16 slot), on the LOB_DATA
 //     unit: text / ntext / image with text in row off, and MAX columns written under `large value types
 //     out of row`.

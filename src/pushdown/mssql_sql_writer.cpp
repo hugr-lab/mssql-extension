@@ -160,24 +160,38 @@ void CountRemotePushdown() {
 	}
 }
 
-bool SQLWriter::PushesMoreThanScan(const QueryNode &node, const QualificationProbe *probe) {
+namespace {
+
+// LIMIT 0: DuckDB plans an empty result and asks the server nothing,
+// where a vehicle would cost a describe and an execution. DuckLake's
+// attach probes every inlined-data table with one in a UNION ALL, and a
+// thousand of them were seconds pushed (#406 bench).
+bool IsLimitZero(const ResultModifier &modifier) {
+	if (modifier.type != ResultModifierType::LIMIT_MODIFIER) {
+		return false;
+	}
+	auto &limit = modifier.Cast<LimitModifier>();
+	if (limit.limit_type != LimitValueType::ROW_COUNT || !limit.limit ||
+		limit.limit->GetExpressionClass() != ExpressionClass::CONSTANT) {
+		return false;
+	}
+	int64_t rows;
+	const auto &literal = limit.limit->Cast<ConstantExpression>().GetLiteral();
+	return literal.kind == LiteralKind::INTEGER && literal.TryGetInt64(rows) && rows == 0;
+}
+
+bool HasLimitZero(const QueryNode &node) {
 	for (auto &modifier : node.modifiers) {
-		// LIMIT 0: DuckDB plans an empty result and asks the server nothing,
-		// where a vehicle would cost a describe and an execution. DuckLake's
-		// attach probes every inlined-data table with one in a UNION ALL, and a
-		// thousand of them were seconds pushed (#406 bench).
-		if (modifier->type == ResultModifierType::LIMIT_MODIFIER) {
-			auto &limit = modifier->Cast<LimitModifier>();
-			if (limit.limit_type == LimitValueType::ROW_COUNT && limit.limit &&
-				limit.limit->GetExpressionClass() == ExpressionClass::CONSTANT) {
-				int64_t rows;
-				const auto &literal = limit.limit->Cast<ConstantExpression>().GetLiteral();
-				if (literal.kind == LiteralKind::INTEGER && literal.TryGetInt64(rows) && rows == 0) {
-					return false;
-				}
-			}
+		if (IsLimitZero(*modifier)) {
+			return true;
 		}
 	}
+	return false;
+}
+
+// ORDER BY, LIMIT / OFFSET, DISTINCT: fewer rows than the table's, or its
+// first N.
+bool HasGainingModifier(const QueryNode &node) {
 	for (auto &modifier : node.modifiers) {
 		if (modifier->type == ResultModifierType::ORDER_MODIFIER ||
 			modifier->type == ResultModifierType::LIMIT_MODIFIER ||
@@ -185,77 +199,76 @@ bool SQLWriter::PushesMoreThanScan(const QueryNode &node, const QualificationPro
 			return true;
 		}
 	}
-	if (node.type == QueryNodeType::SET_OPERATION_NODE) {
-		// UNION / EXCEPT / INTERSECT compare rows there, not here; a UNION ALL
-		// gains what its children do (DuckDB pushes a filter into each).
-		auto &setop = node.Cast<SetOperationNode>();
-		if (!(setop.setop_type == SetOperationType::UNION && setop.setop_all)) {
+	return false;
+}
+
+// UNION / EXCEPT / INTERSECT compare rows there, not here; a UNION ALL
+// gains what its children do (DuckDB pushes a filter into each).
+bool SetOperationGains(const SetOperationNode &setop, const SQLWriter::QualificationProbe *probe) {
+	if (!(setop.setop_type == SetOperationType::UNION && setop.setop_all)) {
+		return true;
+	}
+	for (auto &child : setop.children) {
+		if (SQLWriter::PushesMoreThanScan(*child, probe)) {
 			return true;
 		}
-		for (auto &child : setop.children) {
-			if (PushesMoreThanScan(*child, probe)) {
-				return true;
-			}
-		}
+	}
+	return false;
+}
+
+// A filter over a derived table's window (`WHERE rn = 1` around
+// row_number()): the scan path cannot push it into the scan.
+bool FiltersDerivedWindow(const SelectNode &select) {
+	if (!select.where_clause || !select.from_table || select.from_table->type != TableReferenceType::SUBQUERY) {
 		return false;
 	}
-	if (node.type != QueryNodeType::SELECT_NODE) {
+	auto &inner = *select.from_table->Cast<SubqueryRef>().subquery->node;
+	if (inner.type != QueryNodeType::SELECT_NODE) {
 		return false;
 	}
-	auto &select = node.Cast<SelectNode>();
-	// QUALIFY drops rows after a window the scan path computes here (PR E2).
-	if (select.qualify) {
-		return true;
-	}
-	// A filter over a derived table's window (`WHERE rn = 1` around
-	// row_number()): the scan path cannot push it into the scan.
-	if (select.where_clause && select.from_table && select.from_table->type == TableReferenceType::SUBQUERY) {
-		auto &inner = *select.from_table->Cast<SubqueryRef>().subquery->node;
-		if (inner.type == QueryNodeType::SELECT_NODE) {
-			for (auto &item : inner.Cast<SelectNode>().select_list) {
-				if (item->IsWindow()) {
-					return true;
-				}
-			}
+	for (auto &item : inner.Cast<SelectNode>().select_list) {
+		if (item->IsWindow()) {
+			return true;
 		}
 	}
-	// A subquery in FROM that gains (its aggregate, its TOP) gains for the
-	// node around it too: pushed whole, rather than handed back with the part.
-	std::function<bool(const TableRef &)> from_gains = [&](const TableRef &ref) -> bool {
-		if (ref.type == TableReferenceType::SUBQUERY) {
-			return PushesMoreThanScan(*ref.Cast<SubqueryRef>().subquery->node, probe);
+	return false;
+}
+
+// A reference to one of the node's CTEs: its body's gain.
+bool CteReferenceGains(const BaseTableRef &base, const SelectNode &select, const SQLWriter::QualificationProbe *probe) {
+	auto &name = base.GetQualifiedName();
+	const bool unqualified = probe && *probe ? (*probe)(base) : name.Catalog().empty() && name.Schema().empty();
+	for (auto &cte : select.cte_map.map) {
+		if (unqualified && StringUtil::CIEquals(cte.first.GetIdentifierName(), name.Name().GetIdentifierName()) &&
+			cte.second->query_node) {
+			return SQLWriter::PushesMoreThanScan(*cte.second->query_node, probe);
 		}
-		if (ref.type == TableReferenceType::BASE_TABLE) {
-			// A reference to one of the node's CTEs: its body's gain.
-			auto &base = ref.Cast<BaseTableRef>();
-			auto &name = base.GetQualifiedName();
-			const bool unqualified = probe && *probe ? (*probe)(base) : name.Catalog().empty() && name.Schema().empty();
-			for (auto &cte : select.cte_map.map) {
-				if (unqualified &&
-					StringUtil::CIEquals(cte.first.GetIdentifierName(), name.Name().GetIdentifierName()) &&
-					cte.second->query_node) {
-					return PushesMoreThanScan(*cte.second->query_node, probe);
-				}
-			}
-		}
-		if (ref.type == TableReferenceType::JOIN) {
-			return from_gains(*ref.Cast<JoinRef>().left) || from_gains(*ref.Cast<JoinRef>().right);
-		}
-		return false;
-	};
-	if (select.from_table && from_gains(*select.from_table)) {
-		return true;
 	}
-	// A subquery in an expression: the server filters (IN / EXISTS) or looks
-	// up (a scalar subquery), where the scan path would read both tables and
-	// join them here.
-	if (HasSubqueryExpression(select)) {
-		return true;
+	return false;
+}
+
+// A subquery in FROM that gains (its aggregate, its TOP) gains for the
+// node around it too: pushed whole, rather than handed back with the part.
+bool FromGains(const TableRef &ref, const SelectNode &select, const SQLWriter::QualificationProbe *probe) {
+	if (ref.type == TableReferenceType::SUBQUERY) {
+		return SQLWriter::PushesMoreThanScan(*ref.Cast<SubqueryRef>().subquery->node, probe);
 	}
-	// A join with conditions: the server matches the rows, where the scans
-	// would each send their whole (filtered) table. A CROSS JOIN anywhere in
-	// the chain -- a comma join included -- can send the product, more rather
-	// than less, so it is a gain only with one of the others below.
+	if (ref.type == TableReferenceType::BASE_TABLE) {
+		return CteReferenceGains(ref.Cast<BaseTableRef>(), select, probe);
+	}
+	if (ref.type == TableReferenceType::JOIN) {
+		auto &join = ref.Cast<JoinRef>();
+		return FromGains(*join.left, select, probe) || FromGains(*join.right, select, probe);
+	}
+	return false;
+}
+
+// A join with conditions: the server matches the rows, where the scans
+// would each send their whole (filtered) table. A CROSS JOIN anywhere in
+// the chain -- a comma join included -- can send the product, more rather
+// than less, so it is a gain only with one of the others the node is asked
+// about.
+bool JoinsWithoutCross(const SelectNode &select) {
 	bool joined = false;
 	bool crossed = false;
 	for (auto ref = select.from_table.get(); ref && ref->type == TableReferenceType::JOIN;
@@ -263,9 +276,11 @@ bool SQLWriter::PushesMoreThanScan(const QueryNode &node, const QualificationPro
 		joined = true;
 		crossed = crossed || ref->Cast<JoinRef>().ref_type == JoinRefType::CROSS;
 	}
-	if (joined && !crossed) {
-		return true;
-	}
+	return joined && !crossed;
+}
+
+// GROUP BY / HAVING, or an aggregate in the select list: one row a group.
+bool GroupsOrAggregates(const SelectNode &select) {
 	if (!select.groups.group_expressions.empty() || !select.groups.grouping_sets.empty() || select.having ||
 		select.aggregate_handling != AggregateHandling::STANDARD_HANDLING) {
 		return true;
@@ -276,6 +291,44 @@ bool SQLWriter::PushesMoreThanScan(const QueryNode &node, const QualificationPro
 		}
 	}
 	return false;
+}
+
+bool SelectGains(const SelectNode &select, const SQLWriter::QualificationProbe *probe) {
+	// QUALIFY drops rows after a window the scan path computes here (PR E2).
+	if (select.qualify) {
+		return true;
+	}
+	if (FiltersDerivedWindow(select)) {
+		return true;
+	}
+	if (select.from_table && FromGains(*select.from_table, select, probe)) {
+		return true;
+	}
+	// A subquery in an expression: the server filters (IN / EXISTS) or looks
+	// up (a scalar subquery), where the scan path would read both tables and
+	// join them here.
+	if (HasSubqueryExpression(select)) {
+		return true;
+	}
+	return JoinsWithoutCross(select) || GroupsOrAggregates(select);
+}
+
+}  // namespace
+
+bool SQLWriter::PushesMoreThanScan(const QueryNode &node, const QualificationProbe *probe) {
+	if (HasLimitZero(node)) {
+		return false;
+	}
+	if (HasGainingModifier(node)) {
+		return true;
+	}
+	if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+		return SetOperationGains(node.Cast<SetOperationNode>(), probe);
+	}
+	if (node.type != QueryNodeType::SELECT_NODE) {
+		return false;
+	}
+	return SelectGains(node.Cast<SelectNode>(), probe);
 }
 
 }  // namespace mssql

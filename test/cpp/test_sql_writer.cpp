@@ -1033,6 +1033,19 @@ int main() {
 	ExpectVeto("SELECT ratio * ratio AS r FROM t LIMIT 1");
 	ExpectVeto("SELECT ratio % 2 FROM t LIMIT 1");
 	ExpectVeto("SELECT ratio + amount FROM t LIMIT 1");
+	// Issue #662: a string constant in arithmetic beside a COMPUTED string. The
+	// rewriter asks about the parsed statement before the binder refuses it
+	// (`-(STRING_LITERAL, VARCHAR)` is no function), and the constant was bound
+	// against a column the COALESCE / CASE result does not have: a null
+	// dereference, the process gone. Each is a veto, so DuckDB reports its error.
+	ExpectVeto("SELECT '12' - coalesce(name, 'x') FROM t LIMIT 1");
+	ExpectVeto("SELECT '12' + coalesce(name, 'x') FROM t LIMIT 1");
+	ExpectVeto("SELECT coalesce(name, 'x') * '2' FROM t LIMIT 1");
+	ExpectVeto("SELECT id FROM t WHERE coalesce(name, 'x') - '1' = 1 LIMIT 1");
+	ExpectVeto("SELECT '12' - CASE WHEN id > 0 THEN name ELSE 'q' END FROM t LIMIT 1");
+	ExpectVeto("SELECT max('12' % coalesce(name, 'x')) FROM t");
+	// A plain column beside it was always a veto, and stays one.
+	ExpectVeto("SELECT '12' - name FROM t LIMIT 1");
 
 	// Derived tables (PR E1): the inner node rendered in place, its columns
 	// already read (a cast of the read expression is not repeated),

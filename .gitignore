@@ -44,7 +44,7 @@ Thumbs.db
 *.log
 *.bak
 # The committed backup samples (spec 085 task 10): synthetic, made on a clean instance by
-# test/data/backup/generate.sh (switch_in/, lob_changes/, open_tail/, history_break/, clr/, clr_types/, sparse/, tail_window/, variant/ and vector/ too, databases of their own). No other .bak
+# test/data/backup/generate.sh (switch_in/, lob_changes/, open_tail/, history_break/, clr/, clr_types/, sparse/, tail_window/, variant/, datetime2/ and vector/ too, databases of their own). No other .bak
 # is ever committed (spec 085 T4).
 !test/data/backup/*.bak
 !test/data/backup/switch_in/*.bak
@@ -56,6 +56,7 @@ Thumbs.db
 !test/data/backup/sparse/*.bak
 !test/data/backup/tail_window/*.bak
 !test/data/backup/variant/*.bak
+!test/data/backup/datetime2/*.bak
 !test/data/backup/vector/*.bak
 
 # Environment

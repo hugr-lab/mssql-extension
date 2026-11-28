@@ -7,7 +7,7 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant"): samples.sql, the database of the
+# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant datetime2"): samples.sql, the database of the
 # committed samples; catalog.sql, the catalog fixture (spec 085 PR 2b); partition.sql, E7's partitioning
 # database and more boundary types (PR 2c); files.sql, two data files and a second
 # filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
@@ -38,7 +38,9 @@
 # 2025's committed under test/data/backup/clr_types); variant.sql,
 # sql_variant of every base type in every storage form and off row, then variant_changes.sql's changes and a
 # differential (spec 093 T8b: variant_full, variant_diff, paired as variant_over; 2025's committed under
-# test/data/backup/variant); vector.sql, SQL Server 2025's vector (float32 and float16, at their edges and
+# test/data/backup/variant); datetime2.sql, datetime2(7) at TIMESTAMP_NS's edges and datetime2's in every
+# storage form, a temporal table, then datetime2_changes.sql's changes and a differential (spec 093 T8c:
+# datetime2_full, datetime2_diff, paired as datetime2_over; 2025's committed under test/data/backup/datetime2); vector.sql, SQL Server 2025's vector (float32 and float16, at their edges and
 # dimension limits) in every storage form and off row, then vector_changes.sql's changes and a differential
 # (spec 093 T8d: vector_full, vector_diff, paired as vector_over; skipped before 2025, which has no vector;
 # committed under test/data/backup/vector);
@@ -64,7 +66,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant vector}"
+FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant datetime2 vector}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -430,6 +432,14 @@ for fixture in ${FIXTURES}; do
 		run_sql vector_changes.sql
 		sets+=("vector_full|vector_full.bak" "vector_diff|vector_diff.bak")
 		overlays+=("vector_over|vector_full|vector_diff")
+		;;
+	datetime2)
+		# datetime2(7) at TIMESTAMP_NS's edges and datetime2's (spec 093 T8c), compressed; then
+		# datetime2_changes.sql's changes and differential.
+		golden bak_datetime2 datetime2_full
+		run_sql datetime2_changes.sql
+		sets+=("datetime2_full|datetime2_full.bak" "datetime2_diff|datetime2_diff.bak")
+		overlays+=("datetime2_over|datetime2_full|datetime2_diff")
 		;;
 	tail_window)
 		# Changes at known points of a backup's data copy (spec 085 D11, review of #591; run by default, so the

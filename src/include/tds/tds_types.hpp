@@ -197,8 +197,11 @@ constexpr uint8_t TDS_TYPE_VECTOR = 0xF5;
 //! alike, and sys.columns.user_type_id gives it (measured V1, V5).
 constexpr uint32_t VECTOR_USER_TYPE = 255;
 constexpr uint16_t VECTOR_HEADER_BYTES = 8;
-//! vector(n): 1 to 1998 dimensions (a float32 value then fills varbinary(8000)).
+//! vector(n): 1 to 1998 dimensions of float32 (a value then fills varbinary(8000)); a float16 one up to
+//! 3996, the same 8000 bytes (issue #644, measured on SQL Server 2025 17.0.4075.5: vector(3996, float16)
+//! has max_length 8000, vector(3997, float16) is refused). VectorMaxDimensions gives an element type's.
 constexpr uint16_t VECTOR_MAX_DIMENSIONS = 1998;
+constexpr uint16_t VECTOR_MAX_LENGTH = 8000;  // the header and the elements
 constexpr uint8_t VECTOR_ELEMENT_FLOAT32 = 0;
 constexpr uint8_t VECTOR_ELEMENT_FLOAT16 = 1;
 //! The VECTORSUPPORT version requested: 2 (float32 and float16). SQL Server 2025 17.0.5035.5 answers 1
@@ -206,6 +209,10 @@ constexpr uint8_t VECTOR_ELEMENT_FLOAT16 = 1;
 constexpr uint8_t VECTOR_SUPPORT_REQUESTED_VERSION = 2;
 inline uint16_t VectorElementBytes(uint8_t element_type) {
 	return element_type == VECTOR_ELEMENT_FLOAT16 ? 2 : 4;
+}
+//! The most dimensions a vector of `element_type` has: 1998 float32, 3996 float16.
+inline uint16_t VectorMaxDimensions(uint8_t element_type) {
+	return static_cast<uint16_t>((VECTOR_MAX_LENGTH - VECTOR_HEADER_BYTES) / VectorElementBytes(element_type));
 }
 constexpr uint8_t TDS_TYPE_IMAGE = 0x22;  // Deprecated
 constexpr uint8_t TDS_TYPE_TEXT = 0x23;	  // Deprecated

@@ -624,9 +624,10 @@ ColumnReading TypeReading(const CatalogColumn &c, const TypeForms &forms) {
 		return raw(why);
 	}
 	try {
-		// datetime2(7) as TIMESTAMP_NS until spec 093 T8 hooks mssql_datetime2_7_as into the backup scan.
+		// A datetime2(7) as the forms say (spec 093 T8c): TIMESTAMP_NS, a value outside 1677-2262 NULL with a
+		// WARNING (RecordStager's TypeNote), or TIMESTAMP, its 100 ns digit truncated -- TYPE mssql's D8.
 		r.type = MSSQLColumnInfo::MapSQLServerTypeToDuckDB(c.system_type_name, c.max_length, c.precision, c.scale,
-														   MSSQLDatetime2Read::Nanoseconds);
+														   forms.datetime2_read);
 	} catch (std::exception &e) {
 		return raw(type + " has no DuckDB type here (" + std::string(e.what()) + ")");
 	}
