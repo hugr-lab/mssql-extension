@@ -368,7 +368,7 @@ LogicalType MapJson(const ColumnShape &) {
 
 // vector(n) (SQL Server 2025, spec 093 D4): FLOAT[n], float16 elements widened exactly. sys.columns
 // gives the element type in scale (0 float32, 1 float16) and 8 + n x element size in max_length (V5).
-LogicalType MapVector(const ColumnShape &shape) {
+LogicalType MapSqlVector(const ColumnShape &shape) {
 	const int element = shape.scale == 1 ? 2 : 4;
 	const int dimensions = shape.max_length > 8 ? (shape.max_length - 8) / element : 1;
 	return LogicalType::ARRAY(LogicalType::FLOAT, static_cast<idx_t>(dimensions));
@@ -460,7 +460,7 @@ const TypeMapping TYPE_MAPPINGS[] = {
 	{"rowversion", LogicalTypeId::BLOB, nullptr},
 
 	{"json", LogicalTypeId::VARCHAR, MapJson},
-	{"vector", LogicalTypeId::ARRAY, MapVector},
+	{"vector", LogicalTypeId::ARRAY, MapSqlVector},
 
 	// Special types
 	{"uniqueidentifier", LogicalTypeId::UUID, nullptr},
