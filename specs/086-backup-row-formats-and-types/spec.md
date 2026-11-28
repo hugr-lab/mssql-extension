@@ -19,7 +19,8 @@ binary is undocumented; it is a research task with a gate, not a promise (R§2, 
 ## Scope
 
 In: ROW compression (the CD record format), PAGE compression (anchor and dictionary), sparse columns
-and the column set, `xml` (MS-BINXML → text), and the `json` research spike. The double-byte code pages
+(the column set itself is not read: D7, its sparse columns are read one by one), `xml` (MS-BINXML → text),
+and the `json` research spike. The double-byte code pages
 (932, 936, 949, 950) moved to 085 PR 2d (D9). `sql_variant`, `vector`, `hierarchyid`, `geometry` and
 `geography` moved to spec 093 (2026-11-13).
 
@@ -267,7 +268,7 @@ format dates from 2008, so a 2017 failure points at a layout difference, not a n
 
 Acceptance:
 1. Every fixture column of every version in the matrix equals the oracle, or is refused by name with
-   the reason the oracle found.
+   the reason the oracle found. A column set is outside the comparison: it is not read, by D7.
 2. ROW and PAGE versions of a table equal its uncompressed version, `_mssql_rid` included (085 D8's
    uncompressed key bytes).
 3. (Moved to spec 093: `sql_variant`.)
@@ -374,7 +375,7 @@ text. What it found:
 
 **PR 3 — sparse**
 
-7. Sparse vector and the column set (D7) — 1.5 d
+7. Sparse vector (the column set decided as not read: D7, decision A) — 1.5 d
 8. – 10., 12. (Moved to spec 093, 2026-11-13: `sql_variant`, `vector`, `hierarchyid` and their fuzz
     harnesses and fixtures.)
 11. (Moved to 085 PR 2d: the double-byte code pages, D9.)
@@ -384,25 +385,34 @@ DBCC PAGE, D1's clean room; every sparse value of every record placed where the 
 beyond X§4:
 - **Where:** the last variable column, after the regular ones stored (their NULL and empty trailing ones are
   left out first, so it can be variable column 0), or before a forwarded record's back pointer; a uniquifier of
-  0 is not stored either, so the vector can take its index. Its tag decides, not the null bitmap (review of
-  #626: an empty value's null bit is clear).
+  0 is not stored either, so the vector can take its index. Its tag decides where the null bitmap says no
+  regular column is stored at that index; where the bitmap says one is (an empty value's null bit is clear:
+  review of #626), a tagged column is the vector only if every id is a sparse column's of the layout and its
+  last value ends at its end; one that fails is read as that regular column only when it is a LOB root pointer's
+  16 bytes, and refused by name at any other size (E24, "What the reader does").
 - **The ids** are `sysrscols.hbcolid`: after `ALTER COLUMN … ADD SPARSE` a column's value is under a new one,
   and after `DROP SPARSE` or a dropped column the old entries stay under the dropped column's.
 - **Bit 15** of an entry's end marks an off-row value: an in-row LOB root, a row-overflow pointer.
 - **A sparse column** has status `0x100`, offset 0 and no null bit in `sysrscols`, and no bit in the record's
   null bitmap; it takes no DEFAULT (1791).
 
-`backup_system_tables`: `IndexSparse` (the layout's `sparse` flag, the null bit at each variable index),
-`FindSparseVector` (every part bounded; once per record, in `RowRecord::Fixed`, which then counts the vector out
-of the regular columns), `SparseVector::Find` (a binary search on the ids) and `LocateValue`'s sparse arm (a
-fixed type's entry checked to be its width). The stager maps a sparse column of a variable type into
-`_mssql_lob`; the change listing compares a sparse table's rows by their values (`ValueForm::by_value`), so a
+`backup_system_tables`: `IndexSparse` (the layout's `sparse` flag, the null bit at each variable index, the
+sorted `sparse_hbcolids` of its live and dropped sparse columns), `FindSparseVector` (every part bounded, and the
+two stricter checks above where the bitmap says a regular column is stored there; once per record, in
+`RowRecord::Fixed`, which then counts the vector out of the regular columns), `SparseVector::Find` (a binary search on the ids) and `LocateValue`'s sparse arm (a
+fixed type's entry checked to be its width). The stager maps a sparse column of any type that is not fixed into
+`_mssql_lob` (as `LocateValue` reads it); the change listing compares a sparse table's rows by their values (`ValueForm::by_value`), so a
 rewrite by `ALTER` is no change. Also found and fixed: a nullable char / binary under ANSI_PADDING OFF holding
 `''` / `0x` is one pad byte (DATALENGTH 1), which the reader trimmed to none. Tests: `test_backup_rows` (E24's
 records, the refusals), `fuzz_backup_record` (a sparse bit in the layout, E24's seed), the fixture `sparse.sql`
 (+ `sparse_changes.sql`, committed under `test/data/backup/sparse`, `mssql_backup_sparse.test`); against
 RESTORE on 2025: `compare_rows` 10 tables, 5,648 rows, the overlay 5,907, 0 failures; `compare_catalog` 17,599
-fields, 0 differences; the change listing equal to the two scans' differences on every table.
+fields, 0 differences; the change listing equal to the two scans' differences on every table. Those counts are
+the first fixture's: the review of #626 added 46 rows (4 in `types_sparse`, 40 in `heap_sparse`, 2 in
+`uniq_sparse`) and the committed fixture was regenerated; `compare_rows` was run again on it against RESTORE on
+2019, 2022 and 2025, 0 failures for the full backup and the overlay (PR #626's review reply). The second
+review fix regenerated it once more on 2025: 13 tables, 0 failures against RESTORE (commit `cad9e6e2`). The row
+counts of the two later runs were not recorded.
 
 **PR 4 — `xml`**
 
