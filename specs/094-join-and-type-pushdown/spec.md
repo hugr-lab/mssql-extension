@@ -417,12 +417,12 @@ is exact for each of them.
   superset, and there is no re-check.
 - **The index: DQ-3 (open, the owner's call).** The envelope form uses no index (X2). An indexed form
   would be the server's exact predicate or `Filter` against the constant itself, in the constant's SRID,
-  `UNION ALL` the envelope form for `g.STSrid <> @s`. It is safe only once X4 / X5 show the indexed
+  `UNION ALL` the envelope form for `g.STSrid <> @s`. It is safe only once X4 shows the indexed
   predicate is a superset of DuckDB's on boundary cases, and that a forced index never evaluates `Filter`
   exactly (an invalid candidate fails unguarded). Options:
   - (a) P2 ships the envelope form alone: less on the wire, the server's work a full scan;
   - (b) the indexed branch, added for `ST_Intersects` / `ST_Within` / `ST_Contains` / `ST_DWithin` after
-    X4 / X5. It never applies to `&&`: `Filter` against an envelope is narrower for a non-point row, e.g.
+    X4. It never applies to `&&`: `Filter` against an envelope is narrower for a non-point row, e.g.
     the line (0,0)-(10,10) against the box [8,20] x [0,2], whose boxes meet.
     - Only (b) needs `sys.spatial_indexes` in the catalog, to know which column has an index. That is a
       change to spec 084's metadata batch, so it belongs to (b), not to P2.
@@ -446,9 +446,8 @@ not fixed there.
   `st_intersects_extent(column, envelope)`.
   - `LogicalGet::dynamic_filters` is copied to the physical scan (`plan_get.cpp`), and the schedule
     orders the build before the probe's init.
-  - The scan renders it by D3's envelope form (a superset; the join re-checks), so one box. Up to N boxes
-    would travel as one `ExpressionFilter`, an OR of N `st_intersects_extent` calls, rendered as an OR of
-    envelope tests (X7 to measure; no index either way).
+  - The scan renders it by D3's envelope form (a superset; the join re-checks), and P3 ships **one box**: the
+    union extent of X's rows.
 - **The predicates** are the ones whose matches imply the boxes meet (D3's list). For `ST_DWithin` X's
   extent is grown by `d`. No `ST_Disjoint` and no negation.
 - **The operator's lifecycle.** `DynamicTableFilterSet::PushFilter` ANDs into what is already stored for
@@ -471,7 +470,11 @@ not fixed there.
   - rewriting the join into range joins on extent columns (option A): one box only, and it needs virtual
     extent columns and functions core lacks;
   - an in-out table function staging the build in `#stage` (option C): the right shape for many boxes or
-    exact matches, later, as tier 1 of the keys.
+    exact matches, later, as tier 1 of the keys;
+  - several boxes in P3: they would travel as one `ExpressionFilter`, an OR of N `st_intersects_extent`
+    calls rendered as an OR of envelope tests. N and the rule that groups X's rows into boxes are not
+    decided, and with no index either way each box is one more envelope test a row on a full scan. A
+    later step, once the cost of one box against N is measured.
 
 ### D5 (P4): spatial functions in the 079 writer
 
@@ -520,7 +523,7 @@ The candidates are `ST_X` / `ST_Y` (`.STX` / `.STY`), `ST_NumPoints`, `ST_IsEmpt
 | P0 | D1: FilterEncoder unwraps the optional join filters, per conjunct; IN on any type, non-equality filters from a join only where `OrdersLikeDuckDB`; the dense keys' bounds (plain comparisons under the optional wrapper: no D0); X6; tests with a local table ⋈ a server table (sparse keys: 1, 3, 40, 100; consecutive ids, each dense branch, a two-key join) |
 | P1 | D0 and D2: the superset result; VECTOR_DISTANCE in the 079 vocabulary (cast to `real`) and the TOP N path with its own parameters; NULL / NaN emulation, the zero vector in conditions and result columns; float32 only; the prepared `$q` pinned as not pushed; X1c, X1d, X8 |
 | P2 | D3: spatial predicates with a constant as supersets (D0), SRID-blind, geography in its planar form, the EMPTY / degenerate / non-finite cases not pushed; X4; DQ-3 (and `sys.spatial_indexes` only with its option b) |
-| P3 | D4: the bbox hint operator, cleared each execution; X7, with a LEFT and an ANTI spatial join left unhinted |
+| P3 | D4: the bbox hint operator (one box, the union extent), cleared each execution; X7, with a LEFT and an ANTI spatial join left unhinted |
 | P4 | D5: the writer's spatial functions; X5 |
 
 **Off switches.** Every shipped pushdown has one (`mssql_order_pushdown`, `mssql_remote_pushdown`,
