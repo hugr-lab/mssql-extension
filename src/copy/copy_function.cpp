@@ -140,6 +140,99 @@ namespace mssql {
 // BCPCopyBind - Parse target URL and options
 //===----------------------------------------------------------------------===//
 
+// Verify catalog exists and is an MSSQL catalog
+static void RequireMSSQLCatalog(ClientContext &context, const string &catalog_name) {
+	try {
+		auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
+		if (catalog.GetCatalogType() != "mssql") {
+			throw InvalidInputException(
+				"MSSQL COPY: Catalog '%s' is not an MSSQL catalog (type: %s). "
+				"The 'bcp' format can only be used with attached MSSQL databases.",
+				catalog_name, catalog.GetCatalogType());
+		}
+	} catch (CatalogException &e) {
+		throw InvalidInputException(
+			"MSSQL COPY: Catalog '%s' not found. "
+			"Use ATTACH '<connection_string>' AS %s (TYPE mssql) first.",
+			catalog_name, catalog_name);
+	}
+}
+
+// Catalog syntax: catalog.schema.table or catalog.table or catalog..#temp
+static BCPCopyTarget ResolveCatalogSyntaxTarget(ClientContext &context, const string &target_path) {
+	vector<string> parts = StringUtil::Split(target_path, '.');
+
+	if (parts.size() < 2 || parts.size() > 3) {
+		throw InvalidInputException(
+			"MSSQL COPY: Invalid target format. Use either:\n"
+			"  - URL syntax: 'mssql://<catalog>/<schema>/<table>'\n"
+			"  - Catalog syntax: <catalog>.<schema>.<table> or <catalog>.<table>\n"
+			"  - Temp table: <catalog>..#temp_table (empty schema)\n"
+			"Got: %s",
+			target_path);
+	}
+
+	string catalog_name = parts[0];
+	string schema_name;
+	string table_name;
+	bool allow_empty_schema = false;
+
+	if (parts.size() == 2) {
+		// catalog.table - no schema: ResolveCatalog gives it the catalog's
+		// default schema (`dbo` unless ATTACH set one, issue #322)
+		table_name = parts[1];
+	} else {
+		// catalog.schema.table or catalog..#temp (empty schema)
+		schema_name = parts[1];
+		table_name = parts[2];
+		// If schema is empty, this is the catalog..#temp syntax
+		allow_empty_schema = schema_name.empty();
+	}
+
+	RequireMSSQLCatalog(context, catalog_name);
+
+	// Use ResolveCatalog to create the target
+	auto target = TargetResolver::ResolveCatalog(context, catalog_name, schema_name, table_name, allow_empty_schema);
+
+	CopyDebugLog(1, "BCPCopyBind: resolved catalog syntax: catalog='%s', schema='%s', table='%s', empty_schema=%d",
+				 catalog_name.c_str(), schema_name.c_str(), table_name.c_str(), allow_empty_schema ? 1 : 0);
+	return target;
+}
+
+// Spec 060 D8: per-statement override of mssql_default_string_length.
+static int32_t StringLengthOption(const Value &value) {
+	const int64_t raw = BigIntValue::Get(value);
+	if (raw < 0) {
+		throw InvalidInputException("MSSQL COPY: string_length must be >= 0 (0 = MAX), got %lld", (long long)raw);
+	}
+	return raw == 0 ? 0 : static_cast<int32_t>(std::min<int64_t>(raw, INT32_MAX));
+}
+
+// One COPY option over the settings' defaults, by its lowercased name.
+static void ApplyCopyOption(BCPCopyConfig &config, const string &loption, const vector<Value> &values) {
+	if (loption == "create_table") {
+		config.create_table = BooleanValue::Get(values[0]);
+		CopyDebugLog(2, "BCPCopyBind: set create_table=%d", config.create_table ? 1 : 0);
+	} else if (loption == "replace") {
+		config.overwrite = BooleanValue::Get(values[0]);
+		CopyDebugLog(2, "BCPCopyBind: set replace=%d", config.overwrite ? 1 : 0);
+	} else if (loption == "flush_rows") {
+		config.flush_rows = static_cast<idx_t>(BigIntValue::Get(values[0]));
+	} else if (loption == "tablock") {
+		// A per-statement `tablock` option is by definition explicit, so it
+		// resolves to ON/OFF and never to AUTO — this is the one place the old
+		// `tablock_explicit` flag was set correctly.
+		config.tablock_choice = BooleanValue::Get(values[0]) ? MSSQLTablockChoice::ON : MSSQLTablockChoice::OFF;
+	} else if (loption == "truncate") {
+		config.truncate = BooleanValue::Get(values[0]);
+	} else if (loption == "table_kind") {
+		config.table_options.ApplyOption("table_kind", values[0].ToString());
+	} else if (loption == "string_length") {
+		config.default_string_length = StringLengthOption(values[0]);
+	}
+	// Ignore unknown options (may be standard COPY options)
+}
+
 unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInput &input,
 									 const vector<Identifier> &names, const vector<LogicalType> &sql_types) {
 	auto bind_data = make_uniq<MSSQLCopyBindData>();
@@ -163,58 +256,7 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 		// URL syntax
 		bind_data->target = TargetResolver::ResolveURL(context, target_path);
 	} else {
-		// Try catalog syntax: catalog.schema.table or catalog.table or catalog..#temp
-		vector<string> parts = StringUtil::Split(target_path, '.');
-
-		if (parts.size() < 2 || parts.size() > 3) {
-			throw InvalidInputException(
-				"MSSQL COPY: Invalid target format. Use either:\n"
-				"  - URL syntax: 'mssql://<catalog>/<schema>/<table>'\n"
-				"  - Catalog syntax: <catalog>.<schema>.<table> or <catalog>.<table>\n"
-				"  - Temp table: <catalog>..#temp_table (empty schema)\n"
-				"Got: %s",
-				target_path);
-		}
-
-		string catalog_name = parts[0];
-		string schema_name;
-		string table_name;
-		bool allow_empty_schema = false;
-
-		if (parts.size() == 2) {
-			// catalog.table - no schema: ResolveCatalog gives it the catalog's
-			// default schema (`dbo` unless ATTACH set one, issue #322)
-			table_name = parts[1];
-		} else {
-			// catalog.schema.table or catalog..#temp (empty schema)
-			schema_name = parts[1];
-			table_name = parts[2];
-			// If schema is empty, this is the catalog..#temp syntax
-			allow_empty_schema = schema_name.empty();
-		}
-
-		// Verify catalog exists and is an MSSQL catalog
-		try {
-			auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
-			if (catalog.GetCatalogType() != "mssql") {
-				throw InvalidInputException(
-					"MSSQL COPY: Catalog '%s' is not an MSSQL catalog (type: %s). "
-					"The 'bcp' format can only be used with attached MSSQL databases.",
-					catalog_name, catalog.GetCatalogType());
-			}
-		} catch (CatalogException &e) {
-			throw InvalidInputException(
-				"MSSQL COPY: Catalog '%s' not found. "
-				"Use ATTACH '<connection_string>' AS %s (TYPE mssql) first.",
-				catalog_name, catalog_name);
-		}
-
-		// Use ResolveCatalog to create the target
-		bind_data->target =
-			TargetResolver::ResolveCatalog(context, catalog_name, schema_name, table_name, allow_empty_schema);
-
-		CopyDebugLog(1, "BCPCopyBind: resolved catalog syntax: catalog='%s', schema='%s', table='%s', empty_schema=%d",
-					 catalog_name.c_str(), schema_name.c_str(), table_name.c_str(), allow_empty_schema ? 1 : 0);
+		bind_data->target = ResolveCatalogSyntaxTarget(context, target_path);
 	}
 
 	bind_data->catalog_name = bind_data->target.catalog_name;
@@ -228,35 +270,7 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 		auto loption = StringUtil::Lower(option.first.GetIdentifierName());
 		CopyDebugLog(2, "BCPCopyBind: option '%s' (lower: '%s')", option.first.c_str(), loption.c_str());
 
-		if (loption == "create_table") {
-			bind_data->config.create_table = BooleanValue::Get(option.second[0]);
-			CopyDebugLog(2, "BCPCopyBind: set create_table=%d", bind_data->config.create_table ? 1 : 0);
-		} else if (loption == "replace") {
-			bind_data->config.overwrite = BooleanValue::Get(option.second[0]);
-			CopyDebugLog(2, "BCPCopyBind: set replace=%d", bind_data->config.overwrite ? 1 : 0);
-		} else if (loption == "flush_rows") {
-			bind_data->config.flush_rows = static_cast<idx_t>(BigIntValue::Get(option.second[0]));
-		} else if (loption == "tablock") {
-			// A per-statement `tablock` option is by definition explicit, so it
-			// resolves to ON/OFF and never to AUTO — this is the one place the old
-			// `tablock_explicit` flag was set correctly.
-			bind_data->config.tablock_choice =
-				BooleanValue::Get(option.second[0]) ? MSSQLTablockChoice::ON : MSSQLTablockChoice::OFF;
-		} else if (loption == "truncate") {
-			bind_data->config.truncate = BooleanValue::Get(option.second[0]);
-		} else if (loption == "table_kind") {
-			bind_data->config.table_options.ApplyOption("table_kind", option.second[0].ToString());
-		} else if (loption == "string_length") {
-			// Spec 060 D8: per-statement override of mssql_default_string_length.
-			const int64_t raw = BigIntValue::Get(option.second[0]);
-			if (raw < 0) {
-				throw InvalidInputException("MSSQL COPY: string_length must be >= 0 (0 = MAX), got %lld",
-											(long long)raw);
-			}
-			bind_data->config.default_string_length =
-				raw == 0 ? 0 : static_cast<int32_t>(std::min<int64_t>(raw, INT32_MAX));
-		}
-		// Ignore unknown options (may be standard COPY options)
+		ApplyCopyOption(bind_data->config, loption, option.second);
 	}
 
 	// Fabric Data Warehouse has no nvarchar type at all, so the setting cannot be
@@ -298,6 +312,424 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 // BCPCopyInitGlobal - Acquire connection, send INSERT BULK, start BCP
 //===----------------------------------------------------------------------===//
 
+// Release the connection when the init fails before the shared session has it
+static void ReleaseConnectionOnInitError(ClientContext &context, MSSQLCatalog &mssql_catalog,
+										 MSSQLCopyGlobalState &gstate) {
+	if (gstate.connection) {
+		CopyDebugLog(2, "BCPCopyInitGlobal: releasing connection due to error");
+		// Ensure connection is in Idle state before releasing
+		if (gstate.connection->GetState() == tds::ConnectionState::Executing) {
+			gstate.connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
+		}
+		bool in_transaction = ConnectionProvider::IsInTransaction(context, mssql_catalog);
+		if (in_transaction) {
+			ConnectionProvider::ReleaseConnection(context, mssql_catalog, gstate.connection);
+		} else {
+			mssql_catalog.GetConnectionPool().Release(gstate.connection);
+		}
+		gstate.connection.reset();
+	}
+}
+
+// Check connection is in Idle state
+static void RequireIdleConnection(tds::TdsConnection &connection) {
+	if (connection.GetState() != tds::ConnectionState::Idle) {
+		auto state = connection.GetState();
+		string state_str = tds::ConnectionStateToString(state);
+
+		// Provide specific error messages based on connection state
+		if (state == tds::ConnectionState::Executing) {
+			throw InvalidInputException(
+				"MSSQL COPY: Connection is busy executing another query. "
+				"This can happen if you're reading from an MSSQL table (via mssql_scan) "
+				"and writing to the same MSSQL database within a transaction. "
+				"Either: (1) Read data into a local table first, then COPY to MSSQL, or "
+				"(2) Use separate transactions for reading and writing. "
+				"Connection state: %s",
+				state_str);
+		} else {
+			throw InvalidInputException(
+				"MSSQL COPY: Connection is not ready for BCP operation (state: %s). "
+				"The connection may be in an error state or performing another operation.",
+				state_str);
+		}
+	}
+}
+
+// Point invalidation: invalidate schema's table list if table was created/dropped
+// This ensures the new table schema is visible for subsequent queries
+static void InvalidateTargetSchema(ClientContext &context, MSSQLCatalog &mssql_catalog,
+								   const MSSQLCopyBindData &bdata) {
+	if (!bdata.target.IsTempTable() && (bdata.config.create_table || bdata.config.overwrite)) {
+		mssql_catalog.InvalidateSchemaTableSet(bdata.target.schema_name);
+		mssql_catalog.NoteTransactionChange(context, bdata.target.schema_name);
+		CopyDebugLog(2, "BCPCopyInitGlobal: schema '%s' table list invalidated after table creation/modification",
+					 bdata.target.schema_name.c_str());
+	}
+}
+
+// Spec 093 T2: a VARIANT column the load creates writes its string values under the database's
+// collation. The catalog's is empty when it never read it (catalog false) or its query failed;
+// then this COPY's own connection is asked, once, and only when a VARIANT is loaded. Empty again
+// (the read failed too) gives Latin1_General_100_BIN2_UTF8 (codec::variant::StringCollationBytes).
+static string VariantCollation(MSSQLCatalog &mssql_catalog, tds::TdsConnection &connection,
+							   const vector<LogicalType> &source_types) {
+	const auto &known = mssql_catalog.GetDatabaseCollation();
+	bool has_variant = false;
+	for (const auto &type : source_types) {
+		has_variant = has_variant || type.id() == LogicalTypeId::VARIANT;
+	}
+	if (!known.empty() || !has_variant) {
+		return known;
+	}
+	return MSSQLSimpleQuery::ExecuteScalar(connection,
+										   "SELECT CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation'))");
+}
+
+// Columns whose pair bind admitted for the all-NULL case only —
+// TYPED sources; see BCPCopyConfig::null_only_columns. Mark the
+// target metadata so PrepareColumnStates verifies the mask per
+// chunk and routes them through the NullOnly path. A bare
+// `NULL AS col` is a different case, decided by DropUnloadedColumns from its
+// SQLNULL source type.
+// By the target's DuckDB names, as the source names them (issue #572).
+static void MarkNullOnlyColumns(vector<BCPColumnMetadata> &columns, const vector<string> &null_only_columns) {
+	std::vector<std::string> server_names;
+	for (const auto &col : columns) {
+		server_names.push_back(col.name);
+	}
+	const auto duckdb_names = mssql::DuckDBColumnNames(server_names);
+	for (const auto &nn : null_only_columns) {
+		for (idx_t c = 0; c < columns.size(); c++) {
+			if (StringUtil::Lower(duckdb_names[c]) == nn) {
+				columns[c].null_only_source = true;
+			}
+		}
+	}
+}
+
+// Issue #125: Drop target columns that have no matching source column (by name).
+// These are columns the server fills itself — IDENTITY, DEFAULT-valued, or
+// computed columns the source intentionally omits. INSERT BULK only needs the
+// columns actually being loaded; SQL Server auto-generates the rest. Previously
+// every target column was declared, so an unmapped IDENTITY column had NULL
+// streamed into it and the load failed ("Cannot insert the value NULL into
+// column ..." / "Incorrect syntax near the keyword 'with'").
+// `dropped_null_only` counts the columns dropped for a constant NULL source.
+static void DropUnloadedColumns(vector<BCPColumnMetadata> &columns, vector<int32_t> &column_mapping,
+								const vector<LogicalType> &source_types, idx_t &dropped_null_only) {
+	vector<BCPColumnMetadata> mapped_columns;
+	vector<int32_t> mapped_mapping;
+	mapped_columns.reserve(columns.size());
+	mapped_mapping.reserve(column_mapping.size());
+	for (idx_t i = 0; i < columns.size(); i++) {
+		// column_mapping[i] is the source-column index feeding target column i,
+		// or -1 when no source column matches it by name. Keep only the mapped
+		// (>= 0) target columns; the -1 entries are server-generated (IDENTITY,
+		// DEFAULT, computed) and must be left out of INSERT BULK entirely.
+		if (column_mapping[i] >= 0) {
+			// Issue #353 review: a column the wire cannot carry, fed by a source
+			// that is a CONSTANT NULL — `NULL AS g`, which is how one says "leave
+			// this column alone" and which loaded before #353 (by accident: the
+			// sys.types join hid the column entirely).
+			//
+			// It cannot be declared and sent as NULLs: the type mapping gives it
+			// the VARCHAR fallback and an nvarchar column against a geometry
+			// target makes the server refuse the whole INSERT BULK. So it is
+			// dropped from the load exactly like an unmatched column and the
+			// server fills it.
+			//
+			// The test is the SOURCE TYPE, not `null_only_source`. Bind marks
+			// null_only_source for any pair it cannot type-check, which includes
+			// a fully typed source that merely happens to start with NULLs — and
+			// dropping THAT would turn a refusal at init into a refusal on
+			// whichever chunk first carries a value, by which point earlier
+			// batches have committed. A partial write is the wrong answer to a
+			// silent-data-loss issue. DuckDB types a bare NULL as SQLNULL and
+			// keeps it that way to here (measured), and a SQLNULL column has no
+			// other value it could hold, so this drop cannot lose anything.
+			const auto &col = columns[i];
+			const idx_t src = static_cast<idx_t>(column_mapping[i]);
+			if (col.bulk_unsupported && src < source_types.size() && source_types[src].id() == LogicalTypeId::SQLNULL) {
+				dropped_null_only++;
+				CopyDebugLog(1,
+							 "BCPCopyInitGlobal: omitting target column '%s' (%s) from INSERT BULK "
+							 "(constant NULL source; the wire cannot carry this type)",
+							 col.name.c_str(), col.server_type_name.c_str());
+				continue;
+			}
+			mapped_columns.push_back(columns[i]);
+			mapped_mapping.push_back(column_mapping[i]);
+		} else {
+			CopyDebugLog(1,
+						 "BCPCopyInitGlobal: omitting target column '%s' from INSERT BULK "
+						 "(no matching source column; server-generated, e.g. IDENTITY/DEFAULT)",
+						 columns[i].name.c_str());
+		}
+	}
+	columns = std::move(mapped_columns);
+	column_mapping = std::move(mapped_mapping);
+}
+
+// Check if we need to use column mapping (i.e., not a 1:1 positional match)
+// Mapping is needed if: column counts differ, or any mapping != position
+static bool NeedsColumnMapping(idx_t source_count, idx_t target_count, const vector<int32_t> &column_mapping) {
+	bool need_column_mapping = (source_count != target_count);
+	if (!need_column_mapping) {
+		for (idx_t i = 0; i < column_mapping.size(); i++) {
+			if (column_mapping[i] != static_cast<int32_t>(i)) {
+				need_column_mapping = true;
+				break;
+			}
+		}
+	}
+	return need_column_mapping;
+}
+
+// The load's columns from the target table's own: its metadata (the read ValidateTarget made, else
+// one read here), the null-only marks, the source-to-target mapping, and the columns no source
+// feeds dropped. Whatever this throws, ResolveLoadColumns takes for "no metadata yet".
+static void UseTargetColumns(tds::TdsConnection &connection, const MSSQLCopyBindData &bdata,
+							 MSSQLCopyGlobalState &gstate, vector<BCPColumnMetadata> &existing_columns,
+							 idx_t &dropped_null_only) {
+	gstate.columns = !existing_columns.empty()
+						 ? std::move(existing_columns)
+						 : TargetResolver::GetExistingTableColumnMetadata(connection, bdata.target);
+	CopyDebugLog(1, "BCPCopyInitGlobal: using target table column metadata (%llu columns)",
+				 (unsigned long long)gstate.columns.size());
+
+	MarkNullOnlyColumns(gstate.columns, bdata.config.null_only_columns);
+
+	// Build column mapping from source to target
+	gstate.column_mapping = TargetResolver::BuildColumnMapping(bdata.source_names, gstate.columns);
+
+	DropUnloadedColumns(gstate.columns, gstate.column_mapping, bdata.source_types, dropped_null_only);
+
+	if (NeedsColumnMapping(bdata.source_names.size(), gstate.columns.size(), gstate.column_mapping)) {
+		CopyDebugLog(1, "BCPCopyInitGlobal: using column mapping (source: %llu cols, target: %llu cols)",
+					 (unsigned long long)bdata.source_names.size(), (unsigned long long)gstate.columns.size());
+	}
+}
+
+// Generate column metadata for BCP
+// For existing tables (not created or replaced), we MUST use the target table's column types
+// for COLMETADATA. The BCP protocol requires COLMETADATA to match the target table exactly.
+// For newly created tables, we use source types since the table was created from them.
+//
+// "Nothing left to load" has to be raised OUTSIDE the try below, because
+// that block ends in a bare `catch (...)` meant for "the table was just
+// created and has no metadata yet" — a throw inside it silently becomes a
+// fallback to source-derived metadata, which is how a geometry column came
+// to be declared varbinary(max) and the server answered "Invalid column
+// type from bcp client" instead of our message. Two ways to get here now,
+// and they are different user errors, so they carry different text.
+// So this answers whether the target's metadata was used, and counts the constant-NULL drops,
+// for RefuseNothingToLoad.
+static bool ResolveLoadColumns(MSSQLCatalog &mssql_catalog, const MSSQLCopyBindData &bdata,
+							   MSSQLCopyGlobalState &gstate, vector<BCPColumnMetadata> &existing_columns,
+							   idx_t &dropped_null_only) {
+	bool need_target_metadata = !bdata.config.overwrite;
+	bool target_metadata_used = false;
+	if (need_target_metadata) {
+		// Try to get target column metadata - this will work for existing tables
+		try {
+			UseTargetColumns(*gstate.connection, bdata, gstate, existing_columns, dropped_null_only);
+			target_metadata_used = true;
+		} catch (...) {
+			// If we can't get target metadata (e.g., table was just created), use source types
+			gstate.columns = TargetResolver::GenerateColumnMetadata(
+				bdata.source_types, bdata.source_names, bdata.config.wire_varchar_collation,
+				bdata.config.text_type_varchar,
+				VariantCollation(mssql_catalog, *gstate.connection, bdata.source_types));
+			CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (%llu columns)",
+						 (unsigned long long)gstate.columns.size());
+		}
+	} else {
+		// Table was replaced or created, use source types
+		gstate.columns = TargetResolver::GenerateColumnMetadata(
+			bdata.source_types, bdata.source_names, bdata.config.wire_varchar_collation, bdata.config.text_type_varchar,
+			VariantCollation(mssql_catalog, *gstate.connection, bdata.source_types));
+		CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (table created/replaced)");
+	}
+	return target_metadata_used;
+}
+
+// Issue #353: a target column whose type the bulk wire cannot carry, still
+// present after the unmatched-column drop above — which means a source
+// column feeds it by name.
+//
+// This runs OUTSIDE ResolveLoadColumns' try on purpose. That block ends in a bare
+// `catch (...)` meant for "the table was just created and has no metadata
+// yet", and it swallows everything: a refusal thrown inside it silently
+// became a fallback to source-derived metadata, which declared a geometry
+// column as varbinary(max) and let the server answer "Invalid column type
+// from bcp client" instead. Measured while writing this.
+//
+// Until #353 such a column never got here at all: the metadata query's
+// INNER JOIN to sys.types dropped every CLR UDT, so the source column was
+// ignored and its values were lost with no error. A column NO source feeds
+// is still left out of the load, exactly as before, and so is one fed by a
+// constant NULL.
+//
+// This is the ONLY place such a column is refused, and it runs before a
+// single row is encoded — so a COPY that is going to fail for this reason
+// writes nothing at all, rather than committing the batches that happened
+// to precede the first non-NULL value.
+static void RefuseUnsupportedColumns(const vector<BCPColumnMetadata> &columns, const BCPCopyTarget &target) {
+	for (const auto &col : columns) {
+		if (!col.bulk_unsupported) {
+			continue;
+		}
+		throw InvalidInputException(
+			"MSSQL COPY: column '%s' of table '%s' has type %s, which the bulk-load wire cannot "
+			"carry — its wire form is SQL Server's own, not the bytes a DuckDB value holds. "
+			"Use INSERT for this table, or leave the column out of the source. A literal, "
+			"uncast `NULL AS %s` is also accepted — the column is then dropped from the load "
+			"exactly like an omitted one and the SERVER fills it: with NULL, with its DEFAULT, "
+			"or with a generated value for a rowversion, and a NOT NULL column without a "
+			"default fails there — but a TYPED null is not: `CAST(NULL AS VARCHAR) AS %s`, or "
+			"an all-NULL column read from a table or a file, carries a type and lands here "
+			"with everything else.",
+			col.name, target.GetFullyQualifiedName(), col.server_type_name, col.name, col.name);
+	}
+}
+
+// Nothing left to load. Deliberately outside the try, per the note above:
+// inside it, both of these became a silent fallback to source-derived
+// metadata. They are different mistakes and say so.
+static void RefuseNothingToLoad(bool target_metadata_used, const vector<BCPColumnMetadata> &columns,
+								idx_t dropped_null_only, const BCPCopyTarget &target) {
+	if (target_metadata_used && columns.empty()) {
+		if (dropped_null_only > 0) {
+			throw InvalidInputException(
+				"MSSQL COPY: every source column that matches target table '%s' feeds a column the "
+				"bulk-load wire cannot carry and was given a constant NULL, so there is nothing to "
+				"load. Drop those columns from the source, or give the statement a column the target "
+				"can take.",
+				target.GetFullyQualifiedName());
+		}
+		throw InvalidInputException(
+			"MSSQL COPY: no source columns match target table '%s' by name; "
+			"nothing to load. Ensure source column names match the target's columns.",
+			target.GetFullyQualifiedName());
+	}
+}
+
+// TABLOCK by the target's shape (spec 057 step 1, replacing issue #45's
+// "new tables" rule). ValidateTarget set target_shape — from
+// sys.indexes for an existing table, from what we just created otherwise.
+static void ResolveTablock(BCPCopyConfig &config) {
+	config.tablock = MSSQLResolveTablock(config.tablock_choice, config.target_shape);
+	CopyDebugLog(1, "BCPCopyInitGlobal: TABLOCK=%d (choice=%d, target_shape=%d, new_table=%d)", config.tablock ? 1 : 0,
+				 (int)config.tablock_choice, (int)config.target_shape, config.is_new_table ? 1 : 0);
+}
+
+// How many bulk-load sessions this COPY may open, and on whose connection
+// (spec 057 step 7; resolved by one shared function since spec 063 D1,
+// because COPY derived this inline and CTAS derived it again, differently).
+//
+// COPY answers JoinsTransaction: it may be loading into a table that
+// existed before the statement, whose rows nothing else can undo, so
+// inside a transaction the transaction has to own the load — and a second
+// writer would sit outside it and not roll back with the rest. A
+// correctness question, not a tuning one.
+static idx_t ParallelWriterLimit(ClientContext &context, MSSQLCatalog &mssql_catalog, const BCPCopyTarget &target,
+								 bool transaction_pinned) {
+	Value pw;
+	int64_t configured = 0;
+	if (context.TryGetCurrentSetting("mssql_copy_parallel_writers", pw)) {
+		configured = pw.GetValue<int64_t>();
+	}
+	const auto policy =
+		MSSQLResolveLoadPolicy(target.is_temp_table, transaction_pinned, MSSQLLoadTransactionRole::JoinsTransaction,
+							   configured, static_cast<uint64_t>(context.db->NumberOfThreads()),
+							   static_cast<uint64_t>(mssql_catalog.GetConnectionLimit()));
+	return static_cast<idx_t>(policy.max_writers);
+}
+
+// The connection is the session's from here: the last step of init, so
+// every throw before it still goes through ReleaseConnectionOnInitError and
+// every release after this point is the session's.
+static void HandConnectionToSession(ClientContext &context, MSSQLCatalog &mssql_catalog, MSSQLCopyBindData &bdata,
+									MSSQLCopyGlobalState &gstate, bool defer_connection) {
+	BulkLoadSessionParams params;
+	params.pool_handle = gstate.pool_handle;
+	params.insert_bulk_sql = &gstate.insert_bulk_sql;
+	params.target = &bdata.target;
+	params.columns = &gstate.columns;
+	params.column_mapping = &gstate.column_mapping;
+	params.flush_rows = bdata.config.flush_rows;
+	params.collect_timings = mssql::CountersEnabled();
+	params.reset_on_release = gstate.reset_on_release;
+	if (defer_connection) {
+		gstate.deferred_params = params;
+		gstate.shared.DeferAdoption(gstate.deferred_params);
+		ConnectionProvider::ReleaseConnection(context, mssql_catalog, std::move(gstate.connection));
+	} else {
+		gstate.shared.Adopt(std::move(gstate.connection), params, gstate.transaction_pinned);
+	}
+	gstate.connection.reset();
+}
+
+// Everything the init does on its connection, in order: the target checked or created, the load's
+// columns, TABLOCK, the INSERT BULK text, the writer limit, and the connection handed to the shared
+// session. A throw leaves the connection in `gstate` for the caller to release.
+static void PrepareLoad(ClientContext &context, MSSQLCatalog &mssql_catalog, MSSQLCopyBindData &bdata,
+						MSSQLCopyGlobalState &gstate, bool defer_connection) {
+	RequireIdleConnection(*gstate.connection);
+
+	// Check if we're in a DuckDB transaction - warn about potential issues
+	bool in_transaction = ConnectionProvider::IsInTransaction(context, mssql_catalog);
+	if (in_transaction) {
+		CopyDebugLog(1,
+					 "BCPCopyInitGlobal: Running COPY within a transaction. "
+					 "If COPY fails mid-stream, partial data may be committed. "
+					 "For atomic bulk loads, ensure the COPY completes successfully before COMMIT.");
+	}
+
+	// Validate target and optionally create table
+	// The target's columns when it existed: read once, there, and the COLMETADATA built from that read
+	// (review of #574: a second read could see a column another session added, and move a name).
+	vector<BCPColumnMetadata> existing_columns;
+	TargetResolver::ValidateTarget(context, *gstate.connection, bdata.target, bdata.config, bdata.source_types,
+								   bdata.source_names, &existing_columns);
+
+	InvalidateTargetSchema(context, mssql_catalog, bdata);
+
+	idx_t dropped_null_only = 0;
+	const bool target_metadata_used =
+		ResolveLoadColumns(mssql_catalog, bdata, gstate, existing_columns, dropped_null_only);
+
+	RefuseUnsupportedColumns(gstate.columns, bdata.target);
+	RefuseNothingToLoad(target_metadata_used, gstate.columns, dropped_null_only, bdata.target);
+
+	ResolveTablock(bdata.config);
+
+	// Build and execute INSERT BULK statement — one builder for every consumer
+	// (spec 063 D4), which is what stops CTAS silently omitting ROWS_PER_BATCH.
+	const string insert_bulk =
+		BuildInsertBulkSql(bdata.target, gstate.columns, bdata.config.tablock, bdata.config.flush_rows);
+	CopyDebugLog(2, "BCPCopyInitGlobal: INSERT BULK SQL: %s", insert_bulk.c_str());
+
+	// Cache the INSERT BULK SQL for re-execution on batch flush
+	gstate.insert_bulk_sql = insert_bulk;
+
+	// INSERT BULK is NOT sent here. DuckDB creates the sink state before it
+	// initialises the source (an open job scheduled from RequestFileState),
+	// and inside a transaction the source scan drains on this same pinned
+	// connection; a stream opened here would be the collision W3 exists to
+	// remove. The shared session opens its stream on the first chunk.
+
+	gstate.parallel_writer_limit = ParallelWriterLimit(context, mssql_catalog, bdata.target, gstate.transaction_pinned);
+	CopyDebugLog(1, "BCPCopyInitGlobal: parallel_writer_limit=%llu (pinned=%d, session_temp=%d)",
+				 (unsigned long long)gstate.parallel_writer_limit, gstate.transaction_pinned ? 1 : 0,
+				 bdata.target.is_temp_table ? 1 : 0);
+
+	HandConnectionToSession(context, mssql_catalog, bdata, gstate, defer_connection);
+
+	CopyDebugLog(1, "BCPCopyInitGlobal: ready; the BCP stream opens on the first chunk (spec 075 W3)");
+}
+
 unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, FunctionData &bind_data,
 												 const string &file_path) {
 	auto &bdata = bind_data.Cast<MSSQLCopyBindData>();
@@ -313,8 +745,8 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 	mssql_catalog.CheckWriteAccess("COPY TO");
 
 	// Capture the destructor's release targets here, on the client thread — it must not touch a
-	// ClientContext itself (issue #178 / PR #179). Covers the sink-throw path, where neither the
-	// helper below nor BCPCopyFinalize runs (issue #191).
+	// ClientContext itself (issue #178 / PR #179). Covers the sink-throw path, where neither
+	// ReleaseConnectionOnInitError nor BCPCopyFinalize runs (issue #191).
 	gstate->pool_handle = mssql_catalog.GetConnectionPoolHandle();
 	gstate->transaction_pinned = !context.transaction.IsAutoCommit();
 	gstate->reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
@@ -353,364 +785,11 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 	gstate->transaction_pinned = ConnectionProvider::IsInTransaction(context, mssql_catalog);
 	CopyDebugLog(2, "BCPCopyInitGlobal: connection acquired");
 
-	// Helper to release connection on error
-	auto release_connection_on_error = [&]() {
-		if (gstate->connection) {
-			CopyDebugLog(2, "BCPCopyInitGlobal: releasing connection due to error");
-			// Ensure connection is in Idle state before releasing
-			if (gstate->connection->GetState() == tds::ConnectionState::Executing) {
-				gstate->connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-			}
-			bool in_transaction = ConnectionProvider::IsInTransaction(context, mssql_catalog);
-			if (in_transaction) {
-				ConnectionProvider::ReleaseConnection(context, mssql_catalog, gstate->connection);
-			} else {
-				mssql_catalog.GetConnectionPool().Release(gstate->connection);
-			}
-			gstate->connection.reset();
-		}
-	};
-
 	try {
-		// Check connection is in Idle state
-		if (gstate->connection->GetState() != tds::ConnectionState::Idle) {
-			auto state = gstate->connection->GetState();
-			string state_str = tds::ConnectionStateToString(state);
-
-			// Provide specific error messages based on connection state
-			if (state == tds::ConnectionState::Executing) {
-				throw InvalidInputException(
-					"MSSQL COPY: Connection is busy executing another query. "
-					"This can happen if you're reading from an MSSQL table (via mssql_scan) "
-					"and writing to the same MSSQL database within a transaction. "
-					"Either: (1) Read data into a local table first, then COPY to MSSQL, or "
-					"(2) Use separate transactions for reading and writing. "
-					"Connection state: %s",
-					state_str);
-			} else {
-				throw InvalidInputException(
-					"MSSQL COPY: Connection is not ready for BCP operation (state: %s). "
-					"The connection may be in an error state or performing another operation.",
-					state_str);
-			}
-		}
-
-		// Check if we're in a DuckDB transaction - warn about potential issues
-		bool in_transaction = ConnectionProvider::IsInTransaction(context, mssql_catalog);
-		if (in_transaction) {
-			CopyDebugLog(1,
-						 "BCPCopyInitGlobal: Running COPY within a transaction. "
-						 "If COPY fails mid-stream, partial data may be committed. "
-						 "For atomic bulk loads, ensure the COPY completes successfully before COMMIT.");
-		}
-
-		// Validate target and optionally create table
-		// The target's columns when it existed: read once, there, and the COLMETADATA built from that read
-		// (review of #574: a second read could see a column another session added, and move a name).
-		vector<BCPColumnMetadata> existing_columns;
-		TargetResolver::ValidateTarget(context, *gstate->connection, bdata.target, bdata.config, bdata.source_types,
-									   bdata.source_names, &existing_columns);
-
-		// Point invalidation: invalidate schema's table list if table was created/dropped
-		// This ensures the new table schema is visible for subsequent queries
-		if (!bdata.target.IsTempTable() && (bdata.config.create_table || bdata.config.overwrite)) {
-			mssql_catalog.InvalidateSchemaTableSet(bdata.target.schema_name);
-			mssql_catalog.NoteTransactionChange(context, bdata.target.schema_name);
-			CopyDebugLog(2, "BCPCopyInitGlobal: schema '%s' table list invalidated after table creation/modification",
-						 bdata.target.schema_name.c_str());
-		}
-
-		// Generate column metadata for BCP
-		// For existing tables (not created or replaced), we MUST use the target table's column types
-		// for COLMETADATA. The BCP protocol requires COLMETADATA to match the target table exactly.
-		// For newly created tables, we use source types since the table was created from them.
-		bool need_target_metadata = !bdata.config.overwrite;
-		// Spec 093 T2: a VARIANT column the load creates writes its string values under the database's
-		// collation. The catalog's is empty when it never read it (catalog false) or its query failed;
-		// then this COPY's own connection is asked, once, and only when a VARIANT is loaded. Empty again
-		// (the read failed too) gives Latin1_General_100_BIN2_UTF8 (codec::variant::StringCollationBytes).
-		auto variant_collation = [&]() -> string {
-			const auto &known = mssql_catalog.GetDatabaseCollation();
-			bool has_variant = false;
-			for (const auto &type : bdata.source_types) {
-				has_variant = has_variant || type.id() == LogicalTypeId::VARIANT;
-			}
-			if (!known.empty() || !has_variant) {
-				return known;
-			}
-			return MSSQLSimpleQuery::ExecuteScalar(
-				*gstate->connection, "SELECT CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation'))");
-		};
-		bool need_column_mapping = false;
-		// "Nothing left to load" has to be raised OUTSIDE the try below, because
-		// that block ends in a bare `catch (...)` meant for "the table was just
-		// created and has no metadata yet" — a throw inside it silently becomes a
-		// fallback to source-derived metadata, which is how a geometry column came
-		// to be declared varbinary(max) and the server answered "Invalid column
-		// type from bcp client" instead of our message. Two ways to get here now,
-		// and they are different user errors, so they carry different text.
-		bool target_metadata_used = false;
-		idx_t dropped_null_only = 0;
-		if (need_target_metadata) {
-			// Try to get target column metadata - this will work for existing tables
-			try {
-				gstate->columns = !existing_columns.empty() ? std::move(existing_columns)
-															: TargetResolver::GetExistingTableColumnMetadata(
-																  *gstate->connection, bdata.target);
-				CopyDebugLog(1, "BCPCopyInitGlobal: using target table column metadata (%llu columns)",
-							 (unsigned long long)gstate->columns.size());
-
-				// Columns whose pair bind admitted for the all-NULL case only —
-				// TYPED sources; see BCPCopyConfig::null_only_columns. Mark the
-				// target metadata so PrepareColumnStates verifies the mask per
-				// chunk and routes them through the NullOnly path. A bare
-				// `NULL AS col` is a different case, decided below by its
-				// SQLNULL source type.
-				// By the target's DuckDB names, as the source names them (issue #572).
-				std::vector<std::string> server_names;
-				for (const auto &col : gstate->columns) {
-					server_names.push_back(col.name);
-				}
-				const auto duckdb_names = mssql::DuckDBColumnNames(server_names);
-				for (const auto &nn : bdata.config.null_only_columns) {
-					for (idx_t c = 0; c < gstate->columns.size(); c++) {
-						if (StringUtil::Lower(duckdb_names[c]) == nn) {
-							gstate->columns[c].null_only_source = true;
-						}
-					}
-				}
-
-				// Build column mapping from source to target
-				gstate->column_mapping = TargetResolver::BuildColumnMapping(bdata.source_names, gstate->columns);
-
-				// Issue #125: Drop target columns that have no matching source column (by name).
-				// These are columns the server fills itself — IDENTITY, DEFAULT-valued, or
-				// computed columns the source intentionally omits. INSERT BULK only needs the
-				// columns actually being loaded; SQL Server auto-generates the rest. Previously
-				// every target column was declared, so an unmapped IDENTITY column had NULL
-				// streamed into it and the load failed ("Cannot insert the value NULL into
-				// column ..." / "Incorrect syntax near the keyword 'with'").
-				{
-					vector<BCPColumnMetadata> mapped_columns;
-					vector<int32_t> mapped_mapping;
-					mapped_columns.reserve(gstate->columns.size());
-					mapped_mapping.reserve(gstate->column_mapping.size());
-					for (idx_t i = 0; i < gstate->columns.size(); i++) {
-						// column_mapping[i] is the source-column index feeding target column i,
-						// or -1 when no source column matches it by name. Keep only the mapped
-						// (>= 0) target columns; the -1 entries are server-generated (IDENTITY,
-						// DEFAULT, computed) and must be left out of INSERT BULK entirely.
-						if (gstate->column_mapping[i] >= 0) {
-							// Issue #353 review: a column the wire cannot carry, fed by a source
-							// that is a CONSTANT NULL — `NULL AS g`, which is how one says "leave
-							// this column alone" and which loaded before #353 (by accident: the
-							// sys.types join hid the column entirely).
-							//
-							// It cannot be declared and sent as NULLs: the type mapping gives it
-							// the VARCHAR fallback and an nvarchar column against a geometry
-							// target makes the server refuse the whole INSERT BULK. So it is
-							// dropped from the load exactly like an unmatched column and the
-							// server fills it.
-							//
-							// The test is the SOURCE TYPE, not `null_only_source`. Bind marks
-							// null_only_source for any pair it cannot type-check, which includes
-							// a fully typed source that merely happens to start with NULLs — and
-							// dropping THAT would turn a refusal at init into a refusal on
-							// whichever chunk first carries a value, by which point earlier
-							// batches have committed. A partial write is the wrong answer to a
-							// silent-data-loss issue. DuckDB types a bare NULL as SQLNULL and
-							// keeps it that way to here (measured), and a SQLNULL column has no
-							// other value it could hold, so this drop cannot lose anything.
-							const auto &col = gstate->columns[i];
-							const idx_t src = static_cast<idx_t>(gstate->column_mapping[i]);
-							if (col.bulk_unsupported && src < bdata.source_types.size() &&
-								bdata.source_types[src].id() == LogicalTypeId::SQLNULL) {
-								dropped_null_only++;
-								CopyDebugLog(1,
-											 "BCPCopyInitGlobal: omitting target column '%s' (%s) from INSERT BULK "
-											 "(constant NULL source; the wire cannot carry this type)",
-											 col.name.c_str(), col.server_type_name.c_str());
-								continue;
-							}
-							mapped_columns.push_back(gstate->columns[i]);
-							mapped_mapping.push_back(gstate->column_mapping[i]);
-						} else {
-							CopyDebugLog(1,
-										 "BCPCopyInitGlobal: omitting target column '%s' from INSERT BULK "
-										 "(no matching source column; server-generated, e.g. IDENTITY/DEFAULT)",
-										 gstate->columns[i].name.c_str());
-						}
-					}
-					gstate->columns = std::move(mapped_columns);
-					gstate->column_mapping = std::move(mapped_mapping);
-				}
-
-				// Check if we need to use column mapping (i.e., not a 1:1 positional match)
-				// Mapping is needed if: column counts differ, or any mapping != position
-				need_column_mapping = (bdata.source_names.size() != gstate->columns.size());
-				if (!need_column_mapping) {
-					for (idx_t i = 0; i < gstate->column_mapping.size(); i++) {
-						if (gstate->column_mapping[i] != static_cast<int32_t>(i)) {
-							need_column_mapping = true;
-							break;
-						}
-					}
-				}
-
-				if (need_column_mapping) {
-					CopyDebugLog(1, "BCPCopyInitGlobal: using column mapping (source: %llu cols, target: %llu cols)",
-								 (unsigned long long)bdata.source_names.size(),
-								 (unsigned long long)gstate->columns.size());
-				}
-				target_metadata_used = true;
-			} catch (...) {
-				// If we can't get target metadata (e.g., table was just created), use source types
-				gstate->columns = TargetResolver::GenerateColumnMetadata(
-					bdata.source_types, bdata.source_names, bdata.config.wire_varchar_collation,
-					bdata.config.text_type_varchar, variant_collation());
-				CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (%llu columns)",
-							 (unsigned long long)gstate->columns.size());
-			}
-		} else {
-			// Table was replaced or created, use source types
-			gstate->columns = TargetResolver::GenerateColumnMetadata(
-				bdata.source_types, bdata.source_names, bdata.config.wire_varchar_collation,
-				bdata.config.text_type_varchar, variant_collation());
-			CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (table created/replaced)");
-		}
-
-		// Issue #353: a target column whose type the bulk wire cannot carry, still
-		// present after the unmatched-column drop above — which means a source
-		// column feeds it by name.
-		//
-		// This runs OUTSIDE the try above on purpose. That block ends in a bare
-		// `catch (...)` meant for "the table was just created and has no metadata
-		// yet", and it swallows everything: a refusal thrown inside it silently
-		// became a fallback to source-derived metadata, which declared a geometry
-		// column as varbinary(max) and let the server answer "Invalid column type
-		// from bcp client" instead. Measured while writing this.
-		//
-		// Until #353 such a column never got here at all: the metadata query's
-		// INNER JOIN to sys.types dropped every CLR UDT, so the source column was
-		// ignored and its values were lost with no error. A column NO source feeds
-		// is still left out of the load, exactly as before, and so is one fed by a
-		// constant NULL.
-		//
-		// This is the ONLY place such a column is refused, and it runs before a
-		// single row is encoded — so a COPY that is going to fail for this reason
-		// writes nothing at all, rather than committing the batches that happened
-		// to precede the first non-NULL value.
-		for (const auto &col : gstate->columns) {
-			if (!col.bulk_unsupported) {
-				continue;
-			}
-			throw InvalidInputException(
-				"MSSQL COPY: column '%s' of table '%s' has type %s, which the bulk-load wire cannot "
-				"carry — its wire form is SQL Server's own, not the bytes a DuckDB value holds. "
-				"Use INSERT for this table, or leave the column out of the source. A literal, "
-				"uncast `NULL AS %s` is also accepted — the column is then dropped from the load "
-				"exactly like an omitted one and the SERVER fills it: with NULL, with its DEFAULT, "
-				"or with a generated value for a rowversion, and a NOT NULL column without a "
-				"default fails there — but a TYPED null is not: `CAST(NULL AS VARCHAR) AS %s`, or "
-				"an all-NULL column read from a table or a file, carries a type and lands here "
-				"with everything else.",
-				col.name, bdata.target.GetFullyQualifiedName(), col.server_type_name, col.name, col.name);
-		}
-
-		// Nothing left to load. Deliberately outside the try, per the note above:
-		// inside it, both of these became a silent fallback to source-derived
-		// metadata. They are different mistakes and say so.
-		if (target_metadata_used && gstate->columns.empty()) {
-			if (dropped_null_only > 0) {
-				throw InvalidInputException(
-					"MSSQL COPY: every source column that matches target table '%s' feeds a column the "
-					"bulk-load wire cannot carry and was given a constant NULL, so there is nothing to "
-					"load. Drop those columns from the source, or give the statement a column the target "
-					"can take.",
-					bdata.target.GetFullyQualifiedName());
-			}
-			throw InvalidInputException(
-				"MSSQL COPY: no source columns match target table '%s' by name; "
-				"nothing to load. Ensure source column names match the target's columns.",
-				bdata.target.GetFullyQualifiedName());
-		}
-
-		// TABLOCK by the target's shape (spec 057 step 1, replacing issue #45's
-		// "new tables" rule). ValidateTarget above set target_shape — from
-		// sys.indexes for an existing table, from what we just created otherwise.
-		bdata.config.tablock = MSSQLResolveTablock(bdata.config.tablock_choice, bdata.config.target_shape);
-		CopyDebugLog(1, "BCPCopyInitGlobal: TABLOCK=%d (choice=%d, target_shape=%d, new_table=%d)",
-					 bdata.config.tablock ? 1 : 0, (int)bdata.config.tablock_choice, (int)bdata.config.target_shape,
-					 bdata.config.is_new_table ? 1 : 0);
-
-		// Build and execute INSERT BULK statement — one builder for every consumer
-		// (spec 063 D4), which is what stops CTAS silently omitting ROWS_PER_BATCH.
-		const string insert_bulk =
-			BuildInsertBulkSql(bdata.target, gstate->columns, bdata.config.tablock, bdata.config.flush_rows);
-		CopyDebugLog(2, "BCPCopyInitGlobal: INSERT BULK SQL: %s", insert_bulk.c_str());
-
-		// Cache the INSERT BULK SQL for re-execution on batch flush
-		gstate->insert_bulk_sql = insert_bulk;
-
-		// INSERT BULK is NOT sent here. DuckDB creates the sink state before it
-		// initialises the source (an open job scheduled from RequestFileState),
-		// and inside a transaction the source scan drains on this same pinned
-		// connection; a stream opened here would be the collision W3 exists to
-		// remove. The shared session opens its stream on the first chunk.
-
-		// How many bulk-load sessions this COPY may open, and on whose connection
-		// (spec 057 step 7; resolved by one shared function since spec 063 D1,
-		// because COPY derived this inline and CTAS derived it again, differently).
-		//
-		// COPY answers JoinsTransaction: it may be loading into a table that
-		// existed before the statement, whose rows nothing else can undo, so
-		// inside a transaction the transaction has to own the load — and a second
-		// writer would sit outside it and not roll back with the rest. A
-		// correctness question, not a tuning one.
-		{
-			Value pw;
-			int64_t configured = 0;
-			if (context.TryGetCurrentSetting("mssql_copy_parallel_writers", pw)) {
-				configured = pw.GetValue<int64_t>();
-			}
-			const auto policy = MSSQLResolveLoadPolicy(bdata.target.is_temp_table, gstate->transaction_pinned,
-													   MSSQLLoadTransactionRole::JoinsTransaction, configured,
-													   static_cast<uint64_t>(context.db->NumberOfThreads()),
-													   static_cast<uint64_t>(mssql_catalog.GetConnectionLimit()));
-			gstate->parallel_writer_limit = static_cast<idx_t>(policy.max_writers);
-		}
-		CopyDebugLog(1, "BCPCopyInitGlobal: parallel_writer_limit=%llu (pinned=%d, session_temp=%d)",
-					 (unsigned long long)gstate->parallel_writer_limit, gstate->transaction_pinned ? 1 : 0,
-					 bdata.target.is_temp_table ? 1 : 0);
-
-		// The connection is the session's from here: the last step of init, so
-		// every throw above still goes through release_connection_on_error and
-		// every release after this point is the session's.
-		{
-			BulkLoadSessionParams params;
-			params.pool_handle = gstate->pool_handle;
-			params.insert_bulk_sql = &gstate->insert_bulk_sql;
-			params.target = &bdata.target;
-			params.columns = &gstate->columns;
-			params.column_mapping = &gstate->column_mapping;
-			params.flush_rows = bdata.config.flush_rows;
-			params.collect_timings = mssql::CountersEnabled();
-			params.reset_on_release = gstate->reset_on_release;
-			if (defer_connection) {
-				gstate->deferred_params = params;
-				gstate->shared.DeferAdoption(gstate->deferred_params);
-				ConnectionProvider::ReleaseConnection(context, mssql_catalog, std::move(gstate->connection));
-			} else {
-				gstate->shared.Adopt(std::move(gstate->connection), params, gstate->transaction_pinned);
-			}
-			gstate->connection.reset();
-		}
-
-		CopyDebugLog(1, "BCPCopyInitGlobal: ready; the BCP stream opens on the first chunk (spec 075 W3)");
-
+		PrepareLoad(context, mssql_catalog, bdata, *gstate, defer_connection);
 	} catch (...) {
 		// Release connection on any error during initialization
-		release_connection_on_error();
+		ReleaseConnectionOnInitError(context, mssql_catalog, *gstate);
 		throw;
 	}
 
