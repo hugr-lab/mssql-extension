@@ -13,7 +13,11 @@ covers it). Nine tables in a scratch database:
   smallmoney, real, float, date, time (7) and (0), datetime, smalldatetime, datetime2 (7),
   datetimeoffset (7), uniqueidentifier, char / varchar / nchar / nvarchar, binary / varbinary, the three
   `(max)` types, sql_variant, xml) between two regular variable columns: a row of NULLs, a row of edge
-  values, one value alone, empty strings and binaries, values of 9,000 to 10,000 bytes;
+  values, one value alone, empty strings and binaries, values of 9,000 to 10,000 bytes. Not in it:
+  `hierarchyid`, which may be sparse too (measured 2026-11-28 on SQL Server 2022, 16.0.4295, review of
+  #626): the rowset holds it as a `varbinary(892)` (`sys.system_internals_partition_columns` type 165,
+  as a regular hierarchyid), so its entry in the vector is a variable one, and a backup's sparse
+  hierarchyid of `/`, `/42/`, `/-1/0.5/`, a ten-level path and NULL read as `ToString()` gives them;
 - `t_wide`: 600 sparse ints and a varchar, three of them set;
 - `t_colset`: eight sparse columns behind a column set;
 - `t_alter`: a sparse column added, then a regular one made sparse (`ALTER COLUMN … ADD SPARSE`);

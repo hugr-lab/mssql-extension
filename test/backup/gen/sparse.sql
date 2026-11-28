@@ -1,5 +1,6 @@
 -- Spec 086 PR 3: sparse columns (the record's sparse vector, E24), for the oracle lane, local development and the
--- committed test/data/backup/sparse. Every type a sparse column can have, at its edges and over rows that set a
+-- committed test/data/backup/sparse. Every type a sparse column can have but hierarchyid (a varbinary(892) in the
+-- rowset, measured to read: E24), at its edges and over rows that set a
 -- few of them; a regular column off row before the vector; 1000 sparse columns; a column set; sparseness
 -- changed by ALTER (rows rewritten, the old entries kept under a dropped hbcolid); a sparse column dropped and
 -- one added; a heap whose rows grow and are forwarded; a non-unique clustered index
