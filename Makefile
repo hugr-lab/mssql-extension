@@ -671,6 +671,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_ddl_translator.cpp \
     test/cpp/test_ctas_type_mapping.cpp \
     test/cpp/test_login_retry.cpp \
+    test/cpp/codec/test_type_converter_fallback.cpp \
     test/cpp/backup/test_backup_allocation.cpp \
     test/cpp/backup/test_backup_boot.cpp \
     test/cpp/backup/test_backup_bytes.cpp \

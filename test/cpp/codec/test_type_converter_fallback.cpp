@@ -44,7 +44,8 @@ using duckdb::LogicalType;
 using duckdb::tds::ColumnMetadata;
 using duckdb::tds::encoding::TypeConverter;
 
-// Every ConvertValue here passes no decode notes: no column is a sql_variant or a geometry / geography.
+// Every ConvertValue here passes no decode notes: none is needed for a column that is neither a sql_variant nor
+// a geometry / geography, and the one sql_variant test counts nothing.
 
 namespace {
 
@@ -221,6 +222,42 @@ void TestStringIntoVarcharVectorTakesNormalPath() {
 	CHECK_EQ(ReadVectorString(vec, 0), std::string("hi"));
 }
 
+// Issue #683: a sql_variant value into a vector that is neither VARIANT nor VARCHAR used to be copied
+// into it as a VARIANT (a segfault in VectorBuffer::Copy). It is refused by name, whatever the target.
+void TestSqlVariantIntoWrongVectorIsRefused() {
+	std::cout << "Test: SQL_VARIANT TDS into a non-VARIANT vector — refused by name (issue #683)\n";
+
+	// An int: base type 0x38, no property bytes, the value 42.
+	std::vector<uint8_t> wire = {0x38, 0x00, 0x2A, 0x00, 0x00, 0x00};
+	auto col = MakeColumn(duckdb::tds::TDS_TYPE_SQL_VARIANT);
+	col.name = "v";
+
+	const LogicalType targets[] = {LogicalType::BLOB,	LogicalType::INTEGER,		LogicalType::BIGINT,
+								   LogicalType::DOUBLE, LogicalType::BOOLEAN,		LogicalType::TIMESTAMP,
+								   LogicalType::UUID,	LogicalType::DECIMAL(18, 4)};
+	for (const auto &target : targets) {
+		duckdb::Vector vec(target, 1);
+		std::string message;
+		try {
+			TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0, nullptr, nullptr);
+		} catch (const duckdb::InvalidInputException &e) {
+			message = e.what();
+		}
+		CHECK_EQ(message.find("column 'v' streams a sql_variant") != std::string::npos, true);
+		CHECK_EQ(message.find(target.ToString()) != std::string::npos, true);
+	}
+
+	// A NULL needs no decode and is still a NULL in any vector.
+	duckdb::Vector blob(LogicalType::BLOB, 1);
+	TypeConverter::ConvertValue({}, /*is_null*/ true, col, blob, 0, nullptr, nullptr);
+	CHECK_EQ(duckdb::FlatVector::IsNull(blob, 0), true);
+
+	// The VARIANT target is unchanged: the value decodes.
+	duckdb::Vector variant(LogicalType::VARIANT(), 1);
+	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, variant, 0, nullptr, nullptr);
+	CHECK_EQ(duckdb::FlatVector::IsNull(variant, 0), false);
+}
+
 }  // namespace
 
 int main() {
@@ -234,6 +271,7 @@ int main() {
 	TestNullIntoVarcharVector();
 	TestUuidIntoVarcharVector();
 	TestStringIntoVarcharVectorTakesNormalPath();
+	TestSqlVariantIntoWrongVectorIsRefused();
 
 	if (failures > 0) {
 		std::cerr << "\n" << failures << " assertion(s) failed.\n";
