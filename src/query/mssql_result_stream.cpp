@@ -985,7 +985,7 @@ void MSSQLResultStream::DrainAfterCancel() {
 		read_count++;
 
 		tds::ParsedTokenType token;
-		while ((token = parser_.TryParseNext()) != tds::ParsedTokenType::NeedMoreData) {
+		while (DrainNextToken(token) && token != tds::ParsedTokenType::NeedMoreData) {
 			token_count++;
 
 			if (token == tds::ParsedTokenType::Done) {
@@ -1011,6 +1011,22 @@ void MSSQLResultStream::DrainAfterCancel() {
 	}
 }
 
+bool MSSQLResultStream::DrainNextToken(tds::ParsedTokenType &token) {
+	// Issue #682: the row reader refuses a malformed length by throwing (a sql_variant value past 8,009
+	// bytes, a TEXT / NTEXT / IMAGE or PLP length it cannot hold). A drain meets the row FillChunk already
+	// refused, and it runs from the destructor: the exception must not leave it. What cannot be parsed
+	// cannot be drained, so the connection is closed, never handed back as reusable.
+	try {
+		token = parser_.TryParseNext();
+		return true;
+	} catch (const std::exception &e) {
+		MSSQL_DEBUG_LOG(1, "drain: the response cannot be parsed (%s), closing connection", e.what());
+		connection_->Close();
+		state_ = MSSQLResultStreamState::Error;
+		return false;
+	}
+}
+
 void MSSQLResultStream::DrainRemainingTokens() {
 	// Drain remaining TDS tokens after detecting an error condition.
 	// Similar to DrainAfterCancel but without sending ATTENTION signal.
@@ -1028,7 +1044,10 @@ void MSSQLResultStream::DrainRemainingTokens() {
 			return;
 		}
 
-		tds::ParsedTokenType token = parser_.TryParseNext();
+		tds::ParsedTokenType token;
+		if (!DrainNextToken(token)) {
+			return;
+		}
 
 		if (token == tds::ParsedTokenType::Done) {
 			auto done = parser_.GetDone();
