@@ -40,7 +40,10 @@
 # differential (spec 093 T8b: variant_full, variant_diff, paired as variant_over; 2025's committed under
 # test/data/backup/variant); datetime2.sql, datetime2(7) at TIMESTAMP_NS's edges and datetime2's in every
 # storage form, a temporal table, then datetime2_changes.sql's changes and a differential (spec 093 T8c:
-# datetime2_full, datetime2_diff, paired as datetime2_over; 2025's committed under test/data/backup/datetime2);
+# datetime2_full, datetime2_diff, paired as datetime2_over; 2025's committed under test/data/backup/datetime2); vector.sql, SQL Server 2025's vector (float32 and float16, at their edges and
+# dimension limits) in every storage form and off row, then vector_changes.sql's changes and a differential
+# (spec 093 T8d: vector_full, vector_diff, paired as vector_over; skipped before 2025, which has no vector;
+# committed under test/data/backup/vector);
 # tail_window.sql, changes made at known points of a backup's copy -- the backup written into a FIFO this
 # script reads, held in its first data pass and inside its second (review of #591: tail_window_full, compared
 # with its RESTORE as compare_rows.sh's FUZZY; committed under test/data/backup/tail_window, made by its
@@ -63,7 +66,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant datetime2}"
+FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant datetime2 vector}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -195,6 +198,10 @@ for fixture in ${FIXTURES}; do
 		hex="$(tr -d ' \n' <"${HERE}/../../data/clr/mssql_test_udt.dll.hex")"
 		printf "DECLARE @b varbinary(max) = 0x%s;\nDECLARE @h varbinary(64) = HASHBYTES('SHA2_512', @b);\nIF NOT EXISTS (SELECT 1 FROM sys.trusted_assemblies WHERE hash = @h) EXEC sys.sp_add_trusted_assembly @h, N'mssql_test_udt';\nCREATE ASSEMBLY MssqlTestUdt FROM @b WITH PERMISSION_SET = SAFE;\n" \
 			"${hex}" | docker exec -i -u 0 "${CONTAINER}" sh -c 'cat >/tmp/gen/clr_assembly.sql && chmod 644 /tmp/gen/clr_assembly.sql'
+	fi
+	if [ "${fixture}" = vector ] && [ "${major}" -lt 17 ]; then
+		echo ">> skipping vector.sql: SQL Server ${major} has no vector type (2025 on)"
+		continue
 	fi
 	echo ">> running ${fixture}.sql"
 	run_sql "${fixture}.sql"
@@ -418,6 +425,13 @@ for fixture in ${FIXTURES}; do
 		run_sql variant_changes.sql
 		sets+=("variant_full|variant_full.bak" "variant_diff|variant_diff.bak")
 		overlays+=("variant_over|variant_full|variant_diff")
+		;;
+	vector)
+		# vector (spec 093 T8d), compressed; then vector_changes.sql's changes and differential. 2025 on.
+		golden bak_vector vector_full
+		run_sql vector_changes.sql
+		sets+=("vector_full|vector_full.bak" "vector_diff|vector_diff.bak")
+		overlays+=("vector_over|vector_full|vector_diff")
 		;;
 	datetime2)
 		# datetime2(7) at TIMESTAMP_NS's edges and datetime2's (spec 093 T8c), compressed; then

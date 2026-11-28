@@ -30,6 +30,7 @@
 
 #include "codec/clr/hierarchyid_codec.hpp"
 #include "codec/clr/spatial_codec.hpp"
+#include "codec/sql_vector/vector_codec.hpp"
 #include "codec/staging/column_ops.hpp"
 #include "codec/staging/column_staging.hpp"
 #include "codec/variant/variant_codec.hpp"
@@ -96,11 +97,13 @@ struct StagingCounters {
 //! one: where the values it cannot read as NULL go (T8, a backup's pages); nullptr refuses such a value
 //! (the server's own values). No defaults: a caller says where its notes go, or passes nullptr when its
 //! kernels are never Variant or Spatial (a WARNING is not lost by omission) -- for `hierarchyid_notes`,
-//! nullptr is the refusal.
+//! nullptr is the refusal. `vector_notes`, for a Vector one, is hierarchyid_notes' rule (T8d): a backup's
+//! value that is no vector of the column's shape read as NULL; nullptr refuses it (the server's own).
 void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
 						  Vector &out, variant::VariantColumnNotes *variant_notes,
 						  spatial::SpatialColumnNotes *spatial_notes,
-						  hierarchyid::HierarchyIdColumnNotes *hierarchyid_notes);
+						  hierarchyid::HierarchyIdColumnNotes *hierarchyid_notes,
+						  sql_vector::VectorColumnNotes *vector_notes);
 
 //! AND the staged NULLs of `count` rows into `out`'s mask (a kernel may have set NULLs of its own,
 //! which must stay); nothing when the column staged none.

@@ -1,0 +1,134 @@
+# name: test/sql/backup/mssql_backup_vector.test
+# description: Spec 093 T8d -- SQL Server 2025's vector read from a backup as FLOAT[n], by T3's kernel from its stored bytes
+# group: [mssql]
+#
+# test/data/backup/vector (test/backup/gen/vector.sql and vector_changes.sql, SQL Server 2025): float32 and float16
+# at their edges and at their dimension limits (1998, 3996), NULLs, a clustered table, a heap, ROW / PAGE
+# compression, values off row, and a differential over the full. A vector is stored as varbinary (xtype 165,
+# utype 255) whose bytes are the 0xF5 wire value's (measured/V4.md). The oracle lane compares every table with a
+# RESTORE through TYPE mssql on 2025; this pins the committed backup's values. A row's sum is cast to DECIMAL before
+# the rows are summed, so a total does not depend on the scan's order. No SQL Server is needed.
+
+require mssql
+
+statement ok
+SET VARIABLE f = 'test/data/backup/vector/vector_full.bak';
+
+statement ok
+SET VARIABLE d = 'test/data/backup/vector/vector_diff.bak';
+
+# Read as FLOAT[n], as TYPE mssql reads it (T3): converted, no longer its stored bytes; n from the declared length
+# and the element type (its scale).
+query TTTT
+SELECT table_name, column_name, duckdb_type, state FROM mssql_backup_columns(getvariable('f'), 'dbo')
+WHERE column_name IN ('v', 'h') ORDER BY 1, 2;
+----
+vec_edges	h	FLOAT[3]	converted
+vec_edges	v	FLOAT[3]	converted
+vec_heap	h	FLOAT[4]	converted
+vec_heap	v	FLOAT[4]	converted
+vec_limits	h	FLOAT[3996]	converted
+vec_limits	v	FLOAT[1998]	converted
+vec_many	h	FLOAT[8]	converted
+vec_many	v	FLOAT[16]	converted
+vec_ovf	v	FLOAT[1998]	converted
+vec_page	h	FLOAT[8]	converted
+vec_page	v	FLOAT[16]	converted
+vec_row	h	FLOAT[8]	converted
+vec_row	v	FLOAT[16]	converted
+
+# The edges: float32's largest, smallest normal and smallest subnormal; float16's 65504, smallest normal and
+# smallest subnormal, and 0.1 as float16 rounds it; NULLs, which a record stores with no header.
+query ITT
+SELECT id, v, h FROM mssql_backup_scan(getvariable('f'), 'dbo', 'vec_edges') ORDER BY id;
+----
+1	[1.0, 2.0, 3.0]	[1.0, 2.0, 3.0]
+2	[-1.5, 0.0, 0.25]	[-1.5, 0.0, 0.25]
+3	[3.4028235e+38, -3.4028235e+38, 1.1754944e-38]	[65504.0, -65504.0, 6.1035156e-05]
+4	[1e-45, 0.0, 0.1]	[5.9604645e-08, 0.0, 0.099975586]
+5	NULL	[7.0, 8.0, 9.0]
+6	[4.0, 5.0, 6.0]	NULL
+7	NULL	NULL
+
+# The dimension limits, 8000 bytes a value: vector(1998) and vector(3996, float16) (#644).
+query IIIII
+SELECT id, len(v), list_sum(v::FLOAT[])::DECIMAL(10, 3), len(h), list_sum(h::FLOAT[])::DECIMAL(10, 3)
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'vec_limits') ORDER BY id;
+----
+1	1998	11861.125	3996	29861.500
+2	1998	11868.375	3996	29970.250
+3	1998	11875.625	3996	29941.750
+4	1998	11882.875	3996	29974.250
+5	1998	11890.125	3996	29961.000
+6	1998	11897.375	3996	29978.250
+7	NULL	NULL	NULL	NULL
+
+query IIIII
+SELECT count(*), count(v), count(h), sum(list_sum(v::FLOAT[])::DECIMAL(18, 6)), sum(list_sum(h::FLOAT[])::DECIMAL(18, 6))
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'vec_many');
+----
+2000	1847	1819	8946.002778	8518.750000
+
+# ROW and PAGE compression store the same bytes: the compressed tables read as the clustered one.
+query II
+SELECT (SELECT count(*) FROM (SELECT id, v, h FROM mssql_backup_scan(getvariable('f'), 'dbo', 'vec_many') WHERE id <= 500
+		EXCEPT SELECT id, v, h FROM mssql_backup_scan(getvariable('f'), 'dbo', 'vec_row'))),
+	(SELECT count(*) FROM (SELECT id, tag, v, h FROM mssql_backup_scan(getvariable('f'), 'dbo', 'vec_many')
+		EXCEPT SELECT id, tag, v, h FROM mssql_backup_scan(getvariable('f'), 'dbo', 'vec_page')));
+----
+0	0
+
+# Off row: the 8000-byte vectors pushed to row-overflow beside a long varchar read whole.
+query II
+SELECT count(*), count(*) FILTER (WHERE len(v) = 1998 AND list_sum(v::FLOAT[]) > 0) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'vec_ovf');
+----
+6	6
+
+# A heap.
+query II
+SELECT count(*), sum(v[1])::INTEGER FROM mssql_backup_scan(getvariable('f'), 'dbo', 'vec_heap');
+----
+300	45150
+
+# The differential over the full: values changed, set NULL and back.
+query ITT
+SELECT id, v, h FROM mssql_backup_scan(getvariable('f'), 'dbo', 'vec_edges', diff := getvariable('d')) WHERE id IN (1, 2, 7) ORDER BY id;
+----
+1	[9.0, 9.0, 9.0]	NULL
+2	NULL	[-1.5, 0.0, 0.25]
+7	NULL	[0.5, 0.5, 0.5]
+
+query TI
+SELECT change_type, count(*) FROM mssql_backup_table_changes(getvariable('f'), 'dbo', 'vec_many', diff := getvariable('d'))
+GROUP BY ALL ORDER BY 1;
+----
+delete	61
+insert	200
+update_postimage	41
+update_preimage	41
+
+# An attached backup reads the same, and a correct value is never noted.
+statement ok
+SET enable_logging = true;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+ATTACH 'test/data/backup/vector/vector_full.bak' AS bkv (TYPE mssql_backup);
+
+query II
+SELECT count(*), count(v) FROM bkv.dbo.vec_many;
+----
+2000	1847
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%(vector) holds%';
+----
+0
+
+statement ok
+DETACH bkv;
+
+statement ok
+SET enable_logging = false;

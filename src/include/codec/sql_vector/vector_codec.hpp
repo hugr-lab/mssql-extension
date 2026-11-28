@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "codec/sql_vector/vector_bytes.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -34,11 +35,20 @@ bool IsVectorType(const LogicalType &type);
 //! ARRAY(FLOAT, dimensions).
 LogicalType FloatArrayType(uint16_t dimensions);
 
-//! A chunk's staged values (either wire form) into `out`, an ARRAY(FLOAT, n): a value of another shape
-//! than the column's is an error naming the column. NULL rows' elements are zero; their validity is
-//! PublishStagedValidity's.
-void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
-							Vector &out);
+//! The values of a column the kernel could not read as NULL (spec 093 T8d: a backup's pages).
+struct VectorColumnNotes {
+	//! Values that are not a vector of the column's shape.
+	idx_t malformed = 0;
+	//! The first such value's status.
+	VectorStatus first_malformed = VectorStatus::Ok;
+};
+
+//! A chunk's staged values (either wire form) into `out`, an ARRAY(FLOAT, n). A value of another shape
+//! than the column's is, with `notes` given (a backup's pages: a damaged page, a value the server took
+//! unchecked), set NULL in `out` and counted there; with none (the server's own values on the wire), an
+//! error naming the column. NULL rows' elements are zero; their validity is PublishStagedValidity's.
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta, Vector &out,
+							VectorColumnNotes *notes);
 //! One value, for the per-value path (TypeConverter::ConvertValue).
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &meta, Vector &out, idx_t row);
 

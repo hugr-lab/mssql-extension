@@ -616,6 +616,69 @@ int main() {
 						  std::string::npos,
 				  "a 9000-byte sql_variant off row: NULL and noted, nothing read or reserved");
 		}
+		// A vector through the stager (spec 093 T8d): xtype varbinary, utype 255, its element type its scale and its
+		// length 8 + n x element size (V4); its stored bytes the 0xF5 wire value's, read by T3's kernel. A value of
+		// another shape NULL, counted in the column's notes, its row read.
+		{
+			auto vector_col = [](int32_t id, uint8_t element, int16_t length) {
+				CatalogColumn c = Col(id, "emb", XTYPE_VARBINARY, "vector", length, 0, element);
+				c.system_type_name = "varbinary";
+				c.user_type_id = 255;
+				return c;
+			};
+			CatalogTable with_vector = t;
+			with_vector.columns.push_back(vector_col(38, 0, 20));  // vector(3)
+			with_vector.columns.push_back(vector_col(39, 1, 14));  // vector(3, float16)
+			Check(ReadingOf(with_vector.columns[with_vector.columns.size() - 2], TypeForms()).type ==
+						  LogicalType::ARRAY(LogicalType::FLOAT, 3) &&
+					  ReadingOf(with_vector.columns.back(), TypeForms()).type ==
+						  LogicalType::ARRAY(LogicalType::FLOAT, 3),
+				  "a float32 and a float16 vector(3): FLOAT[3]");
+			// A declaration no vector has: its stored bytes, why named; never refused.
+			const ColumnReading odd_element = ReadingOf(vector_col(40, 2, 20), TypeForms());
+			const ColumnReading odd_length = ReadingOf(vector_col(41, 0, 21), TypeForms());
+			const ColumnReading too_long = ReadingOf(vector_col(42, 0, 8004), TypeForms());
+			Check(odd_element.raw && odd_element.note.find("element type 2") != std::string::npos && odd_length.raw &&
+					  odd_length.note.find("21 bytes long") != std::string::npos && too_long.raw &&
+					  too_long.note.find("float32 vector(1..1998)") != std::string::npos &&
+					  !ReadingOf(vector_col(43, 1, 8000), TypeForms()).raw,
+				  "an element type 2, a length of no whole element, 1999 float32 dimensions: their bytes; 3996 "
+				  "float16: a vector");
+			RowsetLayout vector_layout = layout;
+			vector_layout.columns.push_back(Phys(38, XTYPE_VARBINARY, -2, 19));
+			vector_layout.columns.push_back(Phys(39, XTYPE_VARBINARY, -3, 20));
+			// [1, 2, 3] as float32 and as float16 (V4's example), and a value whose header says 2 dimensions.
+			const std::vector<uint8_t> v32 = {0xa9, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+											  0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x40, 0x40};
+			const std::vector<uint8_t> v16 = {0xa9, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00,
+											  0x00, 0x00, 0x3c, 0x00, 0x40, 0x00, 0x42};
+			std::vector<uint8_t> bad32 = v32;
+			bad32[2] = 0x02;
+			const Page vector_page =
+				PageOf({Record(fixed, 20, 0, {note, v32, v16}), Record(fixed, 20, 0, {note, bad32, v16})});
+			RecordStager vector_stager(with_vector, {38, 39}, TypeForms());
+			vector_stager.UseLayout(vector_layout);
+			DataChunk vector_chunk;
+			vector_chunk.Initialize(Allocator::DefaultAllocator(), vector_stager.Types());
+			vector_stager.BeginChunk(vector_chunk);
+			vector_stager.Append(ReadSlot(vector_page.bytes.data(), PAGE_SIZE, 2, 0, "the test"));
+			vector_stager.Append(ReadSlot(vector_page.bytes.data(), PAGE_SIZE, 2, 1, "the test"));
+			vector_stager.FinalizeChunk(vector_chunk);
+			const auto vector_notes = vector_stager.TypeNotes();
+			Check(vector_chunk.GetValue(0, 0).ToString() == "[1.0, 2.0, 3.0]" &&
+					  vector_chunk.GetValue(1, 0).ToString() == "[1.0, 2.0, 3.0]" &&
+					  vector_chunk.GetValue(0, 1).IsNull() &&
+					  vector_chunk.GetValue(1, 1).ToString() == "[1.0, 2.0, 3.0]" && vector_notes.size() == 1 &&
+					  vector_notes[0].type == "vector" && vector_notes[0].name == "dbo.synthetic.emb" &&
+					  vector_notes[0].vector.malformed == 1 && vector_notes[0].Unreadable() == 1,
+				  "vectors read as FLOAT[3], a value of another shape NULL and noted: " +
+					  vector_chunk.GetValue(0, 0).ToString() + " | " + vector_chunk.GetValue(1, 0).ToString() + " | " +
+					  vector_chunk.GetValue(0, 1).ToString() + " | " + vector_chunk.GetValue(1, 1).ToString() +
+					  " | notes " + std::to_string(vector_notes.size()) +
+					  (vector_notes.empty() ? std::string()
+											: " " + vector_notes[0].type + " " + vector_notes[0].name + " " +
+												  std::to_string(vector_notes[0].vector.malformed)));
+		}
 		Check(ErrorOf([&]() { RecordStager(t, {99}, TypeForms()); }).find("has no column 99") != std::string::npos,
 			  "a column the table does not have");
 		RowsetLayout wrong = layout;

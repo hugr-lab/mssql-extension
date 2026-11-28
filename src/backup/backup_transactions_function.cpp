@@ -232,12 +232,13 @@ public:
 			stager_->Append(row);
 			const idx_t unread = Unreadable();
 			stager_->FinalizeChunk(chunk_);
-			// A CLR or sql_variant value its kernel read as NULL (bytes that are not MS-SSCLRT, a hierarchyid's or
-			// a sql_variant's), or a datetime2(7) past TIMESTAMP_NS (spec 093 T8c): the scan says it in a WARNING,
-			// the records have none, so the image keeps its bytes and says why (review of #621; spec 093 T8b).
+			// A CLR, sql_variant or vector value its kernel read as NULL (bytes that are not MS-SSCLRT, a
+			// hierarchyid's, a sql_variant's or a vector of its column's shape), or a datetime2(7) past TIMESTAMP_NS
+			// (spec 093 T8c): the scan says it in a WARNING, the records have none, so the image keeps its bytes and
+			// says why (review of #621; spec 093 T8b, T8d).
 			if (Unreadable() != unread) {
 				reason =
-					"a geometry, geography, hierarchyid or sql_variant value whose stored bytes cannot be read "
+					"a geometry, geography, hierarchyid, sql_variant or vector value whose stored bytes cannot be read "
 					"as its type, or a datetime2(7) outside TIMESTAMP_NS's range (datetime2_7_as 'timestamp' "
 					"as an ATTACH option, or SET mssql_datetime2_7_as = 'timestamp' before the ATTACH or before a "
 					"call over files, reads it)";
@@ -258,8 +259,8 @@ public:
 	}
 
 private:
-	//! The values the stager's CLR and sql_variant kernels read as NULL so far, and its datetime2(7) values
-	//! that did not fit TIMESTAMP_NS (RecordStager::TypeNotes).
+	//! The values the stager's CLR, sql_variant and vector kernels read as NULL so far, and its datetime2(7)
+	//! values that did not fit TIMESTAMP_NS (RecordStager::TypeNotes).
 	idx_t Unreadable() const {
 		idx_t n = 0;
 		for (const auto &note : stager_->TypeNotes()) {

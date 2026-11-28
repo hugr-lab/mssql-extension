@@ -39,5 +39,7 @@ OUT="${HERE}/tail_window" VERSION="${VERSION}" FIXTURES=tail_window TAIL_WINDOW_
 OUT="${HERE}/variant" VERSION="${VERSION}" FIXTURES=variant "${HERE}/../../backup/gen/generate.sh"
 # datetime2(7) at TIMESTAMP_NS's edges and datetime2's, a temporal table, a full and a differential (spec 093 T8c).
 OUT="${HERE}/datetime2" VERSION="${VERSION}" FIXTURES=datetime2 "${HERE}/../../backup/gen/generate.sh"
+# SQL Server 2025's vector, float32 and float16, in every storage form, a full and a differential (spec 093 T8d).
+OUT="${HERE}/vector" VERSION="${VERSION}" FIXTURES=vector "${HERE}/../../backup/gen/generate.sh"
 # Values stored off row changed every way, then a shrink (spec 085 PR 4c-3, the LOB tail).
 OUT="${HERE}/lob_changes" VERSION="${VERSION}" FIXTURES=lob_changes exec "${HERE}/../../backup/gen/generate.sh"

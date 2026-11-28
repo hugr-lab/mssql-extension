@@ -1245,6 +1245,13 @@ void TypeWarnings::Say(ClientContext &context, const char *function, const std::
 							   function, n.name.c_str(),
 							   codec::hierarchyid::DescribeStatus(n.hierarchyid.first_malformed));
 		}
+		// Spec 093 T8d: a vector's stored value that is no vector of the column's shape, NULL.
+		if (n.vector.malformed > 0 && said_.insert(n.name + "|vector").second) {
+			DUCKDB_LOG_WARNING(context,
+							   "%s: column %s (vector) holds values whose stored bytes are no vector of its "
+							   "declared shape (the first: %s), read as NULL, their rows read",
+							   function, n.name.c_str(), codec::sql_vector::DescribeStatus(n.vector.first_malformed));
+		}
 		// Spec 093 T8b: a sql_variant's value that is not one, NULL; a string the VARIANT cannot hold as
 		// text (TYPE mssql's rule, LogVariantNotes), its bytes.
 		if (n.variant.malformed > 0 && said_.insert(n.name + "|variant").second) {

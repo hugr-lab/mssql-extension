@@ -41,6 +41,11 @@ tds::ColumnMetadata MetadataOf(const CatalogColumn &c, const TypeForms &forms) {
 		DescribeSqlVariant(m);
 		return m;
 	}
+	std::string vector_why;
+	if (IsVectorColumn(c) && VectorDeclaration(c, vector_why) != 0) {
+		DescribeVector(c, m);
+		return m;
+	}
 	m.type_id = c.system_type_id;
 	if (c.system_type_id == XTYPE_BIT) {
 		m.type_id = tds::TDS_TYPE_BIT;
@@ -510,6 +515,13 @@ OffRowNeed RecordStager::PrepareRow(const RowRecord &row) {
 			p.oversized = true;
 			continue;
 		}
+		// So is a vector of another length than its declared shape's (spec 093 T8d): the kernel would answer
+		// WrongLength after the tree was walked and reserved for.
+		if (c.meta.IsVectorWire() &&
+			p.length != codec::sql_vector::ValueBytes(c.meta.VectorDimensions(), c.meta.vector_element_type)) {
+			p.oversized = true;
+			continue;
+		}
 		// A long value goes to its vector by the shortest way: its bytes (a BLOB, a UTF-8 text), or decoded
 		// block by block into room for its longest UTF-8 (3 bytes a UTF-16 unit or a code-page byte); a short
 		// one, and any other, is staged for its column's batch kernel.
@@ -832,7 +844,11 @@ void RecordStager::Append(const RowRecord &row) {
 								  " is a fixed-width column whose value is marked as stored off row");
 			}
 			if (prepared_[i].oversized) {
-				if (c.variant_notes.malformed++ == 0) {
+				if (c.meta.IsVectorWire()) {
+					if (c.vector_notes.malformed++ == 0) {
+						c.vector_notes.first_malformed = codec::sql_vector::VectorStatus::WrongLength;
+					}
+				} else if (c.variant_notes.malformed++ == 0) {
 					c.variant_notes.first_malformed = "a sql_variant value of " + std::to_string(prepared_[i].length) +
 													  " bytes stored off row, longer than any (" +
 													  std::to_string(tds::SQL_VARIANT_MAX_BYTES) + ")";
@@ -866,12 +882,15 @@ std::vector<RecordStager::TypeNote> RecordStager::TypeNotes() const {
 	for (const auto &col : columns_) {
 		const auto &v = col.variant_notes;
 		if (col.spatial_notes.not_geometry + col.spatial_notes.malformed + col.hierarchyid_notes.malformed +
-				v.malformed + v.unknown_collation + v.invalid_utf8 + col.out_of_range >
+				v.malformed + v.unknown_collation + v.invalid_utf8 + col.vector_notes.malformed + col.out_of_range >
 			0) {
 			const std::string type = col.meta.variant_disk_form ? "sql_variant"
+									 : col.meta.IsVectorWire()	? "vector"
 									 : col.counts_out_of_range	? "datetime2(7)"
 																: col.meta.udt_type_name;
-			notes.push_back(TypeNote{col.name, type, col.spatial_notes, col.hierarchyid_notes, v, col.out_of_range});
+			TypeNote note{col.name, type, col.spatial_notes, col.hierarchyid_notes, v, col.vector_notes};
+			note.out_of_range = col.out_of_range;
+			notes.push_back(std::move(note));
 		}
 	}
 	return notes;
@@ -890,11 +909,11 @@ void RecordStager::FinalizeChunk() {
 	begun_ = false;
 	for (size_t i = 0; i < columns_.size(); i++) {
 		const ColumnStaging &st = arena_.Column(i);
-		// A spatial, hierarchyid or sql_variant column's notes kept across chunks (spec 093 T8: a value the
-		// kernel cannot read is NULL, its row read).
+		// A spatial, hierarchyid, sql_variant or vector column's notes kept across chunks (spec 093 T8: a
+		// value the kernel cannot read is NULL, its row read).
 		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, *targets_[i],
 											 &columns_[i].variant_notes, &columns_[i].spatial_notes,
-											 &columns_[i].hierarchyid_notes);
+											 &columns_[i].hierarchyid_notes, &columns_[i].vector_notes);
 		if (columns_[i].counts_out_of_range) {
 			// Spec 093 T8c, as RowStager counts D8's: the kernel's NULLs are in the mask before the staged
 			// validity is ANDed in, so its NULLs now are exactly the values that did not fit TIMESTAMP_NS.
