@@ -361,7 +361,8 @@ All of these use the structures above.
 
 ## 6. Remaining unknowns and limits
 
-1. **Other SQL Server versions.** Only 2025 was tested; `version` = 1 in every segment and dictionary. Run the
+1. **Other SQL Server versions.** (Answered for 2019 and 2022 by E5b, `E5b-columnstore-versions.md`: every
+   table read equal with this decoder unchanged; segment header word 3 below is not a constant.) Only 2025 was tested; `version` = 1 in every segment and dictionary. Run the
    same scripts on 2016 / 2017 / 2019 / 2022: catalog columns differ (`collation_id` and `min/max_deep_data`
    only exist from 2022), and older builds may lack the Huffman pages. This is the main residual risk.
 2. **Native `json`** in a CCI is the same binary as rowstore. The bytes come out complete, but a text decoder
