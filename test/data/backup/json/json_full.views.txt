@@ -1,0 +1,2 @@
+schema_name|view_name|object_id|is_encrypted|definition_length|definition_sha256|is_indexed|row_count
+-----------|---------|---------|------------|-----------------|-----------------|----------|---------

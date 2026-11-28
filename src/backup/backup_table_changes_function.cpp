@@ -794,6 +794,7 @@ TableFunction MakeTableChangesFunction(const char *name, const LogicalType &path
 	// Spec 093 T8 / T8c: as mssql_backup_scan's.
 	f.GetSignature().AddKeywordOnly("geometry_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	f.GetSignature().AddKeywordOnly("datetime2_7_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
+	f.GetSignature().AddKeywordOnly("json_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	return f;
 }
 

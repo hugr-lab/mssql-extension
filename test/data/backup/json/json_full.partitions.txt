@@ -1,0 +1,8 @@
+schema_name|table_name|partition_number|filegroup|rows|compression
+-----------|----------|----------------|---------|----|-----------
+dbo|j_added|1|PRIMARY|301|NONE
+dbo|j_corpus|1|PRIMARY|61|NONE
+dbo|j_mod|1|PRIMARY|6|NONE
+dbo|j_page|1|PRIMARY|1549|PAGE
+dbo|j_row|1|PRIMARY|1549|ROW
+dbo|j_rows|1|PRIMARY|1500|NONE

@@ -201,6 +201,11 @@ uint32_t DecimalWireWidth(uint8_t precision) {
 //! enough either: DECIMAL(18,2) and DECIMAL(18,4) share a physical type and
 //! mean different numbers. So the exemptions are named one by one.
 bool IsSupportedRetarget(const tds::ColumnMetadata &column, const LogicalType &target_type) {
+	// Spec 086 PR 6: a json column's stored binary form (a backup's) into JSON (a VARCHAR) or VARIANT, by the
+	// Json kernel.
+	if (column.json_disk_form) {
+		return target_type.id() == LogicalTypeId::VARCHAR || target_type.id() == LogicalTypeId::VARIANT;
+	}
 	switch (column.type_id) {
 	case tds::TDS_TYPE_DATETIME2:
 		// The kernel converts into the target's own unit, so every TIMESTAMP
@@ -246,6 +251,10 @@ AppendArm DirectArm(uint8_t type_id, uint32_t width) {
 //! The kernel of a column staged on a binary arm (bounded, PLP or legacy LOB): the arms carry
 //! CHAR / VARCHAR / TEXT, VARBINARY / IMAGE and the CLR types alike, and the column says which.
 FinalizeKernel BinaryArmKernel(const tds::ColumnMetadata &column, const LogicalType &target_type) {
+	// Spec 086 PR 6: a json column's stored binary form (a backup's) decoded into JSON or VARIANT.
+	if (column.json_disk_form) {
+		return FinalizeKernel::Json;
+	}
 	// Spec 093 T5: a geometry / geography UDT stages its bytes on the PLP binary
 	// arm and is decoded into WKB -- always into a GEOMETRY, into a BLOB unless
 	// geometry_as 'native' asks for the stored bytes.
@@ -566,10 +575,21 @@ bool StageFixedWidth(const tds::ColumnMetadata &column, const LogicalType &targe
 		   StageFixedFamily(column, width, ops) || StageOtherFixed(column, width, ops);
 }
 
+//! A json column in its stored binary form (spec 086 PR 6, a backup's: ColumnMetadata::json_disk_form), its
+//! assembled bytes staged for the Json kernel, into JSON (a VARCHAR) or VARIANT.
+bool StageJsonDiskForm(const tds::ColumnMetadata &column, const LogicalType &target_type, ColumnOps &ops) {
+	if (!column.json_disk_form ||
+		(target_type.id() != LogicalTypeId::VARCHAR && target_type.id() != LogicalTypeId::VARIANT)) {
+		return false;
+	}
+	return ClaimVar(ops, AppendArm::PlpStageBinary);
+}
+
 //! A column whose values vary in length.
 bool StageVariableWidth(const tds::ColumnMetadata &column, const LogicalType &target_type, ColumnOps &ops) {
-	return StageVariant(column, target_type, ops) || StageClr(column, target_type, ops) ||
-		   StageLegacyLob(column, ops) || StageUtf16(column, ops) || StageBytes(column, ops);
+	return StageJsonDiskForm(column, target_type, ops) || StageVariant(column, target_type, ops) ||
+		   StageClr(column, target_type, ops) || StageLegacyLob(column, ops) || StageUtf16(column, ops) ||
+		   StageBytes(column, ops);
 }
 
 //! The arm/kind/stride half of the resolution; ResolveColumnOps adds the kernel.
@@ -620,6 +640,8 @@ const char *FinalizeKernelName(FinalizeKernel kernel) {
 		return "hierarchyid";
 	case FinalizeKernel::Vector:
 		return "vector";
+	case FinalizeKernel::Json:
+		return "json";
 	}
 	return "?";
 }

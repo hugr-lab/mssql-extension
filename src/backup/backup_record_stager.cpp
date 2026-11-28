@@ -288,7 +288,14 @@ RecordStager::Column RecordStager::ResolveColumn(const std::string &table, const
 		throw InvalidInputException("backup: %s: %s", col.name, reading.note);
 	}
 	type = reading.type;
-	col.meta = reading.raw ? RawMetadataOf(c) : MetadataOf(c, forms);
+	col.json = !reading.raw && IsJsonColumn(c);
+	if (col.json) {
+		// Spec 086 PR 6: its stored binary form, staged as bytes for the codec's Json kernel.
+		col.meta = RawMetadataOf(c);
+		col.meta.json_disk_form = true;
+	} else {
+		col.meta = reading.raw ? RawMetadataOf(c) : MetadataOf(c, forms);
+	}
 	col.ops = codec::staging::ResolveColumnOps(col.meta, type);
 	col.counts_out_of_range = col.ops.kernel == FinalizeKernel::Datetime &&
 							  col.meta.type_id == tds::TDS_TYPE_DATETIME2 && type.id() == LogicalTypeId::TIMESTAMP_NS;
@@ -882,14 +889,17 @@ std::vector<RecordStager::TypeNote> RecordStager::TypeNotes() const {
 	for (const auto &col : columns_) {
 		const auto &v = col.variant_notes;
 		if (col.spatial_notes.not_geometry + col.spatial_notes.malformed + col.hierarchyid_notes.malformed +
-				v.malformed + v.unknown_collation + v.invalid_utf8 + col.vector_notes.malformed + col.out_of_range >
+				v.malformed + v.unknown_collation + v.invalid_utf8 + col.vector_notes.malformed + col.out_of_range +
+				col.json_notes.malformed >
 			0) {
 			const std::string type = col.meta.variant_disk_form ? "sql_variant"
 									 : col.meta.IsVectorWire()	? "vector"
 									 : col.counts_out_of_range	? "datetime2(7)"
+									 : col.json					? "json"
 																: col.meta.udt_type_name;
 			TypeNote note{col.name, type, col.spatial_notes, col.hierarchyid_notes, v, col.vector_notes};
 			note.out_of_range = col.out_of_range;
+			note.json = col.json_notes;
 			notes.push_back(std::move(note));
 		}
 	}
@@ -913,7 +923,8 @@ void RecordStager::FinalizeChunk() {
 		// value the kernel cannot read is NULL, its row read).
 		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, *targets_[i],
 											 &columns_[i].variant_notes, &columns_[i].spatial_notes,
-											 &columns_[i].hierarchyid_notes, &columns_[i].vector_notes);
+											 &columns_[i].hierarchyid_notes, &columns_[i].vector_notes,
+											 &columns_[i].json_notes);
 		if (columns_[i].counts_out_of_range) {
 			// Spec 093 T8c, as RowStager counts D8's: the kernel's NULLs are in the mask before the staged
 			// validity is ANDed in, so its NULLs now are exactly the values that did not fit TIMESTAMP_NS.
@@ -929,6 +940,7 @@ void RecordStager::FinalizeChunk() {
 		FlatVector::GetDataMutable<string_t>(*targets_[d.column])[d.row] = d.value;
 	}
 	direct_values_.clear();
+
 	arena_.EndChunk();
 	// A value stored off row may have grown a column's buffer far past what its next chunk needs; what
 	// a task keeps between calls stays about one reservation (D17), so the excess goes now.

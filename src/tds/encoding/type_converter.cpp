@@ -12,6 +12,7 @@
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
+#include "codec/json/json_codec.hpp"
 #include "codec/money_codec.hpp"
 #include "codec/sql_vector/vector_codec.hpp"
 #include "codec/string_codec.hpp"
@@ -352,6 +353,14 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	if (vector.GetType().id() == LogicalTypeId::VARCHAR && !IsStringTdsType(column.type_id) &&
 		!column.IsHierarchyIdUdt()) {
 		WriteAsStringFallback(value, column, vector, row_idx);
+		return;
+	}
+
+	// Spec 086 PR 6: a backup's stored json form (varbinary on its wire type); a stream never carries it (J1: the
+	// server sends text), and the backup reader stages every json column, so this per-value branch is for
+	// completeness, unnoted.
+	if (column.json_disk_form) {
+		mssql::codec::json::DecodeFromTds(value, column, vector, row_idx, nullptr);
 		return;
 	}
 

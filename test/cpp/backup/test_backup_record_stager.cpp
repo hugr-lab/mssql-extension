@@ -529,7 +529,6 @@ int main() {
 		const std::vector<std::pair<CatalogColumn, std::string>> raws = {
 			{Col(31, "doc", XTYPE_XML, "xml", -1), "binary XML"},
 			{Col(32, "point", XTYPE_CLR, "", 9), "a user CLR type"},
-			{Col(34, "j", 244, "json", -1), "json"},
 			{Col(35, "mystery", 250, "", 16), "does not know"}};
 		bool all_raw = true;
 		for (const auto &rc : raws) {
@@ -537,7 +536,15 @@ int main() {
 			all_raw = all_raw && reading.readable && reading.raw && reading.type.id() == LogicalTypeId::BLOB &&
 					  reading.note.find(rc.second) != std::string::npos;
 		}
-		Check(all_raw, "xml, a user CLR type, json and an unknown type: their stored bytes, a BLOB");
+		Check(all_raw, "xml, a user CLR type and an unknown type: their stored bytes, a BLOB");
+		// Spec 086 PR 6: json decoded from its stored binary form -- JSON (its server's text) or, under json_as
+		// 'variant', a VARIANT.
+		TypeForms as_variant;
+		as_variant.json_as = JsonAs::Variant;
+		const CatalogColumn j = Col(34, "j", 244, "json", -1);
+		Check(!ReadingOf(j, TypeForms()).raw && ReadingOf(j, TypeForms()).type == LogicalType::JSON() &&
+				  ReadingOf(j, as_variant).type.id() == LogicalTypeId::VARIANT,
+			  "json: JSON, or a VARIANT under json_as 'variant'");
 		const ColumnReading sql_variant =
 			ReadingOf(Col(30, "variant", XTYPE_SQL_VARIANT, "sql_variant", 8016), TypeForms());
 		Check(sql_variant.readable && !sql_variant.raw && sql_variant.type.id() == LogicalTypeId::VARIANT,

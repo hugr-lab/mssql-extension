@@ -1708,7 +1708,9 @@ flowchart LR
   the reader converts takes D6's DuckDB type -- every collation, the double-byte code pages included,
   through spec 091's kernels on the client --, the CLR system types and `sql_variant` the TDS path's
   kernels (spec 093 T8a / T8b, `backup_type_forms`); one whose conversion is still to come (`xml`, a user
-  CLR type, `vector`, `json`, a type the reader does not know) is its stored bytes, a `BLOB`.
+  CLR type, `vector`, a type the reader does not know) is its stored bytes, a `BLOB`; a `json` column
+  (SQL Server 2025) is decoded from its stored binary form by the codec's Json kernel (spec 086 PR 6:
+  `JSON`, or a `VARIANT` under `json_as 'variant'`).
   Not readable, named: a computed column not persisted (no stored value), a column set (computed from
   the sparse columns, not stored). The scan registers the columns that are not readable as virtual columns, so
   `SELECT *` leaves them out and naming one is refused with its reason. A sparse column is read from the record's sparse vector (spec 086 PR 3,

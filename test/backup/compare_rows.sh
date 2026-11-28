@@ -16,13 +16,15 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR="$(cd "${1:?usage: compare_rows.sh DIR}" && pwd)"
 : "${VERSION:?set VERSION (2017, 2019, 2022 or 2025)}"
 DUCKDB="${DUCKDB:-build/release/duckdb}"
-QUIET="${QUIET:-full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full lob_full lob_xpress cd_full cd_xpress page_full page_xpress sparse_full names_full diffs_full clr_types_full variant_full datetime2_full vector_full}"
+QUIET="${QUIET:-full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full lob_full lob_xpress cd_full cd_xpress page_full page_xpress sparse_full names_full diffs_full clr_types_full variant_full datetime2_full vector_full json_full}"
 # Spec 085 PR 4c: the full + differential pairs of overlays.txt (name|full set|differential set) compared
 # too: the full restored WITH NORECOVERY, the differential WITH RECOVERY, against
 # mssql_backup_scan(full, diff := differential).
 OVERLAYS="${OVERLAYS-diffs_over diffs_over_xpress page_over sparse_over clr_types_over variant_over datetime2_over}"
-OVERLAYS_2025="${OVERLAYS_2025-vector_over}"
-if [ "${VERSION}" = 2025 ]; then
+# Pairs of a version's own fixtures, expected only there: vector (spec 093 T8d) and json (spec 086 PR 6) are
+# 2025's. Not added to an OVERLAYS='' (no pair compared).
+OVERLAYS_2025="${OVERLAYS_2025-vector_over json_over}"
+if [ "${VERSION}" = 2025 ] && [ -n "${OVERLAYS}" ]; then
 	OVERLAYS="${OVERLAYS} ${OVERLAYS_2025}"
 fi
 # The quiet sets also compared with geometry_as 'native' on both sides (spec 093 T8).

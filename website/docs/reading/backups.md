@@ -139,7 +139,7 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 | `created`, `modified` | `TIMESTAMP` | `sys.tables.create_date` / `modify_date` |
 | `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether `mssql_backup_scan` reads the table, and why not (a clustered columnstore, for now; ROW and PAGE compression are read) |
 | `fuzzy_status`, `open_transactions`, `stale_transactions` | `VARCHAR`, `INTEGER`, `INTEGER` | `consistent`, `stale`, `dirty` or `stale+dirty` (see [A backup taken under writes](#a-backup-taken-under-writes)); the transactions whose open changes the table's page copies hold, and those whose finished changes they lack |
-| `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `type_schema` (the schema of the column's type: `sys` for a system type, the one an alias or CLR type was created in), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type the scan returns: the one `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off -- a plain `VARCHAR` for a string --, or for now `BLOB`, its stored bytes, for `xml`, `vector` and `json`, which a later release converts, and for a user CLR type), `decodable` (false only for a column the scan cannot read: a computed one not persisted, and a sparse table's column set, `COLUMN_SET FOR ALL_SPARSE_COLUMNS`, whose sparse columns are read one by one), `reason` (why a column is not converted or not readable) |
+| `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `type_schema` (the schema of the column's type: `sys` for a system type, the one an alias or CLR type was created in), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type the scan returns: the one `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off -- a plain `VARCHAR` for a string --, or for now `BLOB`, its stored bytes, for `xml` and `vector`, which a later release converts, and for a user CLR type), `decodable` (false only for a column the scan cannot read: a computed one not persisted, and a sparse table's column set, `COLUMN_SET FOR ALL_SPARSE_COLUMNS`, whose sparse columns are read one by one), `reason` (why a column is not converted or not readable) |
 | `allocation_units` | `LIST(STRUCT(…))` | the table's allocation units: `au_id`, `type` (`IN_ROW_DATA`, `LOB_DATA`, `ROW_OVERFLOW_DATA`), `rowset_id`, `index_id`, `partition_number`, `compression`, `filegroup_id`, `first_page`, `root_page`, `first_iam_page`, `live_pages` (NULL for now) |
 | `partitioning` | `STRUCT(…)` | for a partitioned table (NULL on a filegroup): `function_name`, `scheme_name`, `column_name`, `column_id`, `parameter_type`, `range_right`, `boundaries` (a list of `VARIANT`s in the parameter's type, in boundary order; a NULL boundary is a NULL element), `destinations` (the filegroup of each partition), `next_used`, and `reason` when the reader cannot give it exactly (the boundaries are then NULL, never a partial list; the destinations and `next_used` are still given when only a boundary's value could not be read). The table's rows are read either way |
 | `partitions` | `LIST(STRUCT(…))` | every partition: `partition_number`, `rows`, `compression`, `filegroup` |
@@ -159,7 +159,7 @@ The states:
 | state | meaning |
 |---|---|
 | `converted` | read as `duckdb_type` |
-| `stored_bytes` | read as its stored bytes (`BLOB`): a type whose conversion comes later (`xml`, `vector`, `json`), and a user CLR type, opaque by design |
+| `stored_bytes` | read as its stored bytes (`BLOB`): a type whose conversion comes later (`xml`, `vector`), and a user CLR type, opaque by design |
 | `not_stored` | a computed column that is not persisted, or a column set: it has no stored value (a column set's sparse columns are read one by one) |
 
 A value stored off row -- `text` / `ntext` / `image`, a MAX type's long value, a value pushed off a
@@ -239,9 +239,14 @@ string under a collation with no code page here, its bytes, with one WARNING per
 is a `TIMESTAMP_NS`, as `TYPE mssql` reads it by default: a value outside 1677–2262 (a temporal table's
 period end, 9999-12-31, say) is NULL with one WARNING per column, its row read; `datetime2_7_as :=
 'timestamp'`, on the call, as an ATTACH option or as the `mssql_datetime2_7_as` setting, reads the column
-as a `TIMESTAMP` over 0001–9999, the 100 ns digit truncated. A type whose
-conversion comes in a later release -- `xml`, `vector`,
-`json` -- and a user CLR type are returned as their stored bytes, a `BLOB`; no column is refused for
+as a `TIMESTAMP` over 0001–9999, the 100 ns digit truncated. A SQL Server 2025 `json` column is
+decoded from the binary form it is stored in: a `JSON` holding the server's own text (what
+`CAST(j AS nvarchar(max))` gives, as `TYPE mssql` reads the column), or under `json_as := 'variant'` (on
+the call or as an ATTACH option) a `VARIANT` -- the one DuckDB's `CAST(text AS JSON)::VARIANT` gives, an
+integer `UBIGINT` / `BIGINT`, any other number `DOUBLE`, its keys sorted -- with no text in between; a value
+that is no json document is NULL with one WARNING per column. A type whose
+conversion comes in a later release -- `xml`, `vector` -- and a user CLR type are returned as their stored
+bytes, a `BLOB`; no column is refused for
 its type. Sparse columns are read like the others, from the row's sparse vector. A column the scan
 cannot read -- a computed column that is not persisted, or a column set (neither has a stored value; a
 column set's sparse columns are read one by one) -- is left out of `SELECT *`; a query that names it is
@@ -480,6 +485,7 @@ It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, 
 | `history`, `snapshot_version`, `snapshot_time` | A history of backups ([below](#a-history-of-backups)) |
 | `fuzzy` | What a scan of its tables -- and the change listing or `mssql_backup_catalog` over its name -- does with one that is not consistent: `'warn'`, `'error'` or `'ignore'` ([above](#a-backup-taken-under-writes)); unset, the `mssql_backup_fuzzy` setting |
 | `geometry_as` | What its `geometry` / `geography` columns are read as: `'geometry'` (the default), `'wkb'` or `'native'`, as `TYPE mssql`'s option ([above](#rows)); a call's `geometry_as :=` wins over it |
+| `json_as` | What its `json` columns (SQL Server 2025) are read as: `'json'` (the default, the server's text) or `'variant'` ([above](#rows)); a call's `json_as :=` wins over it |
 | `datetime2_7_as` | What its `datetime2(7)` columns are read as: `'timestamp_ns'` or `'timestamp'`, as `TYPE mssql`'s option ([above](#rows)); unset, the `mssql_datetime2_7_as` setting at ATTACH; a call's `datetime2_7_as :=` wins over it |
 
 The filters work as `TYPE mssql`'s. An object is kept when it passes the filter -- it matches it, or

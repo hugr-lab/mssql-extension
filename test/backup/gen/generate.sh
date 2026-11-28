@@ -7,7 +7,7 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant datetime2"): samples.sql, the database of the
+# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant datetime2 json"; json on 2025 only): samples.sql, the database of the
 # committed samples; catalog.sql, the catalog fixture (spec 085 PR 2b); partition.sql, E7's partitioning
 # database and more boundary types (PR 2c); files.sql, two data files and a second
 # filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
@@ -66,7 +66,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant datetime2 vector}"
+FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd page sparse names diffs clr_types tail_window variant datetime2 vector json}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -199,8 +199,9 @@ for fixture in ${FIXTURES}; do
 		printf "DECLARE @b varbinary(max) = 0x%s;\nDECLARE @h varbinary(64) = HASHBYTES('SHA2_512', @b);\nIF NOT EXISTS (SELECT 1 FROM sys.trusted_assemblies WHERE hash = @h) EXEC sys.sp_add_trusted_assembly @h, N'mssql_test_udt';\nCREATE ASSEMBLY MssqlTestUdt FROM @b WITH PERMISSION_SET = SAFE;\n" \
 			"${hex}" | docker exec -i -u 0 "${CONTAINER}" sh -c 'cat >/tmp/gen/clr_assembly.sql && chmod 644 /tmp/gen/clr_assembly.sql'
 	fi
-	if [ "${fixture}" = vector ] && [ "${major}" -lt 17 ]; then
-		echo ">> skipping vector.sql: SQL Server ${major} has no vector type (2025 on)"
+	if [ "${major}" -lt 17 ] && { [ "${fixture}" = vector ] || [ "${fixture}" = json ]; }; then
+		# SQL Server 2025's vector (spec 093 T8d) and json (spec 086 PR 6) types: an older server has none.
+		echo ">> skipping ${fixture}.sql: SQL Server ${major} has no ${fixture} type (2025 on)"
 		continue
 	fi
 	echo ">> running ${fixture}.sql"
@@ -440,6 +441,14 @@ for fixture in ${FIXTURES}; do
 		run_sql datetime2_changes.sql
 		sets+=("datetime2_full|datetime2_full.bak" "datetime2_diff|datetime2_diff.bak")
 		overlays+=("datetime2_over|datetime2_full|datetime2_diff")
+		;;
+	json)
+		# SQL Server 2025's json type (spec 086 PR 6, E9 / E9b), compressed; then json_changes.sql's changes and
+		# differential (skipped above below major 17).
+		golden bak_json json_full
+		run_sql json_changes.sql
+		sets+=("json_full|json_full.bak" "json_diff|json_diff.bak")
+		overlays+=("json_over|json_full|json_diff")
 		;;
 	tail_window)
 		# Changes at known points of a backup's data copy (spec 085 D11, review of #591; run by default, so the
