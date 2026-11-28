@@ -237,24 +237,36 @@ A CCI on 2025 accepts `json`, `vector` and every `(max)` type, and refuses `sql_
     read is never refused for it. Records of the tuple mover or of a compression (new segments,
     `syscsrowgroups` rows changing) must count as changes of the table.
 
-    E11's `stale` may have come from the second hold's inserts and deletes alone. So task 9 checks a tail that
-    holds only a REORGANIZE, and adds those records to D11's row operations if they are not counted.
-  - **Not caught.** A change during the table's own copy was not caught, and with it a copy holding the
-    rowgroups from before a tuple-mover step and its segments or delete bitmap from after it. Such a copy can
-    read a row twice or lose one, and D11's status is what tells the importer. Task 9 places a hold within the
-    table's pages.
+    **They do** (E11, the tuple mover in the tail). A tail that holds only a `REORGANIZE … COMPRESS_ALL_ROW_GROUPS`
+    flags the table `stale`. The new segments arrive as `LOP_FORMAT_PAGE` records carrying their page's image,
+    which D11 already counts as it does a TABLOCK load's, and the catalog rows (`syscscolsegments`,
+    `syscsdictionaries`, `syscsrowgroups`) as row operations. No change to D11 is needed.
+  - **Two data passes keep the copy whole** (2019 on).
+    - A tuple-mover step during the first pass is copied again by the second: the copy is the state after it,
+      with nothing in the tail.
+    - A step during the last pass is in the tail, and the copy is the state before it.
+
+    In every placement E11 ran (three held backups), the copy was one consistent state, equal to the server's
+    before or after.
+  - **Not produced:** a copy holding the rowgroups from before a step and its segments or delete bitmap from
+    after it. It needs the table's own pages copied in the last pass on both sides of the change, which the
+    holds cannot place (the server reads ahead). Such a copy can read a row twice or lose one, and D11's status
+    is what tells the importer. 2017 copies its data once, so the oracle lane's 2017 sets are where a torn copy
+    is likeliest. A fixture there is the next step, not a blocker.
 
   The principle (owner, 2026-11-28) is to read the utmost a backup holds, under load too; consistency and the
   import rules are the importer's. So nothing here refuses a CCI, and a torn tuple-mover step is read as far
   as it can be. A rowgroup whose segment fails its invariants is a candidate to be read from the TOMBSTONE's
-  delta store: E11 found it kept until a REORGANIZE, the same rows. To be checked in task 9, with a hold
-  inside the table's pages.
+  delta store: E11 found it kept until a REORGANIZE, the same rows. No torn copy was produced to need it, so it
+  is kept as an option for such a copy, not built.
 
   Recovery is 090's, which treats a CCI as any table (DQ-07 superseded). Its columnstore extension redoes
-  delta-store and delete-bitmap records as rowstore, and the tuple mover's records if the tail carries their
-  pages as images. Task 9 measures that, as tail_window found for a TABLOCK load.
+  delta-store and delete-bitmap records as rowstore. It redoes the tuple mover's records too, since the tail
+  carries the new segments as page images (E11: `LOP_FORMAT_PAGE`, 312 to 8,192 bytes of each page's used part,
+  no row records for their content) and the catalog's rows as row operations. That is a TABLOCK load's redo
+  plus three base tables.
 
-- **D7 — the differential evidence (E11, measured on 2022).** A full backup and its differential, overlaid in
+- **D7 — the differential evidence (E11, measured on 2022 and again on 2019, the same).** A full backup and its differential, overlaid in
   restore order, equal the server after each of 21 steps (19 run, 2 refused by the server), so 085's overlay reads a CCI as it is; nothing
   columnstore-specific. What 089 builds on:
   - a bulk insert adds a COMPRESSED rowgroup (its segment LOBs in the differential);
@@ -394,16 +406,17 @@ Costs follow E5§7, without its NCCI share.
 7. Scan integration: rowgroup units, projection, locators; measure rowgroup elimination with filter
    pushdown and decide — 4 d
 8. Oracle matrix (E5's scripts) and the five fuzz harnesses — 6 d
-9. E11's remainder (the spike itself was done 2026-11-28: `experiments/E11-columnstore-diff.md`) — 1.5 d:
-   - a tail that holds only a REORGANIZE, and D11's count of it (D6);
-   - a hold placed within the table's pages, the tuple mover running there (D6);
-   - E11 on 2019, so far measured on 2022 only;
-   - the REBUILD event (acceptance 8);
-   - whether the tail carries the tuple mover's segment pages as images (090's redo), and reading a torn
-     rowgroup from its TOMBSTONE's delta store (D6).
+9. E11's remainder — done 2026-11-28 (`experiments/E11-columnstore-diff.md`):
+   - a tail holding only a REORGANIZE: `stale`, counted through the FORMAT_PAGE images (D6);
+   - three held placements, each a consistent copy (D6);
+   - E11 on 2019: the same as on 2022;
+   - the segments in the tail as page images (090's redo).
+
+   Left for the build, not the spike: the REBUILD event (acceptance 8), and a 2017 fixture for a torn copy
+   (D6).
 10. Docs (README, `DATAMODEL.md` columnstore layer, CLAUDE.md, CHANGELOG) — 1 d
 
-**Total ≈ 35.5 days, 6–8 weeks** (E5§7: ≈ 34 days, 5–8 weeks; plus E11's remainder, minus the NCCI work). R§8
+**Total ≈ 34 days, 6–8 weeks** (E5§7: ≈ 34 days, 5–8 weeks; plus E11's remainder, minus the NCCI work). R§8
 phase 3 gave 5–8 weeks at medium risk after E5.
 
 ## Risks

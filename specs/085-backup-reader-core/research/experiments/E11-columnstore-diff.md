@@ -1,6 +1,7 @@
 # E11: columnstore in differentials and fuzzy backups
 
-Date: 2026-11-28. Spec 088 D7 / task 9: what a differential carries for a clustered columnstore index (CCI),
+Date: 2026-11-28 (the steps on 2022, then on 2019; the tuple mover in the tail, the second part below). Spec
+088 D7 / task 9: what a differential carries for a clustered columnstore index (CCI),
 whether a rowgroup id is ever reused within a rowset (D3's keys), what a SWITCH of a partition with an OPEN
 delta store does, and what a full backup copied while the tuple mover runs holds. SQL Server 2022 RTM-CU27-GDR
 (16.0.4305.5), linux/amd64 under Rosetta. Background tuple mover off (trace flag 634, on the throwaway container
@@ -111,6 +112,55 @@ A COMPRESSED rowgroup's own rows never change.
 - **Not caught:** a copy that holds the catalog's rowgroups from before a tuple-mover step and the segments or
   delete bitmap from after it. Such a copy would read rows twice or lose them, and D11's `dirty` / `stale` is
   what tells the importer. Whether the decoder can refuse nothing and still be right there is 090's question.
+
+## The tuple mover in the tail (task 9)
+
+Three more held backups on 2022, each with one change: `REORGANIZE … COMPRESS_ALL_ROW_GROUPS` over a table with a
+compressed rowgroup and an OPEN delta store of 50,000 rows (`fuzzy.sh`, now parametrised:
+`FZ_HOLD1` / `FZ_HOLD2`, and `FZ_HOLD1_AFTER_TABLE`, which places the first hold just past the table's pages
+as a trial backup lays them out, via `table_offsets.py`). Evidence: `fuzzy_reorg*/read.txt`.
+
+| hold | where | the copy | the tail | D11 |
+|---|---|---|---|---|
+| inside the second pass, its usual size | the server had read ahead past it | the state before (delta OPEN) | no record of it: the change came after the backup's last LSN | `consistent` |
+| just past the table's pages, in the first data pass (69 %) | after the table was copied | the state **after** (TOMBSTONE + a new COMPRESSED rowgroup), equal to the server: the second data pass copied the changed extents again | none of it | `consistent` |
+| inside a second pass made large (the 96 MB filler rewritten at the first hold) | during the last pass | the state **before** (delta OPEN), equal to it | the whole step | **`stale`** |
+
+**Two data passes protect the copy** (2019 on; 2017 copies once). A change during the first pass is copied
+again by the second, so its copy is the state after, and its records come before the CheckpointLSN, not in the
+tail. Only a change during the last pass reaches the tail. In all three runs the copy was one consistent state:
+no row twice, none missing. The torn copy D6 worries about would need the table's own pages copied in the last
+pass on both sides of a change. The holds cannot place a change that finely, because the server reads ahead of
+its writes. It stays unproduced, and D11's status is what covers it.
+
+**What the tuple mover writes to the log** (the third run's tail, its 3 transactions):
+- the new segments as **`LOP_FORMAT_PAGE` records carrying the page's image**: 27 on `LCX_TEXT_MIX` and 2 on
+  `LCX_TEXT_TREE`, with images of 312 to 8,192 bytes (the page's used part), and no row records for their
+  content;
+- the catalog's rows as row operations: `LOP_INSERT_ROWS` into `syscscolsegments` (3) and `syscsdictionaries`
+  (1), `LOP_INSERT_ROWS` / `LOP_MODIFY_ROW` / `LOP_MODIFY_COLUMNS` on `syscsrowgroups`;
+- the extents' allocation (`LCX_GAM` / `LCX_IAM` / `LCX_PFS`).
+
+So:
+- **D11 counts the tuple mover.** The table is flagged `stale` by its FORMAT_PAGE images, as for a TABLOCK load
+  (085's review of #591), with no other row operation on the table.
+- **090 can redo it** by applying the images and the catalog rows. Nothing columnstore-specific is needed
+  beyond what a TABLOCK load's redo already takes.
+- **The TOMBSTONE fallback is not needed for these placements.** It would read a torn rowgroup from its
+  TOMBSTONE's delta store, which the copy keeps until a later REORGANIZE. No torn copy was produced to need it,
+  so it stays an idea, for a copy that reads rows twice.
+
+## On SQL Server 2019
+
+The 21 steps ran again on 2019 RTM-CU32-GDR (15.0.4500.2), `E11_2019/` (with `dbo.e5_gs` in place of
+`GENERATE_SERIES`):
+- 105 of 105 reads of full + differential equal the server;
+- the same catalog changes step by step (rowgroups, statuses, rowsets);
+- the same events from `mssql_backup_schema_changes`: `table_truncated` for both TRUNCATEs, none for the
+  REBUILD, `table_reload` and `partition_switched_out` for the SWITCH (`E11_2019/schema_changes.txt`);
+- the same refusals of SPLIT / MERGE on non-empty partitions.
+
+Only the page counts differ: the reorganize's delete-bitmap pages are 32 against 36.
 
 ## Procedure
 
