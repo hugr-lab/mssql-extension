@@ -212,8 +212,55 @@ private:
 	// timeout_ms: socket receive timeout in milliseconds
 	bool ReadMoreData(int timeout_ms);
 
+	//! Initialize's part in one token: true once the stream has its columns (Streaming) or its final
+	//! DONE with none (Complete).
+	bool ConsumeInitialToken(tds::ParsedTokenType token);
+	//! The parser's COLMETADATA as the stream's columns: names, types, and the counters' per-column facts.
+	void AdoptColumnMetadata();
+	//! The parser's ERROR token, kept; a fatal one (severity >= 20) throws at once.
+	void NoteServerError();
+
+	// The parts of FillChunk, in the order it runs them.
+
+	//! False when there is nothing to read: the stream is over, or was cancelled (and is drained here).
+	bool ReadyToFill();
+	//! Whether this chunk takes the staged read path, which is then set up for it.
+	bool BeginStagedChunk(DataChunk &chunk);
+	//! FillChunk's phase times, in nanoseconds (measured only when timing_enabled_).
+	struct FillPhaseTimes {
+		uint64_t parse_ns = 0;
+		uint64_t read_ns = 0;
+		uint64_t process_ns = 0;
+	};
+	//! The token loop: rows into the chunk until it is full, the stream ends, or a read gives nothing
+	//! more. Returns the rows read.
+	idx_t ReadRows(DataChunk &chunk, bool staged, FillPhaseTimes &times);
+	//! Any token of the loop but a row. True when the chunk ends here.
+	bool ConsumeStreamToken(tds::ParsedTokenType token, idx_t row_count, uint64_t &read_time_ns);
+	//! A DONE token: throws on its error bit, ends the stream on a final one.
+	void ConsumeDone();
+	//! The parser has no whole token: read another packet. True when the chunk ends here -- the stream
+	//! is complete, or the read failed with rows already in the chunk (with none, it throws).
+	bool ReadForMoreRows(idx_t row_count, uint64_t &read_time_ns);
+	//! The stream Complete, its connection back to Idle.
+	void FinishStream();
+	[[noreturn]] void FailOnParseError();
+	//! A second COLMETADATA: the rest of the response is drained and the batch refused.
+	[[noreturn]] void RefuseSecondResultSet();
+	//! Publishes the staged chunk and notes what its columns call a warning for.
+	void FinishStagedChunk(DataChunk &chunk, idx_t row_count);
+	void NoteStagedColumn(idx_t c);
+
 	// Process parsed row into DataChunk
 	void ProcessRow(DataChunk &chunk, idx_t row_idx);
+	//! How many of the SQL columns ProcessRow fills.
+	idx_t ColumnsToFill(const DataChunk &chunk) const;
+	//! What a value ProcessRow converted calls a warning for: its spatial / sql_variant notes, a vector
+	//! read from its text. Called for the columns of those kinds only; the rest of ProcessRow's work per
+	//! value stays in its loop.
+	void NoteDecodeNotes(idx_t col_idx, const Vector &target_vector,
+						 const mssql::codec::variant::VariantColumnNotes *variant_notes,
+						 const mssql::codec::spatial::SpatialColumnNotes *spatial_notes);
 
 	// Staged read path (spec 055 T5). Resolve the output vector for each SQL
 	// column exactly once per chunk, applying the same target_vectors_ /
@@ -306,6 +353,14 @@ private:
 	bool SpatialWarningPending(idx_t c) const;
 	//! Log the spatial WARNINGs not yet logged, one a column for each kind.
 	void SurfaceSpatialWarnings(ClientContext &context);
+	//! SurfaceWarnings' other parts, each once a column: datetime2 values read as NULL, a vector read
+	//! from its text, sql_variant values read as their bytes, code-page bytes handed over verbatim.
+	void SurfaceOutOfRangeWarnings(ClientContext &context);
+	void SurfaceVectorTextWarnings(ClientContext &context);
+	void SurfaceVariantWarnings(ClientContext &context);
+	void SurfaceCollationWarnings(ClientContext &context);
+	//! What SurfaceCollationWarnings tells the caller to do about it.
+	const char *VerbatimBytesFix() const;
 	bool is_catalog_scan_ = false;
 
 	// Statistics
