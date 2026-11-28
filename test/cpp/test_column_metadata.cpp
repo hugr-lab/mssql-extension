@@ -178,6 +178,15 @@ void TestMalformedDeclarations() {
 	Check(Has(element, "Column 'emb' declares vector element type 2"), "a vector's element type: " + element);
 	const std::string length = Answer(Token({Column({TDS_TYPE_VECTOR, 0x09, 0x00, 0x00}, "emb")}));
 	Check(Has(length, "Column 'emb' declares a vector's maximum length as 9 bytes"), "a vector's length: " + length);
+	// #644: each element type's limit -- float32 1998 dimensions (8 + 7992 bytes), float16 3996 (8 + 7992).
+	// max_length is a u16, little-endian: 8000 = 0x1F40, 8004 = 0x1F44, 8002 = 0x1F42.
+	Check(Answer(Token({Column({TDS_TYPE_VECTOR, 0x40, 0x1F, 0x00}, "emb")})) == "OK", "float32 vector(1998) parses");
+	Check(Has(Answer(Token({Column({TDS_TYPE_VECTOR, 0x44, 0x1F, 0x00}, "emb")})), "no float32 vector(1..1998)"),
+		  "float32 vector(1999) is refused");
+	Check(Answer(Token({Column({TDS_TYPE_VECTOR, 0x40, 0x1F, 0x01}, "emb")})) == "OK",
+		  "float16 vector(3996) parses (it was refused, #644)");
+	Check(Has(Answer(Token({Column({TDS_TYPE_VECTOR, 0x42, 0x1F, 0x01}, "emb")})), "no float16 vector(1..3996)"),
+		  "float16 vector(3997) is refused");
 
 	// Until the name has arrived the answer is "more", then the error with the name.
 	const Bytes token = Token({Column({TDS_TYPE_TIME, 8}, "ts")});

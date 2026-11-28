@@ -1,0 +1,70 @@
+# name: test/sql/pushdown/remote_pushdown_string_arithmetic.test
+# description: A string constant in arithmetic beside a COALESCE / CASE string is DuckDB's binder error, not a crash (issue #662)
+# group: [pushdown]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The remote-pushdown rewriter asks the writer about the PARSED statement,
+# before the binder has refused it. `'12' - coalesce(name, 'x')` is no function
+# to DuckDB (`-(STRING_LITERAL, VARCHAR)`), but the writer bound the constant
+# against the column of its peer first, and a COALESCE / CASE result has none:
+# a null dereference, and the process was gone (SIGSEGV). Each statement below
+# is now a veto in the writer, so DuckDB binds it and reports its own error.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Remote pushdown is on by default; say so, the test is about it.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rsa (TYPE mssql, remote_pushdown true);
+
+statement ok
+SELECT mssql_exec('rsa', 'DROP TABLE IF EXISTS dbo.rsa_t;
+	CREATE TABLE dbo.rsa_t (id int NOT NULL PRIMARY KEY, name nvarchar(50) NULL);
+	INSERT INTO dbo.rsa_t VALUES (1, N''A''), (2, NULL)');
+
+statement error
+SELECT '12' - coalesce(name, 'x') FROM rsa.dbo.rsa_t ORDER BY 1 LIMIT 1;
+----
+No function matches
+
+statement error
+SELECT '12' + coalesce(name, 'x') FROM rsa.dbo.rsa_t ORDER BY 1 LIMIT 1;
+----
+No function matches
+
+statement error
+SELECT count(*) FROM rsa.dbo.rsa_t WHERE coalesce(name, 'x') - '1' = 1;
+----
+No function matches
+
+statement error
+SELECT '12' - CASE WHEN id > 0 THEN name ELSE 'q' END FROM rsa.dbo.rsa_t ORDER BY 1 LIMIT 1;
+----
+No function matches
+
+statement error
+SELECT max('12' * coalesce(name, 'x')) FROM rsa.dbo.rsa_t;
+----
+No function matches
+
+# A plain column beside the constant was always the binder's error.
+statement error
+SELECT '12' - name FROM rsa.dbo.rsa_t ORDER BY 1 LIMIT 1;
+----
+No function matches
+
+# The session is still there, and a computed string outside arithmetic reads.
+query T
+SELECT coalesce(name, 'x') FROM rsa.dbo.rsa_t ORDER BY id;
+----
+A
+x
+
+statement ok
+SELECT mssql_exec('rsa', 'DROP TABLE dbo.rsa_t');
+
+statement ok
+DETACH rsa;

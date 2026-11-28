@@ -1039,6 +1039,18 @@ ExpressionEncodeResult FilterEncoder::EncodeSearchCondition(const Expression &ex
 	return result;
 }
 
+ExpressionEncodeResult FilterEncoder::EncodeValue(const Expression &expr, const ExpressionEncodeContext &ctx) {
+	auto result = EncodeExpression(expr, ctx);
+	if (result.supported) {
+		SqlOperand operand;
+		operand.sql = result.sql;
+		operand.is_condition = EncodesAsSearchCondition(expr);
+		operand.type = expr.GetReturnType();
+		result.sql = ExpressionVocabulary::AsValue(operand);
+	}
+	return result;
+}
+
 //------------------------------------------------------------------------------
 // Expression Encoding
 //------------------------------------------------------------------------------

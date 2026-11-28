@@ -179,99 +179,109 @@ bool MSSQLResultStream::Initialize() {
 
 		tds::ParsedTokenType token;
 		while ((token = parser_.TryParseNext()) != tds::ParsedTokenType::NeedMoreData) {
-			switch (token) {
-			case tds::ParsedTokenType::ColMetadata: {
-				// Got column metadata - transition to streaming
-				const auto &parsed_columns = parser_.GetColumnMetadata();
-				column_metadata_.clear();
-				column_metadata_.reserve(parsed_columns.size());
-				for (const auto &col : parsed_columns) {
-					column_metadata_.push_back(col);
-				}
-				if (client_transcode_) {
-					mssql::codec::code_page::ResolveWireCodePages(column_metadata_);
-				}
-				// Spec 093 T5: what a geometry / geography column is read as, the catalog's, before its
-				// type is asked below.
-				for (auto &col : column_metadata_) {
-					col.geometry_as = geometry_as_;
-				}
-				column_names_.clear();
-				column_types_.clear();
-
-				for (const auto &col : column_metadata_) {
-					column_names_.push_back(col.name);
-					column_types_.push_back(tds::encoding::TypeConverter::GetDuckDBType(col));
-				}
-
-				// D4 (spec 054): precompute per-column decode family + PLP-ness
-				// for the debug counters (FamilyFromTdsType is the same dispatch
-				// TypeConverter::ConvertValue uses per value).
-				if (counters_enabled_) {
-					counter_col_family_.clear();
-					counter_col_plp_.clear();
-					for (const auto &col : column_metadata_) {
-						uint8_t family = 0xFF;
-						try {
-							family = static_cast<uint8_t>(mssql::codec::FamilyFromTdsType(col.type_id));
-						} catch (...) {
-							// Unknown wire type — counted as unknown_family_values.
-						}
-						counter_col_family_.push_back(family);
-						counter_col_plp_.push_back(col.max_length == 0xFFFF);
-					}
-				}
-
-				state_ = MSSQLResultStreamState::Streaming;
+			if (ConsumeInitialToken(token)) {
 				return true;
-			}
-
-			case tds::ParsedTokenType::Error: {
-				auto error = parser_.GetError();
-				errors_.push_back(error);
-				// Fatal errors (severity >= 20) throw immediately
-				if (error.IsFatal()) {
-					state_ = MSSQLResultStreamState::Error;
-					throw IOException("SQL Server fatal error [%d, severity %d]: %s", error.number, error.severity,
-									  error.message);
-				}
-				break;
-			}
-
-			case tds::ParsedTokenType::Info:
-				info_messages_.push_back(parser_.GetInfo());
-				break;
-
-			case tds::ParsedTokenType::Done: {
-				auto done = parser_.GetDone();
-				// Check for errors accumulated from previous ERROR tokens
-				if (!errors_.empty()) {
-					state_ = MSSQLResultStreamState::Error;
-					ThrowServerError(errors_);
-				}
-				// If more results follow, continue looking for COLMETADATA
-				if (!done.IsFinal()) {
-					break;
-				}
-				// Final DONE with no columns — empty result set
-				state_ = MSSQLResultStreamState::Complete;
-				return true;
-			}
-
-			case tds::ParsedTokenType::None:
-				if (parser_.GetState() == tds::ParserState::Error) {
-					throw IOException("TDS parse error: " + parser_.GetParseError());
-				}
-				break;
-
-			default:
-				// Skip other tokens
-				break;
 			}
 		}
 	}
 
 	return state_ == MSSQLResultStreamState::Streaming || state_ == MSSQLResultStreamState::Complete;
+}
+
+bool MSSQLResultStream::ConsumeInitialToken(tds::ParsedTokenType token) {
+	switch (token) {
+	case tds::ParsedTokenType::ColMetadata:
+		// Got column metadata - transition to streaming
+		AdoptColumnMetadata();
+		state_ = MSSQLResultStreamState::Streaming;
+		return true;
+
+	case tds::ParsedTokenType::Error:
+		NoteServerError();
+		return false;
+
+	case tds::ParsedTokenType::Info:
+		info_messages_.push_back(parser_.GetInfo());
+		return false;
+
+	case tds::ParsedTokenType::Done: {
+		auto done = parser_.GetDone();
+		// Check for errors accumulated from previous ERROR tokens
+		if (!errors_.empty()) {
+			state_ = MSSQLResultStreamState::Error;
+			ThrowServerError(errors_);
+		}
+		// If more results follow, continue looking for COLMETADATA
+		if (!done.IsFinal()) {
+			return false;
+		}
+		// Final DONE with no columns — empty result set
+		state_ = MSSQLResultStreamState::Complete;
+		return true;
+	}
+
+	case tds::ParsedTokenType::None:
+		if (parser_.GetState() == tds::ParserState::Error) {
+			throw IOException("TDS parse error: " + parser_.GetParseError());
+		}
+		return false;
+
+	default:
+		// Skip other tokens
+		return false;
+	}
+}
+
+void MSSQLResultStream::AdoptColumnMetadata() {
+	const auto &parsed_columns = parser_.GetColumnMetadata();
+	column_metadata_.clear();
+	column_metadata_.reserve(parsed_columns.size());
+	for (const auto &col : parsed_columns) {
+		column_metadata_.push_back(col);
+	}
+	if (client_transcode_) {
+		mssql::codec::code_page::ResolveWireCodePages(column_metadata_);
+	}
+	// Spec 093 T5: what a geometry / geography column is read as, the catalog's, before its
+	// type is asked below.
+	for (auto &col : column_metadata_) {
+		col.geometry_as = geometry_as_;
+	}
+	column_names_.clear();
+	column_types_.clear();
+
+	for (const auto &col : column_metadata_) {
+		column_names_.push_back(col.name);
+		column_types_.push_back(tds::encoding::TypeConverter::GetDuckDBType(col));
+	}
+
+	// D4 (spec 054): precompute per-column decode family + PLP-ness
+	// for the debug counters (FamilyFromTdsType is the same dispatch
+	// TypeConverter::ConvertValue uses per value).
+	if (counters_enabled_) {
+		counter_col_family_.clear();
+		counter_col_plp_.clear();
+		for (const auto &col : column_metadata_) {
+			uint8_t family = 0xFF;
+			try {
+				family = static_cast<uint8_t>(mssql::codec::FamilyFromTdsType(col.type_id));
+			} catch (...) {
+				// Unknown wire type — counted as unknown_family_values.
+			}
+			counter_col_family_.push_back(family);
+			counter_col_plp_.push_back(col.max_length == 0xFFFF);
+		}
+	}
+}
+
+void MSSQLResultStream::NoteServerError() {
+	auto error = parser_.GetError();
+	errors_.push_back(error);
+	// Fatal errors (severity >= 20) throw immediately
+	if (error.IsFatal()) {
+		state_ = MSSQLResultStreamState::Error;
+		throw IOException("SQL Server fatal error [%d, severity %d]: %s", error.number, error.severity, error.message);
+	}
 }
 
 namespace {
@@ -305,204 +315,24 @@ struct PhaseTimer {
 idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 	PhaseTimer chunk_timer(timing_enabled_);
 
-	if (state_ == MSSQLResultStreamState::Complete || state_ == MSSQLResultStreamState::Error) {
-		return 0;
-	}
-
-	if (state_ != MSSQLResultStreamState::Streaming) {
-		throw InvalidInputException("MSSQLResultStream not in streaming state");
-	}
-
-	// Check for cancellation
-	if (is_cancelled_.load(std::memory_order_acquire)) {
-		DrainAfterCancel();
+	if (!ReadyToFill()) {
 		return 0;
 	}
 
 	// Reset chunk for new data - DuckDB already initialized it with correct types
 	chunk.Reset();
 
-	// Staged read path (spec 055 T5). Not used with target_vectors_: those are
-	// STRUCT children owned by the caller, and publishing a whole column's
-	// validity mask at once would overwrite what the caller already wrote there.
-	const bool staged = target_vectors_.empty() && !column_metadata_.empty();
-	if (staged) {
-		ResolveStagedTargets(chunk);
-		if (!stager_.IsConfigured()) {
-			stager_.Configure(column_metadata_, staged_targets_);
-			parser_.SetRawRowMode(true);
-		}
-		stager_.BeginChunk(staged_targets_);
-	}
+	const bool staged = BeginStagedChunk(chunk);
 
-	const idx_t max_rows = STANDARD_VECTOR_SIZE;  // 2048
-	idx_t row_count = 0;
-	uint64_t parse_time_ns = 0;
-	uint64_t read_time_ns = 0;
-	uint64_t process_time_ns = 0;
+	FillPhaseTimes times;
 	// D4: snapshot the thread-local fallback counter; the delta at exit is
 	// this call's fallbacks (FillChunk runs entirely on one thread).
 	const uint64_t utf16_fallbacks_at_entry = counters_enabled_ ? tds::encoding::Utf16FallbackCount() : 0;
 
-	while (row_count < max_rows && state_ == MSSQLResultStreamState::Streaming) {
-		// Check for cancellation periodically
-		if (is_cancelled_.load(std::memory_order_acquire)) {
-			break;
-		}
+	const idx_t row_count = ReadRows(chunk, staged, times);
 
-		PhaseTimer parse_timer(timing_enabled_);
-		tds::ParsedTokenType token = parser_.TryParseNext();
-		parse_timer.Stop(parse_time_ns);
-
-		switch (token) {
-		case tds::ParsedTokenType::Row: {
-			PhaseTimer process_timer(timing_enabled_);
-			if (staged) {
-				const uint8_t *row = parser_.GetRawRow();
-				const size_t row_length = parser_.GetRawRowLength();
-				if (counters_enabled_) {
-					counters_.wire_bytes_in += row_length;
-				}
-				if (parser_.IsRawRowNBC()) {
-					stager_.StageNBCRow(row, row_length, row_count);
-				} else {
-					stager_.StageRow(row, row_length, row_count);
-				}
-				row_count++;
-				// A MAX-typed column can stage megabytes per row, so a chunk is
-				// closed on staged BYTES as well as on rows. DataChunk is allowed
-				// to be short; without this, 2048 rows of large values would be
-				// buffered in full before DuckDB saw any of them.
-				if (stager_.StagedBytesExceed(mssql::codec::staging::STAGING_CHUNK_PAYLOAD_BUDGET_BYTES)) {
-					goto exit_loop;
-				}
-			} else {
-				ProcessRow(chunk, row_count++);
-			}
-			process_timer.Stop(process_time_ns);
-			rows_read_++;
-			break;
-		}
-
-		case tds::ParsedTokenType::Done: {
-			auto done = parser_.GetDone();
-			if (done.HasError()) {
-				// Error indicated in DONE token
-				state_ = MSSQLResultStreamState::Error;
-				if (!errors_.empty()) {
-					ThrowServerError(errors_);
-				}
-				throw InvalidInputException("SQL Server returned error status");
-			}
-			if (done.IsFinal()) {
-				state_ = MSSQLResultStreamState::Complete;
-				// Transition connection back to Idle
-				connection_->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-			}
-			break;
-		}
-
-		case tds::ParsedTokenType::Error: {
-			auto error = parser_.GetError();
-			errors_.push_back(error);
-			// Fatal errors (severity >= 20) throw immediately
-			if (error.IsFatal()) {
-				state_ = MSSQLResultStreamState::Error;
-				throw IOException("SQL Server fatal error [%d, severity %d]: %s", error.number, error.severity,
-								  error.message);
-			}
-			break;
-		}
-
-		case tds::ParsedTokenType::Info:
-			info_messages_.push_back(parser_.GetInfo());
-			break;
-
-		case tds::ParsedTokenType::NeedMoreData:
-			// Check if parser is in terminal state (Complete or Error)
-			if (parser_.GetState() == tds::ParserState::Complete) {
-				state_ = MSSQLResultStreamState::Complete;
-				connection_->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-				goto exit_loop;	 // Exit the while loop
-			}
-			if (parser_.GetState() == tds::ParserState::Error) {
-				state_ = MSSQLResultStreamState::Error;
-				throw IOException("TDS parse error: " + parser_.GetParseError());
-			}
-			{
-				PhaseTimer read_timer(timing_enabled_);
-				bool read_ok = ReadMoreData(read_timeout_ms_);
-				read_timer.Stop(read_time_ns);
-				if (!read_ok) {
-					if (row_count > 0) {
-						// Return what we have
-						goto exit_loop;
-					}
-					if (IsTimeoutError()) {
-						throw IOException(GetTimeoutErrorMessage());
-					}
-					throw IOException("Connection closed unexpectedly");
-				}
-			}
-			break;
-
-		case tds::ParsedTokenType::None:
-			if (parser_.GetState() == tds::ParserState::Error) {
-				state_ = MSSQLResultStreamState::Error;
-				throw IOException("TDS parse error: " + parser_.GetParseError());
-			}
-			if (parser_.GetState() == tds::ParserState::Complete) {
-				state_ = MSSQLResultStreamState::Complete;
-				connection_->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-			}
-			break;
-
-		case tds::ParsedTokenType::ColMetadata: {
-			// A second COLMETADATA token means another result set is starting.
-			// This is not supported — only one result-producing statement per batch.
-			state_ = MSSQLResultStreamState::Error;
-			DrainRemainingTokens();
-			throw InvalidInputException(
-				"MSSQL Error: The SQL batch produced multiple result sets. "
-				"Only one result-producing statement is allowed per mssql_scan() call. "
-				"Ensure your batch contains only one SELECT or other result-producing statement, "
-				"or use separate mssql_scan() calls for multiple result sets.");
-		}
-
-		default:
-			// Skip other tokens
-			break;
-		}
-	}
-
-exit_loop:
 	if (staged) {
-		stager_.FinalizeChunk(row_count);
-		for (idx_t c = 0; c < column_metadata_.size(); c++) {
-			if (stager_.ChunkOutOfRange(c) > 0) {
-				NoteOutOfRange(c);
-			}
-			if (stager_.KernelOf(c) == mssql::codec::staging::FinalizeKernel::Vector &&
-				column_metadata_[c].IsVectorText()) {
-				NoteVectorText(c);
-			}
-			// Spec 093 T1: a sql_variant value read as its bytes is said as soon as the scan meets
-			// one, like D8's out-of-range values, so a query that stops early still says it.
-			if (column_metadata_[c].type_id == tds::TDS_TYPE_SQL_VARIANT &&
-				(c >= variant_notes_warned_.size() || !variant_notes_warned_[c])) {
-				const auto &notes = stager_.VariantNotes(c);
-				if (notes.unknown_collation + notes.invalid_utf8 > 0) {
-					warnings_pending_ = true;
-				}
-			}
-			// Spec 093 T5: a spatial value read as NULL, likewise.
-			if (column_metadata_[c].IsSpatialUdt() && SpatialWarningPending(c)) {
-				warnings_pending_ = true;
-			}
-		}
-		if (counters_enabled_) {
-			CountChunkForDebug(chunk, row_count);
-		}
+		FinishStagedChunk(chunk, row_count);
 	}
 	// 2.0 vectors carry their own size, and every consumer keyed on
 	// Vector::size() — IsNull, filters, the hash join — sees an empty vector
@@ -520,41 +350,275 @@ exit_loop:
 	uint64_t total_ns = 0;
 	chunk_timer.Stop(total_ns);
 	MSSQL_DEBUG_LOG(1, "FillChunk: %llu rows, total=%lluns, parse=%lluns, read=%lluns, process=%lluns",
-					(unsigned long long)row_count, (unsigned long long)total_ns, (unsigned long long)parse_time_ns,
-					(unsigned long long)read_time_ns, (unsigned long long)process_time_ns);
+					(unsigned long long)row_count, (unsigned long long)total_ns, (unsigned long long)times.parse_ns,
+					(unsigned long long)times.read_ns, (unsigned long long)times.process_ns);
 
 	if (counters_enabled_) {
 		if (row_count > 0) {
 			counters_.chunks++;
 		}
 		counters_.fill_total_ns += total_ns;
-		counters_.fill_parse_ns += parse_time_ns;
-		counters_.fill_read_ns += read_time_ns;
-		counters_.fill_process_ns += process_time_ns;
+		counters_.fill_parse_ns += times.parse_ns;
+		counters_.fill_read_ns += times.read_ns;
+		counters_.fill_process_ns += times.process_ns;
 		counters_.utf16_fallbacks += tds::encoding::Utf16FallbackCount() - utf16_fallbacks_at_entry;
 	}
 
 	return row_count;
 }
 
-void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
-	const auto &row = parser_.GetRow();
+bool MSSQLResultStream::ReadyToFill() {
+	if (state_ == MSSQLResultStreamState::Complete || state_ == MSSQLResultStreamState::Error) {
+		return false;
+	}
 
+	if (state_ != MSSQLResultStreamState::Streaming) {
+		throw InvalidInputException("MSSQLResultStream not in streaming state");
+	}
+
+	// Check for cancellation
+	if (is_cancelled_.load(std::memory_order_acquire)) {
+		DrainAfterCancel();
+		return false;
+	}
+	return true;
+}
+
+bool MSSQLResultStream::BeginStagedChunk(DataChunk &chunk) {
+	// Staged read path (spec 055 T5). Not used with target_vectors_: those are
+	// STRUCT children owned by the caller, and publishing a whole column's
+	// validity mask at once would overwrite what the caller already wrote there.
+	const bool staged = target_vectors_.empty() && !column_metadata_.empty();
+	if (staged) {
+		ResolveStagedTargets(chunk);
+		if (!stager_.IsConfigured()) {
+			stager_.Configure(column_metadata_, staged_targets_);
+			parser_.SetRawRowMode(true);
+		}
+		stager_.BeginChunk(staged_targets_);
+	}
+	return staged;
+}
+
+idx_t MSSQLResultStream::ReadRows(DataChunk &chunk, bool staged, FillPhaseTimes &times) {
+	const idx_t max_rows = STANDARD_VECTOR_SIZE;  // 2048
+	idx_t row_count = 0;
+
+	while (row_count < max_rows && state_ == MSSQLResultStreamState::Streaming) {
+		// Check for cancellation periodically
+		if (is_cancelled_.load(std::memory_order_acquire)) {
+			break;
+		}
+
+		PhaseTimer parse_timer(timing_enabled_);
+		tds::ParsedTokenType token = parser_.TryParseNext();
+		parse_timer.Stop(times.parse_ns);
+
+		// A row is handled here, in the loop: this is the path every row of every scan takes.
+		if (token != tds::ParsedTokenType::Row) {
+			if (ConsumeStreamToken(token, row_count, times.read_ns)) {
+				break;
+			}
+			continue;
+		}
+
+		PhaseTimer process_timer(timing_enabled_);
+		if (staged) {
+			const uint8_t *row = parser_.GetRawRow();
+			const size_t row_length = parser_.GetRawRowLength();
+			if (counters_enabled_) {
+				counters_.wire_bytes_in += row_length;
+			}
+			if (parser_.IsRawRowNBC()) {
+				stager_.StageNBCRow(row, row_length, row_count);
+			} else {
+				stager_.StageRow(row, row_length, row_count);
+			}
+			row_count++;
+			// A MAX-typed column can stage megabytes per row, so a chunk is
+			// closed on staged BYTES as well as on rows. DataChunk is allowed
+			// to be short; without this, 2048 rows of large values would be
+			// buffered in full before DuckDB saw any of them.
+			// The loop is left before this row is timed and counted in rows_read_, as it always was.
+			if (stager_.StagedBytesExceed(mssql::codec::staging::STAGING_CHUNK_PAYLOAD_BUDGET_BYTES)) {
+				break;
+			}
+		} else {
+			ProcessRow(chunk, row_count++);
+		}
+		process_timer.Stop(times.process_ns);
+		rows_read_++;
+	}
+	return row_count;
+}
+
+bool MSSQLResultStream::ConsumeStreamToken(tds::ParsedTokenType token, idx_t row_count, uint64_t &read_time_ns) {
+	switch (token) {
+	case tds::ParsedTokenType::Done:
+		ConsumeDone();
+		return false;
+
+	case tds::ParsedTokenType::Error:
+		NoteServerError();
+		return false;
+
+	case tds::ParsedTokenType::Info:
+		info_messages_.push_back(parser_.GetInfo());
+		return false;
+
+	case tds::ParsedTokenType::NeedMoreData:
+		return ReadForMoreRows(row_count, read_time_ns);
+
+	case tds::ParsedTokenType::None:
+		if (parser_.GetState() == tds::ParserState::Error) {
+			FailOnParseError();
+		}
+		if (parser_.GetState() == tds::ParserState::Complete) {
+			FinishStream();
+		}
+		return false;
+
+	case tds::ParsedTokenType::ColMetadata:
+		RefuseSecondResultSet();
+
+	default:
+		// Skip other tokens
+		return false;
+	}
+}
+
+void MSSQLResultStream::ConsumeDone() {
+	auto done = parser_.GetDone();
+	if (done.HasError()) {
+		// Error indicated in DONE token
+		state_ = MSSQLResultStreamState::Error;
+		if (!errors_.empty()) {
+			ThrowServerError(errors_);
+		}
+		throw InvalidInputException("SQL Server returned error status");
+	}
+	if (done.IsFinal()) {
+		FinishStream();
+	}
+}
+
+bool MSSQLResultStream::ReadForMoreRows(idx_t row_count, uint64_t &read_time_ns) {
+	// Check if parser is in terminal state (Complete or Error)
+	if (parser_.GetState() == tds::ParserState::Complete) {
+		FinishStream();
+		return true;
+	}
+	if (parser_.GetState() == tds::ParserState::Error) {
+		FailOnParseError();
+	}
+	PhaseTimer read_timer(timing_enabled_);
+	bool read_ok = ReadMoreData(read_timeout_ms_);
+	read_timer.Stop(read_time_ns);
+	if (!read_ok) {
+		if (row_count > 0) {
+			// Return what we have
+			return true;
+		}
+		if (IsTimeoutError()) {
+			throw IOException(GetTimeoutErrorMessage());
+		}
+		throw IOException("Connection closed unexpectedly");
+	}
+	return false;
+}
+
+void MSSQLResultStream::FinishStream() {
+	state_ = MSSQLResultStreamState::Complete;
+	// Transition connection back to Idle
+	connection_->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
+}
+
+void MSSQLResultStream::FailOnParseError() {
+	state_ = MSSQLResultStreamState::Error;
+	throw IOException("TDS parse error: " + parser_.GetParseError());
+}
+
+void MSSQLResultStream::RefuseSecondResultSet() {
+	// A second COLMETADATA token means another result set is starting.
+	// This is not supported — only one result-producing statement per batch.
+	state_ = MSSQLResultStreamState::Error;
+	DrainRemainingTokens();
+	throw InvalidInputException(
+		"MSSQL Error: The SQL batch produced multiple result sets. "
+		"Only one result-producing statement is allowed per mssql_scan() call. "
+		"Ensure your batch contains only one SELECT or other result-producing statement, "
+		"or use separate mssql_scan() calls for multiple result sets.");
+}
+
+void MSSQLResultStream::FinishStagedChunk(DataChunk &chunk, idx_t row_count) {
+	stager_.FinalizeChunk(row_count);
+	for (idx_t c = 0; c < column_metadata_.size(); c++) {
+		NoteStagedColumn(c);
+	}
+	if (counters_enabled_) {
+		CountChunkForDebug(chunk, row_count);
+	}
+}
+
+void MSSQLResultStream::NoteStagedColumn(idx_t c) {
+	if (stager_.ChunkOutOfRange(c) > 0) {
+		NoteOutOfRange(c);
+	}
+	if (stager_.KernelOf(c) == mssql::codec::staging::FinalizeKernel::Vector && column_metadata_[c].IsVectorText()) {
+		NoteVectorText(c);
+	}
+	// Spec 093 T1: a sql_variant value read as its bytes is said as soon as the scan meets
+	// one, like D8's out-of-range values, so a query that stops early still says it.
+	if (column_metadata_[c].type_id == tds::TDS_TYPE_SQL_VARIANT &&
+		(c >= variant_notes_warned_.size() || !variant_notes_warned_[c])) {
+		const auto &notes = stager_.VariantNotes(c);
+		if (notes.unknown_collation + notes.invalid_utf8 > 0) {
+			warnings_pending_ = true;
+		}
+	}
+	// Spec 093 T5: a spatial value read as NULL, likewise.
+	if (column_metadata_[c].IsSpatialUdt() && SpatialWarningPending(c)) {
+		warnings_pending_ = true;
+	}
+}
+
+idx_t MSSQLResultStream::ColumnsToFill(const DataChunk &chunk) const {
 	// Determine how many columns to fill:
 	// - If target_vectors_ is set, use those vectors instead of chunk.data
 	// - If columns_to_fill_ was explicitly set (e.g., for COUNT(*)), use that
 	// - Otherwise, fill up to chunk's column count (but not more than we have data for)
-	idx_t cols_to_fill;
 	if (!target_vectors_.empty()) {
 		// Use target vectors - columns_to_fill_ should match target_vectors_.size()
-		cols_to_fill = std::min(target_vectors_.size(), column_metadata_.size());
-	} else if (columns_to_fill_ != static_cast<idx_t>(-1)) {
-		// Explicitly set - use this value (may be 0 for COUNT(*))
-		cols_to_fill = std::min(columns_to_fill_, static_cast<idx_t>(column_metadata_.size()));
-	} else {
-		// Default behavior - fill columns that exist in both SQL result and chunk
-		cols_to_fill = std::min(static_cast<idx_t>(column_metadata_.size()), chunk.ColumnCount());
+		return std::min(target_vectors_.size(), column_metadata_.size());
 	}
+	if (columns_to_fill_ != static_cast<idx_t>(-1)) {
+		// Explicitly set - use this value (may be 0 for COUNT(*))
+		return std::min(columns_to_fill_, static_cast<idx_t>(column_metadata_.size()));
+	}
+	// Default behavior - fill columns that exist in both SQL result and chunk
+	return std::min(static_cast<idx_t>(column_metadata_.size()), chunk.ColumnCount());
+}
+
+void MSSQLResultStream::NoteDecodeNotes(idx_t col_idx, const Vector &target_vector,
+										const mssql::codec::variant::VariantColumnNotes *variant_notes,
+										const mssql::codec::spatial::SpatialColumnNotes *spatial_notes) {
+	if (spatial_notes && SpatialWarningPending(col_idx)) {
+		warnings_pending_ = true;
+	}
+	if (column_metadata_[col_idx].IsVectorText() && target_vector.GetType().id() == LogicalTypeId::ARRAY) {
+		NoteVectorText(col_idx);
+	}
+	// Spec 093 T1: as the staged path, said as soon as the scan meets one.
+	if (variant_notes && variant_notes->unknown_collation + variant_notes->invalid_utf8 > 0 &&
+		(col_idx >= variant_notes_warned_.size() || !variant_notes_warned_[col_idx])) {
+		warnings_pending_ = true;
+	}
+}
+
+void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
+	const auto &row = parser_.GetRow();
+
+	const idx_t cols_to_fill = ColumnsToFill(chunk);
 
 	// Debug: log column count info on first row
 	if (row_idx == 0) {
@@ -592,16 +656,10 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 		tds::encoding::TypeConverter::ConvertValue(row.values[col_idx], row.null_mask[col_idx],
 												   column_metadata_[col_idx], *target_vector, row_idx, variant_notes,
 												   spatial_notes);
-		if (spatial_notes && SpatialWarningPending(col_idx)) {
-			warnings_pending_ = true;
-		}
-		if (column_metadata_[col_idx].IsVectorText() && target_vector->GetType().id() == LogicalTypeId::ARRAY) {
-			NoteVectorText(col_idx);
-		}
-		// Spec 093 T1: as the staged path, said as soon as the scan meets one.
-		if (variant_notes && variant_notes->unknown_collation + variant_notes->invalid_utf8 > 0 &&
-			(col_idx >= variant_notes_warned_.size() || !variant_notes_warned_[col_idx])) {
-			warnings_pending_ = true;
+		// Only a spatial, a sql_variant or a vector-as-text column has anything to note; for any other
+		// the three tests are all there is, as they were.
+		if (spatial_notes || variant_notes || column_metadata_[col_idx].IsVectorText()) {
+			NoteDecodeNotes(col_idx, *target_vector, variant_notes, spatial_notes);
 		}
 		// A datetime2 value read as NULL for not fitting TIMESTAMP_NS (issue #168): spec 093 D8's warning.
 		const auto &meta = column_metadata_[col_idx];
@@ -1138,46 +1196,56 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 	if (warnings_pending_) {
 		warnings_pending_ = false;
 		SurfaceSpatialWarnings(context);
-		for (idx_t c = 0; c < out_of_range_.size(); c++) {
-			if (out_of_range_[c] != 1) {
-				continue;
-			}
-			out_of_range_[c] = 2;
-			// The ATTACH form first: the setting is read at ATTACH, and whoever reads this has an attached
-			// catalog, on which a bare SET changes nothing (review of #560).
-			DUCKDB_LOG_WARNING(context,
-							   "mssql: column \"%s\" holds datetime2(7) values outside 1677-2262 (a temporal "
-							   "table's 9999-12-31, say), read as NULL as TIMESTAMP_NS cannot hold them; attach with "
-							   "datetime2_7_as 'timestamp' (or SET mssql_datetime2_7_as = 'timestamp' before ATTACH) "
-							   "to read them as TIMESTAMP, the 100 ns digit truncated",
-							   column_metadata_[c].name.c_str());
-		}
+		SurfaceOutOfRangeWarnings(context);
 	}
 
+	SurfaceVectorTextWarnings(context);
+	SurfaceVariantWarnings(context);
+	SurfaceCollationWarnings(context);
+}
+
+void MSSQLResultStream::SurfaceOutOfRangeWarnings(ClientContext &context) {
+	for (idx_t c = 0; c < out_of_range_.size(); c++) {
+		if (out_of_range_[c] != 1) {
+			continue;
+		}
+		out_of_range_[c] = 2;
+		// The ATTACH form first: the setting is read at ATTACH, and whoever reads this has an attached
+		// catalog, on which a bare SET changes nothing (review of #560).
+		DUCKDB_LOG_WARNING(context,
+						   "mssql: column \"%s\" holds datetime2(7) values outside 1677-2262 (a temporal "
+						   "table's 9999-12-31, say), read as NULL as TIMESTAMP_NS cannot hold them; attach with "
+						   "datetime2_7_as 'timestamp' (or SET mssql_datetime2_7_as = 'timestamp' before ATTACH) "
+						   "to read them as TIMESTAMP, the 100 ns digit truncated",
+						   column_metadata_[c].name.c_str());
+	}
+}
+
+void MSSQLResultStream::SurfaceVectorTextWarnings(ClientContext &context) {
 	// Spec 093 D4: a vector column read from its JSON text on a connection that was not granted
 	// VECTORSUPPORT, where a float32 column arrives that way too and its 8 significant digits can put an
 	// element one ulp from the stored one (V2: about 1.5 % of values). Under the feature only a float16
 	// column is text, and exact, so it is not said. Once per column per statement.
-	{
-		auto connection = GetConnection();
-		const bool granted = connection && connection->VectorSupportVersion() > 0;
-		for (idx_t c = 0; c < vector_text_.size(); c++) {
-			if (vector_text_[c] != 1) {
-				continue;
-			}
-			vector_text_[c] = 2;
-			if (granted) {
-				continue;
-			}
-			DUCKDB_LOG_WARNING(context,
-							   "mssql: column \"%s\" is a vector read from its JSON text, as a session without "
-							   "VECTORSUPPORT receives it (mssql_vector_support false at ATTACH, or a server that does "
-							   "not grant it): a float32 element can read one ulp from its stored value (8 significant "
-							   "digits); with the feature (SQL Server 2025) a float32 vector streams its bytes",
-							   column_metadata_[c].name.c_str());
+	auto connection = GetConnection();
+	const bool granted = connection && connection->VectorSupportVersion() > 0;
+	for (idx_t c = 0; c < vector_text_.size(); c++) {
+		if (vector_text_[c] != 1) {
+			continue;
 		}
+		vector_text_[c] = 2;
+		if (granted) {
+			continue;
+		}
+		DUCKDB_LOG_WARNING(context,
+						   "mssql: column \"%s\" is a vector read from its JSON text, as a session without "
+						   "VECTORSUPPORT receives it (mssql_vector_support false at ATTACH, or a server that does "
+						   "not grant it): a float32 element can read one ulp from its stored value (8 significant "
+						   "digits); with the feature (SQL Server 2025) a float32 vector streams its bytes",
+						   column_metadata_[c].name.c_str());
 	}
+}
 
+void MSSQLResultStream::SurfaceVariantWarnings(ClientContext &context) {
 	// Spec 093 T1: sql_variant values the scan read as their bytes (a collation this build has no code
 	// page for, UTF-8 bytes that are not UTF-8), once a column.
 	if (stager_.IsConfigured() || !row_variant_notes_.empty()) {
@@ -1199,7 +1267,9 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 			}
 		}
 	}
+}
 
+void MSSQLResultStream::SurfaceCollationWarnings(ClientContext &context) {
 	// Issue #224, narrowed by spec 092 D9: a CHAR / VARCHAR / TEXT column under a
 	// code page is transcoded on the client (ColumnMetadata::code_page), except on
 	// a catalog with client_transcode off and for a collation newer than the
@@ -1230,27 +1300,29 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 		if (!col.IsSingleByteTextColumn() || col.IsUtf8Collation() || col.code_page != nullptr) {
 			continue;
 		}
-		// What the caller can do depends on why it was not transcoded and on the
-		// path. A raw mssql_scan() caller wrote the T-SQL and can cast in it; a
-		// catalog scan's SQL is generated, and under client_transcode off such a
-		// column reached here because mssql_convert_varchar_max was turned off too.
-		const char *fix;
-		if (client_transcode_) {
-			fix = is_catalog_scan_ ? "The collation is newer than this build's code-page tables; set "
-									 "mssql_convert_varchar_max=true so the server converts it."
-								   : "The collation is newer than this build's code-page tables; CAST it to NVARCHAR "
-									 "in the query to convert.";
-		} else if (is_catalog_scan_) {
-			fix = "Attach with client_transcode true, or set mssql_convert_varchar_max=true so the server converts it.";
-		} else {
-			fix = "Attach with client_transcode true, or CAST it to NVARCHAR in the query to convert.";
-		}
 		DUCKDB_LOG_WARNING(context,
 						   "mssql: column \"%s\" has a non-UTF-8 collation (LCID 0x%04X, SortId %u); its bytes are "
 						   "returned verbatim and may not be valid UTF-8. %s",
 						   col.name.c_str(), (unsigned)(col.collation & 0xFFFFFu), (unsigned)col.collation_sort_id,
-						   fix);
+						   VerbatimBytesFix());
 	}
+}
+
+const char *MSSQLResultStream::VerbatimBytesFix() const {
+	// What the caller can do depends on why it was not transcoded and on the
+	// path. A raw mssql_scan() caller wrote the T-SQL and can cast in it; a
+	// catalog scan's SQL is generated, and under client_transcode off such a
+	// column reached here because mssql_convert_varchar_max was turned off too.
+	if (client_transcode_) {
+		return is_catalog_scan_ ? "The collation is newer than this build's code-page tables; set "
+								  "mssql_convert_varchar_max=true so the server converts it."
+								: "The collation is newer than this build's code-page tables; CAST it to NVARCHAR "
+								  "in the query to convert.";
+	}
+	if (is_catalog_scan_) {
+		return "Attach with client_transcode true, or set mssql_convert_varchar_max=true so the server converts it.";
+	}
+	return "Attach with client_transcode true, or CAST it to NVARCHAR in the query to convert.";
 }
 
 }  // namespace duckdb

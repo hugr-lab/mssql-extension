@@ -13,7 +13,11 @@ covers it). Nine tables in a scratch database:
   smallmoney, real, float, date, time (7) and (0), datetime, smalldatetime, datetime2 (7),
   datetimeoffset (7), uniqueidentifier, char / varchar / nchar / nvarchar, binary / varbinary, the three
   `(max)` types, sql_variant, xml) between two regular variable columns: a row of NULLs, a row of edge
-  values, one value alone, empty strings and binaries, values of 9,000 to 10,000 bytes;
+  values, one value alone, empty strings and binaries, values of 9,000 to 10,000 bytes. Not in it:
+  `hierarchyid`, which may be sparse too (measured 2026-11-28 on SQL Server 2022, 16.0.4295, review of
+  #626): the rowset holds it as a `varbinary(892)` (`sys.system_internals_partition_columns` type 165,
+  as a regular hierarchyid), so its entry in the vector is a variable one, and a backup's sparse
+  hierarchyid of `/`, `/42/`, `/-1/0.5/`, a ten-level path and NULL read as `ToString()` gives them;
 - `t_wide`: 600 sparse ints and a varchar, three of them set;
 - `t_colset`: eight sparse columns behind a column set;
 - `t_alter`: a sparse column added, then a regular one made sparse (`ALTER COLUMN … ADD SPARSE`);
@@ -102,8 +106,9 @@ that is not persisted, and read as one (owner, 2026-11-24: decision A).
   whose low 16 bits were 0 in every value (E21). Past every regular column, the last one must be the vector.
   Every part is checked: n, the ids ascending, the ends ascending and within the vector. Where the bitmap says
   the regular column at that index holds a value, the vector must also have every id a sparse column's of the
-  layout (live or dropped) and its last value end at its end; a tagged column that fails is that column, not
-  an error. The vector is then not counted among the
+  layout (live or dropped) and its last value end at its end; a tagged column that fails is that column only when it
+  is a LOB root pointer's 16 bytes (a text / ntext / image root), and is refused by name at any other size. The
+  vector is then not counted among the
   record's regular variable columns, so a regular one at its index is not stored.
 - **The change listing:** a sparse table's rows are compared by their values, not their bytes. `ALTER`
   rewrites every row with its values the same, and a vector keeps a dropped column's entries.

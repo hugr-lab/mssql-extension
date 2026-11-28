@@ -150,6 +150,79 @@ bool MemberFits(uint8_t parent, uint8_t child) {
 	}
 }
 
+//! x and y, and a Z and an M where the value has them.
+uint32_t Dimensions(bool z, bool m) {
+	return 2 + (z ? 1 : 0) + (m ? 1 : 0);
+}
+
+//! A shape's type is one its version has: 8 - 11 in version 2 only.
+bool TypeKnown(uint8_t type, uint8_t version) {
+	return type >= T_POINT && type <= T_FULLGLOBE && (version != 1 || type <= T_COLLECTION);
+}
+
+//! A Z or an M per point, where the value has them. False when they do not fit.
+bool TakeOrdinates(Reader &r, bool present, uint32_t point_count, const uint8_t *&ordinates) {
+	if (!present) {
+		return true;
+	}
+	ordinates = r.Take(point_count, 8);
+	return ordinates != nullptr;
+}
+
+//! The figures: a count, then an attribute and a first point each. False when they do not fit.
+bool TakeFigures(Reader &r, std::vector<WkbDecoder::Figure> &figures) {
+	uint32_t figure_count;
+	if (!r.U32(figure_count)) {
+		return false;
+	}
+	const uint8_t *stored = r.Take(figure_count, 5);
+	if (!stored) {
+		return false;
+	}
+	figures.resize(figure_count);
+	for (uint32_t f = 0; f < figure_count; f++) {
+		const uint8_t *at = stored + static_cast<size_t>(f) * 5;
+		figures[f].attribute = at[0];
+		figures[f].first_point = LoadU32(at + 1);
+	}
+	return true;
+}
+
+//! The shapes: a count, then a parent, a first figure and a type each. False when they do not fit.
+bool TakeShapes(Reader &r, std::vector<WkbDecoder::Shape> &shapes) {
+	uint32_t shape_count;
+	if (!r.U32(shape_count)) {
+		return false;
+	}
+	const uint8_t *stored = r.Take(shape_count, 9);
+	if (!stored) {
+		return false;
+	}
+	shapes.resize(shape_count);
+	for (uint32_t s = 0; s < shape_count; s++) {
+		const uint8_t *at = stored + static_cast<size_t>(s) * 9;
+		const uint32_t parent = LoadU32(at);
+		const uint32_t figure = LoadU32(at + 4);
+		std::memcpy(&shapes[s].parent, &parent, 4);
+		std::memcpy(&shapes[s].first_figure, &figure, 4);
+		shapes[s].type = at[8];
+	}
+	return true;
+}
+
+//! Version 2 carries its segments when it has any (G1: a CompoundCurve's); none means none. A count, then
+//! a byte each. False when they do not fit.
+bool TakeSegments(Reader &r, uint8_t version, const uint8_t *&segments, uint32_t &segment_count) {
+	if (version != 2 || r.Left() == 0) {
+		return true;
+	}
+	if (!r.U32(segment_count)) {
+		return false;
+	}
+	segments = r.Take(segment_count, 1);
+	return segments != nullptr;
+}
+
 }  // namespace
 
 //! The WKB of a validated value (not P / L), walked once to size it (WRITE false: lengths only, no
@@ -158,83 +231,30 @@ bool MemberFits(uint8_t parent, uint8_t child) {
 template <bool WRITE>
 class Emitter {
 public:
-	Emitter(const WkbDecoder &d, char *dst) : d_(d), p_(dst), dims_(2 + (d.z_ ? 1 : 0) + (d.m_ ? 1 : 0)) {}
+	Emitter(const WkbDecoder &d, char *dst) : d_(d), p_(dst), dims_(Dimensions(d.z_, d.m_)) {}
 
 	bool Emit(int32_t s) {
-		const WkbDecoder::Shape &shape = d_.shapes_[s];
-		const bool empty = shape.first_figure < 0;
-		const uint32_t first = empty ? 0 : static_cast<uint32_t>(shape.first_figure);
-		const uint32_t figure_count = empty ? 0 : d_.figure_end_[s] - first;
-		switch (shape.type) {
+		switch (d_.shapes_[s].type) {
 		case T_POINT:
-			Head(T_POINT);
-			if (empty) {
-				// DuckDB's POINT EMPTY: a point of NaN coordinates (K1), where the server writes MULTIPOINT
-				// EMPTY or leaves a MULTIPOINT's member out (owner, 2026-11-20).
-				for (uint32_t k = 0; k < dims_; k++) {
-					NaN();
-				}
-			} else {
-				Point(d_.figures_[first].first_point);
-			}
+			EmitPoint(s);
 			return true;
 		case T_LINESTRING:
 		case T_CIRCULARSTRING:
-			Head(shape.type);
-			if (empty) {
-				U32(0);
-			} else {
-				Points(first);
-			}
+			EmitLine(s);
 			return true;
 		case T_POLYGON:
-			Head(T_POLYGON);
-			U32(figure_count);
-			for (uint32_t f = first; f < first + figure_count; f++) {
-				Points(f);
-			}
+			EmitPolygon(s);
 			return true;
 		case T_COMPOUNDCURVE:
-			Head(T_COMPOUNDCURVE);
-			if (empty) {
-				U32(0);
-				return true;
-			}
-			return Compound(first);
+			return EmitCompoundCurve(s);
 		case T_CURVEPOLYGON:
-			Head(T_CURVEPOLYGON);
-			U32(figure_count);
-			for (uint32_t f = first; f < first + figure_count; f++) {
-				const uint8_t attribute = d_.figures_[f].attribute;
-				if (attribute == ATTR_COMPOSITE) {
-					Head(T_COMPOUNDCURVE);
-					if (!Compound(f)) {
-						return false;
-					}
-				} else {
-					Head(attribute == ATTR_ARC ? T_CIRCULARSTRING : T_LINESTRING);
-					Points(f);
-				}
-			}
-			return true;
+			return EmitCurvePolygon(s);
 		case T_FULLGLOBE:
 			Byte(1);
 			U32(WKB_FULLGLOBE);
 			return true;
-		default: {	// the collections; Validate let no other type through
-			Head(shape.type);
-			uint32_t members = 0;
-			for (int32_t c = d_.first_child_[s]; c >= 0; c = d_.next_sibling_[c]) {
-				members++;
-			}
-			U32(members);
-			for (int32_t c = d_.first_child_[s]; c >= 0; c = d_.next_sibling_[c]) {
-				if (!Emit(c)) {
-					return false;
-				}
-			}
-			return true;
-		}
+		default:  // the collections; Validate let no other type through
+			return EmitCollection(s);
 		}
 	}
 
@@ -246,6 +266,93 @@ public:
 	}
 
 private:
+	//! A shape's figures: none for an EMPTY one, else from its first to where the next shape's start.
+	bool Empty(int32_t s) const {
+		return d_.shapes_[s].first_figure < 0;
+	}
+	uint32_t FirstFigure(int32_t s) const {
+		return Empty(s) ? 0 : static_cast<uint32_t>(d_.shapes_[s].first_figure);
+	}
+	uint32_t FigureCount(int32_t s) const {
+		return Empty(s) ? 0 : d_.figure_end_[s] - FirstFigure(s);
+	}
+
+	void EmitPoint(int32_t s) {
+		Head(T_POINT);
+		if (!Empty(s)) {
+			Point(d_.figures_[FirstFigure(s)].first_point);
+			return;
+		}
+		// DuckDB's POINT EMPTY: a point of NaN coordinates (K1), where the server writes MULTIPOINT
+		// EMPTY or leaves a MULTIPOINT's member out (owner, 2026-11-20).
+		for (uint32_t k = 0; k < dims_; k++) {
+			NaN();
+		}
+	}
+	//! A LineString or a CircularString: its one figure's points.
+	void EmitLine(int32_t s) {
+		Head(d_.shapes_[s].type);
+		if (Empty(s)) {
+			U32(0);
+		} else {
+			Points(FirstFigure(s));
+		}
+	}
+	//! A Polygon: a ring per figure.
+	void EmitPolygon(int32_t s) {
+		const uint32_t first = FirstFigure(s);
+		const uint32_t figure_count = FigureCount(s);
+		Head(T_POLYGON);
+		U32(figure_count);
+		for (uint32_t f = first; f < first + figure_count; f++) {
+			Points(f);
+		}
+	}
+	bool EmitCompoundCurve(int32_t s) {
+		Head(T_COMPOUNDCURVE);
+		if (Empty(s)) {
+			U32(0);
+			return true;
+		}
+		return Compound(FirstFigure(s));
+	}
+	//! A CurvePolygon: a ring per figure, each a LineString, a CircularString or a CompoundCurve by its
+	//! figure's attribute.
+	bool EmitCurvePolygon(int32_t s) {
+		const uint32_t first = FirstFigure(s);
+		const uint32_t figure_count = FigureCount(s);
+		Head(T_CURVEPOLYGON);
+		U32(figure_count);
+		for (uint32_t f = first; f < first + figure_count; f++) {
+			const uint8_t attribute = d_.figures_[f].attribute;
+			if (attribute == ATTR_COMPOSITE) {
+				Head(T_COMPOUNDCURVE);
+				if (!Compound(f)) {
+					return false;
+				}
+			} else {
+				Head(attribute == ATTR_ARC ? T_CIRCULARSTRING : T_LINESTRING);
+				Points(f);
+			}
+		}
+		return true;
+	}
+	//! A collection: the count of its members, then each of them.
+	bool EmitCollection(int32_t s) {
+		Head(d_.shapes_[s].type);
+		uint32_t members = 0;
+		for (int32_t c = d_.first_child_[s]; c >= 0; c = d_.next_sibling_[c]) {
+			members++;
+		}
+		U32(members);
+		for (int32_t c = d_.first_child_[s]; c >= 0; c = d_.next_sibling_[c]) {
+			if (!Emit(c)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	void Byte(uint8_t b) {
 		if (WRITE) {
 			*p_++ = static_cast<char>(b);
@@ -303,10 +410,21 @@ private:
 		if (end < begin + 2) {
 			return false;  // no segment has room
 		}
-		const uint8_t *segments = d_.segments_;
 		uint32_t at = segment_at_;
-		uint32_t i = begin;
 		uint32_t parts = 0;
+		if (!CutParts(begin, end, at, parts)) {
+			return false;
+		}
+		U32(parts);
+		Parts(begin, at);
+		segment_at_ = at;
+		return true;
+	}
+	//! The first walk: the segments from `at` that cut the points [begin, end) counted into parts, `at`
+	//! left after the last of them. False when they do not cut the points.
+	bool CutParts(uint32_t begin, uint32_t end, uint32_t &at, uint32_t &parts) const {
+		const uint8_t *segments = d_.segments_;
+		uint32_t i = begin;
 		bool previous_arc = false;
 		while (i < end - 1) {
 			if (at >= d_.segment_count_) {
@@ -329,9 +447,14 @@ private:
 			}
 			i += step;
 		}
-		U32(parts);
+		return true;
+	}
+	//! The second walk: the parts the segments [segment_at_, at) cut the points from `begin` into, each a
+	//! LineString or a CircularString.
+	void Parts(uint32_t begin, uint32_t at) {
+		const uint8_t *segments = d_.segments_;
 		uint32_t k = segment_at_;
-		i = begin;
+		uint32_t i = begin;
 		while (k < at) {
 			const bool arc = segments[k] == 1 || segments[k] == 3;
 			const uint32_t first = i;
@@ -345,8 +468,6 @@ private:
 				Point(q);
 			}
 		}
-		segment_at_ = at;
-		return true;
 	}
 
 	const WkbDecoder &d_;
@@ -365,52 +486,14 @@ SpatialStatus WkbDecoder::ReadArrays(const uint8_t *data, size_t size, uint8_t v
 	if (!points_) {
 		return SpatialStatus::Truncated;
 	}
-	if (z_ && !(zs_ = r.Take(point_count_, 8))) {
+	if (!TakeOrdinates(r, z_, point_count_, zs_) || !TakeOrdinates(r, m_, point_count_, ms_)) {
 		return SpatialStatus::Truncated;
 	}
-	if (m_ && !(ms_ = r.Take(point_count_, 8))) {
+	if (!TakeFigures(r, figures_) || !TakeShapes(r, shapes_)) {
 		return SpatialStatus::Truncated;
 	}
-	uint32_t figure_count;
-	if (!r.U32(figure_count)) {
+	if (!TakeSegments(r, version, segments_, segment_count_)) {
 		return SpatialStatus::Truncated;
-	}
-	const uint8_t *figures = r.Take(figure_count, 5);
-	if (!figures) {
-		return SpatialStatus::Truncated;
-	}
-	figures_.resize(figure_count);
-	for (uint32_t f = 0; f < figure_count; f++) {
-		const uint8_t *at = figures + static_cast<size_t>(f) * 5;
-		figures_[f].attribute = at[0];
-		figures_[f].first_point = LoadU32(at + 1);
-	}
-	uint32_t shape_count;
-	if (!r.U32(shape_count)) {
-		return SpatialStatus::Truncated;
-	}
-	const uint8_t *shapes = r.Take(shape_count, 9);
-	if (!shapes) {
-		return SpatialStatus::Truncated;
-	}
-	shapes_.resize(shape_count);
-	for (uint32_t s = 0; s < shape_count; s++) {
-		const uint8_t *at = shapes + static_cast<size_t>(s) * 9;
-		const uint32_t parent = LoadU32(at);
-		const uint32_t figure = LoadU32(at + 4);
-		std::memcpy(&shapes_[s].parent, &parent, 4);
-		std::memcpy(&shapes_[s].first_figure, &figure, 4);
-		shapes_[s].type = at[8];
-	}
-	// Version 2 carries its segments when it has any (G1: a CompoundCurve's); none means none.
-	if (version == 2 && r.Left() > 0) {
-		if (!r.U32(segment_count_)) {
-			return SpatialStatus::Truncated;
-		}
-		segments_ = r.Take(segment_count_, 1);
-		if (!segments_) {
-			return SpatialStatus::Truncated;
-		}
 	}
 	return r.Left() != 0 ? SpatialStatus::TrailingBytes : SpatialStatus::Ok;
 }
@@ -419,12 +502,8 @@ SpatialStatus WkbDecoder::ReadArrays(const uint8_t *data, size_t size, uint8_t v
 //! may be; and say whether DuckDB's GEOMETRY can hold the value.
 SpatialStatus WkbDecoder::Validate(uint8_t version, bool &geometry_holds) {
 	geometry_holds = true;
-	uint32_t previous_point = 0;
-	for (const auto &figure : figures_) {
-		if (figure.attribute > 3 || figure.first_point < previous_point || figure.first_point > point_count_) {
-			return SpatialStatus::BadFigure;
-		}
-		previous_point = figure.first_point;
+	if (!FiguresInOrder()) {
+		return SpatialStatus::BadFigure;
 	}
 	const uint32_t shape_count = static_cast<uint32_t>(shapes_.size());
 	if (shape_count == 0) {
@@ -438,102 +517,151 @@ SpatialStatus WkbDecoder::Validate(uint8_t version, bool &geometry_holds) {
 	depth_.assign(shape_count, 0);
 	int32_t previous_figure = 0;
 	for (uint32_t s = 0; s < shape_count; s++) {
-		const Shape &shape = shapes_[s];
-		if (shape.type < T_POINT || shape.type > T_FULLGLOBE || (version == 1 && shape.type > T_COLLECTION)) {
-			return SpatialStatus::BadShape;
+		const auto placed = PlaceShape(s, version, previous_figure, geometry_holds);
+		if (placed != SpatialStatus::Ok) {
+			return placed;
 		}
-		if (shape.type >= T_CIRCULARSTRING) {
-			geometry_holds = false;
-		}
-		if (shape.first_figure >= 0) {
-			if (static_cast<uint32_t>(shape.first_figure) >= figure_count || shape.first_figure < previous_figure) {
-				return SpatialStatus::BadShape;
-			}
-			previous_figure = shape.first_figure;
-		} else if (shape.first_figure != -1) {
-			return SpatialStatus::BadShape;
-		}
-		if (s == 0) {
-			if (shape.parent != -1) {
-				return SpatialStatus::BadShape;
-			}
-			continue;
-		}
-		// A member names a collection before it, and the shapes are in depth-first order: the parent is the
-		// shape before this one or one of its ancestors, so the emission order is the stored order (the
-		// figures and the segments are consumed in it).
-		if (shape.parent < 0 || static_cast<uint32_t>(shape.parent) >= s ||
-			!MemberFits(shapes_[shape.parent].type, shape.type)) {
-			return SpatialStatus::BadShape;
-		}
-		int32_t ancestor = static_cast<int32_t>(s) - 1;
-		while (ancestor >= 0 && ancestor != shape.parent) {
-			ancestor = shapes_[ancestor].parent;
-		}
-		if (ancestor != shape.parent) {
-			return SpatialStatus::BadShape;
-		}
-		depth_[s] = depth_[shape.parent] + 1;
-		if (depth_[s] > MAX_DEPTH) {
-			return SpatialStatus::TooDeep;
-		}
-		if (depth_[s] > GEOMETRY_MAX_DEPTH) {
-			geometry_holds = false;
-		}
-		if (last_child_[shape.parent] < 0) {
-			first_child_[shape.parent] = static_cast<int32_t>(s);
-		} else {
-			next_sibling_[last_child_[shape.parent]] = static_cast<int32_t>(s);
-		}
-		last_child_[shape.parent] = static_cast<int32_t>(s);
 	}
-	// A shape's figures end where the next shape that has any starts (G1's prototype).
-	uint32_t next_start = figure_count;
-	for (uint32_t s = shape_count; s-- > 0;) {
+	EndFigures();
+	// Each leaf holds the figures and points its type has room for.
+	for (uint32_t s = 0; s < shape_count; s++) {
+		if (!LeafHoldsItsFigures(s)) {
+			return SpatialStatus::BadShape;
+		}
+	}
+	return SpatialStatus::Ok;
+}
+
+//! Every figure has an attribute the format defines and starts at or after the one before, within the points.
+bool WkbDecoder::FiguresInOrder() const {
+	uint32_t previous_point = 0;
+	for (const auto &figure : figures_) {
+		if (figure.attribute > 3 || figure.first_point < previous_point || figure.first_point > point_count_) {
+			return false;
+		}
+		previous_point = figure.first_point;
+	}
+	return true;
+}
+
+//! Shape `s` in the stored order: its type, its first figure (`previous_figure`: the last one a shape before
+//! it named), its parent; a member is linked under its parent. A curve or a FullGlobe clears `geometry_holds`,
+//! and so does a member nested past what a GEOMETRY reads.
+SpatialStatus WkbDecoder::PlaceShape(uint32_t s, uint8_t version, int32_t &previous_figure, bool &geometry_holds) {
+	const Shape &shape = shapes_[s];
+	if (!TypeKnown(shape.type, version)) {
+		return SpatialStatus::BadShape;
+	}
+	if (shape.type >= T_CIRCULARSTRING) {
+		geometry_holds = false;
+	}
+	if (!FirstFigureInOrder(shape, previous_figure)) {
+		return SpatialStatus::BadShape;
+	}
+	if (s == 0) {
+		return shape.parent == -1 ? SpatialStatus::Ok : SpatialStatus::BadShape;
+	}
+	if (!ParentHolds(s)) {
+		return SpatialStatus::BadShape;
+	}
+	return LinkMember(s, geometry_holds);
+}
+
+//! A shape's first figure is none (-1), or a figure at or after the one the shapes before it reached.
+bool WkbDecoder::FirstFigureInOrder(const Shape &shape, int32_t &previous_figure) const {
+	if (shape.first_figure < 0) {
+		return shape.first_figure == -1;
+	}
+	const uint32_t figure_count = static_cast<uint32_t>(figures_.size());
+	if (static_cast<uint32_t>(shape.first_figure) >= figure_count || shape.first_figure < previous_figure) {
+		return false;
+	}
+	previous_figure = shape.first_figure;
+	return true;
+}
+
+//! A member names a collection before it, and the shapes are in depth-first order: the parent is the
+//! shape before this one or one of its ancestors, so the emission order is the stored order (the
+//! figures and the segments are consumed in it).
+bool WkbDecoder::ParentHolds(uint32_t s) const {
+	const Shape &shape = shapes_[s];
+	if (shape.parent < 0 || static_cast<uint32_t>(shape.parent) >= s ||
+		!MemberFits(shapes_[shape.parent].type, shape.type)) {
+		return false;
+	}
+	int32_t ancestor = static_cast<int32_t>(s) - 1;
+	while (ancestor >= 0 && ancestor != shape.parent) {
+		ancestor = shapes_[ancestor].parent;
+	}
+	return ancestor == shape.parent;
+}
+
+//! A member's depth, and its place as its parent's last child so far.
+SpatialStatus WkbDecoder::LinkMember(uint32_t s, bool &geometry_holds) {
+	const int32_t parent = shapes_[s].parent;
+	depth_[s] = depth_[parent] + 1;
+	if (depth_[s] > MAX_DEPTH) {
+		return SpatialStatus::TooDeep;
+	}
+	if (depth_[s] > GEOMETRY_MAX_DEPTH) {
+		geometry_holds = false;
+	}
+	if (last_child_[parent] < 0) {
+		first_child_[parent] = static_cast<int32_t>(s);
+	} else {
+		next_sibling_[last_child_[parent]] = static_cast<int32_t>(s);
+	}
+	last_child_[parent] = static_cast<int32_t>(s);
+	return SpatialStatus::Ok;
+}
+
+//! A shape's figures end where the next shape that has any starts (G1's prototype).
+void WkbDecoder::EndFigures() {
+	uint32_t next_start = static_cast<uint32_t>(figures_.size());
+	for (uint32_t s = static_cast<uint32_t>(shapes_.size()); s-- > 0;) {
 		figure_end_[s] = next_start;
 		if (shapes_[s].first_figure >= 0) {
 			next_start = static_cast<uint32_t>(shapes_[s].first_figure);
 		}
 	}
-	// Each leaf holds the figures and points its type has room for.
-	for (uint32_t s = 0; s < shape_count; s++) {
-		const Shape &shape = shapes_[s];
-		const bool empty = shape.first_figure < 0;
-		const uint32_t first = empty ? 0 : static_cast<uint32_t>(shape.first_figure);
-		const uint32_t figures = empty ? 0 : figure_end_[s] - first;
-		switch (shape.type) {
-		case T_POINT:
-			if (!empty) {
-				const uint32_t end = first + 1 < figure_count ? figures_[first + 1].first_point : point_count_;
-				if (figures != 1 || end - figures_[first].first_point != 1) {
-					return SpatialStatus::BadShape;
-				}
-			}
-			break;
-		case T_LINESTRING:
-		case T_CIRCULARSTRING:
-		case T_COMPOUNDCURVE:
-			if (!empty && figures != 1) {
-				return SpatialStatus::BadShape;
-			}
-			break;
-		case T_POLYGON:
-		case T_CURVEPOLYGON:
-			if (!empty && figures == 0) {
-				return SpatialStatus::BadShape;
-			}
-			break;
-		case T_FULLGLOBE:
-			// G1: the value alone, with no figure (it is stored as an EMPTY shape of type 11).
-			if (!empty || s != 0 || shape_count != 1) {
-				return SpatialStatus::BadShape;
-			}
-			break;
-		default:  // a collection's figures are its members'
-			break;
-		}
+}
+
+//! Shape `s` holds the figures and points its type has room for.
+bool WkbDecoder::LeafHoldsItsFigures(uint32_t s) const {
+	const Shape &shape = shapes_[s];
+	if (shape.type == T_FULLGLOBE) {
+		return FullGlobeIsAlone(s);
 	}
-	return SpatialStatus::Ok;
+	if (shape.first_figure < 0) {
+		return true;  // an EMPTY shape of any other type
+	}
+	const uint32_t figures = figure_end_[s] - static_cast<uint32_t>(shape.first_figure);
+	switch (shape.type) {
+	case T_POINT:
+		return PointHasOnePoint(s);
+	case T_LINESTRING:
+	case T_CIRCULARSTRING:
+	case T_COMPOUNDCURVE:
+		return figures == 1;
+	case T_POLYGON:
+	case T_CURVEPOLYGON:
+		return figures != 0;
+	default:  // a collection's figures are its members'
+		return true;
+	}
+}
+
+//! G1: the value alone, with no figure (it is stored as an EMPTY shape of type 11).
+bool WkbDecoder::FullGlobeIsAlone(uint32_t s) const {
+	return shapes_[s].first_figure < 0 && s == 0 && shapes_.size() == 1;
+}
+
+//! A Point that is not EMPTY: one figure of one point.
+bool WkbDecoder::PointHasOnePoint(uint32_t s) const {
+	const uint32_t first = static_cast<uint32_t>(shapes_[s].first_figure);
+	const uint32_t figure_count = static_cast<uint32_t>(figures_.size());
+	const uint32_t end = first + 1 < figure_count ? figures_[first + 1].first_point : point_count_;
+	return figure_end_[s] - first == 1 && end - figures_[first].first_point == 1;
 }
 
 SpatialStatus WkbDecoder::Read(const uint8_t *data, size_t size, bool geography, bool curves) {
@@ -554,26 +682,32 @@ SpatialStatus WkbDecoder::Read(const uint8_t *data, size_t size, bool geography,
 	z_ = (properties & PROP_Z) != 0;
 	m_ = (properties & PROP_M) != 0;
 	geography_ = geography;
-	const uint32_t dims = 2 + (z_ ? 1 : 0) + (m_ ? 1 : 0);
 	single_ = (properties & (PROP_P | PROP_L)) != 0;
-	if (single_) {
-		// The single point, or the single line of two points: the points, then their Z, then their M, and
-		// nothing else -- no arrays, no shapes, so nothing to check but the length.
-		point_count_ = (properties & PROP_P) ? 1 : 2;
-		const size_t stored = HEADER_BYTES + static_cast<size_t>(point_count_) * 8 * dims;
-		if (size < stored) {
-			return SpatialStatus::Truncated;
-		}
-		if (size > stored) {
-			return SpatialStatus::TrailingBytes;
-		}
-		single_type_ = (properties & PROP_P) ? T_POINT : T_LINESTRING;
-		points_ = data + HEADER_BYTES;
-		zs_ = points_ + static_cast<size_t>(point_count_) * 16;
-		ms_ = zs_ + (z_ ? static_cast<size_t>(point_count_) * 8 : 0);
-		size_ = 5 + (single_type_ == T_LINESTRING ? 4 : 0) + static_cast<size_t>(point_count_) * 8 * dims;
-		return SpatialStatus::Ok;
+	return single_ ? ReadSingle(data, size, (properties & PROP_P) != 0) : ReadShaped(data, size, version, curves);
+}
+
+//! The single point, or the single line of two points: the points, then their Z, then their M, and
+//! nothing else -- no arrays, no shapes, so nothing to check but the length.
+SpatialStatus WkbDecoder::ReadSingle(const uint8_t *data, size_t size, bool point) {
+	const uint32_t dims = Dimensions(z_, m_);
+	point_count_ = point ? 1 : 2;
+	const size_t stored = HEADER_BYTES + static_cast<size_t>(point_count_) * 8 * dims;
+	if (size < stored) {
+		return SpatialStatus::Truncated;
 	}
+	if (size > stored) {
+		return SpatialStatus::TrailingBytes;
+	}
+	single_type_ = point ? T_POINT : T_LINESTRING;
+	points_ = data + HEADER_BYTES;
+	zs_ = points_ + static_cast<size_t>(point_count_) * 16;
+	ms_ = zs_ + (z_ ? static_cast<size_t>(point_count_) * 8 : 0);
+	size_ = 5 + (single_type_ == T_LINESTRING ? 4 : 0) + static_cast<size_t>(point_count_) * 8 * dims;
+	return SpatialStatus::Ok;
+}
+
+//! Any other value: its arrays read and checked, its WKB sized.
+SpatialStatus WkbDecoder::ReadShaped(const uint8_t *data, size_t size, uint8_t version, bool curves) {
 	segments_ = nullptr;
 	segment_count_ = 0;
 	zs_ = nullptr;

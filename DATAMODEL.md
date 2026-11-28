@@ -1723,11 +1723,11 @@ flowchart LR
   kernels (spec 093 T8a / T8b, `backup_type_forms`); one whose conversion is still to come (`xml`, a user
   CLR type, `vector`, `json`, a type the reader does not know) is its stored bytes, a `BLOB`.
   Not readable, named: a computed column not persisted (no stored value), a column set (computed from
-  the sparse columns, not stored). A sparse column is read from the record's sparse vector (spec 086 PR 3,
+  the sparse columns, not stored). The scan registers the columns that are not readable as virtual columns, so
+  `SELECT *` leaves them out and naming one is refused with its reason. A sparse column is read from the record's sparse vector (spec 086 PR 3,
   E24: the last variable column, after the regular ones stored (trailing NULL and empty ones are not) -- or
-  before a forwarded record's back pointer -- tagged `0x0005` (the tag decides, not the null bitmap), its entries by `sysrscols.hbcolid`; `FindSparseVector` once per record,
-  in `RowRecord::Fixed`, `LocateValue` the entry; an off-row entry under bit 15 walked as any). The scan registers these as virtual columns, so `SELECT *` leaves them out and naming one is refused with its
-  reason. `mssql_backup_tables.columns` and the scan take this one answer.
+  before a forwarded record's back pointer -- tagged `0x0005` (the tag decides where the null bitmap says no regular column is stored at that index; where it says one is, the tagged column must also carry only the layout's sparse ids and end at its last value, else it is read as that regular column only at a LOB root pointer's 16 bytes and refused by name at any other size), its entries by `sysrscols.hbcolid`; `FindSparseVector` once per record,
+  in `RowRecord::Fixed`, `LocateValue` the entry; an off-row entry under bit 15 walked as any). `mssql_backup_tables.columns` and the scan take this one answer.
 - **Rows** (PR 2d). A record (`RecordView`, allocation-free) is split by its header alone; types 2-7
   (stubs, index and LOB records, ghosts, version ghosts) are not rows, a forwarded record's last
   variable column is its back pointer, a version tag (statusA 0x40) trails the record unread.
@@ -1748,8 +1748,8 @@ flowchart LR
   measured in E21). A complex column's in-row bytes are told apart by their length: 16 a pointer to
   a root record (text / ntext / image with `text in row` off, and a MAX type under `large value types
   out of row`; with `text in row` on, a long value takes an in-row root), 24 of kind 2 a row-overflow pointer to one DATA
-  fragment in the rowset's ROW_OVERFLOW_DATA unit, 12 + 12n of kind 4 or 5 an in-row root over up to
-  five links. `WalkLob` follows the tree over `PageStore`'s live pages and checks every node as it
+  fragment in the rowset's ROW_OVERFLOW_DATA unit, 12 + 12n of kind 4 an in-row root over up to
+  five links (kind 5 is the sparse vector's tag, E24, and is refused as a value). `WalkLob` follows the tree over `PageStore`'s live pages and checks every node as it
   reads it: a node's bytes are what its parent claims (but the DATA fragment of a node's last link,
   which a truncating `.WRITE` leaves with a stale tail), its level agrees with its children, its page
   is of the form's unit, each fragment is referenced once, a NULL root (a text value updated to NULL
