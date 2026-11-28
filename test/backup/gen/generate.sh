@@ -91,7 +91,9 @@ SA_PASSWORD="Bk$(openssl rand -hex 16)!a1"
 export MSSQL_SA_PASSWORD="${SA_PASSWORD}" SQLCMDPASSWORD="${SA_PASSWORD}"
 # Spec 087: the master key's password and the exported keys' (encrypted.sql's $(MKPASS) / $(PVKPASS), which
 # sqlcmd reads from its environment), this run's own; the PVK one is written beside the keys it protects.
-export MKPASS="Mk$(openssl rand -hex 16)!a1" PVKPASS="Pv$(openssl rand -hex 16)!a1"
+MKPASS="Mk$(openssl rand -hex 16)!a1"
+PVKPASS="Pv$(openssl rand -hex 16)!a1"
+export MKPASS PVKPASS
 
 echo ">> starting ${IMAGE} as ${CONTAINER}"
 # Created, then started: the trap is set on the container we created (by its id, so a container of
