@@ -1,0 +1,280 @@
+# name: test/sql/backup/mssql_backup_encryption.test
+# description: Spec 087 over the committed samples (test/data/backup/encryption, made by its generate.sh with
+#              test-only certificates): D10 -- info without a key shows what is in clear, reading needs the key,
+#              named --; the mssql_backup_key secret (D1 / D2: checked at CREATE SECRET), D3's selection; an
+#              encrypted backup, a TDE database's backups uncompressed / compressed (E4c) / encrypted too, read;
+#              D9 -- a TDE backup's fuzzy status is unknown, fuzzy := 'error' refuses it. No SQL Server.
+# group: [sql]
+
+require mssql
+
+# --- D10: without a key -----------------------------------------------------------------------------------
+
+# An encrypted backup: only its container header is in clear -- compressed, its algorithm, encrypted, the
+# encryptor's thumbprint; every column of the decrypted stream NULL (and a WARNING naming the certificate).
+query IIIIIIIII
+SELECT compressed, compression_algorithm, encrypted, encryptor_thumbprint IS NOT NULL, key_algorithm IS NULL, tde,
+       backup_set_guid IS NULL, database_name IS NULL, files IS NULL
+FROM mssql_backup_info('test/data/backup/encryption/enc_sample.bak');
+----
+true	MS_XPRESS	true	true	true	false	true	true	true
+
+# A TDE database's compressed backup (E4c): its header names the DEK's certificate, the rest is ciphertext.
+query IIIII
+SELECT compressed, encrypted, tde, tde_thumbprint IS NOT NULL, database_name IS NULL
+FROM mssql_backup_info('test/data/backup/encryption/tde_sample_xpress.bak');
+----
+true	false	true	true	true
+
+# An uncompressed TDE backup's MTF headers are in clear: described whole, its DEK's certificate from its data
+# file's SFIN (FILELISTONLY's TDEThumbprint), the log file's NULL.
+query IIIIII
+SELECT compressed, encrypted, tde, database_name, list_count(files),
+       list_count(list_filter(files, lambda f: f.tde_thumbprint IS NOT NULL))
+FROM mssql_backup_info('test/data/backup/encryption/tde_sample.bak');
+----
+false	false	true	bak_tde_sample	2	1
+
+query I
+SELECT tde_thumbprint = (list_filter(files, lambda f: f.type = 'data'))[1].tde_thumbprint
+FROM mssql_backup_info('test/data/backup/encryption/tde_sample.bak');
+----
+true
+
+# Reading needs the key: named before any row -- the thumbprint, the secrets that match, CREATE SECRET's form.
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/encryption/enc_sample.bak', 'dbo', 't');
+----
+no mssql_backup_key secret whose scope matches the path holds its key (none matches): CREATE SECRET (TYPE mssql_backup_key
+
+statement error
+SELECT * FROM mssql_backup_tables('test/data/backup/encryption/tde_sample_xpress.bak');
+----
+is a backup of a TDE database, its DEK encrypted by the certificate with thumbprint
+
+# The uncompressed TDE form: its headers read, its pages need the DEK.
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/encryption/tde_sample.bak', 'dbo', 't');
+----
+no mssql_backup_key secret whose scope matches the path holds its key
+
+statement error
+ATTACH 'test/data/backup/encryption/enc_sample.bak' AS es_nokey (TYPE mssql_backup);
+----
+no mssql_backup_key secret
+
+# A history over files some of which no secret holds the key of: those are left out, as a log is, and the rest
+# is read (review of #670; owner 2026-11-28: read the utmost). Here only tde_sample.bak, whose headers are in clear.
+query II
+SELECT count(*), list(backup_type) FROM mssql_backup_snapshots('test/data/backup/encryption/*.bak');
+----
+1	[full]
+
+# --- the secret (D1 / D2) --------------------------------------------------------------------------------
+
+# A wrong password fails at CREATE SECRET, before any backup is touched.
+statement error
+CREATE SECRET enc_wrong (TYPE mssql_backup_key, CERTIFICATE 'test/data/backup/encryption/sample_enc_cert.cer',
+    PRIVATE_KEY 'test/data/backup/encryption/sample_enc_cert.pvk', PASSWORD 'not the password');
+----
+a wrong password
+
+# Another certificate's key: refused by its modulus.
+statement error
+CREATE SECRET enc_other (TYPE mssql_backup_key, CERTIFICATE 'test/data/backup/encryption/sample_tde_cert.cer',
+    PRIVATE_KEY 'test/data/backup/encryption/sample_enc_cert.pvk', PASSWORD 'test-only sample key 087!');
+----
+the private key is not the certificate's
+
+# A secret scoped elsewhere matches nothing here (D3: no fall-through).
+statement ok
+CREATE SECRET enc_elsewhere (TYPE mssql_backup_key, CERTIFICATE 'test/data/backup/encryption/sample_enc_cert.cer',
+    PRIVATE_KEY 'test/data/backup/encryption/sample_enc_cert.pvk', PASSWORD 'test-only sample key 087!',
+    SCOPE 's3://elsewhere/');
+
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/encryption/enc_sample.bak', 'dbo', 't');
+----
+(none matches)
+
+# The password is redacted, the thumbprint shown.
+query II
+SELECT secret_string LIKE '%test-only sample key%', secret_string LIKE '%thumbprint=%'
+FROM duckdb_secrets() WHERE name = 'enc_elsewhere';
+----
+false	true
+
+statement ok
+DROP SECRET enc_elsewhere;
+
+statement ok
+CREATE SECRET enc_key (TYPE mssql_backup_key, CERTIFICATE 'test/data/backup/encryption/sample_enc_cert.cer',
+    PRIVATE_KEY 'test/data/backup/encryption/sample_enc_cert.pvk', PASSWORD 'test-only sample key 087!',
+    SCOPE 'test/data/backup/encryption/');
+
+# The DEK's certificate is not the backup's: a secret of the type matches the path, but not its thumbprint.
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/encryption/tde_sample.bak', 'dbo', 't');
+----
+1 match: enc_key
+
+statement ok
+CREATE SECRET tde_key (TYPE mssql_backup_key, CERTIFICATE 'test/data/backup/encryption/sample_tde_cert.cer',
+    PRIVATE_KEY 'test/data/backup/encryption/sample_tde_cert.pvk', PASSWORD 'test-only sample key 087!',
+    SCOPE 'test/data/backup/encryption/');
+
+# --- with the keys --------------------------------------------------------------------------------------------
+
+# The key in other containers (review of 087), made from sample_enc_cert's by OpenSSL: a PKCS#8 PEM under AES-256
+# (`openssl pkcs8 -topk8 -v2 aes-256-cbc`), selected by its longer scope (D3); a PFX under RC2 (an old Windows
+# export, `-keypbe PBE-SHA1-RC2-40`), refused at CREATE SECRET with the re-export hint.
+statement ok
+CREATE SECRET pem_key (TYPE mssql_backup_key, CERTIFICATE 'test/data/backup/encryption/sample_enc_cert.cer',
+    PRIVATE_KEY 'test/data/backup/encryption/sample_enc_cert.pem', PASSWORD 'test-only sample key 087!',
+    SCOPE 'test/data/backup/encryption/enc_sample.bak');
+
+query I
+SELECT count(*) > 0 FROM mssql_backup_scan('test/data/backup/encryption/enc_sample.bak', 'dbo', 't');
+----
+true
+
+statement ok
+DROP SECRET pem_key;
+
+statement error
+CREATE SECRET rc2_key (TYPE mssql_backup_key, PRIVATE_KEY 'test/data/backup/encryption/sample_enc_cert_rc2.pfx',
+    PASSWORD 'test-only sample key 087!');
+----
+the PFX is protected by a cipher this build does not carry
+
+
+query IIIII
+SELECT encrypted, key_algorithm, tde, database_name, backup_type
+FROM mssql_backup_info('test/data/backup/encryption/enc_sample.bak');
+----
+true	aes_256	false	bak_enc_sample	full
+
+query IIII
+SELECT compressed, tde, encrypted, database_name FROM mssql_backup_info('test/data/backup/encryption/tde_sample_xpress.bak');
+----
+true	true	false	bak_tde_sample
+
+query IIII
+SELECT encrypted, key_algorithm, tde, database_name FROM mssql_backup_info('test/data/backup/encryption/tde_sample_enc.bak');
+----
+true	aes_256	true	bak_tde_sample
+
+# Every form reads the same rows.
+foreach sample enc_sample tde_sample tde_sample_xpress tde_sample_enc
+
+query II
+SELECT id, v FROM mssql_backup_scan('test/data/backup/encryption/${sample}.bak', 'dbo', 't', fuzzy := 'ignore') ORDER BY id;
+----
+1	one
+2	two
+3	three
+
+query III
+SELECT count(*), min(name), max(id) FROM mssql_backup_scan('test/data/backup/encryption/${sample}.bak', 'dbo', 'big', fuzzy := 'ignore');
+----
+2000	row 1	2000
+
+endloop
+
+# The catalog: ATTACH reads the same.
+statement ok
+ATTACH 'test/data/backup/encryption/tde_sample_xpress.bak' AS tde_x (TYPE mssql_backup, fuzzy 'ignore');
+
+query I
+SELECT string_agg(v, ',' ORDER BY id) FROM tde_x.dbo.t;
+----
+one,two,three
+
+statement ok
+DETACH tde_x;
+
+# --- D9: a TDE database's log tail is encrypted (E10): its fuzzy status unknown ----------------------------
+
+query I
+SELECT DISTINCT fuzzy_status FROM mssql_backup_tables('test/data/backup/encryption/tde_sample.bak') WHERE table_name IN ('t', 'big');
+----
+unknown
+
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/encryption/tde_sample_xpress.bak', 'dbo', 't', fuzzy := 'error');
+----
+not decrypted yet (spec 087 E10)
+
+statement error
+SELECT * FROM mssql_backup_transactions('test/data/backup/encryption/tde_sample.bak');
+----
+not decrypted yet (spec 087 E10)
+
+query I
+SELECT consistent IS NULL FROM mssql_backup_info('test/data/backup/encryption/tde_sample.bak');
+----
+true
+
+# An encrypted backup of a database without TDE has a tail like any other.
+query I
+SELECT consistent IS NOT NULL FROM mssql_backup_info('test/data/backup/encryption/enc_sample.bak');
+----
+true
+
+# D4 (review of 087): the keys are asked again by every statement -- of an attached backup, and of an uncompressed
+# TDE backup whose DEK its page index holds -- not only by a call over files.
+statement ok
+ATTACH 'test/data/backup/encryption/enc_sample.bak' AS es_d4 (TYPE mssql_backup);
+
+statement ok
+ATTACH 'test/data/backup/encryption/tde_sample.bak' AS tde_d4 (TYPE mssql_backup, fuzzy 'ignore');
+
+query II
+SELECT (SELECT count(*) > 0 FROM es_d4.dbo.t), (SELECT count(*) > 0 FROM tde_d4.dbo.t);
+----
+true	true
+
+# The uncompressed TDE backup read over files once, so its cached entry holds the DEK.
+query I
+SELECT count(*) > 0 FROM mssql_backup_scan('test/data/backup/encryption/tde_sample.bak', 'dbo', 't', fuzzy := 'ignore');
+----
+true
+
+statement ok
+DROP SECRET tde_key;
+
+statement error
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/encryption/tde_sample.bak', 'dbo', 't', fuzzy := 'ignore');
+----
+is a backup of a TDE database, its DEK encrypted by the certificate with thumbprint
+
+statement error
+SELECT count(*) FROM tde_d4.dbo.t;
+----
+is a backup of a TDE database, its DEK encrypted by the certificate with thumbprint
+
+statement ok
+DETACH tde_d4;
+
+# D4: the secret dropped, the cached backup is refused at once.
+statement ok
+DROP SECRET enc_key;
+
+statement error
+SELECT count(*) FROM es_d4.dbo.t;
+----
+no mssql_backup_key secret whose scope matches the path holds its key
+
+statement ok
+DETACH es_d4;
+
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/encryption/enc_sample.bak', 'dbo', 't');
+----
+no mssql_backup_key secret whose scope matches the path holds its key
+
+# ... and info falls back to its header.
+query II
+SELECT encrypted, database_name IS NULL FROM mssql_backup_info('test/data/backup/encryption/enc_sample.bak');
+----
+true	true

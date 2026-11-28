@@ -53,6 +53,32 @@ class DuckDB:
         self.preamble = "\n".join(lines) + "\n"
         self.warnings = []
 
+    def add_backup_keys(self, local, remotes):
+        """Spec 087: one mssql_backup_key secret per <name>.cer with a <name>.pvk in a samples directory that has a
+        pvk_password (the committed encryption samples: test-only keys), scoped to that directory locally and in
+        every remote, so each backup is read with its key wherever it is read from."""
+        lines = [".output /dev/null"]
+        n = 0
+        for sub in sorted(d for d in os.listdir(local) if os.path.isfile(os.path.join(local, d, "pvk_password"))):
+            base = os.path.join(local, sub)
+            with open(os.path.join(base, "pvk_password")) as f:
+                password = f.read().strip()
+            self.secrets += [v for v in {password, password.replace("'", "''")} if v]
+            scopes = [base + "/"] + [r.rstrip("/") + "/" + sub + "/" for r in remotes]
+            scope_list = "[" + ", ".join(sql_string(x) for x in scopes) + "]"
+            for cer in sorted(f for f in os.listdir(base) if f.endswith(".cer")):
+                pvk = cer[:-4] + ".pvk"
+                if not os.path.isfile(os.path.join(base, pvk)):
+                    continue
+                lines += [f"CREATE SECRET backup_key_{n} (TYPE mssql_backup_key,",
+                          f"CERTIFICATE {sql_string(os.path.join(base, cer))},",
+                          f"PRIVATE_KEY {sql_string(os.path.join(base, pvk))},",
+                          f"PASSWORD {sql_string(password)},", f"SCOPE {scope_list});"]
+                n += 1
+        lines.append(".output")
+        if n:
+            self.preamble += "\n".join(lines) + "\n"
+
     def mask(self, text):
         for s in sorted(self.secrets, key=len, reverse=True):
             text = text.replace(s, "***")
@@ -116,6 +142,7 @@ def statements(local):
     it lies over, a state with no table read): reported as differences, so coverage cannot drop unseen."""
     out, problems = [], []
     db = DuckDB(ARGS.duckdb)
+    db.add_backup_keys(local, [])
     # Each database's directory: the samples, and every directory beside them with a sets.txt.
     dirs = [""] + sorted(d + "/" for d in os.listdir(local)
                          if os.path.isfile(os.path.join(local, d, "sets.txt")))
@@ -194,6 +221,7 @@ def main():
     ARGS = parser.parse_args()
     local = os.path.abspath(ARGS.local)
     db = DuckDB(ARGS.duckdb)
+    db.add_backup_keys(local, ARGS.remote)
     compared = 0
     kinds = {}
     entries, differences = statements(local)

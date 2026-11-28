@@ -19,6 +19,9 @@
 
 #pragma once
 
+#include "backup/backup_bytes.hpp"
+#include "backup/backup_container.hpp"
+#include "backup/backup_crypto.hpp"
 #include "backup/backup_mtf.hpp"
 
 #include <atomic>
@@ -236,6 +239,24 @@ bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t le
 bool CheckDifferentialRanks(const RandomAccess &stream, const PassMap &first, const std::vector<const PassMap *> &later,
 							uint64_t *groups_read = nullptr);
 
+//! SQL Server's page checksum (PAGE_VERIFY CHECKSUM, m_flagBits 0x0200, stored at +60) of an 8 KB page: per
+//! 512-byte sector the XOR of its 32-bit little-endian words (the checksum's own word taken as 0), rotated left
+//! by 15 minus the sector's number, the sectors XORed together. Checked on the committed samples' pages
+//! (514 of 514). DuckDB-free.
+uint32_t PageChecksum(const uint8_t *page);
+
+//! A TDE page whose plaintext does not verify after its decryption: its checksum (when its header says it has
+//! one) is not the decrypted page's -- a page under another DEK (a backup taken while the key was regenerated),
+//! or a damaged or crafted one (review of #670). Its rows are not read: PageStore makes it an
+//! UnreadablePageError, which the readers pass over as they do a Pending page.
+class PageVerifyError : public FormatError {
+public:
+	PageVerifyError(const std::string &message, uint16_t file_, uint32_t page_)
+		: FormatError(message), file(file_), page(page_) {}
+	uint16_t file;
+	uint32_t page;
+};
+
 //! Where a page's latest copy lies.
 struct PageLocation {
 	static constexpr uint64_t NO_BLOCK = ~uint64_t(0);
@@ -259,6 +280,8 @@ struct ContainerFamily {
 	const std::vector<SeekEntry> *seek = nullptr;
 	uint64_t chain_end = 0;
 	std::function<void(const uint8_t *, size_t, uint8_t *, size_t)> decoder;
+	//! Spec 087: an encrypted container's content keys (its blocks decrypted before they are decoded).
+	ContainerKeys keys;
 };
 
 //! One media family's data: its stream (a family file, or a container's data set) and its walk;
@@ -299,6 +322,12 @@ struct PageIndexOptions {
 	PassMapper mapper;
 	//! The backup's data files (SFIN), by id (a differential's: what a striped one's DCM set is built over).
 	std::vector<uint16_t> data_files;
+	//! Spec 087: an uncompressed TDE backup's pages are encrypted past their 96-byte header (E4), its GAM / DCM
+	//! bitmaps included, so its passes are never ranked from them (searched, or mapped by their headers; review
+	//! of 087: the ranks read ciphertext as bitmaps and relied on their checks to reject it). `page_key`, its
+	//! DEK when known before the build (its data files' SFIN, D10), is the index's from the start.
+	bool encrypted_pages = false;
+	std::shared_ptr<const ContentKey> page_key;
 };
 
 //! One pass of the index: mapped (ranked or by headers) or searched.
@@ -354,6 +383,15 @@ public:
 	//! The 8 KB at `page`'s location into `out`: false when no pass carries it (`expected` as for
 	//! Locate). Its header is the caller's to check (a ranked pass may locate a zero unit, E12).
 	bool ReadPage(uint16_t file, uint32_t page, std::vector<uint8_t> &out, bool expected = false) const;
+	//! Spec 087 (TDE): the database's DEK; ReadPage then decrypts this backup's own pages (not the base's,
+	//! which has its own): AES-CBC over bytes [96:8192], IV = u32 page id || u16 file id || 10 zero bytes (E4),
+	//! every page but the boot page (13) and the file header (15), which TDE leaves in clear, and a zero unit.
+	void SetPageKey(std::shared_ptr<const ContentKey> key) {
+		page_key_ = std::move(key);
+	}
+	bool Encrypted() const {
+		return page_key_ != nullptr;
+	}
 
 	size_t PassCount() const {
 		return passes_.size();
@@ -408,6 +446,10 @@ private:
 	uint64_t id_ = 0;
 	mutable std::vector<IndexedPass> passes_;
 	mutable std::unique_ptr<std::mutex> fallback_lock_;
+	//! `page` decrypted in place when the database is TDE (SetPageKey) and the page says it is encrypted,
+	//! its header then the server's for a page in clear (E4c).
+	void DecryptPage(std::vector<uint8_t> &page) const;
+	std::shared_ptr<const ContentKey> page_key_;
 	const PageIndex *base_ = nullptr;
 };
 

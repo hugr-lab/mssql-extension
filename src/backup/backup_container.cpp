@@ -17,6 +17,20 @@ static constexpr size_t BLOCK_HEADER = 28;
 static constexpr uint32_t MAX_BLOCK = 65536;
 static constexpr uint8_t KIND_COMPRESSED = 0x21;
 static constexpr uint8_t KIND_STORED = 0x23;
+// Spec 087 (E4b): an encrypted container's blocks, the same two with bit 0x10: the payload is the
+// ciphertext of `clen` plaintext bytes, its length on disk the header's u32 at 20, the IV at 4.
+static constexpr uint8_t KIND_ENCRYPTED_COMPRESSED = 0x31;
+static constexpr uint8_t KIND_ENCRYPTED_STORED = 0x33;
+// E4c: a TDE database's compressed backup -- its payload the DEK's ciphertext (0x61), and under the backup's key
+// too when the backup is encrypted (0x71). Only compressed ones were seen.
+static constexpr uint8_t KIND_TDE_COMPRESSED = 0x61;
+static constexpr uint8_t KIND_TDE_ENCRYPTED_COMPRESSED = 0x71;
+// E4c: where such a header keeps the wrapped DEK, and its media label.
+static constexpr size_t TDE_DEK_AT = 0x214;
+static constexpr uint64_t TDE_TAPE_AT = 0x438;
+static constexpr size_t ENCRYPTED_LENGTH_AT = 20;
+static constexpr size_t IV_AT = 4;
+static constexpr uint64_t ENCRYPTED_STORED_CHAIN_START = 0x3000;
 // The seek index record: u32 length at +0, u32 entry count at +28, entries (u64 logical, u64
 // physical) from +40. Seen with 3 entries; bounded so a crafted count cannot allocate.
 static constexpr size_t SEEK_COUNT_AT = 28;
@@ -84,11 +98,12 @@ ContainerHeader ReadContainerHeader(const RandomAccess &file) {
 			   "container version " + std::to_string(header.version) + ", not 2: a version the reader does not know");
 	}
 	header.flags = r.U32(0x0C);
-	// Seen: 3 MS_XPRESS, 0x83 ZSTD, 5 encrypted, 7 encrypted and compressed (E4); read as bits 0x2
-	// compressed, 0x4 encrypted, 0x80 ZSTD. Only these four are accepted: any other word, 0x87
-	// (encrypted and ZSTD) included until a backup shows it, is refused naming the word.
+	// Seen: 3 MS_XPRESS, 0x83 ZSTD, 5 encrypted, 7 encrypted and MS_XPRESS (E4), 0x87 encrypted and ZSTD
+	// (E4b); read as bits 0x2 compressed, 0x4 encrypted, 0x80 ZSTD. A TDE database's compressed backup adds
+	// bits 0x8 and 0x20 (E4c): 0x2B MS_XPRESS, 0xAB ZSTD, 0x2F encrypted too (MS_XPRESS). Only these eight are
+	// accepted: 0xAF (TDE, encrypted, ZSTD), not seen, and any other word are refused naming it.
 	const uint32_t f = header.flags;
-	if (f != 0x3 && f != 0x83 && f != 0x5 && f != 0x7) {
+	if (f != 0x3 && f != 0x83 && f != 0x5 && f != 0x7 && f != 0x87 && f != 0x2B && f != 0xAB && f != 0x2F) {
 		char word[16];
 		snprintf(word, sizeof(word), "0x%X", header.flags);
 		r.Fail(0x0C, std::string("container flags ") + word + ": a combination the reader does not know");
@@ -99,12 +114,43 @@ ContainerHeader ReadContainerHeader(const RandomAccess &file) {
 					   : (header.flags & 0x80) != 0 ? CompressionAlgorithm::Zstd
 													: CompressionAlgorithm::MsXpress;
 	if (header.encrypted) {
+		// Spec 087 (E4): u32 the thumbprint's length (20) at 0x14, the thumbprint, u32 the wrapped key's
+		// length (the certificate's modulus size), then the wrapped key.
+		if (r.U32(0x14) != 20) {
+			r.Fail(0x14, "an encryptor thumbprint of " + std::to_string(r.U32(0x14)) + " bytes, not 20");
+		}
 		const uint8_t *thumbprint = r.Bytes(0x18, 20);
 		for (size_t i = 0; i < 20; i++) {
 			header.encryptor_thumbprint[i] = thumbprint[i];
 		}
+		const uint32_t wrapped = r.U32(0x2C);
+		if (wrapped < 128 || wrapped > 1024) {
+			r.Fail(0x2C, "a wrapped key of " + std::to_string(wrapped) + " bytes (an RSA modulus is 128 to 1024)");
+		}
+		const uint8_t *blob = r.Bytes(0x30, wrapped);
+		header.wrapped_key.assign(blob, blob + wrapped);
+	}
+	header.tde = (f & 0x28) == 0x28;
+	if (header.tde) {
+		if (r.U32(TDE_DEK_AT) != 20) {
+			r.Fail(TDE_DEK_AT,
+				   "a TDE certificate's thumbprint of " + std::to_string(r.U32(TDE_DEK_AT)) + " bytes, not 20");
+		}
+		const uint8_t *thumbprint = r.Bytes(TDE_DEK_AT + 4, 20);
+		std::memcpy(header.tde_thumbprint.data(), thumbprint, 20);
+		const uint32_t wrapped = r.U32(TDE_DEK_AT + 24);
+		if (wrapped < 128 || wrapped > 1024) {
+			r.Fail(TDE_DEK_AT + 24,
+				   "a wrapped DEK of " + std::to_string(wrapped) + " bytes (an RSA modulus is 128 to 1024)");
+		}
+		const uint8_t *blob = r.Bytes(TDE_DEK_AT + 28, wrapped);
+		header.wrapped_dek.assign(blob, blob + wrapped);
 	}
 	return header;
+}
+
+uint64_t ChainStart(const ContainerHeader &header) {
+	return header.encrypted && !header.compressed ? ENCRYPTED_STORED_CHAIN_START : CHAIN_START;
 }
 
 //! The chain block whose header's BLOCK_HEADER bytes are `bytes`, at `at` of `file`: false when no
@@ -113,14 +159,25 @@ static bool ParseBlockHeader(const RandomAccess &file, const uint8_t *bytes, uin
 							 ChainBlock &block) {
 	ByteReader r(bytes, BLOCK_HEADER, "a container block header", at);
 	const uint8_t kind = r.U8(0);
-	if (kind != KIND_COMPRESSED && kind != KIND_STORED) {
+	if (kind != KIND_COMPRESSED && kind != KIND_STORED && kind != KIND_ENCRYPTED_COMPRESSED &&
+		kind != KIND_ENCRYPTED_STORED && kind != KIND_TDE_COMPRESSED && kind != KIND_TDE_ENCRYPTED_COMPRESSED) {
 		return false;
 	}
 	block.kind = kind;
 	block.physical = at;
 	block.output = static_cast<uint32_t>(r.U8(1)) * 512;
 	const uint16_t length = r.U16(2);
-	block.payload = length == 0 ? MAX_BLOCK : length;
+	block.plain = length == 0 ? MAX_BLOCK : length;
+	block.payload = block.plain;
+	if (block.Encrypted()) {
+		// E4b: the ciphertext's length on disk, the plaintext's rounded up to 16 (for 3DES too).
+		block.payload = r.U32(ENCRYPTED_LENGTH_AT);
+		if (block.payload != (block.plain + 15) / 16 * 16) {
+			r.Fail(ENCRYPTED_LENGTH_AT, "an encrypted block of " + std::to_string(block.plain) +
+											" plaintext bytes whose ciphertext is " + std::to_string(block.payload) +
+											" bytes, not the plaintext rounded up to 16");
+		}
+	}
 	block.logical = logical;
 	if (block.output == 0 || block.output > MAX_BLOCK) {
 		r.Fail(1, "a block whose output is " + std::to_string(block.output) + " bytes, not 1..65536");
@@ -128,8 +185,8 @@ static bool ParseBlockHeader(const RandomAccess &file, const uint8_t *bytes, uin
 	if (block.payload > file.Size() - at - BLOCK_HEADER) {
 		r.Fail(2, "a block whose " + std::to_string(block.payload) + "-byte payload runs past the end of the file");
 	}
-	if (kind == KIND_STORED && block.payload != block.output) {
-		r.Fail(2, "a stored block of " + std::to_string(block.payload) + " bytes that claims an output of " +
+	if (block.Stored() && block.plain != block.output) {
+		r.Fail(2, "a stored block of " + std::to_string(block.plain) + " bytes that claims an output of " +
 					  std::to_string(block.output));
 	}
 	return true;
@@ -175,9 +232,9 @@ private:
 	std::vector<uint8_t> bytes_;
 };
 
-BlockChain WalkChain(const RandomAccess &file) {
+BlockChain WalkChain(const RandomAccess &file, uint64_t start) {
 	BlockChain chain;
-	uint64_t at = CHAIN_START;
+	uint64_t at = start;
 	uint64_t logical = 0;
 	ChainBlock block;
 	uint64_t since = 0;
@@ -195,7 +252,7 @@ BlockChain WalkChain(const RandomAccess &file) {
 		at += BLOCK_HEADER + block.payload;
 	}
 	if (chain.block_count == 0) {
-		throw FormatError(Where(file, CHAIN_START) + ": a container with no block where its chain starts");
+		throw FormatError(Where(file, start) + ": a container with no block where its chain starts");
 	}
 	chain.logical_size = logical;
 	chain.end = at;
@@ -242,8 +299,11 @@ ChainBlock FindBlock(const RandomAccess &file, const BlockChain &chain, uint64_t
 }
 
 //! The seek index's entries at `at` (where the chain ends), or empty when no seek index record is
-//! there. Entries must ascend in both offsets and name a block header between the chain's start
-//! and `at`; whether each starts its logical offset is the caller's to check.
+//! there. Entries must ascend in their logical offsets, not descend in their physical ones, and name a
+//! block header between the chain's start and `at`; whether each starts its logical offset is the
+//! caller's to check. Spec 087 E4c: a TDE database's compressed backup also names offsets inside its
+//! last block (0x344000 the block's start, then 0x345254, 0x346254, 0x347254 at the same physical offset,
+//! 4 of 4 such files): an entry at the previous one's physical offset is one of those.
 static std::vector<SeekEntry> ParseSeekIndex(const RandomAccess &file, uint64_t at) {
 	std::vector<SeekEntry> entries;
 	if (at > file.Size() || file.Size() - at < SEEK_ENTRIES_AT) {
@@ -266,7 +326,7 @@ static std::vector<SeekEntry> ParseSeekIndex(const RandomAccess &file, uint64_t 
 		SeekEntry entry;
 		entry.logical = e.U64(16 * i);
 		entry.physical = e.U64(16 * i + 8);
-		if ((i > 0 && (entry.logical <= entries.back().logical || entry.physical <= entries.back().physical)) ||
+		if ((i > 0 && (entry.logical <= entries.back().logical || entry.physical < entries.back().physical)) ||
 			entry.physical < CHAIN_START || entry.physical >= at) {
 			e.Fail(16 * i, "a seek index entry out of order or outside the chain");
 		}
@@ -282,9 +342,11 @@ std::vector<SeekEntry> ReadSeekIndex(const RandomAccess &file, const BlockChain 
 		if (entry.logical >= chain.logical_size) {
 			throw FormatError(Where(file, chain.end) + ": a seek index entry past the data set");
 		}
-		// It must name a chain block whose output starts at its logical offset.
+		// It must name a chain block whose output starts at its logical offset -- or, at the previous
+		// entry's physical offset (E4c), the block that holds it.
 		auto block = FindBlock(file, chain, entry.logical);
-		if (block.logical != entry.logical || block.physical != entry.physical) {
+		const bool inside = i > 0 && entries[i - 1].physical == entry.physical;
+		if ((block.logical != entry.logical && !inside) || block.physical != entry.physical) {
 			throw FormatError(Where(file, chain.end) + ": a seek index entry (logical " +
 							  std::to_string(entry.logical) + ", physical " + std::to_string(entry.physical) +
 							  ") that names no block of the chain");
@@ -297,29 +359,58 @@ std::vector<SeekEntry> ReadSeekIndex(const RandomAccess &file, const BlockChain 
 // of its header, 4 KB of output, whose bytes are the TAPE DBLK an uncompressed family starts with.
 static constexpr uint64_t HEADER_TAPE_AT = 0x1E0;
 
-std::vector<uint8_t> ReadContainerTape(const RandomAccess &file, const BlockDecoder &decoder) {
+//! `block`'s payload (`payload`, its bytes on disk) decrypted with `keys` when it is encrypted -- the backup's
+//! layer, then the DEK's (E4c), each with the header's IV --: its first `block.plain` bytes, in `scratch`; else
+//! `payload` itself.
+static const uint8_t *Plaintext(const RandomAccess &file, const ChainBlock &block, const uint8_t *header,
+								const uint8_t *payload, const ContainerKeys &keys, std::vector<uint8_t> &scratch) {
+	if (!block.Encrypted()) {
+		return payload;
+	}
+	if ((block.BackupLayer() && !keys.backup) || (block.DekLayer() && !keys.dek)) {
+		throw FormatError(Where(file, block.physical) + ": an encrypted block, and no key to decrypt it");
+	}
+	scratch.assign(payload, payload + block.payload);
+	if (block.BackupLayer()) {
+		DecryptCbc(*keys.backup, header + IV_AT, scratch.data(), scratch.size());
+	}
+	if (block.DekLayer()) {
+		DecryptCbc(*keys.dek, header + IV_AT, scratch.data(), scratch.size());
+	}
+	return scratch.data();
+}
+
+std::vector<uint8_t> ReadContainerTape(const RandomAccess &file, const BlockDecoder &decoder, const ContainerKeys &keys,
+									   bool tde) {
+	const uint64_t label_at = tde ? TDE_TAPE_AT : HEADER_TAPE_AT;
 	ChainBlock block;
-	if (!ReadBlockHeader(file, HEADER_TAPE_AT, 0, block) ||
-		block.payload > CONTAINER_HEADER - HEADER_TAPE_AT - BLOCK_HEADER) {
-		throw FormatError(Where(file, HEADER_TAPE_AT) +
+	// An encrypted, stored container's label is stored too: 4 KB of payload, which runs past the 4 KB header
+	// into the 4 KB before its SFMB at 0x2000 (E4b); every other's fits the header.
+	if (!ReadBlockHeader(file, label_at, 0, block) ||
+		block.payload >
+			(block.Encrypted() && block.Stored() ? ENCRYPTED_STORED_CHAIN_START - CONTAINER_HEADER : CONTAINER_HEADER) -
+				label_at - BLOCK_HEADER) {
+		throw FormatError(Where(file, label_at) +
 						  ": no block holding the media label where every compressed backup keeps it");
 	}
-	auto payload = Read(file, HEADER_TAPE_AT + BLOCK_HEADER, block.payload, "the media label block");
+	auto bytes = Read(file, label_at, BLOCK_HEADER + block.payload, "the media label block");
+	std::vector<uint8_t> scratch;
+	const uint8_t *payload = Plaintext(file, block, bytes.data(), bytes.data() + BLOCK_HEADER, keys, scratch);
 	std::vector<uint8_t> out(block.output);
 	if (block.Stored()) {
-		std::memcpy(out.data(), payload.data(), block.output);
+		std::memcpy(out.data(), payload, block.output);
 	} else if (!decoder) {
-		throw FormatError(Where(file, HEADER_TAPE_AT) + ": a compressed media label, and no decoder for it");
+		throw FormatError(Where(file, label_at) + ": a compressed media label, and no decoder for it");
 	} else {
-		decoder(payload.data(), payload.size(), out.data(), block.output);
+		decoder(payload, block.plain, out.data(), block.output);
 	}
 	if (out.size() < 4 || std::memcmp(out.data(), "TAPE", 4) != 0) {
-		throw FormatError(Where(file, HEADER_TAPE_AT) + ": the media label block does not hold a TAPE block");
+		throw FormatError(Where(file, label_at) + ": the media label block does not hold a TAPE block");
 	}
 	return out;
 }
 
-bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<SeekEntry> &seek) {
+bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<SeekEntry> &seek, uint64_t start) {
 	const uint64_t size = file.Size();
 	if (size % 4096 != 0 || size < CHAIN_START + TAIL_RECORD_FROM_END) {
 		return false;
@@ -347,7 +438,7 @@ bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<
 	// blocks; the data set's size from walking the trailer, the blocks after the last entry.
 	BlockChain located;
 	ChainBlock block;
-	if (!ReadBlockHeader(file, CHAIN_START, 0, block)) {
+	if (!ReadBlockHeader(file, start, 0, block)) {
 		return false;
 	}
 	located.checkpoints.push_back(block);
@@ -355,6 +446,14 @@ bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<
 	// set's offset at a physical offset is bounded: a crafted entry cannot claim more, or wrap.
 	auto max_logical = [](uint64_t physical) { return (physical - CHAIN_START) / (BLOCK_HEADER + 1) * MAX_BLOCK; };
 	for (const auto &entry : entries) {
+		if (entry.physical == block.physical && located.checkpoints.size() > 1) {
+			// An offset inside the last entry's block (E4c): no checkpoint of its own.
+			if (entry.logical <= block.logical || entry.logical >= block.logical + block.output) {
+				throw FormatError(Where(file, entry.physical) + ": a seek index entry at data-set offset " +
+								  std::to_string(entry.logical) + ", outside the block it names");
+			}
+			continue;
+		}
 		if (entry.logical == 0) {
 			throw FormatError(Where(file, entry.physical) +
 							  ": a seek index entry at data-set offset 0, where the chain's first block is");
@@ -399,10 +498,11 @@ static uint64_t NextStreamId() {
 	return next.fetch_add(1);
 }
 
-ContainerStream::ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder)
+ContainerStream::ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder, ContainerKeys keys)
 	: file_(file),
 	  chain_(std::move(chain)),
 	  decoder_(std::move(decoder)),
+	  keys_(std::move(keys)),
 	  name_(file.Name() + " (data set)"),
 	  id_(NextStreamId()) {
 	spans_.reserve(chain_.checkpoints.size());
@@ -460,7 +560,11 @@ ContainerStream::Shared ContainerStream::RecentLocked(uint64_t logical) const {
 
 ContainerStream::Shared ContainerStream::Decode(const ChainBlock &block) const {
 	auto d = std::make_shared<DecodedBlock>();
-	const uint8_t *payload = Window(block.physical + BLOCK_HEADER, block.payload);
+	const uint8_t *bytes = Window(block.physical, BLOCK_HEADER + block.payload);
+	// An encrypted block's plaintext in a buffer of the thread's own (the window's bytes are kept for the
+	// next read and must stay the file's).
+	static thread_local std::vector<uint8_t> scratch;
+	const uint8_t *payload = Plaintext(file_, block, bytes, bytes + BLOCK_HEADER, keys_, scratch);
 	d->output.resize(block.output);
 	if (block.Stored()) {
 		std::memcpy(d->output.data(), payload, block.output);
@@ -469,7 +573,7 @@ ContainerStream::Shared ContainerStream::Decode(const ChainBlock &block) const {
 			throw FormatError(Where(file_, block.physical) +
 							  ": a compressed block, and no decoder for this container's algorithm");
 		}
-		decoder_(payload, block.payload, d->output.data(), block.output);
+		decoder_(payload, block.plain, d->output.data(), block.output);
 	}
 	d->block = block;
 	return d;

@@ -363,8 +363,10 @@ struct ScanGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint64_t> rows_read{0};
 	//! A page taken into use while the backup ran met by any task: said once per scan.
 	mutable std::atomic<bool> pending_warned{false};
+	mutable std::atomic<bool> unreadable_warned{false};	 // a TDE page that did not verify said once (#670)
 	//! A value stored off row on a Pending page, read as NULL, said once a scan too (its own WARNING).
 	mutable std::atomic<bool> pending_values_warned{false};
+	mutable std::atomic<bool> unreadable_values_warned{false};	// a value on a page that did not decrypt (#670)
 	int64_t row_count = -1;
 
 	idx_t MaxThreads() const override {
@@ -378,9 +380,10 @@ struct ScanLocalState : public LocalTableFunctionState {
 	const RowsetLayout *layout = nullptr;  // the stager's (UseLayout), to switch only between partitions
 	LobPageFetch off_row_fetch;			   // the stager's pages for values stored off row (live ones only)
 
-	std::atomic<bool> *pending_warned = nullptr;	// the scan's: a Pending page said once (ScanGlobalState)
-	std::shared_ptr<const PartitionCursor> cursor;	// of the unit being read
-	idx_t batch = 0;								// the unit's batch index
+	std::atomic<bool> *pending_warned = nullptr;	 // the scan's: a Pending page said once (ScanGlobalState)
+	std::atomic<bool> *unreadable_warned = nullptr;	 // and a page that did not decrypt
+	std::shared_ptr<const PartitionCursor> cursor;	 // of the unit being read
+	idx_t batch = 0;								 // the unit's batch index
 	bool have_unit = false;
 	size_t next_page = 0;
 	size_t end_page = 0;
@@ -390,7 +393,8 @@ struct ScanLocalState : public LocalTableFunctionState {
 	//! The stager's PendingValues as of its last appended row: a row prepared and then left for the next
 	//! chunk (no reservation) is not one the WARNING may name (review of #591).
 	idx_t pending_appended = 0;
-	CdRecord cd_record;	 // a ROW-compressed rowset's record and its values (spec 086 PR 1), reused
+	idx_t unreadable_appended = 0;	// and the stager's UnreadableValues so
+	CdRecord cd_record;				// a ROW-compressed rowset's record and its values (spec 086 PR 1), reused
 	CdRow cd_row;
 	PageCompression page_ci;		// a PAGE page's compression information (spec 086 PR 2); not present on a ROW page
 	std::vector<bool> cd_needed;	// the layout's columns this scan reads: the stager's, the key's
@@ -595,6 +599,7 @@ unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &execution, Table
 	const auto &global = global_state->Cast<ScanGlobalState>();
 	auto local = make_uniq<ScanLocalState>();
 	local->pending_warned = &global.pending_warned;
+	local->unreadable_warned = &global.unreadable_warned;
 	local->stager = make_uniq<RecordStager>(*data.entry, global.staged, data.Forms());
 	local->stager->LimitBytes(global.chunk_allowance, global.virtual_row);
 	const PageStore &store = *data.catalog->pages->store;
@@ -822,6 +827,16 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 					"%s: %s.%s: %s (fuzzy := 'error'; under 'warn' the table's other pages "
 					"are read)",
 					data.function.c_str(), data.schema, data.table, e.what());
+			}
+			// A page that does not decrypt (review of #670) is no fuzziness: said under 'ignore' too, once a scan.
+			if (dynamic_cast<UnreadablePageError *>(&e)) {
+				if (local.unreadable_warned && !local.unreadable_warned->exchange(true)) {
+					DUCKDB_LOG_WARNING(context,
+									   "%s: %s.%s: %s; its rows are not read, the table's other pages are (any "
+									   "further such page of the table is passed over without another WARNING)",
+									   data.function.c_str(), data.schema, data.table, e.what());
+				}
+				continue;
 			}
 			// One WARNING per table and scan, as for the table's status (review of #591): the first page met.
 			if (mode == FuzzyMode::Warn && local.pending_warned && !local.pending_warned->exchange(true)) {
@@ -1085,13 +1100,21 @@ void StageRows(ClientContext &context, const ScanBindData &data, ScanGlobalState
 		}
 		local.stager->Append(row);
 		local.pending_appended = local.stager->PendingValues();
+		local.unreadable_appended = local.stager->UnreadableValues();
 		KeepVirtual(data, global, local, row, at);
 	}
 }
 
-//! Once a scan: a value stored off row on a Pending page was read as NULL (fuzzy := 'warn').
+//! Once a scan: a value stored off row on a Pending page was read as NULL (fuzzy := 'warn'); and, under any
+//! policy that reads it, one on a TDE page that did not verify (review of #670).
 void WarnPendingValues(ClientContext &context, const ScanBindData &data, ScanGlobalState &global,
 					   const ScanLocalState &local) {
+	if (local.unreadable_appended > 0 && !global.unreadable_values_warned.exchange(true)) {
+		DUCKDB_LOG_WARNING(context,
+						   "%s: %s.%s: a value stored off row is read as NULL, its row read: %s (further such values "
+						   "of the table are NULL without another WARNING; fuzzy := 'error' refuses the table)",
+						   data.function.c_str(), data.schema, data.table, local.stager->FirstUnreadable().c_str());
+	}
 	if (local.pending_appended > 0 && !global.pending_values_warned.load() &&
 		FuzzyModeOf(context, data.fuzzy, data.function.c_str()) == FuzzyMode::Warn &&
 		!global.pending_values_warned.exchange(true)) {

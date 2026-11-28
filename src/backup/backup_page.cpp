@@ -137,7 +137,13 @@ PageState PageStore::Fetch(uint16_t file, uint32_t page, Page &out) const {
 	// data pass ran, past the data the pass copies (see the pad below): a ZeroCopyError, Pending when the
 	// backup's log tail formats the page. Otherwise -- and always beside a later pass, which copies such a
 	// page -- an index that does not find it searched wrongly or the backup is short, refused.
-	if (!index_.ReadPage(file, page, out.bytes, true)) {
+	bool copied = false;
+	try {
+		copied = index_.ReadPage(file, page, out.bytes, true);
+	} catch (PageVerifyError &e) {
+		throw UnreadablePageError(e.what(), this);
+	}
+	if (!copied) {
 		ThrowUncopied(want, "backup: page " + want.ToString() + " is live, and the backup carries no copy of it");
 	}
 	if (out.bytes.size() != PAGE_SIZE) {

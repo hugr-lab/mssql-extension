@@ -119,6 +119,16 @@ public:
 	const PageStore *store;
 };
 
+//! A TDE page that does not verify after its decryption (PageVerifyError, rethrown by PageStore with the store):
+//! passed over as a Pending page is -- its rows (or a value stored off row on it, NULL) not read, said with one
+//! WARNING a scan under 'warn' and 'ignore' alike (it is no fuzziness), the read refused under 'error' -- so the
+//! rest of the table is read (owner, 2026-11-28: read the utmost a backup holds; review of
+//! #670). The readers word it by its own message.
+class UnreadablePageError : public PendingPageError {
+public:
+	UnreadablePageError(const std::string &message, const PageStore *store_) : PendingPageError(message, store_) {}
+};
+
 //! A value stored off row met on a Pending page by a stager that does not read it as NULL (fuzzy :=
 //! 'error'): told apart from a Pending page met elsewhere (an IAM page), whose refusal is worded otherwise.
 class PendingValueError : public PendingPageError {

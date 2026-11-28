@@ -2,6 +2,7 @@
 #include "azure/azure_test_function.hpp"
 #include "backup/backup_changes_function.hpp"
 #include "backup/backup_info_function.hpp"
+#include "backup/backup_key_secret.hpp"
 #include "backup/backup_scan_function.hpp"
 #include "backup/backup_snapshots_function.hpp"
 #include "backup/backup_tables_function.hpp"
@@ -212,6 +213,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterMSSQLCopyFunctions(loader);
 
 	// Spec 085: the backup reader's functions (mssql_backup_info).
+	mssql::backup::RegisterBackupKeySecret(loader);	 // spec 087: key material only through a secret
 	mssql::backup::RegisterBackupInfoFunction(loader);
 	mssql::backup::RegisterBackupSnapshotsFunction(loader);
 	mssql::backup::RegisterBackupTransactionsFunctions(loader);

@@ -58,6 +58,10 @@ struct OpenedFamily {
 	BlockChain chain;
 	std::vector<SeekEntry> seek;
 	BlockDecoder decoder;
+	//! Spec 087: an encrypted container's content keys -- the backup's, and a TDE database's DEK when its backup
+	//! is compressed (E4c) -- unwrapped by the secrets D3 selected; zeroised with the family (the opened-file
+	//! cache's entry), D4 selecting again before a cached entry is used.
+	ContainerKeys keys;
 	std::unique_ptr<ContainerStream> data_set;
 	MtfLayout layout;
 	BackupSetHeader set;
@@ -98,7 +102,23 @@ struct OpenedHeaders {
 	bool Compressed() const {
 		return families.front()->container;
 	}
+	//! Spec 087: a TDE database's backup -- its container header names the DEK (a compressed one, E4c) or an
+	//! SFIN of its data files does (D10) -- and, when it is, the certificate's thumbprint that wraps the DEK.
+	bool Tde(Thumbprint *thumbprint = nullptr) const;
+	//! Spec 087 D9: why the log of a TDE database's backup is not read (encrypted, E10), naming the DEK's
+	//! certificate; empty for any other backup. Every reader of the log (the summary, the record listing)
+	//! refuses with it instead of parsing ciphertext.
+	std::string TdeLogRefusal() const;
 };
+
+//! Spec 087 D10: what a file of a backup says in clear, read without a key -- whether it is a container, and
+//! its header (the flags, the encryptor's and the DEK's thumbprints). Nothing past the header is read.
+struct ClearFileHeader {
+	std::string path;
+	bool container = false;
+	ContainerHeader header;
+};
+std::vector<ClearFileHeader> ReadClearHeaders(ClientContext &context, const std::vector<std::string> &paths);
 
 //! Stages 2 and 3 of an opened backup (spec 085 § Data structures, task 11b): where each page's
 //! latest copy lies (the page index, D4a, DQ-41) and which pages are live (the allocation map), and
@@ -117,6 +137,9 @@ struct OpenPagesOptions {
 	//! Task 24 (D12): a differential's pages over these, its full's (chain checked by the caller):
 	//! its own passes win, liveness from the overlaid allocation pages. Must outlive the pages.
 	const PageIndex *base = nullptr;
+	//! Spec 087 (TDE): the database's DEK, given the certificate's thumbprint and the wrapped key its boot page
+	//! holds (FCBFileDEK); the caller's selection of a secret (D3). Unset, a TDE backup is refused by name.
+	std::function<std::shared_ptr<const ContentKey>(const Thumbprint &, const std::vector<uint8_t> &)> tde_key;
 };
 
 //! The pages of the full backup `headers` holds, or of a differential over its full's
@@ -206,6 +229,11 @@ public:
 	const shared_ptr<OpenedBackup> &Base() const {
 		return base_;
 	}
+	//! Spec 087 D4: every key this entry has unwrapped -- its containers' (the backup's key, a compressed TDE
+	//! backup's DEK) and, once its pages are built, an uncompressed TDE backup's DEK -- still held by the secret
+	//! D3 selects, else refused by name. Asked by every statement that opens the entry (from the opened-file
+	//! cache, as an attached backup); its base is asked by the base's own open.
+	void RequireKeysHeld(ClientContext &context) const;
 	//! Stage 5 (D11, task 27): what the backup's log tail says, read now when it is not -- family 1's
 	//! MQTL streams (the tail is in that family only, E2§6), through the statement's files bound to the
 	//! thread -- and kept. Read outside the entry's locks; a second statement waits for the first's read in
@@ -260,6 +288,10 @@ private:
 	//! older, smaller measure last, the entry charged for less than it held).
 	std::mutex weigh_lock_;
 	std::atomic<size_t> estimate_{0};
+	//! The certificate that wraps an uncompressed TDE backup's DEK, set by the build that unwrapped it (before
+	//! tde_dek_held_, released; read after it, acquired).
+	Thumbprint tde_dek_thumbprint_{};
+	std::atomic<bool> tde_dek_held_{false};
 };
 
 //! `backup` put in the instance's ObjectCache under `key`, its estimate measured first when it still holds

@@ -77,6 +77,11 @@ Packed Pack(const Bytes &data, uint8_t units, const std::vector<size_t> &index_b
 	for (int i = 0; i < 20; i++) {
 		p.file[0x18 + i] = static_cast<uint8_t>(0xA0 + i);
 	}
+	if (flags & 0x4) {
+		// An encrypted header (E4, spec 087): the thumbprint's length before it, the wrapped key's after.
+		Put32(p.file, 0x14, 20);
+		Put32(p.file, 0x2C, 384);
+	}
 	PutTag(p.file, 4096, "SFMB");
 	Put16(p.file, 4096 + 50, Xor16(p.file, 4096, 50));
 	size_t logical = 0;
@@ -296,12 +301,45 @@ int main() {
 		MemoryAccess g("flags.bak", odd.file.data(), odd.file.size());
 		Check(ErrorOf([&]() { ReadContainerHeader(g); }).find("0x13") != std::string::npos,
 			  "an unknown flag word is refused naming it");
-		for (uint32_t flags : {0x85u, 0x87u, 0x1u}) {
+		for (uint32_t flags : {0x85u, 0x1u}) {
 			auto x = Pack(data, 8, {}, flags);
 			MemoryAccess xf("x.bak", x.file.data(), x.file.size());
 			Check(!ErrorOf([&]() { ReadContainerHeader(xf); }).empty(),
-				  "flags " + std::to_string(flags) + " (not one of 3, 0x83, 5, 7) are refused");
+				  "flags " + std::to_string(flags) + " (not one of 3, 0x83, 5, 7, 0x87) are refused");
 		}
+		// Spec 087 E4b: 0x87 is encrypted and ZSTD; E4c: 0x2B / 0xAB / 0x2F a TDE database's compressed backup,
+		// its wrapped DEK at 0x214.
+		auto enc_zstd = Pack(data, 8, {}, 0x87);
+		MemoryAccess ez("enc_zstd.bak", enc_zstd.file.data(), enc_zstd.file.size());
+		const auto ezh = ReadContainerHeader(ez);
+		Check(ezh.encrypted && ezh.algorithm == CompressionAlgorithm::Zstd && ezh.wrapped_key.size() == 384,
+			  "flags 0x87: encrypted and ZSTD, a 384-byte wrapped key");
+		for (uint32_t flags : {0x2Bu, 0xABu, 0x2Fu}) {
+			auto x = Pack(data, 8, {}, flags);
+			MemoryAccess bare("tde.bak", x.file.data(), x.file.size());
+			Check(ErrorOf([&]() { ReadContainerHeader(bare); }).find("TDE certificate's thumbprint of 0 bytes") !=
+					  std::string::npos,
+				  "flags " + std::to_string(flags) +
+					  ": a TDE database's compressed backup with no DEK at 0x214 is refused");
+			Put32(x.file, 0x214, 20);
+			Put32(x.file, 0x214 + 24, 384);
+			MemoryAccess xf("tde.bak", x.file.data(), x.file.size());
+			const auto th = ReadContainerHeader(xf);
+			Check(th.tde && th.compressed && th.wrapped_dek.size() == 384 && th.encrypted == (flags == 0x2F) &&
+					  (th.algorithm == CompressionAlgorithm::Zstd) == (flags == 0xAB),
+				  "flags " + std::to_string(flags) + ": a TDE database's compressed backup, its 384-byte wrapped DEK");
+		}
+		{
+			auto x = Pack(data, 8, {}, 0xAF);
+			MemoryAccess xf("tde.bak", x.file.data(), x.file.size());
+			Check(ErrorOf([&]() { ReadContainerHeader(xf); }).find("0xAF") != std::string::npos,
+				  "flags 0xAF (TDE, encrypted, ZSTD: not seen) refused naming it");
+		}
+		auto no_length = Pack(data, 8, {}, 0x7);
+		Put32(no_length.file, 0x14, 0);
+		MemoryAccess nl("nl.bak", no_length.file.data(), no_length.file.size());
+		Check(ErrorOf([&]() { ReadContainerHeader(nl); }).find("thumbprint of 0 bytes") != std::string::npos,
+			  "an encrypted header whose thumbprint is not 20 bytes is refused");
 		auto only_encrypted = Pack(data, 8, {}, 0x5);
 		MemoryAccess oe("enc_only.bak", only_encrypted.file.data(), only_encrypted.file.size());
 		auto oh = ReadContainerHeader(oe);

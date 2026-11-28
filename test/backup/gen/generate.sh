@@ -44,6 +44,14 @@
 # with its RESTORE as compare_rows.sh's FUZZY; committed under test/data/backup/tail_window, made by its
 # generate.sh, which sets TAIL_WINDOW_REQUIRED=1: a backup that missed its window fails, where the lane's
 # only says so);
+# encrypted.sql, spec 087's matrix -- backup encryption of every algorithm, compression and CHECKSUM, striped, a
+# second certificate, a differential; TDE under AES_256 / AES_128, uncompressed and compressed (E4c), an encrypted
+# backup of a TDE database, the DEK rotated; a tiny TDE database three ways -- with the certificates exported
+# (<name>.cer / .pvk, enc_cert.pfx where the version writes one) and the PVK password in pvk_password (0600; this
+# run's own, for the reader's secrets; not run by default: compare_info --keys reads it, compare_rows takes no secret yet);
+# encryption_samples.sql, the committed ones (spec 087 task 9: enc_sample, tde_sample, tde_sample_xpress,
+# tde_sample_enc, by test-only certificates committed with their keys and password; not run by default;
+# committed under test/data/backup/encryption, made by its generate.sh);
 # bench_changes.sql, a benchmark of 10 million rows and differentials of 10k / 110k / 1.1M changes and an index rebuild
 # (PR 4c-3: bench_full, bench_diff_*, each also compressed as *_x; not run by default). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
@@ -81,6 +89,11 @@ fi
 # (`-e NAME`, which docker reads from its own environment), so the value is on no command line.
 SA_PASSWORD="Bk$(openssl rand -hex 16)!a1"
 export MSSQL_SA_PASSWORD="${SA_PASSWORD}" SQLCMDPASSWORD="${SA_PASSWORD}"
+# Spec 087: the master key's password and the exported keys' (encrypted.sql's $(MKPASS) / $(PVKPASS), which
+# sqlcmd reads from its environment), this run's own; the PVK one is written beside the keys it protects.
+MKPASS="Mk$(openssl rand -hex 16)!a1"
+PVKPASS="Pv$(openssl rand -hex 16)!a1"
+export MKPASS PVKPASS
 
 echo ">> starting ${IMAGE} as ${CONTAINER}"
 # Created, then started: the trap is set on the container we created (by its id, so a container of
@@ -110,7 +123,7 @@ find_sqlcmd() {
 	return 1
 }
 sql() {	# $@ = sqlcmd arguments
-	docker exec -e SQLCMDPASSWORD "${CONTAINER}" "${SQLCMD[@]}" -S localhost -U sa -b "$@"
+	docker exec -e SQLCMDPASSWORD -e MKPASS -e PVKPASS "${CONTAINER}" "${SQLCMD[@]}" -S localhost -U sa -b "$@"
 }
 
 echo ">> waiting for the server"
@@ -560,6 +573,30 @@ for fixture in ${FIXTURES}; do
 	clr)
 		# CLR columns of every storage form (a Format.Native user type at a fixed offset, described as binary).
 		sets+=("clr_full|clr_full.bak")
+		;;
+	encrypted)
+		# What the version wrote (a refused combination is printed by the script: ZSTD before 2025, the PFX form),
+		# by name; the striped pair one set. The keys beside them.
+		for f in $(docker exec "${CONTAINER}" sh -c "cd '${DIR}' && ls plain_full.bak enc_*.bak tde*.bak 2>/dev/null"); do
+			name="${f%.bak}"
+			case "${name}" in
+			enc_striped_2) ;;
+			enc_striped_1) sets+=("enc_striped|enc_striped_1.bak,enc_striped_2.bak") ;;
+			*) sets+=("${name}|${f}") ;;
+			esac
+		done
+		for f in $(docker exec "${CONTAINER}" sh -c "cd '${DIR}' && ls *_cert*.cer *_cert*.pvk *_cert*.pfx 2>/dev/null"); do
+			extras+=("${f}")
+		done
+		overlays+=("enc_over|enc_cert2_full|enc_diff" "tde256_rotated_over|tde256_rotated_full|tde256_rotated_diff")
+		(umask 077 && printf '%s\n' "${PVKPASS}" >"${OUT}/pvk_password")
+		;;
+	encryption_samples)
+		sets+=("enc_sample|enc_sample.bak" "tde_sample|tde_sample.bak" "tde_sample_xpress|tde_sample_xpress.bak"
+			"tde_sample_enc|tde_sample_enc.bak")
+		extras+=("sample_enc_cert.cer" "sample_enc_cert.pvk" "sample_tde_cert.cer" "sample_tde_cert.pvk")
+		# The test-only keys' password, public by design (encryption_samples.sql), for compare_info.py --keys.
+		printf '%s\n' 'test-only sample key 087!' >"${OUT}/pvk_password"
 		;;
 	bench_changes)
 		# A benchmark (spec 085 PR 4c-3): 10 million rows, then differentials of 10k / 110k / 1.1M changes, and

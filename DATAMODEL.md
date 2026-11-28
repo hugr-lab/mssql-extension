@@ -1538,7 +1538,8 @@ layer 5 (spec 091) are its only shared state. It is a stack of its own, planned 
 flowchart BT
   fs["DuckDB FileSystem<br/>(CachingFileSystem: local, s3://, https://)"] --> src["ByteSource / SourceAccess<br/>every family of one media set;<br/>ranges coalesced (backup_ranges),<br/>fetched sync or on the ASYNC pool"]
   src --> plain["plain family:<br/>MTF walk (WalkMtf)"]
-  src --> cont["MSSQLBAK container:<br/>header, chain located from the tail,<br/>seek index → ContainerStream<br/>(XPRESS / ZSTD per block)"]
+  src --> cont["MSSQLBAK container:<br/>header, chain located from the tail,<br/>seek index → ContainerStream<br/>(decrypt (spec 087), then XPRESS / ZSTD per block)"]
+  secret["mssql_backup_key secret (spec 087)<br/>D3: longest scope, then thumbprint;<br/>unwrap → ContainerKeys / the DEK"] -.-> cont
   cont --> ds["WalkMtfDataSet<br/>(the container's MTF data set)"]
   plain --> set["BackupSetHeader<br/>TAPE / RAID, SSET, VOLB,<br/>trailer MQCI: SCIN, SFGI, SFIN"]
   ds --> set
@@ -1588,6 +1589,25 @@ flowchart BT
   its own tail). `mssql_backup_transaction_records` walks the tail again through a cursor -- the summary read
   only when `transaction_status` is selected --, a row image laid on a page of its own and staged by `RecordStager` into the
   table's columns, built into a VARIANT.
+
+- **Encrypted and TDE backups** (spec 087): key material only through an `mssql_backup_key` secret
+  (`backup_key_secret` [DuckDB]: checked at CREATE SECRET; `SelectContentKey` chooses one per file by D3 --
+  the longest matching scope, then the certificate's thumbprint -- on every call, a cached entry included:
+  `OpenedBackup::RequireKeysHeld`). The keys are `ContainerKeys` (the backup's key, a compressed TDE backup's DEK; E4c),
+  held by the `OpenedFamily` (so by the opened-file cache's entry, zeroised with it) and handed to
+  `ContainerStream`, `ReadContainerTape` and the pass search's `ContainerPassMedium`, which decrypt a block
+  (`backup_crypto`: AES / 3DES CBC, the backup's layer outside the DEK's) before decompressing it into a
+  buffer of their own. A key is unwrapped under RSA-OAEP / SHA-256 (2025's `CERTIFICATE_OAEP_256`), else PKCS#1
+  v1.5 (2019's and 2022's `CERTIFICATE`) with OpenSSL's implicit rejection only, every failure one message
+  (`UnwrapContentKey`). An uncompressed TDE backup's pages are decrypted by `PageIndex::ReadPage` with the DEK
+  its data file's SFIN names, else its boot page's (`OpenPagesOptions::tde_key`, `ApplyTde`), wherever
+  `m_flagBits` 0x0800 says so. The header is then the server's for a page in clear, so both forms read the same
+  page, and a page with a checksum is verified against it: one that does not verify (another DEK, damage) is a
+  `PageVerifyError`, which `PageStore` makes an `UnreadablePageError`. The scan passes over such a page as it
+  does a Pending one (its rows not read, one WARNING, refused under `fuzzy := 'error'`). Without a key,
+  `mssql_backup_info` opens the backup and falls back to `ReadClearHeaders` on `MissingBackupKey` (D10), and a
+  keyed row is bound again on every EXECUTE. A TDE backup's log is never parsed (`OpenedHeaders::TdeLogRefusal`,
+  D9).
 
 - **A differential over its full** (spec 085 PR 4c, `diff :=`): its own `OpenedBackup`, whose base is
   the full's (`OpenedBackup::Base`; a cache entry of its own, keyed by both backups' files). Its

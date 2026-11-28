@@ -14,11 +14,13 @@
 #include "backup/backup_bytes.hpp"
 #include "backup/backup_collation.hpp"
 #include "backup/backup_function_common.hpp"
+#include "backup/backup_key_secret.hpp"
 #include "backup/backup_opened.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "mssql_function_docs.hpp"
 
@@ -47,6 +49,7 @@ LogicalType FileType() {
 	fields.emplace_back("unique_id", LogicalType::UUID);
 	fields.emplace_back("backup_size_bytes", LogicalType::BIGINT);
 	fields.emplace_back("is_present", LogicalType::BOOLEAN);
+	fields.emplace_back("tde_thumbprint", LogicalType::BLOB);  // FILELISTONLY's TDEThumbprint (spec 087)
 	return LogicalType::STRUCT(std::move(fields));
 }
 
@@ -87,6 +90,9 @@ std::vector<Column> Columns() {
 			{"compression_algorithm", LogicalType::VARCHAR},
 			{"encrypted", LogicalType::BOOLEAN},
 			{"encryptor_thumbprint", LogicalType::BLOB},
+			{"key_algorithm", LogicalType::VARCHAR},
+			{"tde", LogicalType::BOOLEAN},
+			{"tde_thumbprint", LogicalType::BLOB},
 			{"has_backup_checksums", LogicalType::BOOLEAN},
 			{"backup_size", LogicalType::BIGINT},
 			{"compressed_size", LogicalType::BIGINT},
@@ -142,6 +148,8 @@ Value FileValue(const DatabaseFile &f, bool present) {
 	fields.emplace_back("unique_id", GuidValue(f.unique_id));
 	fields.emplace_back("backup_size_bytes", Value(LogicalType::BIGINT));
 	fields.emplace_back("is_present", Value::BOOLEAN(present));
+	fields.emplace_back("tde_thumbprint", f.tde ? Value::BLOB(f.tde_thumbprint.data(), f.tde_thumbprint.size())
+												: Value(LogicalType::BLOB));
 	return Value::STRUCT(std::move(fields));
 }
 
@@ -170,6 +178,16 @@ void PutTail(std::vector<Value> &row, const FuzzySummary *tail) {
 	row[at + 3] = tail ? Value::INTEGER(static_cast<int32_t>(tail->rolled_back_after_checkpoint)) : no_int;
 }
 
+//! HEADERONLY's CompressionAlgorithm: NULL for a backup with no container, and for one in a container whose blocks
+//! are stored (an encrypted backup WITHOUT COMPRESSION: RESTORE says Compressed 1, CompressionAlgorithm NULL; measured
+//! on 2025, spec 087's matrix).
+static Value AlgorithmValue(bool compressed, CompressionAlgorithm algorithm) {
+	if (!compressed || algorithm == CompressionAlgorithm::None) {
+		return Value(LogicalType::VARCHAR);
+	}
+	return Value(CompressionAlgorithmName(algorithm));
+}
+
 //! The row of the backup set the files of `opened` hold, D11's columns NULL (PutTail).
 std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	const auto &set = opened.Set();
@@ -194,7 +212,15 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 					present = t.present;
 				}
 			}
-			files.push_back(FileValue(f, present));
+			// FILELISTONLY's TDEThumbprint: the trailer's (the start's list may predate a rotation).
+			DatabaseFile shown = f;
+			for (const auto &t : set.files) {
+				if (t.file_id == f.file_id && t.type == f.type) {
+					shown.tde = t.tde;
+					shown.tde_thumbprint = t.tde_thumbprint;
+				}
+			}
+			files.push_back(FileValue(shown, present));
 		}
 	}
 	const bool single = opened.families.size() == 1;
@@ -242,10 +268,23 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	// One family's number when one family was given; a whole set has no one number.
 	row.push_back(single ? Value::INTEGER(static_cast<int32_t>(set.family_sequence_number)) : no_int);
 	row.push_back(Value::BOOLEAN(opened.Compressed()));
-	row.push_back(opened.Compressed() ? Value(CompressionAlgorithmName(first.container_header.algorithm))
-									  : Value(LogicalType::VARCHAR));
-	row.push_back(Value::BOOLEAN(false));  // an encrypted backup is refused when opened (spec 087)
-	row.push_back(Value(LogicalType::BLOB));
+	row.push_back(AlgorithmValue(opened.Compressed(), first.container_header.algorithm));
+	// Spec 087: an encrypted backup (its key unwrapped by the secret D3 selected) and its encryptor's
+	// thumbprint, as HEADERONLY's EncryptorThumbprint.
+	const bool encrypted = first.container && first.container_header.encrypted;
+	row.push_back(Value::BOOLEAN(encrypted));
+	row.push_back(encrypted ? Value::BLOB(first.container_header.encryptor_thumbprint.data(),
+										  first.container_header.encryptor_thumbprint.size())
+							: Value(LogicalType::BLOB));
+	// The backup key's algorithm, from the key D3's secret unwrapped (HEADERONLY's KeyAlgorithm: aes_128 …).
+	row.push_back(encrypted && first.keys.backup ? Value(KeyAlgorithmName(first.keys.backup->algorithm))
+												 : Value(LogicalType::VARCHAR));
+	// A TDE database's backup, and the certificate that wraps its DEK (the container's header, or the data
+	// files' SFIN: D10).
+	Thumbprint dek_certificate;
+	const bool tde = opened.Tde(&dek_certificate);
+	row.push_back(Value::BOOLEAN(tde));
+	row.push_back(tde ? Value::BLOB(dek_certificate.data(), dek_certificate.size()) : Value(LogicalType::BLOB));
 	row.push_back(Value::BOOLEAN(checksums));
 	// The BackupSize the trailer records (checked against the layout's when the files were opened).
 	row.push_back(
@@ -265,6 +304,52 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	return row;
 }
 
+//! Spec 087 D10 (owner, 2026-11-27): the row of a backup whose key no secret holds -- what its first file's
+//! container header says in clear (compressed, the algorithm, encrypted, the encryptor's thumbprint, TDE and
+//! the DEK's certificate), every column the decrypted stream holds NULL. `position` is the set asked for.
+std::vector<Value> ClearRow(const ClearFileHeader &file) {
+	const auto columns = Columns();
+	std::vector<Value> row;
+	for (const auto &c : columns) {
+		row.push_back(Value(c.type));
+	}
+	const auto &h = file.header;
+	row[ColumnIndex("position")] = Value::INTEGER(1);
+	// HEADERONLY's Compressed is the container's (1 for an encrypted backup stored in one, as with the key:
+	// OpenedBackup::Compressed), the algorithm its blocks'.
+	row[ColumnIndex("compressed")] = Value::BOOLEAN(file.container);
+	row[ColumnIndex("compression_algorithm")] = AlgorithmValue(file.container, h.algorithm);
+	row[ColumnIndex("encrypted")] = Value::BOOLEAN(h.encrypted);
+	if (h.encrypted) {
+		row[ColumnIndex("encryptor_thumbprint")] =
+			Value::BLOB(h.encryptor_thumbprint.data(), h.encryptor_thumbprint.size());
+	}
+	row[ColumnIndex("tde")] = Value::BOOLEAN(h.tde);
+	if (h.tde) {
+		row[ColumnIndex("tde_thumbprint")] = Value::BLOB(h.tde_thumbprint.data(), h.tde_thumbprint.size());
+	}
+	return row;
+}
+
+//! D10: the certificates (thumbprints, in hex) whose key `files` need and no secret holds; empty when every
+//! one is held or none is needed (a plain file, an unencrypted container, an uncompressed TDE backup).
+std::vector<std::string> MissingKeys(ClientContext &context, const std::vector<ClearFileHeader> &files) {
+	std::vector<std::string> missing;
+	for (const auto &f : files) {
+		if (!f.container) {
+			continue;
+		}
+		const auto &h = f.header;
+		if (h.encrypted && !HasBackupKeySecret(context, f.path, h.encryptor_thumbprint)) {
+			missing.push_back(ThumbprintHex(h.encryptor_thumbprint) + " (the backup's key, for \"" + f.path + "\")");
+		}
+		if (h.tde && !HasBackupKeySecret(context, f.path, h.tde_thumbprint)) {
+			missing.push_back(ThumbprintHex(h.tde_thumbprint) + " (the TDE database's DEK, for \"" + f.path + "\")");
+		}
+	}
+	return missing;
+}
+
 struct BackupInfoBindData : public TableFunctionData {
 	vector<std::string> paths;
 	BackupAt at;  // task 24b
@@ -282,6 +367,7 @@ struct BackupInfoBindData : public TableFunctionData {
 		copy->reread = reread;
 		copy->has_tail = has_tail;
 		copy->set_guid = set_guid;
+		copy->keyed = keyed;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -292,9 +378,13 @@ struct BackupInfoBindData : public TableFunctionData {
 	//! a file rewritten under an open backup is invalid anyway while the rewrite runs. `reread := true`
 	//! binds again on every EXECUTE (a device overwritten nightly, read by a statement prepared once). An
 	//! attached name's version is pinned again at every EXECUTE too, so it follows a refresh (review of #581).
+	//! A row that needed a key, or was cut to the clear headers for want of one, is bound again on every EXECUTE
+	//! as well: spec 087 D4 asks the secret per statement (review of #670: a prepared statement kept the
+	//! decrypted row after DROP SECRET, and the NULLs after CREATE SECRET).
 	bool SupportStatementCache() const override {
-		return !reread && at.key.empty();
+		return !reread && at.key.empty() && !keyed;
 	}
+	bool keyed = false;
 };
 
 struct BackupInfoState : public GlobalTableFunctionState {
@@ -334,13 +424,46 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	}
 	try {
 		// The headers are what the opened-file cache holds first (D9): a later call on the same files
-		// takes them, and so does a catalog call after this one.
-		auto opened = OpenBackup(context, std::vector<std::string>(data->paths.begin(), data->paths.end()),
-								 std::vector<std::string>(), data->at);
+		// takes them, and so does a catalog call after this one. D10: a backup whose key no secret holds
+		// (MissingBackupKey) is described by what it says in clear, with a WARNING -- read only then, so a
+		// backup that needs no key costs what it did (review of 087).
+		OpenedForStatement opened;
+		try {
+			opened = OpenBackup(context, std::vector<std::string>(data->paths.begin(), data->paths.end()),
+								std::vector<std::string>(), data->at);
+		} catch (MissingBackupKey &) {
+			// An attached name and a version are refused as any call on them is: their files are not this
+			// call's to describe in clear.
+			if (data->at.IsSet() ||
+				(data->paths.size() == 1 && FindAttachedBackup(context, data->paths.front(), data->at))) {
+				throw;
+			}
+			const auto clear = ReadClearHeaders(context, data->paths);
+			const auto missing = MissingKeys(context, clear);
+			if (missing.empty()) {
+				throw;
+			}
+			std::string list;
+			for (const auto &m : missing) {
+				list += (list.empty() ? "" : ", ") + m;
+			}
+			DUCKDB_LOG_WARNING(context,
+							   "mssql_backup_info: \"%s\": no mssql_backup_key secret whose scope matches holds the "
+							   "key of the certificate %s: the columns its header gives in clear are shown, every "
+							   "other one NULL; CREATE SECRET (TYPE mssql_backup_key, CERTIFICATE ..., PRIVATE_KEY "
+							   "..., PASSWORD ..., SCOPE ...) with it reads the rest",
+							   clear.front().path, list);
+			data->row = ClearRow(clear.front());
+			data->keyed = true;
+			return std::move(data);
+		}
 		// D11's database level from the log tail (stage 5): a data backup's only, read at init.
 		data->has_tail = opened.backup->Headers().Set().kind != BackupKind::Log;
 		data->set_guid = opened.backup->Headers().Set().backup_set_guid.ToString();
 		data->row = InfoRow(opened.backup->Headers());
+		for (const auto &f : opened.backup->Headers().families) {
+			data->keyed = data->keyed || f->keys.backup || f->keys.dek;
+		}
 	} catch (FormatError &e) {
 		throw InvalidInputException("mssql_backup_info: %s", e.what());
 	}

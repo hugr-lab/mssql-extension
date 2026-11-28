@@ -112,7 +112,34 @@ build_harness() {  # $1=name $2=harness.cc ; remaining = library objects
 	[[ -n "${SIMDUTF_INC}" ]] && simd=("${SIMDUTF_OBJ}")
 	echo ">> linking ${name}"
 	"${CXX}" ${CXXFLAGS} ${INC} ${SIMDUTF_INC} \
-		"${HERE}/${hcc}" "$@" ${simd[@]+"${simd[@]}"} ${FUZZ_ENGINE} -o "${OUT}/${name}"
+		"${HERE}/${hcc}" "$@" ${simd[@]+"${simd[@]}"} ${LINK_LIBS} ${FUZZ_ENGINE} -o "${OUT}/${name}"
+}
+LINK_LIBS=""
+
+# --- OpenSSL (the backup reader's decryption, spec 087) ----------------------
+# libcrypto, not instrumented (it is fuzzed upstream): OPENSSL_PREFIX (an install with include/ and
+# lib/libcrypto.a -- the Makefile passes vcpkg's from a release build), else pkg-config's libcrypto (the CI
+# images install libssl-dev). Asked for only by the backup harnesses, whose container reader decrypts.
+ensure_openssl() {
+	[[ -n "${OPENSSL_READY:-}" ]] && return 0
+	if [[ -n "${OPENSSL_PREFIX:-}" ]]; then
+		[[ -f "${OPENSSL_PREFIX}/lib/libcrypto.a" ]] || {
+			echo "ERROR: OPENSSL_PREFIX=${OPENSSL_PREFIX} has no lib/libcrypto.a" >&2
+			exit 1
+		}
+		INC="${INC} -I${OPENSSL_PREFIX}/include"
+		LINK_LIBS="${LINK_LIBS} ${OPENSSL_PREFIX}/lib/libcrypto.a"
+		# A static libcrypto needs the thread library on Linux.
+		[[ "$(uname -s)" == "Linux" ]] && LINK_LIBS="${LINK_LIBS} -lpthread -ldl"
+	elif pkg-config --exists libcrypto 2>/dev/null; then
+		INC="${INC} $(pkg-config --cflags libcrypto)"
+		LINK_LIBS="${LINK_LIBS} $(pkg-config --libs libcrypto)"
+	else
+		echo "ERROR: the backup harnesses need OpenSSL's libcrypto (spec 087): install libssl-dev, or set" >&2
+		echo "       OPENSSL_PREFIX to an install holding include/ and lib/libcrypto.a." >&2
+		exit 1
+	fi
+	OPENSSL_READY=1
 }
 
 # TARGETS selects which harnesses to build (default: all). Lets CI / run.sh /
@@ -130,7 +157,7 @@ TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_respon
 # whole space-separated words, so a stray separator or a typo would otherwise build fewer harnesses
 # than asked, green.
 TARGETS="$(printf '%s %s' "${TARGETS}" "${TARGETS_EXTRA:-}" | tr ',\n\r\t' '    ')"
-KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci variant_envelope vector hierarchyid ssclrt "
+KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci backup_pvk backup_keyblob backup_enc_chain variant_envelope vector hierarchyid ssclrt "
 for t in ${TARGETS}; do
 	if [[ "${KNOWN_TARGETS}" != *" ${t} "* ]]; then
 		echo "ERROR: unknown fuzz target '${t}' in TARGETS / TARGETS_EXTRA (known:${KNOWN_TARGETS})" >&2
@@ -243,6 +270,7 @@ BACKUP_SRCS=(
 	"${BACKUP}/backup_mtf.cpp"
 	"${BACKUP}/backup_set.cpp"
 	"${BACKUP}/backup_container.cpp"
+	"${BACKUP}/backup_crypto.cpp"
 	"${BACKUP}/backup_xpress.cpp"
 	"${BACKUP}/backup_page_index.cpp"
 	"${BACKUP}/backup_pass_search.cpp"
@@ -270,13 +298,20 @@ BACKUP_LOB_SRCS=("${BACKUP}/backup_lob_map.cpp")
 BACKUP_LOG_SRCS=("${BACKUP}/backup_log_tail.cpp" "${BACKUP}/backup_fuzzy.cpp")
 BACKUP_OBJS=""
 if want backup_mtf || want backup_container || want backup_xpress || want backup_page || want backup_catalog ||
-	want backup_record || want backup_lob || want backup_cd || want backup_log || want backup_page_ci; then
+	want backup_record || want backup_lob || want backup_cd || want backup_log || want backup_page_ci ||
+	want backup_pvk || want backup_keyblob || want backup_enc_chain; then
+	ensure_openssl
 	BACKUP_OBJS="$(compile_objs backup "${BACKUP_SRCS[@]}")"
 fi
 want backup_mtf && build_harness fuzz_backup_mtf fuzz_backup_mtf.cc ${BACKUP_OBJS}
 want backup_container && build_harness fuzz_backup_container fuzz_backup_container.cc ${BACKUP_OBJS}
 want backup_xpress && build_harness fuzz_backup_xpress fuzz_backup_xpress.cc ${BACKUP_OBJS}
 want backup_page && build_harness fuzz_backup_page fuzz_backup_page.cc ${BACKUP_OBJS}
+# Spec 087 (task 8): a PVK private key, a PLAINTEXTKEYBLOB, an encrypted container (backup encryption, a TDE
+# database's compressed backup).
+want backup_pvk && build_harness fuzz_backup_pvk fuzz_backup_pvk.cc ${BACKUP_OBJS}
+want backup_keyblob && build_harness fuzz_backup_keyblob fuzz_backup_keyblob.cc ${BACKUP_OBJS}
+want backup_enc_chain && build_harness fuzz_backup_enc_chain fuzz_backup_enc_chain.cc ${BACKUP_OBJS}
 if want backup_catalog || want backup_record || want backup_lob || want backup_cd || want backup_log || want backup_page_ci; then
 	BACKUP_CATALOG_OBJS="$(compile_objs backup_catalog "${BACKUP_CATALOG_SRCS[@]}")"
 fi
@@ -416,7 +451,7 @@ fi
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
 for t in browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode \
 	backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci \
-	variant_envelope vector hierarchyid ssclrt; do
+	backup_pvk backup_keyblob backup_enc_chain variant_envelope vector hierarchyid ssclrt; do
 	# Only the corpora of the targets this build makes: OSS-Fuzz pairs a zip with its binary.
 	want "${t}" || continue
 	if [[ -d "${HERE}/corpus/${t}" ]]; then

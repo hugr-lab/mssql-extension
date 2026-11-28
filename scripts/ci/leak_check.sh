@@ -62,7 +62,7 @@ cd "$HERE"
 # T3's vector, T4's hierarchyid and T5's MS-SSCLRT kernel.
 # Deliberately NOT row_stager or bcp_encode: both link libduckdb and need the suppression file that
 # does not exist yet.
-TARGETS=(browser_response tds_tokens utf16 envchange_txn login_response backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci variant_envelope vector hierarchyid ssclrt)
+TARGETS=(browser_response tds_tokens utf16 envchange_txn login_response backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_log backup_page_ci backup_pvk backup_keyblob backup_enc_chain variant_envelope vector hierarchyid ssclrt)
 
 if [ "$(uname -s)" != "Linux" ]; then
 	echo "SKIP: LeakSanitizer is not supported on $(uname -s) — Apple's toolchain ships no LSan."

@@ -71,12 +71,13 @@ jobs:
         uses: actions/checkout@v7
 
       # clang for -fsanitize=address; curl/unzip for the pinned simdutf
-      # single-header amalgamation fuzz/build.sh fetches. No AFL++ and no
+      # single-header amalgamation fuzz/build.sh fetches; libssl-dev for the
+      # backup reader's decryption (spec 087). No AFL++ and no
       # libFuzzer runtime: REPLAY=1 links fuzz/replay_main.cc for main().
       - name: Install clang + archive tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang curl unzip zip
+          sudo apt-get install -y --no-install-recommends clang curl unzip zip libssl-dev pkg-config
 
       # Prove the oracle before trusting a green result. A lane that reports no
       # leaks because detection is silently off is worse than no lane -- the

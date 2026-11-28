@@ -1,5 +1,7 @@
 #include "backup/backup_opened.hpp"
 
+#include "backup/backup_key_secret.hpp"
+
 #include "backup/backup_boot.hpp"
 #include "backup/backup_function_common.hpp"
 #include "backup/backup_xpress.hpp"
@@ -23,6 +25,13 @@
 namespace duckdb {
 namespace mssql {
 namespace backup {
+
+// Spec 087 (TDE): what a page TDE leaves in clear is told by its header -- version 1, then the type: the
+// boot page (13) and the file header (15) are not encrypted, nor the 96-byte header of any page.
+static constexpr uint8_t TDE_PAGE_VERSION = 1;
+static constexpr uint8_t TDE_PAGE_BOOT = 13;
+static constexpr uint8_t TDE_PAGE_FILE_HEADER = 15;
+static constexpr size_t TDE_PAGE_HEADER = 96;
 
 static constexpr uint16_t MEDIA_ATTRIBUTE_CHECKSUM = 0x100;
 
@@ -53,7 +62,7 @@ static uint64_t NextBackupId() {
 	return next.fetch_add(1);
 }
 
-static std::unique_ptr<OpenedFamily> OpenFamily(const OpenedHeaders &headers, size_t file) {
+static std::unique_ptr<OpenedFamily> OpenFamily(ClientContext &context, const OpenedHeaders &headers, size_t file) {
 	std::unique_ptr<OpenedFamily> f(new OpenedFamily());
 	f->file = file;
 	const auto &key = headers.files[file];
@@ -63,17 +72,25 @@ static std::unique_ptr<OpenedFamily> OpenFamily(const OpenedHeaders &headers, si
 		f->container = true;
 		f->container_header = ReadContainerHeader(access);
 		if (f->container_header.encrypted) {
-			throw FormatError("backup file \"" + access.Name() +
-							  "\" is an encrypted backup: reading one is spec 087's, not supported yet");
+			// Spec 087 D3: the secret whose scope and thumbprint select it; its private key unwraps the
+			// backup's key (a named error when none does).
+			f->keys.backup = SelectContentKey(context, key.path, f->container_header.encryptor_thumbprint,
+											  f->container_header.wrapped_key, "a backup");
+		}
+		if (f->container_header.tde) {
+			// E4c: a TDE database's compressed backup -- its blocks under the DEK the header keeps wrapped.
+			f->keys.dek = SelectContentKey(context, key.path, f->container_header.tde_thumbprint,
+										   f->container_header.wrapped_dek, "a backup of a TDE database, its DEK");
 		}
 		// DQ-41: the chain located from the file's tail, walked only where it is read; a tail of
 		// another layout is walked whole.
-		if (!OpenChainFromTail(access, f->chain, f->seek)) {
-			f->chain = WalkChain(access);
+		const uint64_t start = ChainStart(f->container_header);
+		if (!OpenChainFromTail(access, f->chain, f->seek, start)) {
+			f->chain = WalkChain(access, start);
 			f->seek = ReadSeekIndex(access, f->chain);
 		}
 		f->decoder = DecoderFor(f->container_header.algorithm);
-		f->data_set.reset(new ContainerStream(access, f->chain, f->decoder));
+		f->data_set.reset(new ContainerStream(access, f->chain, f->decoder, f->keys));
 		f->layout = WalkMtfDataSet(*f->data_set);
 	} else {
 		f->layout = WalkMtf(access);
@@ -87,7 +104,7 @@ static std::unique_ptr<OpenedFamily> OpenFamily(const OpenedHeaders &headers, si
 	f->set = ReadBackupSet(stream, f->layout);
 	if (f->container) {
 		// The container keeps its media label in its header, outside its data set.
-		auto tape = ReadContainerTape(access, f->decoder);
+		auto tape = ReadContainerTape(access, f->decoder, f->keys, f->container_header.tde);
 		MemoryAccess label(access.Name() + " (media label)", tape.data(), tape.size());
 		ReadMediaFields(label, WalkMtfTape(label), f->set);
 	}
@@ -129,7 +146,7 @@ static void FillHeaders(OpenedHeaders *opened, const StatementFiles &files) {
 	BindFiles bound(binding);
 	for (size_t i = 0; i < opened->files.size(); i++) {
 		try {
-			opened->families.push_back(OpenFamily(*opened, i));
+			opened->families.push_back(OpenFamily(files.Context(), *opened, i));
 		} catch (FormatError &e) {
 			// Name the file where the parser below could not (a ByteReader knows offsets only).
 			const std::string &path = opened->Path(i);
@@ -224,6 +241,7 @@ BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::s
 	constexpr size_t BATCH = 64;
 	const auto expanded = ByteSource::Expand(context, vector<std::string>(paths.begin(), paths.end()));
 	std::vector<HistoryFamily> families;
+	std::vector<HistorySkipped> keyless;
 	for (size_t from = 0; from < expanded.size(); from += BATCH) {
 		const vector<std::string> batch(expanded.begin() + from,
 										expanded.begin() + std::min(expanded.size(), from + BATCH));
@@ -252,8 +270,13 @@ BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::s
 				family.path = opened.Path(i);
 				family.size = opened.files[i].size;
 				family.version_tag = opened.files[i].version;
-				family.set = OpenFamily(opened, i)->set;
+				family.set = OpenFamily(context, opened, i)->set;
 				families.push_back(std::move(family));
+			} catch (MissingBackupKey &e) {
+				// An encrypted file no secret holds the key of is left out, as a log is, and named (review of #670,
+				// owner 2026-11-28: read the utmost -- the rest of the history is read). A refresh that finds the
+				// secret created since takes it: a file is read again unless it was read whole before.
+				keyless.push_back({opened.Path(i), e.what()});
 			} catch (FormatError &e) {
 				const std::string &path = opened.Path(i);
 				if (std::string(e.what()).find(path) != std::string::npos) {
@@ -263,7 +286,77 @@ BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::s
 			}
 		}
 	}
-	return BuildHistory(std::move(families));
+	BackupHistory history = BuildHistory(std::move(families));
+	history.skipped.insert(history.skipped.end(), keyless.begin(), keyless.end());
+	return history;
+}
+
+bool OpenedHeaders::Tde(Thumbprint *thumbprint) const {
+	for (const auto &f : families) {
+		if (f->container && f->container_header.tde) {
+			if (thumbprint) {
+				*thumbprint = f->container_header.tde_thumbprint;
+			}
+			return true;
+		}
+	}
+	for (const auto &file : Set().files) {
+		if (file.tde) {
+			if (thumbprint) {
+				*thumbprint = file.tde_thumbprint;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+std::string OpenedHeaders::TdeLogRefusal() const {
+	Thumbprint certificate;
+	if (!Tde(&certificate)) {
+		return std::string();
+	}
+	// E4c: the log of every TDE fixture is ciphertext in its backup, the compressed form's too (its stream
+	// decrypted under the DEK, the log blocks still fail their checks); how it is encrypted is E10's.
+	return "backup file \"" + Path(families.front()->file) +
+		   "\": its log is a TDE database's (the DEK wrapped by the certificate " + ThumbprintHex(certificate) +
+		   "), encrypted, and not decrypted yet (spec 087 E10)";
+}
+
+std::vector<ClearFileHeader> ReadClearHeaders(ClientContext &context, const std::vector<std::string> &paths) {
+	OpenedHeaders opened;
+	opened.own_files.reset(
+		new StatementFiles(context, ByteSource::Open(context, vector<std::string>(paths.begin(), paths.end()))));
+	opened.own_binding.reset(new FileBinding());
+	const auto &source = opened.own_files->Source();
+	opened.id = NextBackupId();
+	for (size_t i = 0; i < source.FileCount(); i++) {
+		BackupFileKey key;
+		key.path = source.Path(i);
+		key.size = source.FileSize(i);
+		key.version = source.VersionTag(i);
+		opened.files.push_back(std::move(key));
+	}
+	*opened.own_binding = IdentityBinding(opened, *opened.own_files);
+	std::vector<ClearFileHeader> out;
+	for (size_t i = 0; i < opened.files.size(); i++) {
+		ClearFileHeader h;
+		h.path = opened.Path(i);
+		BoundFile access(opened.id, i, h.path, opened.files[i].size, opened.own_binding.get());
+		try {
+			if (IsContainer(access)) {
+				h.container = true;
+				h.header = ReadContainerHeader(access);
+			}
+		} catch (FormatError &e) {
+			if (std::string(e.what()).find(h.path) != std::string::npos) {
+				throw;
+			}
+			throw FormatError("backup file \"" + h.path + "\": " + e.what());
+		}
+		out.push_back(std::move(h));
+	}
+	return out;
 }
 
 std::unique_ptr<OpenedHeaders> ReadBackupHeaders(const StatementFiles &files) {
@@ -298,6 +391,39 @@ FileBinding BindingFor(const OpenedHeaders &headers, const StatementFiles &files
 std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &, const OpenedHeaders &headers,
 											 const OpenPagesOptions &options) {
 	return OpenBackupPages(headers, options);
+}
+
+//! Spec 087 (TDE): a database under TDE is told by its boot page (9, 1), which TDE leaves in clear: at 912
+//! (2025, E4b) u32 20, the certificate's thumbprint, u32 the wrapped DEK's length (the modulus: 256 to 512),
+//! the wrapped DEK. Its DEK, from `options.tde_key`, then decrypts the index's own pages as they are read --
+//! before the allocation map reads its GAM / PFS / IAM pages, encrypted too (E4§3).
+static void ApplyTde(PageIndex &index, const OpenPagesOptions &options, const std::string &path) {
+	static constexpr size_t FCB_FILE_DEK = 912;
+	if (index.Encrypted()) {
+		return;	 // its DEK from the SFIN, before the index was built
+	}
+	std::vector<uint8_t> boot;
+	if (!index.ReadPage(1, 9, boot, true) || boot.size() != PAGE_SIZE || boot[0] != TDE_PAGE_VERSION ||
+		boot[1] != TDE_PAGE_BOOT) {
+		return;
+	}
+	ByteReader r(boot.data(), boot.size(), "the boot page's FCBFileDEK");
+	const uint32_t wrapped = r.U32(FCB_FILE_DEK + 24);
+	if (r.U32(FCB_FILE_DEK) != 20 || wrapped < 256 || wrapped > 512 || FCB_FILE_DEK + 28 + wrapped > PAGE_SIZE) {
+		return;
+	}
+	Thumbprint thumbprint{};
+	std::memcpy(thumbprint.data(), boot.data() + FCB_FILE_DEK + 4, 20);
+	if (std::all_of(thumbprint.begin(), thumbprint.end(), [](uint8_t b) { return b == 0; })) {
+		return;
+	}
+	if (!options.tde_key) {
+		throw FormatError("backup file \"" + path + "\" is of a TDE database (its DEK wrapped by the certificate " +
+						  ThumbprintHex(thumbprint) +
+						  "): its pages need the certificate's key, a mssql_backup_key secret");
+	}
+	const std::vector<uint8_t> blob(boot.begin() + FCB_FILE_DEK + 28, boot.begin() + FCB_FILE_DEK + 28 + wrapped);
+	index.SetPageKey(options.tde_key(thumbprint, blob));
 }
 
 std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const OpenPagesOptions &options) {
@@ -336,6 +462,7 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 			c.seek = &f.seek;
 			c.chain_end = f.chain.end;
 			c.decoder = f.decoder;
+			c.keys = f.keys;
 			s.container = &c;
 		}
 		pages->streams.push_back(s);
@@ -362,12 +489,31 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 	// By id, as a pass orders its extents.
 	index_options.data_files = data_files;
 	std::sort(index_options.data_files.begin(), index_options.data_files.end());
+	// Spec 087: an uncompressed TDE backup -- a data file's SFIN names its DEK (D10), and no family is a
+	// container (the server decrypts pages before it compresses them, E4c) -- is indexed with its DEK from the
+	// start, and never from its encrypted allocation bitmaps (review of 087).
+	const bool any_container =
+		std::any_of(pages->streams.begin(), pages->streams.end(), [](const FamilyStream &s) { return s.container; });
+	for (const auto &file : set.files) {
+		if (file.type == 'D' && file.tde && !any_container) {
+			index_options.encrypted_pages = true;
+			if (!options.tde_key) {
+				throw FormatError("backup file \"" + first +
+								  "\" is of a TDE database (its DEK wrapped by the certificate " +
+								  ThumbprintHex(file.tde_thumbprint) +
+								  "): its pages need the certificate's key, a mssql_backup_key secret");
+			}
+			index_options.page_key = options.tde_key(file.tde_thumbprint, file.wrapped_dek);
+			break;
+		}
+	}
 	try {
 		pages->index = BuildPageIndex(pages->streams, index_options);
 		// D12: a page the differential does not carry is its full's; liveness is then the overlaid
 		// allocation pages' (the map below reads them through the index), never the full's alone -- a
 		// naive overlay doubled every row after a shrink (E2 apply_diff).
 		pages->index.SetBase(options.base);
+		ApplyTde(pages->index, options, first);
 		// A file marked removed (SFIN flag 0x20, a hint: DatabaseFile::marked_removed) is one only when
 		// the backup carries no page 0 of it -- asked as an expected page, so a searched pass is mapped
 		// rather than trusted --; else it is a live file, read as any other (its id reused by a later ADD
@@ -429,6 +575,13 @@ bool OpenedBackup::EnsureTables(ClientContext &context) {
 			base_->EnsureTables(context);
 			options.base = &base_->Pages().index;
 		}
+		const std::string path = headers_->Path(headers_->families.front()->file);
+		options.tde_key = [this, &context, path](const Thumbprint &thumbprint, const std::vector<uint8_t> &wrapped) {
+			auto key = SelectContentKey(context, path, thumbprint, wrapped, "a backup of a TDE database, its DEK");
+			tde_dek_thumbprint_ = thumbprint;
+			tde_dek_held_.store(true, std::memory_order_release);
+			return key;
+		};
 		pages = OpenBackupPages(*headers_, options);
 		try {
 			Page boot_page;
@@ -470,6 +623,12 @@ const FuzzySummary &OpenedBackup::Fuzzy(ClientContext &context, bool *built) con
 		return *fuzzy_;
 	}
 	if (!fuzzy_error_.empty()) {
+		throw FormatError(fuzzy_error_);
+	}
+	const std::string tde = headers_->TdeLogRefusal();
+	if (!tde.empty()) {
+		// Spec 087 D9: not parsed, so its fuzzy status is unknown -- said by name, kept like any tail's error.
+		fuzzy_error_ = tde + ": its fuzzy status is unknown";
 		throw FormatError(fuzzy_error_);
 	}
 	// Made before the build is marked: nothing may throw between the mark and the try that clears it.
@@ -745,6 +904,8 @@ static OpenedForStatement OpenHeld(ClientContext &context, const shared_ptr<Open
 				key.path, name, name);
 		}
 	}
+	// D4: a DROP SECRET takes effect at the next statement on an attached backup too.
+	backup->RequireKeysHeld(context);
 	opened.backup = backup;
 	// Re-measured and put again by the statement (OpenBackupCatalog) only while the cache is on.
 	opened.cache_key = BackupCacheOn(context) ? cache_key : std::string();
@@ -942,6 +1103,24 @@ OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::str
 	return OpenBackupFiles(context, paths, diff);
 }
 
+void OpenedBackup::RequireKeysHeld(ClientContext &context) const {
+	const OpenedHeaders &headers = *headers_;
+	for (const auto &f : headers.families) {
+		if (f->keys.backup) {
+			RequireBackupKeySecret(context, headers.Path(f->file), f->container_header.encryptor_thumbprint,
+								   "a backup");
+		}
+		if (f->keys.dek) {
+			RequireBackupKeySecret(context, headers.Path(f->file), f->container_header.tde_thumbprint,
+								   "a backup of a TDE database, its DEK");
+		}
+	}
+	if (tde_dek_held_.load(std::memory_order_acquire)) {
+		RequireBackupKeySecret(context, headers.Path(headers.families.front()->file), tde_dek_thumbprint_,
+							   "a backup of a TDE database, its DEK");
+	}
+}
+
 //! The differential on `diff` over `full` (opened for the statement): its own files, its entry in the
 //! ObjectCache keyed by both backups' files (the full's stages its base), its chain checked.
 static OpenedForStatement OpenOverlay(ClientContext &context, OpenedForStatement full,
@@ -954,6 +1133,9 @@ static OpenedForStatement OpenOverlay(ClientContext &context, OpenedForStatement
 	if (!full.cache_key.empty() && !diff_key.empty()) {
 		opened.cache_key = "mssql_backup_overlay:" + full.cache_key + '\x1d' + diff_key;
 		opened.backup = cache.Get<OpenedBackup>(opened.cache_key);
+		if (opened.backup) {
+			opened.backup->RequireKeysHeld(context);
+		}
 	}
 	if (opened.backup && opened.backup->Base() != full.backup) {
 		// The overlay's entry outlived the full's (each is evicted on its own) or was put by another
@@ -997,6 +1179,9 @@ static OpenedForStatement OpenBackupFiles(ClientContext &context, const std::vec
 	if (BackupCacheOn(context)) {
 		opened.cache_key = CacheKey(*opened.files);
 		opened.backup = cache.Get<OpenedBackup>(opened.cache_key);
+		if (opened.backup) {
+			opened.backup->RequireKeysHeld(context);
+		}
 	}
 	if (!opened.backup) {
 		opened.backup = make_shared_ptr<OpenedBackup>(ReadBackupHeaders(*opened.files));

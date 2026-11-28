@@ -3,6 +3,7 @@
 #include "backup/backup_bytes.hpp"
 
 #include <cstdio>
+#include <cstring>
 
 namespace duckdb {
 namespace mssql {
@@ -20,6 +21,8 @@ static constexpr size_t SCIN_COMPRESSED_SIZE_AT = 344;
 static constexpr size_t SFIN_MIN = 202;
 static constexpr uint32_t SFIN_REMOVED = 0x20;
 static constexpr uint32_t SFIN_PRESENT = 0x4;
+// Spec 087 D10: a TDE data file's DEK in its SFIN (DatabaseFile::tde).
+static constexpr size_t SFIN_TDE_AT = 452;
 // A compressed container's soft filemark (spec 085 § Rules, MSSQLBAK).
 static constexpr uint64_t CONTAINER_SOFT_FILEMARK = 4096;
 
@@ -315,6 +318,16 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &block, BackupS
 			f.max_size_bytes = record.U64(86);
 			f.create_lsn = ReadLsn(record, 138);
 			f.unique_id = ReadGuid(record, 186);
+			// The DEK at +452 was measured on 2025 only (D10): a record that does not hold one in that form is
+			// read as naming none (review of 087), never refused -- the boot page names the DEK too (ApplyTde).
+			const uint32_t wrapped = length >= SFIN_TDE_AT + 28 ? record.U32(SFIN_TDE_AT + 24) : 0;
+			if (length >= SFIN_TDE_AT + 28 && record.U32(SFIN_TDE_AT) == 20 && wrapped >= 128 && wrapped <= 1024 &&
+				SFIN_TDE_AT + 28 + wrapped <= length) {
+				f.tde = true;
+				std::memcpy(f.tde_thumbprint.data(), record.Bytes(SFIN_TDE_AT + 4, 20), 20);
+				const uint8_t *blob = record.Bytes(SFIN_TDE_AT + 28, wrapped);
+				f.wrapped_dek.assign(blob, blob + wrapped);
+			}
 			set.files.push_back(std::move(f));
 		}
 		at += length;

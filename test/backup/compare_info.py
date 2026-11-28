@@ -19,6 +19,11 @@ has nothing to compare it with); a column in none of them fails the run by name.
 (the version the lane asked for) asserts the backups' software_version, server.txt and the sample
 sets a server of that version makes (samples_sets). Exits 1 on any difference, or when fewer than
 --min-fields fields were compared (a run that compares nothing is not a pass).
+
+--keys (spec 087): the directory holds encrypted or TDE backups and their certificates (<name>.cer beside
+<name>.pvk) and the PVK password (pvk_password, as generate.sh's encrypted / encryption_samples fixtures write
+them): an mssql_backup_key secret is created for each certificate, scoped to the directory, through DuckDB's
+stdin (the password on no command line, masked in anything printed), so every field is read decrypted.
 """
 import argparse
 import json
@@ -63,8 +68,11 @@ def sql_string(s):
 class DuckDB:
     def __init__(self, binary, base):
         self.binary = binary
-        self.preamble = ""
+        # The shell prints a statement's WARNINGs on stdout, inside its JSON (spec 087 D9: a TDE backup's
+        # D11 columns say their tail is not read): only errors are logged.
+        self.preamble = "SET logging_level = 'error';\n"
         self.secrets = []
+        self.base = base
         if base.startswith("s3://"):
             try:
                 key = os.environ["MSSQL_R2_ACCESS_KEY"]
@@ -77,13 +85,36 @@ class DuckDB:
             endpoint = url.split("://", 1)[-1].rstrip("/")
             # Its result row goes nowhere, so stdout holds only the statement's JSON. One option a
             # line: DuckDB's parser error echoes the line it stopped on, which is then not the key's.
-            self.preamble = (".output /dev/null\n"
+            self.preamble += (".output /dev/null\n"
                              "CREATE SECRET backup_oracle (TYPE s3,\n"
                              f"KEY_ID {sql_string(key)},\n"
                              f"SECRET {sql_string(secret)},\n"
                              f"ENDPOINT {sql_string(endpoint)},\n"
                              "REGION 'auto', URL_STYLE 'path');\n"
                              ".output\n")
+
+    def add_backup_keys(self, base):
+        """Spec 087: one mssql_backup_key secret per <name>.cer with a <name>.pvk under base, scoped to it."""
+        rows = self.query(f"SELECT content FROM read_text({sql_string(base + '/pvk_password')})")
+        if not rows:
+            sys.exit(f"compare_info: --keys: no pvk_password in {base}")
+        password = rows[0]["content"].strip()
+        self.secrets += [v for v in {password, password.replace("'", "''")} if v]
+        files = {os.path.basename(r["file"]) for r in self.query(f"SELECT file FROM glob({sql_string(base + '/*')})")}
+        lines = [".output /dev/null"]
+        for n, cer in enumerate(sorted(f for f in files if f.endswith(".cer"))):
+            pvk = cer[:-4] + ".pvk"
+            if pvk not in files:
+                continue
+            lines.append(f"CREATE SECRET backup_key_{n} (TYPE mssql_backup_key,")
+            lines.append(f"CERTIFICATE {sql_string(base + '/' + cer)},")
+            lines.append(f"PRIVATE_KEY {sql_string(base + '/' + pvk)},")
+            lines.append(f"PASSWORD {sql_string(password)},")
+            lines.append(f"SCOPE {sql_string(base + '/')});")
+        lines.append(".output")
+        if len(lines) == 2:
+            sys.exit(f"compare_info: --keys: no <name>.cer with its <name>.pvk in {base}")
+        self.preamble += "\n".join(lines) + "\n"
 
     def mask(self, text):
         """text with every credential value replaced by ***."""
@@ -176,6 +207,23 @@ def upper(v):
     return None if v is None else v.upper()
 
 
+def blob_hex(v):
+    """A BLOB as DuckDB's VARCHAR cast writes it (printable bytes as themselves, the rest as \\xHH) in RESTORE's
+    form: 0x and upper-case hex."""
+    if v is None:
+        return None
+    out = bytearray()
+    i = 0
+    while i < len(v):
+        if v.startswith("\\x", i) and i + 4 <= len(v):
+            out.append(int(v[i + 2:i + 4], 16))
+            i += 4
+        else:
+            out += v[i].encode("latin-1")
+            i += 1
+    return "0x" + out.hex().upper()
+
+
 def compare_set(c, name, files, info, file_rows, header, label, filelist):
     where = name
     h = header[0]
@@ -212,13 +260,21 @@ def compare_set(c, name, files, info, file_rows, header, label, filelist):
                           ("backup_start_date", "BackupStartDate"), ("backup_finish_date", "BackupFinishDate")]:
         expect(field, date(h[theirs]))
     expect("compressed", boolean(h["Compressed"]))
-    # CompressionAlgorithm is a column from 2022; before it, a compressed backup is MS_XPRESS.
+    # CompressionAlgorithm is a column from 2022; before it, a compressed backup is MS_XPRESS. An encrypted
+    # backup is in a container whatever its compression, and before 2022 HEADERONLY says Compressed 1 for it
+    # with no algorithm to tell stored from MS_XPRESS (2019, review of #670): not compared there.
     if "CompressionAlgorithm" in h:
         expect("compression_algorithm", h["CompressionAlgorithm"])
-    else:
+    elif h.get("KeyAlgorithm") is None:
         expect("compression_algorithm", "MS_XPRESS" if h["Compressed"] == "1" else None)
     expect("encrypted", "false" if h.get("KeyAlgorithm") is None else "true")
-    expect("encryptor_thumbprint", h.get("EncryptorThumbprint"))
+    c.check(where, "encryptor_thumbprint", blob_hex(ours("encryptor_thumbprint")), h.get("EncryptorThumbprint"))
+    # Spec 087: HEADERONLY's KeyAlgorithm (aes_128 ...: the unwrapped key's, with --keys); a TDE database's
+    # backup by FILELISTONLY's TDEThumbprint of its data files (the DEK's certificate).
+    expect("key_algorithm", h.get("KeyAlgorithm"))
+    tde_thumbprints = [r.get("TDEThumbprint") for r in filelist if r.get("Type") == "D" and r.get("TDEThumbprint")]
+    expect("tde", "true" if tde_thumbprints else "false")
+    c.check(where, "tde_thumbprint", blob_hex(ours("tde_thumbprint")), tde_thumbprints[0] if tde_thumbprints else None)
     expect("has_backup_checksums", boolean(h["HasBackupChecksums"]))
     # sys.databases spells it BULK_LOGGED; HEADERONLY BULK-LOGGED.
     expect("recovery_model", None if h["RecoveryModel"] is None else h["RecoveryModel"].replace("-", "_"))
@@ -254,6 +310,7 @@ def compare_set(c, name, files, info, file_rows, header, label, filelist):
         c.check(fw, "type", of_file("type"), {"D": "data", "L": "log"}.get(row["Type"], row["Type"]))
         c.check(fw, "unique_id", upper(of_file("unique_id")), row["UniqueId"])
         c.check(fw, "is_present", of_file("is_present"), {"1": "true", "0": "false"}.get(row["IsPresent"], row["IsPresent"]))
+        c.check(fw, "tde_thumbprint", blob_hex(of_file("tde_thumbprint")), row.get("TDEThumbprint"))
         for field in FILE_UNLOCATED:
             c.check(fw, field, of_file(field), None)
 
@@ -284,6 +341,9 @@ def main():
     parser.add_argument("--min-fields", type=int, default=150)
     parser.add_argument("--require-done", action="store_true",
                         help="the lane's layout: fail, naming DIR, when DIR/DONE is missing")
+    parser.add_argument("--keys", action="store_true",
+                        help="spec 087: create an mssql_backup_key secret for each <name>.cer / .pvk in DIR, "
+                             "with DIR/pvk_password")
     parser.add_argument("--expect-major", type=int, default=None,
                         help="the server version the backups must come from (14 = 2017, 15 = 2019, "
                              "16 = 2022, 17 = 2025): asserted on software_version, server.txt and the "
@@ -302,6 +362,8 @@ def main():
         if not run_dir or "/" in run_dir or run_dir.startswith("."):
             sys.exit(f"compare_info: {base}/DONE names {run_dir!r}, not a subdirectory")
         base = f"{base}/{run_dir}"
+    if args.keys:
+        db.add_backup_keys(base)
     texts = {os.path.basename(r["filename"]): r["content"]
              for r in db.query(f"SELECT filename, content FROM read_text({sql_string(base + '/*.txt')})")}
     if "sets.txt" not in texts:

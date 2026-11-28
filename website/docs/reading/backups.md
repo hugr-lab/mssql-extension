@@ -32,6 +32,9 @@ FROM mssql_backup_info('/backups/sales_full.bak');
 - **Compressed backups**, `MS_XPRESS` (the default `WITH COMPRESSION`) and `ZSTD` (SQL Server 2025).
 - **Striped backups** (`BACKUP … TO DISK = 'a.bak', DISK = 'b.bak'`): pass every file of the set,
   as a list or a glob, in any order.
+- **Encrypted backups** (`BACKUP … WITH ENCRYPTION`, AES 128 / 192 / 256 and `TRIPLE_DES_3KEY`) and
+  **backups of a TDE database**, compressed or not, with the certificate's key given as a secret: see
+  [Encrypted and TDE backups](#encrypted-and-tde-backups).
 
 ```sql
 -- A backup striped over two files
@@ -61,11 +64,13 @@ Each of these is refused by name, before any value is returned:
   family: `… is one family of a media set of 2: the families with FamilySequenceNumber 2 are
   missing (give every file of the set)`.
 - **Files of different backups**, or a compressed file mixed with an uncompressed one.
-- **An encrypted backup** (`WITH ENCRYPTION`). Decryption is planned for a later release.
+- **An encrypted or TDE backup whose key no secret holds**, for reading (see
+  [Encrypted and TDE backups](#encrypted-and-tde-backups)); `mssql_backup_info` describes it from what it
+  says in clear.
 - **A file holding more than one backup set** (appended with `NOINIT`), even with `position = 1`;
   and any `position` other than `1`.
-- **A compressed format the reader does not know** (`QAT_DEFLATE`, or an encrypted `ZSTD`
-  backup): refused naming the container's flag word.
+- **A compressed format the reader does not know** (`QAT_DEFLATE`, an encrypted `ZSTD` backup of a TDE
+  database): refused naming the container's flag word.
 - **A database file of a type other than data or log** in the file list (FILESTREAM, full-text):
   refused naming the file id.
 - **A file, filegroup or partial backup**, and its differential (`BACKUP DATABASE … FILEGROUP = …`,
@@ -96,14 +101,83 @@ Each of these is refused by name, before any value is returned:
 | `database_creation_date`, `backup_start_date`, `backup_finish_date` | `TIMESTAMP` | the server's local time, as `RESTORE HEADERONLY` prints them |
 | `media_set_guid`, `family_count`, `family_sequence_number` | `UUID`, `INTEGER`, `INTEGER` | the media set; `family_sequence_number` only when one file is given |
 | `compressed`, `compression_algorithm` | `BOOLEAN`, `VARCHAR` | `MS_XPRESS` or `ZSTD`; NULL for an uncompressed backup |
-| `encrypted`, `encryptor_thumbprint` | `BOOLEAN`, `BLOB` | always false / NULL: an encrypted backup is refused |
+| `encrypted`, `encryptor_thumbprint` | `BOOLEAN`, `BLOB` | `BACKUP … WITH ENCRYPTION`, and the SHA-1 thumbprint of the certificate it was encrypted by (HEADERONLY's EncryptorThumbprint) |
+| `key_algorithm` | `VARCHAR` | the backup's key: `aes_128`, `aes_192`, `aes_256` or `triple_des_3key` (HEADERONLY's KeyAlgorithm); NULL without the key, which alone tells it |
+| `tde`, `tde_thumbprint` | `BOOLEAN`, `BLOB` | a backup of a TDE database, and the thumbprint of the certificate its database encryption key is wrapped by |
 | `has_backup_checksums` | `BOOLEAN` | `BACKUP … WITH CHECKSUM` |
 | `backup_size`, `compressed_size` | `BIGINT` | `BackupSize` / `CompressedBackupSize`; equal for an uncompressed backup; `compressed_size` NULL when the backup does not record it |
 | `page_count` | `BIGINT` | NULL for now |
 | `log_tail_bytes` | `BIGINT` | the bytes of log the backup carries |
 | `consistent`, `open_transactions`, `committed_after_checkpoint`, `rolled_back_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER`, `INTEGER` | from the backup's log tail (see [A backup taken under writes](#a-backup-taken-under-writes)): no transaction open at the backup's end and none committed or rolled back after its checkpoint; the transactions open, and those committed / rolled back with a row change after the checkpoint (a rolled-back one makes `consistent` false: whether a page copy holds what it undid is the tables' `fuzzy_status`). NULL for a log backup, and with a WARNING when the tail cannot be read whole |
 | `recovery_model` | `VARCHAR` | `FULL`, `BULK_LOGGED` or `SIMPLE` |
-| `files` | `LIST(STRUCT(…))` | the database's files: `logical_name`, `physical_name`, `type` (`data` / `log`), `file_id`, `filegroup_id`, `filegroup_name`, `size_bytes`, `max_size_bytes`, `create_lsn`, `unique_id`, `backup_size_bytes` (NULL for now), `is_present` (FILELISTONLY's IsPresent: the file is in this backup) |
+| `files` | `LIST(STRUCT(…))` | the database's files: `logical_name`, `physical_name`, `type` (`data` / `log`), `file_id`, `filegroup_id`, `filegroup_name`, `size_bytes`, `max_size_bytes`, `create_lsn`, `unique_id`, `backup_size_bytes` (NULL for now), `is_present` (FILELISTONLY's IsPresent: the file is in this backup), `tde_thumbprint` (FILELISTONLY's TDEThumbprint: a TDE database's data files) |
+
+## Encrypted and TDE backups
+
+An encrypted backup and a backup of a TDE database are read with the private key of the certificate that
+protects them, exported from the server once:
+
+```sql
+-- on SQL Server
+BACKUP CERTIFICATE backup_cert TO FILE = '/keys/backup_cert.cer'
+    WITH PRIVATE KEY (FILE = '/keys/backup_cert.pvk', ENCRYPTION BY PASSWORD = '…');
+```
+
+The key reaches the reader only through a DuckDB secret of the type `mssql_backup_key`:
+
+```sql
+CREATE SECRET backup_key (
+    TYPE mssql_backup_key,
+    CERTIFICATE '/keys/backup_cert.cer',
+    PRIVATE_KEY '/keys/backup_cert.pvk',  -- a PVK; or a PFX (.pfx, PKCS#12) or a PEM private key
+    PASSWORD '…',
+    SCOPE '/backups/'                       -- the backups it is for: a path or URL prefix (end it with /)
+);
+SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'dbo', 'orders');
+```
+
+- **Checked when it is created**: the certificate and the key are read (through DuckDB's file system:
+  `s3://` too; or given as base64 with `certificate_data` / `private_key_data`), the key opened with the
+  password and matched to the certificate. A wrong password or another certificate's key fails at
+  `CREATE SECRET`, before any backup is touched. A PFX carries its certificate, so `certificate` may be
+  left out.
+- **Chosen per file**: among the `mssql_backup_key` secrets whose scope matches the file's path, those of
+  the longest scope; among them, the one whose certificate is the file's (by its thumbprint). A file none
+  of them holds the key of is refused by name — the thumbprint it needs, the secrets that match its path,
+  and the form of the secret that would read it — never decrypted with a secret of another scope.
+- **On every call**: a backup opened before is kept decrypted in DuckDB's cache, and an attached one by its
+  catalog, but each statement asks again that a secret of its scope holds the certificate's key, so a
+  `DROP SECRET` takes effect at the next statement.
+- **A scope is a prefix** of the path as written (`'/backups/'`, not `'/backups'`, which would also match
+  `/backups_old/`); a relative path and an absolute one are different prefixes.
+- The password and the key are redacted in `duckdb_secrets()`; the thumbprint is shown. A `PERSISTENT`
+  secret keeps them on disk, unencrypted, as DuckDB stores every persistent secret.
+
+Every form measured is read: `WITH ENCRYPTION` under any algorithm, uncompressed or compressed (`MS_XPRESS`,
+`ZSTD`); a TDE database's backup uncompressed (each page decrypted with its database encryption key) or
+compressed; a TDE database's backup `WITH ENCRYPTION` too, under `MS_XPRESS` (two keys: one secret for each
+certificate; the same under `ZSTD` has not been seen and is refused by name); a database encryption key
+rotated to another certificate (the new certificate's secret reads it). The backup's key is unwrapped with
+RSA-OAEP / SHA-256 (`EncryptorType` `CERTIFICATE_OAEP_256`, SQL Server 2025) or PKCS#1 v1.5 (`CERTIFICATE`,
+2019 and 2022, a TDE database's key too), the latter only under OpenSSL's implicit rejection, so that a crafted
+backup learns nothing from the error. Measured on SQL Server 2019, 2022 and 2025; 2017 is not measured. A TDE
+page is checked against its checksum once decrypted: a page that does not verify (under another key, or damaged)
+is not read, with a WARNING, and the table's other pages are.
+
+**Without the key**, `mssql_backup_info` still answers, with what the file says in clear: for an encrypted
+or a compressed TDE backup, `compressed`, `compression_algorithm`, `encrypted`, `encryptor_thumbprint`,
+`tde` and `tde_thumbprint`, every other column NULL, and a WARNING in `duckdb_logs` naming the certificate
+whose key would read the rest. An uncompressed TDE backup's headers are not encrypted, so it is described
+whole. Reading its data — `mssql_backup_scan`, `mssql_backup_catalog`, the listings, `ATTACH` — needs the
+key.
+
+**A TDE database's log** is encrypted in its backup, and not decrypted yet: such a backup's tables report
+`fuzzy_status = 'unknown'` (read with a WARNING; `fuzzy := 'error'` refuses them), `mssql_backup_info`'s
+`consistent` is NULL, and `mssql_backup_transactions` / `mssql_backup_transaction_records` refuse it by name.
+
+A PFX protected by RC2 / RC4 (an old Windows export) is refused at `CREATE SECRET`: export it again with AES
+(`openssl pkcs12 -export -keypbe AES-256-CBC -certpbe AES-256-CBC`). A backup encrypted by an asymmetric key
+held in an EKM provider has no exportable key, so no secret reads it.
 
 ## Tables and views
 
