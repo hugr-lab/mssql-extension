@@ -1,0 +1,4 @@
+CREATE TABLE geo (id INT, g GEOMETRY('OGC:CRS84'));
+INSERT INTO geo SELECT i, ST_SetCRS(('POINT(' || (i%100) || ' ' || (i//100) || ')')::GEOMETRY, 'OGC:CRS84') FROM range(1000) t(i);
+EXPLAIN SELECT id FROM geo WHERE g && 'POLYGON((0 0, 5 0, 5 5, 0 5, 0 0))'::GEOMETRY;
+EXPLAIN SELECT id FROM geo WHERE g && ST_SetCRS('POLYGON((0 0, 5 0, 5 5, 0 5, 0 0))'::GEOMETRY, 'OGC:CRS84');
