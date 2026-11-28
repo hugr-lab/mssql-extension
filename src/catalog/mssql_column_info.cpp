@@ -324,19 +324,19 @@ struct ColumnShape {
 	MSSQLDatetime2Read datetime2_read;
 };
 
-LogicalType DecimalType(const ColumnShape &shape) {
+LogicalType MapDecimal(const ColumnShape &shape) {
 	return LogicalType::DECIMAL(shape.precision, shape.scale);
 }
 
-LogicalType MoneyType(const ColumnShape &) {
+LogicalType MapMoney(const ColumnShape &) {
 	return LogicalType::DECIMAL(19, 4);
 }
 
-LogicalType SmallMoneyType(const ColumnShape &) {
+LogicalType MapSmallMoney(const ColumnShape &) {
 	return LogicalType::DECIMAL(10, 4);
 }
 
-LogicalType Datetime2Type(const ColumnShape &shape) {
+LogicalType MapDatetime2(const ColumnShape &shape) {
 	// Pick the narrowest DuckDB TIMESTAMP variant that can losslessly hold
 	// the column's wire precision (spec 045 — type round-trip transparency).
 	// scale 0       → TIMESTAMP_S  (seconds)
@@ -362,20 +362,20 @@ LogicalType Datetime2Type(const ColumnShape &shape) {
 // collation — `sp_describe_first_result_set` answers system_type_name `varchar(max)`, tds_type_id
 // 167; JSONSUPPORT (0x0D) is not requested, it would change the describe only — so the bytes are
 // already what the vector wants. A raw scan, typed by the describe, reads VARCHAR.
-LogicalType JsonType(const ColumnShape &) {
+LogicalType MapJson(const ColumnShape &) {
 	return LogicalType::JSON();
 }
 
 // vector(n) (SQL Server 2025, spec 093 D4): FLOAT[n], float16 elements widened exactly. sys.columns
 // gives the element type in scale (0 float32, 1 float16) and 8 + n x element size in max_length (V5).
-LogicalType VectorType(const ColumnShape &shape) {
+LogicalType MapVector(const ColumnShape &shape) {
 	const int element = shape.scale == 1 ? 2 : 4;
 	const int dimensions = shape.max_length > 8 ? (shape.max_length - 8) / element : 1;
 	return LogicalType::ARRAY(LogicalType::FLOAT, static_cast<idx_t>(dimensions));
 }
 
 // sql_variant (spec 093 T1, D3): read bare off the wire, each value a VARIANT of its base type.
-LogicalType VariantType(const ColumnShape &) {
+LogicalType MapVariant(const ColumnShape &) {
 	return LogicalType::VARIANT();
 }
 
@@ -384,11 +384,11 @@ LogicalType VariantType(const ColumnShape &) {
 // value carries (WGS 84, longitude first, built in: spec 093 § Why OGC:CRS84); geometry is a GEOMETRY
 // with no CRS (a column declares no SRID). The catalog's geometry_as may make either a BLOB
 // (MSSQLColumnInfo's constructor).
-LogicalType GeographyType(const ColumnShape &) {
+LogicalType MapGeography(const ColumnShape &) {
 	return LogicalType::GEOMETRY("OGC:CRS84");
 }
 
-LogicalType GeometryType(const ColumnShape &) {
+LogicalType MapGeometry(const ColumnShape &) {
 	return LogicalType::GEOMETRY();
 }
 
@@ -413,10 +413,10 @@ const TypeMapping TYPE_MAPPINGS[] = {
 	{"float", LogicalTypeId::DOUBLE, nullptr},
 
 	// Decimal/numeric types
-	{"decimal", LogicalTypeId::DECIMAL, DecimalType},
-	{"numeric", LogicalTypeId::DECIMAL, DecimalType},
-	{"money", LogicalTypeId::DECIMAL, MoneyType},
-	{"smallmoney", LogicalTypeId::DECIMAL, SmallMoneyType},
+	{"decimal", LogicalTypeId::DECIMAL, MapDecimal},
+	{"numeric", LogicalTypeId::DECIMAL, MapDecimal},
+	{"money", LogicalTypeId::DECIMAL, MapMoney},
+	{"smallmoney", LogicalTypeId::DECIMAL, MapSmallMoney},
 
 	// Character types
 	{"char", LogicalTypeId::VARCHAR, nullptr},
@@ -434,7 +434,7 @@ const TypeMapping TYPE_MAPPINGS[] = {
 	// always fits in DuckDB's µs TIMESTAMP.
 	{"datetime", LogicalTypeId::TIMESTAMP, nullptr},
 	{"smalldatetime", LogicalTypeId::TIMESTAMP, nullptr},
-	{"datetime2", LogicalTypeId::TIMESTAMP, Datetime2Type},
+	{"datetime2", LogicalTypeId::TIMESTAMP, MapDatetime2},
 	// DuckDB has no nanosecond-precision time-zone-aware type; collapse to
 	// µs TIMESTAMP_TZ regardless of source scale (lossless for ≤6, drops
 	// the trailing digit for scale 7).
@@ -459,14 +459,14 @@ const TypeMapping TYPE_MAPPINGS[] = {
 	{"timestamp", LogicalTypeId::BLOB, nullptr},
 	{"rowversion", LogicalTypeId::BLOB, nullptr},
 
-	{"json", LogicalTypeId::VARCHAR, JsonType},
-	{"vector", LogicalTypeId::ARRAY, VectorType},
+	{"json", LogicalTypeId::VARCHAR, MapJson},
+	{"vector", LogicalTypeId::ARRAY, MapVector},
 
 	// Special types
 	{"uniqueidentifier", LogicalTypeId::UUID, nullptr},
-	{"sql_variant", LogicalTypeId::VARIANT, VariantType},
-	{"geography", LogicalTypeId::GEOMETRY, GeographyType},
-	{"geometry", LogicalTypeId::GEOMETRY, GeometryType},
+	{"sql_variant", LogicalTypeId::VARIANT, MapVariant},
+	{"geography", LogicalTypeId::GEOMETRY, MapGeography},
+	{"geometry", LogicalTypeId::GEOMETRY, MapGeometry},
 };
 
 }  // namespace
@@ -520,12 +520,7 @@ bool MSSQLColumnInfo::OrdersLikeDuckDB() const {
 	static const char *const ORDERED_TYPES[] = {
 		"bit",	 "tinyint", "smallint", "int",	"bigint",	"decimal",	 "numeric",		  "money",		   "smallmoney",
 		"float", "real",	"date",		"time", "datetime", "datetime2", "smalldatetime", "datetimeoffset"};
-	for (auto type_name : ORDERED_TYPES) {
-		if (lower_type == type_name) {
-			return true;
-		}
-	}
-	return false;
+	return IsOneOf(lower_type, ORDERED_TYPES);
 }
 
 bool MSSQLColumnInfo::OrdersLikeDuckDBAsBytes() const {
