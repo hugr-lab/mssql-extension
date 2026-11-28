@@ -239,7 +239,7 @@ deduplicated list ordered by impact, with the blocking ones marked. This series'
 
 The consistency pass added DQ-05 (085 PR 3 carries the plain `_mssql_lob`, so a lake born before 089 has
 its LOB maps), DQ-06 (an unhealed stale page is a named error), DQ-07 (a columnstore table under load
-refuses the file), all accepted, and the shape questions of DQ-02. The owner's 2026-11-05 decision to
+refuses the file; superseded 2026-11-28: read the utmost, the importer judges), all accepted, and the shape questions of DQ-02. The owner's 2026-11-05 decision to
 follow DuckLake's rules for partitioning and file layout is recorded there as DQ-10 (decided).
 
 ## Not in this series

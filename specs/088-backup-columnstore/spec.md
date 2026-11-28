@@ -1,21 +1,29 @@
 # Spec 088: columnstore tables
 
-Status: **draft**, 2026-11-05. Not started. Depends on spec 085 (pages, LOB reader, the MS-XCA
-decoder) and on a CD integer decoder (086 PR 1, or the minimal one E5 used). Series overview:
-`../README.md`. Markers and source abbreviations as in 085.
+Status: **draft**, 2026-11-05; revised 2026-11-28 after E5b (the format on 2019 and 2022) and E11 (columnstore
+in differentials and fuzzy backups). Not started. Order (owner, 2026-11-19): after 087, before 089 and 090.
+Depends on spec 085 (pages, LOB reader, the MS-XCA decoder, the differential overlay) and on 086 PR 1's CD
+records (merged). Series overview: `../README.md`. Markers and source abbreviations as in 085.
 
 ## Problem
 
 Columnstore is **required** (owner, R§10.4). Spec 085 lists a clustered columnstore table and refuses
 its scan. E5 decoded the whole format clean-room: 21 tables in three backups, 3.74 M rows, 168 column
 checks, every one equal to the server's `SELECT` as a multiset, byte for byte in canonical form
-(E5§1, §4) **(2025)**. This spec turns E5's decoder into the reader's columnstore path.
+(E5§1, §4) **(2025)**. E5b ran E5's batches on 2019 and 2022 and read every table equal to the server, with
+the decoder unchanged (`E5b-columnstore-versions.md`). E11 did the same with each operation's full and
+differential backups read as one state, 105 of 105 checks equal (`E11-columnstore-diff.md`). This spec turns
+E5's decoder into the reader's columnstore path.
 
 ## Scope
 
 In: clustered columnstore indexes (CCI), `COLUMNSTORE` and `COLUMNSTORE_ARCHIVE`, every rowgroup state,
 delete bitmaps, delta stores, partitions, ordered CCI, every type a CCI accepts, `(max)` values in
-and off row; the locators the lake needs; the evidence a differential carries (an experiment first).
+and off row; the locators the lake needs; a CCI read through `diff :=` (085's overlay, E11). A CCI table is an
+entry of an attached backup's catalog (`FROM bk.dbo.t`, owner 2026-11-22: the catalog is the primary
+interface), read by the same scan as `mssql_backup_scan` and `mssql_backup_catalog`; `mssql_backup_tables` reports it
+`decodable` from this spec on. No table read is refused (owner, 2026-11-22): what the
+decoder does not know becomes NULL with a WARNING (D5).
 
 Out: reading a nonclustered columnstore (NCCI) as a table. An NCCI duplicates columns of a rowstore
 table whose base rowset 085 reads; the scan ignores it. E5's NCCI decoding (delete buffers, locators,
@@ -30,12 +38,13 @@ unchanged: a CCI stores the same binary (E5§6.2).
 |---|---|---|---|
 | 1 | the columnstore itself | 3 COLUMNSTORE, 4 COLUMNSTORE_ARCHIVE | no pages of its own; segments and dictionaries live in its LOB allocation unit |
 | 2 | delete bitmap | 2 (PAGE) | (rowgroup id, tuple id); CD records |
-| 3 | delta store, one per OPEN rowgroup (CLOSED: presumed the same, never observed, E5§6.4; a TOMBSTONE's old one may remain) | 0 | B-tree of data records (CCI) |
+| 3 | delta store, one per OPEN or CLOSED rowgroup (CLOSED seen in E11: 1,048,576 rows, status 258, read as an OPEN one; a TOMBSTONE's old one remains until a REORGANIZE removes it, E11) | 0 | B-tree of data records (CCI) |
 | 4 | delete buffer (NCCI only) | 0 | not read here |
 
 - `syscsrowgroups` (obj 35): `hobt_id`, `segment_id` (= rowgroup id), `version`, `ds_hobtid` (the delta
   store of an OPEN or TOMBSTONE rowgroup, E5§3.1), `row_count`, `status`, `flags`, … State = `status & 0xFF`:
-  1 OPEN, 2 CLOSED, 3 COMPRESSED, 4 TOMBSTONE (matched the DMV on 30 rowgroups).
+  1 OPEN, 2 CLOSED, 3 COMPRESSED, 4 TOMBSTONE (matched the DMV on 30 rowgroups; the high byte varies with how
+  the rowgroup was made, e.g. 515 / 1283 / 1539 / 1795 all COMPRESSED, E11).
 - `syscscolsegments` (obj 62): `hobt_id, column_id, segment_id, version, encoding_type, row_count,
   status, base_id, magnitude (float), primary_dictionary_id, secondary_dictionary_id, min_data_id,
   max_data_id, null_value, on_disk_size, data_ptr binary(16), …, collation_id, min_deep_data,
@@ -55,7 +64,8 @@ unchanged: a CCI stores the same binary (E5§6.2).
 **Segment, encodings 1–4** (lob type 3):
 
 ```
-+0   u32 1, u32 1, u32 0, u32 10      constants
++0   u32 1, u32 1, u32 0, u32 w3      1, 1, 0 on 2019 / 2022 / 2025; w3 is NOT a constant (E5b): 10 on 2025;
+                                       9, 0, 17799, 0xFFFFFFFF on 2022; 10, 0 on 2019. Not read.
 +16  u32 3                             lob type
 +20  u32 B   bookmark count = floor(rows / D) + 1
 +24  u32 D   bookmark distance (64, 256, 512, 16384 seen)
@@ -118,7 +128,8 @@ u32 count N`, then N entries in hash order; entry k ↔ data id k + 3. String (t
 - A full primary dictionary spills into a per-rowgroup secondary one (≈10 MB seen). REBUILD gives
   global dictionaries; bulk load and the tuple mover give local ones.
 
-**Encoding 5 (VLD, lob type 7)**, 2-byte aligned: `u32 1, 1, 0, 10, 7, B, D, R; +32 u16 8`, B
+**Encoding 5 (VLD, lob type 7)**, 2-byte aligned: `u32 1, 1, 0, w3, 7, B, D, R; +32 u16 8` (w3 as in a
+segment), B
 bookmarks, R narrow RLE entries; `VLD Header (u32 8, u32 S strings, u32 8192)`; `Page Size Array
 Header (u32 1, u32 4, u32 P)`, P sizes; pages `u32 9, u8 compression, u8 0, u16 common size, u32
 count`: compression 0 raw, 1 `u16 (size − 1)` + MS-XCA. Uncompressed page: fixed width
@@ -158,8 +169,23 @@ A CCI on 2025 accepts `json`, `vector` and every `(max)` type, and refuses `sql_
   has `_mssql_page` = its delta page in the `01` form, and `_mssql_rid` =
   `0x03 ‖ u64 rowset_id ‖ u32 rowgroup ‖` its hidden key (`rscolid 0`). `rowset_id` is
   the columnstore rowset's id; it is in both because rowgroup ids are numbered per partition and one
-  lake table holds every partition. A SWITCH keeps rowset ids (E7 s12), so the keys stay valid. The
-  keys assume a rowgroup id is never reused within a rowset: **to verify** in E11 (task 9). Reason:
+  lake table holds every partition. A SWITCH keeps rowset ids (E7 s12; E11: an OPEN delta store's rowset
+  changes owner with the others, no page moves), so the keys stay valid.
+
+  Rowgroup ids (E11):
+  - **Not reused while the rowset lives.** After every row of a rowgroup was deleted, a REORGANIZE, its cleanup
+    and a new bulk load, the new rowgroup got id 4 after 0-3. A REBUILD builds new rowsets (new hobt ids),
+    numbered from 0.
+  - **A TRUNCATE restarts them at 0 in the same rowset**, the table form and `WITH (PARTITIONS …)` alike. The
+    columnstore rowset's LOB unit then has another first page and first IAM page, or none, and
+    `mssql_backup_schema_changes` reports `table_truncated` for both (E11).
+  - So a key is unique between two truncates of its rowset. 089 must apply a `table_truncated` before the new
+    state's rows (acceptance 8).
+  - **A REBUILD replaces the rowsets, and 085 reports nothing for it** (no schema change: a rebuild keeps a
+    rowstore's rows). Every key of the rebuilt partitions changes, so this spec reports a CCI whose columnstore
+    rowset was replaced as a `table_reload` of the partition (acceptance 8).
+
+  Reason for the keys:
   R§5's "(rowgroup, tuple), only within a rowgroup — the tuple mover renumbers; handle per rowgroup",
   and DuckLake's own `DELETE` by `_mssql_page` (research-ducklake-import §5): a removed, merged or
   rebuilt rowgroup is deleted by `_mssql_page` like a page; a delete-bitmap entry for tuple t deletes
@@ -182,25 +208,81 @@ A CCI on 2025 accepts `json`, `vector` and every `(max)` type, and refuses `sql_
   reservations' half of `max_memory` waits; one that cannot fit alone is refused by name (085 D17's
   rule). A delta store is a rowstore unit (085 § Resources).
 
-- **D5 — catalog drift is absorbed by name.** The three `syscs*` tables are decoded generically
-  through their own `syscolpars` (085 D5), and fields are read by name: `collation_id` and
-  `min_deep_data` / `max_deep_data` exist only from 2022 (E5§6.1) and are optional. A segment or
-  dictionary whose `version` has low bits other than 1 is refused by name until the matrix shows it
-  (bit 31 is the container flag, set for every ARCHIVE blob and every `(max)` / `json` one).
+- **D5 — drift is absorbed, nothing is refused.** The three `syscs*` tables are decoded generically through
+  their own `syscolpars` (085 D5), and fields are read by name: `collation_id` and `min_deep_data` /
+  `max_deep_data` exist only from 2022 (E5§6.1; E5b: absent on 2019) and are optional.
 
-- **D6 — fuzziness is detected, not repaired, here.** 085's flag (v) covers a CCI through its
-  rowsets: tail records on the delta stores or the delete bitmap flag the table. Records of the tuple
-  mover or of a compression (new segments, `syscsrowgroups` rows changing) mark the table `dirty` with
-  the reason. Spec 090 refuses recovery of columnstore tables by name at first; its listed extension
-  (after 086 PR 1 and this spec) redoes delta-store and delete-bitmap records as rowstore, and the tuple
-  mover's records stay refused (E5§6.6: never tested).
+  A word the decoding does not use is not checked. E5b found segment header word 3, which E5 had called a
+  constant, to differ by version and segment, so a check would have refused valid 2019 and 2022 backups.
 
-- **D7 — the differential evidence is measured before 089 uses it.** The expected shape (R§6.2):
-  new rowgroups are new segment LOBs, in the file; deletes are new delete-bitmap entries on changed
-  pages; the tuple mover appears as a delta store's pages freed plus a new COMPRESSED rowgroup; a
-  REBUILD or REORGANIZE tombstones rowgroups and adds new ones; a SWITCH of a partition with an OPEN
-  delta store moves the delta-store rowset as an AU. None of it is observed. Spike E11 (task 9)
-  observes it, and 089's columnstore path is built on what it finds.
+  What the decoder cannot read makes the values it would have produced NULL, never the table's read (owner,
+  2026-11-22: no read refusals; 085's rule for a value). Cases:
+  - a segment or dictionary `version` with low bits other than 1 (bit 31 is the container flag, set for
+    every ARCHIVE blob and every `(max)` / `json` one);
+  - an unknown encoding, page kind, Huffman blob type or VLD compression;
+  - a segment that fails an invariant (Design).
+
+  The NULLs are those of the segment's column in its rowgroup. Each case logs one WARNING per column per scan,
+  naming the rowgroup and the case.
+
+- **D6 — fuzziness is detected, not repaired, here.** 085's D11 covers a CCI through its rowsets, measured in
+  E11:
+  - **The setup.** A full backup was held twice (tail_window's FIFO). At the first hold, which the server put
+    at 0 %, before the table was copied, deletes and a tuple-mover step (`REORGANIZE …
+    COMPRESS_ALL_ROW_GROUPS`) ran. At the second, at 100 %, an insert, a delete and a REORGANIZE ran.
+  - **What it showed.** The copy held the state after the first changes, consistent: the state before minus
+    exactly the deleted rows, no row twice. The later changes were in the tail only, and D11 called the table `stale` and the heap beside it
+    `consistent`.
+  - **The policy.** A CCI's status, warning and `mssql_backup_fuzzy` policy are those of any table, and the
+    read is never refused for it. Records of the tuple mover or of a compression (new segments,
+    `syscsrowgroups` rows changing) must count as changes of the table.
+
+    **They do** (E11, the tuple mover in the tail). A tail that holds only a `REORGANIZE … COMPRESS_ALL_ROW_GROUPS`
+    flags the table `stale`. The new segments arrive as `LOP_FORMAT_PAGE` records carrying their page's image,
+    which D11 already counts as it does a TABLOCK load's, and the catalog rows (`syscscolsegments`,
+    `syscsdictionaries`, `syscsrowgroups`) as row operations. No change to D11 is needed.
+  - **Two data passes keep the copy whole** (2019 on).
+    - A tuple-mover step during the first pass is copied again by the second: the copy is the state after it,
+      with nothing in the tail.
+    - A step during the last pass is in the tail, and the copy is the state before it.
+
+    In every placement E11 ran (three held backups), the copy was one consistent state, equal to the server's
+    before or after.
+  - **Not produced:** a copy holding the rowgroups from before a step and its segments or delete bitmap from
+    after it. It needs the table's own pages copied in the last pass on both sides of the change, which the
+    holds cannot place (the server reads ahead). Such a copy can read a row twice or lose one, and D11's status
+    is what tells the importer. 2017 copies its data once, so the oracle lane's 2017 sets are where a torn copy
+    is likeliest. A fixture there is the next step, not a blocker.
+
+  The principle (owner, 2026-11-28) is to read the utmost a backup holds, under load too; consistency and the
+  import rules are the importer's. So nothing here refuses a CCI, and a torn tuple-mover step is read as far
+  as it can be. A rowgroup whose segment fails its invariants is a candidate to be read from the TOMBSTONE's
+  delta store: E11 found it kept until a REORGANIZE, the same rows. No torn copy was produced to need it, so it
+  is kept as an option for such a copy, not built.
+
+  Recovery is 090's, which treats a CCI as any table (DQ-07 superseded). Its columnstore extension redoes
+  delta-store and delete-bitmap records as rowstore. It redoes the tuple mover's records too, since the tail
+  carries the new segments as page images (E11: `LOP_FORMAT_PAGE`, 312 to 8,192 bytes of each page's used part,
+  no row records for their content) and the catalog's rows as row operations. That is a TABLOCK load's redo
+  plus three base tables.
+
+- **D7 — the differential evidence (E11, measured on 2022 and again on 2019, the same).** A full backup and its differential, overlaid in
+  restore order, equal the server after each of 21 steps (19 run, 2 refused by the server), so 085's overlay reads a CCI as it is; nothing
+  columnstore-specific. What 089 builds on:
+  - a bulk insert adds a COMPRESSED rowgroup (its segment LOBs in the differential);
+  - a trickle insert, a delta delete and an update change delta-store pages;
+  - a delete of compressed rows adds delete-bitmap entries, and so does an update of them (with a delta
+    insert). The rowgroup's own rows never change, and `syscsrowgroups` does not move;
+  - the tuple mover (REORGANIZE COMPRESS_ALL) makes the delta rowgroup TOMBSTONE, keeping its rowset and
+    pages, and adds a COMPRESSED one of its rows. REORGANIZE also merges compressed rowgroups into new ones,
+    tombstoning them, and a later one removes TOMBSTONEs, their segments and their delta rowsets;
+  - a REBUILD replaces the rowsets, and 085 reports no schema change for it (D3: this spec adds one);
+  - a TRUNCATE empties the rowset and restarts rowgroup ids (D3);
+  - a SWITCH, an OPEN delta store's included, is catalog-only: no data page in the differential;
+  - SPLIT / MERGE are possible only on empty partitions (35346 / 35344) and add or drop empty rowsets.
+
+  So a CCI's changed rows between two states are rowgroups that appeared, disappeared or became TOMBSTONE,
+  delete-bitmap entries added or dropped, and delta-store rows as rowstore changes.
 
 ## Design
 
@@ -225,24 +307,34 @@ clustered rowstore key, since VertiPaq reorders a rowgroup's tuples). The partit
 (ownertype 1), delete-bitmap (2) and delta-store (3) rowsets with one `numpart`; its compressed rows
 are keyed by **rowset**, not by page: `syscsrowgroups` and the segments are keyed by hobt id, and a
 SWITCH leaves them unchanged while the columnstore and delete-bitmap rowsets swap `idmajor` /
-`numpart` (E7 s12, catalog-only). 089's ownership rule moves a compressed row by the rowset its
-rowgroup key names (`02`, D3). The delta-store and delete-bitmap rowsets move as allocation units:
-`au_moved` rows with their base IAM pages, and a delta-store row is found by its `_mssql_page` in
-the `01` form (no lake row is on a delete-bitmap page). E7 s12 had no OPEN delta store, so a
-SWITCH of a partition that has one is **unmeasured**; E11 adds it (task 9).
+`numpart` (E7 s12, catalog-only). 089's ownership rule moves a compressed row by the rowset its rowgroup key
+names (`02`, D3).
+
+A SWITCH of a partition with an OPEN delta store is catalog-only too (E11). Its delta-store rowset changes
+owner and `numpart` with the columnstore and delete-bitmap ones, and no page of it is in the differential. So a
+delta-store row keeps its `01` page and moves by its rowset, which the `03` key names. No lake row is on a
+delete-bitmap page.
+
+Values go through the reader's codec where the stored form is row bytes: a delta store's records, and
+encoding 5's strings and decimals. That is `RecordStager` / `FinalizeStagedColumn`, with 093's kernels and
+086 PR 6's / 095's `json`. Encodings 1, 2 and 4 produce the DuckDB value from the data id per type (E5§3.3), in
+the column's DuckDB type as `mssql_backup_columns.duckdb_type` reports it (085 D6), the same type a rowstore
+table of those columns reads as.
 
 Invariants:
 1. Every decoded segment satisfies `48 + 8(B + R + U) = on_disk_size` (unwrapped), and its RLE plus
    bit-packed runs cover exactly `row_count` rows.
 2. Every column of a rowgroup yields the same number of tuples.
-3. A dictionary id outside its dictionary, a VLD address outside its pages, a Huffman table whose
-   Kraft sum is not exactly 1: a named error, never a NULL.
+3. A dictionary id outside its dictionary, a VLD address outside its pages, a Huffman table whose Kraft sum
+   is not exactly 1: never a wrong value. The segment's column is NULL in its rowgroup, with a WARNING naming
+   the case (D5).
 4. A rowgroup's surviving rows = `row_count` minus its delete-bitmap entries.
 
 ## Security and hardening
 
 - Every count (B, R, U, N, P, S, frame sizes) is bounded by `on_disk_size` before allocation; bit
-  widths outside the 15 are refused; `~value` bit-pack indexes stay within U × (64 / W).
+  widths outside the 15 are not decoded (D5: the segment's column NULL + WARNING); `~value` bit-pack
+  indexes stay within U × (64 / W).
 - Container frames: uncompressed ≤ 65,536, compressed ≤ the remaining bytes, total equal to the
   LOB's length.
 - Huffman: 4-bit lengths, Kraft sum exactly 1, decoding bounded by the page's count and data size;
@@ -258,16 +350,32 @@ Invariants:
 Fixtures: E5's scripts (`experiments/E5/sql/`) become the generator — round 1 (`cs_int`, `cs_num`,
 `cs_dt`, `cs_str`, `cs_str_tm`, `cs_misc`, `cs_rg`, `cs_tomb`, `cs_arch`, `cs_ord`, `cs_dict2`),
 round 2 (`e2_dto`, `e2_mag`, `e2_vld`, `e2_runs`, `e2_part`) and round 3 (`e3_del`, `e3_arch`), minus
-the NCCI tables. Added: a CLOSED rowgroup (a delta store past 1,048,576 rows before the tuple mover
-runs), a page-compressed delete-bitmap page if one can be produced, a non-string secondary dictionary
-with entries, and the E5§5 cells "not produced on this server" where another version produces them.
+the NCCI tables.
+
+Added:
+- E11's operations, with their full and differential backups: a CLOSED rowgroup (E11's `t_closed`, trace
+  flag 634 holding the tuple mover), a TOMBSTONE whose delta store remains, a TRUNCATE that reuses rowgroup
+  ids, a SWITCH out and in with an OPEN delta store, and a REBUILD;
+- a page-compressed delete-bitmap page, if one can be produced;
+- a non-string secondary dictionary with entries;
+- the E5§5 cells "not produced on this server": nvarchar, UTF-8 and `(max)` under encoding 5. E5b did not
+  produce them on 2019 or 2022 either, so they need values that defeat the dictionary.
+
+Every insert of a fixture runs with `OPTION (MAXDOP 1)`. A parallel `INSERT … WITH (TABLOCK)` splits the rows
+between threads, and each share under 102,400 rows lands in its own delta store (E11: 400,000 rows became 12
+delta stores).
 Generated in the oracle lane; a few small blobs and one small CCI backup committed for the
 server-free lane and the fuzz seeds. Canonical comparison as E5's `truth_rows.py` (floats as IEEE
 hex, strings and binaries as bytes, dates in styles 23 / 120 / 121), plus the `TYPE mssql` comparison
 of 085.
 
-Version matrix: 2017 / 2019 / 2022 / 2025. Ordered CCI from 2022, `json` / `vector` in a CCI on 2025
-only. E5§6.1: "Only 2025 was tested … the main residual risk"; the matrix is where it is retired.
+Version matrix: 2017 / 2019 / 2022 / 2025, ordered CCI from 2022, `json` / `vector` in a CCI on 2025 only.
+E5§6.1 called the untested versions "the main residual risk".
+
+E5b retired it for 2019 and 2022. Every fixture table read equal, the segment and dictionary versions,
+dictionary headers and encodings per type were the same as 2025's, and the only differences were header word 3
+and 2019's missing catalog columns (D5). 2017 remains for the oracle lane: its image crashes at start under
+Rosetta.
 
 Acceptance:
 1. Every fixture table of every version in the matrix equals the server's `SELECT` (E5's canonical
@@ -276,8 +384,13 @@ Acceptance:
 3. Projection reads only the projected columns' blobs (counted).
 4. `_mssql_rid` is unique per table, across its partitions, and stable across two backups with no
    change between them; a compressed row's `_mssql_page` is its rowgroup key.
-5. E11's report states the differential evidence of every case in D7.
+5. Every E11 operation's CCI, read through `diff :=` and as an attached backup with `diff`, equals the
+   server after the operation.
 6. Fuzz harnesses replay clean under ASan and UBSan.
+7. A CCI table of an attached backup reads through `FROM bk.<schema>.<table>`, and its rows equal those of
+   `mssql_backup_scan`.
+8. `mssql_backup_schema_changes` reports `table_reload` for a CCI partition whose columnstore rowset a REBUILD
+   replaced, and `table_truncated` for a TRUNCATE (E11's steps); 089's tests apply them before the rows.
 
 ## Tasks
 
@@ -293,32 +406,42 @@ Costs follow E5§7, without its NCCI share.
 7. Scan integration: rowgroup units, projection, locators; measure rowgroup elimination with filter
    pushdown and decide — 4 d
 8. Oracle matrix (E5's scripts) and the five fuzz harnesses — 6 d
-9. **E11 spike**: columnstore in differentials (inserts, deletes, updates, the tuple mover, REORGANIZE,
-   REBUILD, TRUNCATE, SPLIT / MERGE of a partitioned CCI — E7 covered only its SWITCH, s12, which is
-   catalog-only and had no OPEN delta store), a SWITCH of a partition that has an OPEN delta store
-   (unmeasured: which rowsets swap, and whether the delta-store rows move by their `01` pages),
-   whether a rowgroup id is ever reused within a rowset (D3), and the tuple mover running during a
-   full backup; report `experiments/E11-columnstore-diff.md` — 3.5 d
+9. E11's remainder — done 2026-11-28 (`experiments/E11-columnstore-diff.md`):
+   - a tail holding only a REORGANIZE: `stale`, counted through the FORMAT_PAGE images (D6);
+   - three held placements, each a consistent copy (D6);
+   - E11 on 2019: the same as on 2022;
+   - the segments in the tail as page images (090's redo).
+
+   Left for the build, not the spike: the REBUILD event (acceptance 8), and a 2017 fixture for a torn copy
+   (D6).
 10. Docs (README, `DATAMODEL.md` columnstore layer, CLAUDE.md, CHANGELOG) — 1 d
 
-**Total ≈ 37.5 days, 6–9 weeks** (E5§7: ≈ 34 days, 5–8 weeks; plus E11, minus the NCCI work). R§8
+**Total ≈ 34 days, 6–8 weeks** (E5§7: ≈ 34 days, 5–8 weeks; plus E11's remainder, minus the NCCI work). R§8
 phase 3 gave 5–8 weeks at medium risk after E5.
 
 ## Risks
 
-- **Version drift** (E5§6.1): only 2025 was decoded; older builds may lack the Huffman pages or use
-  other header constants. The matrix is the gate; D5 refuses an unknown segment version by name.
-- **Unobserved states** (E5§6.4): CLOSED and INVISIBLE rowgroups, raw container frames, VLD
-  compression other than 0 / 1, Huffman blob types other than 1 / 2, dictionary page types other than
-  5 / 6, a delete-bitmap page with a compression-info record (that one needs 086's PAGE reader). Each
-  is a named refusal until a fixture shows it.
-- **Constants not understood** (E5§6.3) are checked against the observed values and refused when they
-  differ, so a format change is loud.
-- **The differential and fuzzy behaviour** of columnstore is unmeasured (D6, D7); E11 comes before
-  089's columnstore path.
-- Decided ([decisions.md](../085-backup-reader-core/decisions.md)): 090 comes before 088 (R§10.4;
-  DQ-03, accepted); a columnstore table whose tail the recovery cannot cover refuses the file until
-  090's columnstore extension and E11 exist (D6 here, 090 D7; DQ-07, accepted).
+- **Version drift**: 2019 and 2022 measured (E5b), same as 2025 but for D5's two cases; 2017 only in the
+  oracle lane. An unknown version is NULL + WARNING (D5), never a refusal.
+- **Unobserved states** (E5§6.4, after E11, which produced CLOSED):
+  - INVISIBLE rowgroups;
+  - raw container frames;
+  - VLD compression other than 0 / 1;
+  - Huffman blob types other than 1 / 2;
+  - dictionary page types other than 5 / 6;
+  - a delete-bitmap page with a compression-info record (086's PAGE reader, merged, reads it).
+
+  Each is NULL + WARNING (D5) until a fixture shows it.
+- **Constants not understood** (E5§6.3) are not checked (D5). Checking them would have refused valid backups
+  (E5b's word 3). A format change shows as an invariant failing or a value the oracle lane does not match.
+- **A fuzzy copy that mixes a tuple-mover step's before and after** was not produced (D6); D11's status covers
+  it.
+- **Order and DQ-07**, from [decisions.md](../085-backup-reader-core/decisions.md):
+  - Order: DQ-03's "090 before 088" was superseded by the owner's order of 2026-11-19 (088 before 089 and 090,
+    series.md).
+  - DQ-07, "a columnstore table whose tail the recovery cannot cover refuses the file", was **superseded on
+    2026-11-28** (owner): read the utmost, under load too, and leave consistency and the import rules to the
+    importer. A CCI is read, flagged and recovered like any table (D6).
 
 ## References
 
@@ -326,6 +449,10 @@ phase 3 gave 5–8 weeks at medium risk after E5.
   diff), §8 phase 3, §10.4.
 - E5 §1 (result), §3 (format), §4 (verification), §5 (coverage), §6 (unknowns), §7 (effort), §8
   (provenance); `experiments/E5/cs_decode.py`, `csbak.py`, `truth_rows.py`, `sql/`, `blobs/`.
+- E5b (`../085-backup-reader-core/research/experiments/E5b-columnstore-versions.md`): the format on 2019 and
+  2022.
+- E11 (`../085-backup-reader-core/research/experiments/E11-columnstore-diff.md`): differentials, rowgroup ids,
+  SWITCH with an OPEN delta store, the tuple mover during a backup.
 - research-ducklake-import.md §5 (columnstore rowgroup keys; delete-bitmap entries deleted by
   `_mssql_page` and `_mssql_rid`).
 - 085 (LOB reader, MS-XCA decoder, scan units), 086 (CD records), 089 (incremental), 090 (recovery).

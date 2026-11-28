@@ -316,8 +316,10 @@ rows: every page whose rows `mssql_backup_scan` and `mssql_backup_export` return
 arguments (the changed data pages; with 090 also those formatted in the tail or rebuilt, and the
 `pending_applied` ones; not a rowgroup key) must lie, live, on its header AU's IAM chain and on no
 other, in the images it returns over the base's (rule 10; a differential needs `base` for it, as for
-its rows, D4). Otherwise it refuses by name (table, page, AU), and the import then refuses the file:
-the next file could not attribute that page. So a missed delete is never silent on either path, rows
+its rows, D4). Otherwise the table is `unrecoverable` by name (table, page, AU; 090 D7), and the importer's
+`unrecoverable :=` policy decides: by default it skips the table for this file, and `'strict'` refuses the
+file. Either way the next differential could not attribute that page, so only a full brings the table back.
+So a missed delete is never silent on either path, rows
 from the scan (phase A) or from the export. A full's own images always pass; the check guards the
 recovered images (090).
 
@@ -347,9 +349,9 @@ rows as Parquet through DuckDB's `parquet` copy function, as DuckLake writes its
 - Attribution check: the export repeats `mssql_backup_allocation`'s check on the pages it writes
   rows from (not a rowgroup key): each must lie, live, on its header AU's IAM chain and on no other,
   in the images `mssql_backup_allocation` returns for the same file and arguments, which the next
-  file's `base` will hold (rule 10). Otherwise the export refuses by name (table, page, AU), and the
-  import then refuses the file: the next file could not attribute that page, and a missed delete is
-  never silent.
+  file's `base` will hold (rule 10). Otherwise the export refuses that table's rows by name (table, page, AU):
+  the table is `unrecoverable`, and the importer's policy applies (090 D7: skipped by default, the file refused
+  under `'strict'`). The next differential could not attribute that page, and a missed delete is never silent.
 - `partition_by`: per table (`'schema.table'`), the SQL text the importer renders from the
   expression DuckLake binds for the lake table's current spec (`ApplyPartitionTransform`, D9),
   evaluated in the calling session (its `TimeZone` and `Calendar` matter only to a calendar
