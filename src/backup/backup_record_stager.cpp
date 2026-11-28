@@ -285,6 +285,8 @@ RecordStager::Column RecordStager::ResolveColumn(const std::string &table, const
 	type = reading.type;
 	col.meta = reading.raw ? RawMetadataOf(c) : MetadataOf(c, forms);
 	col.ops = codec::staging::ResolveColumnOps(col.meta, type);
+	col.counts_out_of_range = col.ops.kernel == FinalizeKernel::Datetime &&
+							  col.meta.type_id == tds::TDS_TYPE_DATETIME2 && type.id() == LogicalTypeId::TIMESTAMP_NS;
 	col.binary_kernel = col.ops.kernel == FinalizeKernel::Binary && col.meta.type_id != tds::TDS_TYPE_BIGCHAR;
 	col.utf16_kernel = col.ops.kernel == FinalizeKernel::String && col.meta.type_id != tds::TDS_TYPE_NCHAR;
 	col.code_page_kernel = col.ops.kernel == FinalizeKernel::CodePage && col.meta.code_page != nullptr &&
@@ -864,10 +866,12 @@ std::vector<RecordStager::TypeNote> RecordStager::TypeNotes() const {
 	for (const auto &col : columns_) {
 		const auto &v = col.variant_notes;
 		if (col.spatial_notes.not_geometry + col.spatial_notes.malformed + col.hierarchyid_notes.malformed +
-				v.malformed + v.unknown_collation + v.invalid_utf8 >
+				v.malformed + v.unknown_collation + v.invalid_utf8 + col.out_of_range >
 			0) {
-			const std::string type = col.meta.variant_disk_form ? "sql_variant" : col.meta.udt_type_name;
-			notes.push_back(TypeNote{col.name, type, col.spatial_notes, col.hierarchyid_notes, v});
+			const std::string type = col.meta.variant_disk_form ? "sql_variant"
+									 : col.counts_out_of_range	? "datetime2(7)"
+																: col.meta.udt_type_name;
+			notes.push_back(TypeNote{col.name, type, col.spatial_notes, col.hierarchyid_notes, v, col.out_of_range});
 		}
 	}
 	return notes;
@@ -891,6 +895,14 @@ void RecordStager::FinalizeChunk() {
 		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, *targets_[i],
 											 &columns_[i].variant_notes, &columns_[i].spatial_notes,
 											 &columns_[i].hierarchyid_notes);
+		if (columns_[i].counts_out_of_range) {
+			// Spec 093 T8c, as RowStager counts D8's: the kernel's NULLs are in the mask before the staged
+			// validity is ANDed in, so its NULLs now are exactly the values that did not fit TIMESTAMP_NS.
+			const ValidityMask &kernel_nulls = FlatVector::Validity(*targets_[i]);
+			if (!kernel_nulls.CannotHaveNull()) {
+				columns_[i].out_of_range += count_ - kernel_nulls.CountValid(count_);
+			}
+		}
 		codec::staging::PublishStagedValidity(st, count_, *targets_[i]);
 	}
 	// The values written straight into their vectors, over their placeholders.

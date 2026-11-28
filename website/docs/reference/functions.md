@@ -308,7 +308,7 @@ them, values stored off row included; virtual columns `_mssql_page`, `_mssql_rid
 and `_mssql_lob`. See
 [Backup Files](../reading/backups.md#rows).
 
-**Signature:** `mssql_backup_scan(path VARCHAR | VARCHAR[], schema VARCHAR, table VARCHAR [, max_threads := BIGINT, max_memory := VARCHAR]) -> TABLE(...)`
+**Signature:** `mssql_backup_scan(path VARCHAR | VARCHAR[], schema VARCHAR, table VARCHAR [, max_threads := BIGINT, max_memory := VARCHAR, diff := VARCHAR | VARCHAR[], fuzzy := VARCHAR, geometry_as := VARCHAR, datetime2_7_as := VARCHAR]) -> TABLE(...)`
 
 ```sql
 SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');

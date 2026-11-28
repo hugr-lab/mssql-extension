@@ -170,14 +170,9 @@ unique_ptr<FunctionData> BindScan(ClientContext &context, const char *function, 
 		// Over an attached name, the ATTACH's fuzzy option before the setting, as its tables' scans take it.
 		data->fuzzy = AttachedFuzzy(context, data->paths.front());
 	}
-	// Spec 093 T8: the call's geometry_as, else the ATTACH's; checked now.
-	auto geometry_as = input.named_parameters.find("geometry_as");
-	if (geometry_as != input.named_parameters.end() && !geometry_as->second.IsNull()) {
-		data->geometry_as =
-			GeometryAsGiven(geometry_as->second.ToString(), (std::string(function) + ": geometry_as").c_str());
-	} else if (data->paths.size() == 1) {
-		data->geometry_as = AttachedGeometryAs(context, data->paths.front());
-	}
+	// Spec 093 T8 / T8c: the call's geometry_as and datetime2_7_as, else the ATTACH's, else (datetime2_7_as)
+	// the setting; checked now.
+	data->form_options = TypeFormOptionsOf(context, input.named_parameters, data->paths, function);
 	data->Forms();
 	for (const auto &kv : input.named_parameters) {
 		if (kv.first == "max_threads" && !kv.second.IsNull()) {
@@ -266,7 +261,8 @@ void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_dat
 	serializer.WritePropertyWithDefault<std::string>(111, "at_key", data.at.key);
 	serializer.WritePropertyWithDefault<std::string>(112, "fuzzy", data.fuzzy);
 	serializer.WritePropertyWithDefault<std::string>(113, "function", data.function, FUNCTION);
-	serializer.WritePropertyWithDefault<std::string>(114, "geometry_as", data.geometry_as);
+	serializer.WritePropertyWithDefault<std::string>(114, "geometry_as", data.form_options.geometry_as);
+	serializer.WritePropertyWithDefault<std::string>(115, "datetime2_7_as", data.form_options.datetime2_7_as);
 }
 
 unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunction &) {
@@ -285,7 +281,8 @@ unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunct
 	data->at.key = deserializer.ReadPropertyWithDefault<std::string>(111, "at_key");
 	data->fuzzy = deserializer.ReadPropertyWithDefault<std::string>(112, "fuzzy");
 	data->function = deserializer.ReadPropertyWithExplicitDefault<std::string>(113, "function", FUNCTION);
-	data->geometry_as = deserializer.ReadPropertyWithDefault<std::string>(114, "geometry_as");
+	data->form_options.geometry_as = deserializer.ReadPropertyWithDefault<std::string>(114, "geometry_as");
+	data->form_options.datetime2_7_as = deserializer.ReadPropertyWithDefault<std::string>(115, "datetime2_7_as");
 	BindTable(deserializer.Get<ClientContext &>(), *data, nullptr);
 	// The plan's column positions and vectors are those it was bound with: a file at the same path that
 	// reads otherwise now (a nightly backup replaced: a column added, dropped, renamed or retyped) is
@@ -1197,6 +1194,8 @@ TableFunction MakeScanFunction(const LogicalType &path, bool catalog = false) {
 	AddFuzzyParameter(f);
 	// Spec 093 T8: TYPE mssql's geometry_as; NULL (the default): the ATTACH's, else 'geometry'.
 	f.GetSignature().AddKeywordOnly("geometry_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
+	// Spec 093 T8c: TYPE mssql's datetime2_7_as; NULL (the default): the ATTACH's, else the setting.
+	f.GetSignature().AddKeywordOnly("datetime2_7_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	AddVersionParameters(f);
 	f.projection_pushdown = true;
 	f.get_partition_data = PartitionData;
@@ -1228,6 +1227,16 @@ void TypeWarnings::Say(ClientContext &context, const char *function, const std::
 							   "bytes",
 							   function, n.name.c_str(), n.type.c_str(), n.type.c_str(),
 							   codec::ssclrt::DescribeStatus(n.spatial.first_malformed));
+		}
+		// Spec 093 T8c: a datetime2(7) outside TIMESTAMP_NS's range, NULL, as TYPE mssql says it (D8).
+		if (n.out_of_range > 0 && said_.insert(n.name + "|datetime2").second) {
+			DUCKDB_LOG_WARNING(context,
+							   "%s: column %s (datetime2(7)) holds values outside 1677-09-21 .. 2262-04-11, which "
+							   "TIMESTAMP_NS cannot hold, read as NULL, their rows read; datetime2_7_as 'timestamp' "
+							   "(TIMESTAMP over 0001-9999, the 100 ns digit truncated) reads them: as an ATTACH "
+							   "option, on the call, or SET mssql_datetime2_7_as = 'timestamp' before the ATTACH (or "
+							   "before a call over files)",
+							   function, n.name.c_str());
 		}
 		if (n.hierarchyid.malformed > 0 && said_.insert(n.name + "|hierarchyid").second) {
 			DUCKDB_LOG_WARNING(context,
@@ -1311,7 +1320,7 @@ virtual_column_map_t ScanVirtualColumns(const std::vector<UnreadColumn> &unread)
 TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &entry,
 								   std::shared_ptr<const AttachedBackup> attached, const std::string &key,
 								   const std::string &schema, const std::string &table, const std::string &fuzzy,
-								   const std::string &geometry_as, unique_ptr<FunctionData> &bind_data) {
+								   const TypeFormOptions &form_options, unique_ptr<FunctionData> &bind_data) {
 	auto data = make_uniq<ScanBindData>();
 	data->paths = {attached->name};
 	// A plan deserialized finds the version again by its backups and files, not its number.
@@ -1320,7 +1329,7 @@ TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &en
 	data->table = table;
 	data->table_entry = &entry;
 	data->fuzzy = fuzzy;
-	data->geometry_as = geometry_as;
+	data->form_options = form_options;
 	data->attached = std::move(attached);
 	BindTable(context, *data, nullptr);
 	bind_data = std::move(data);

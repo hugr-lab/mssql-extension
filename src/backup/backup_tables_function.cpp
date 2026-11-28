@@ -472,7 +472,8 @@ struct CatalogListBindData : public TableFunctionData {
 	//! The objects the model is built for (task 16e): the listing's kind, the arguments, and the
 	//! names the query's filters ask for (PushdownNames).
 	CatalogScope scope;
-	//! Spec 093 T8: how a kernel's type is listed as read -- an attached name's geometry_as, else the default.
+	//! Spec 093 T8 / T8c: how a kernel's type and a datetime2(7) are listed as read -- an attached name's
+	//! geometry_as / datetime2_7_as, else the defaults (datetime2_7_as: the setting).
 	TypeForms forms;
 
 	unique_ptr<FunctionData> Copy() const override {
@@ -541,9 +542,10 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	if (data->paths.size() == 1) {
 		// Over an attached backup, the version pinned now by its files (task 24b, owner 2026-11-19).
 		PinAttachedVersion(context, data->paths.front(), data->at);
-		data->forms =
-			TypeFormsOf(AttachedGeometryAs(context, data->paths.front()), "the attached backup's geometry_as");
 	}
+	// As a scan of the same name or files reads them: the ATTACH's forms, else (datetime2_7_as) the setting.
+	data->forms =
+		TypeFormsOf(TypeFormOptionsOf(context, input.named_parameters, data->paths, FunctionName(L)), FunctionName(L));
 	if (L == Listing::Columns && input.inputs.size() > 1) {
 		data->by_schema = true;
 		data->schema = NameArgument(input.inputs[1], "schema");

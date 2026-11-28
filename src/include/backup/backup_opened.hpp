@@ -355,9 +355,6 @@ std::shared_ptr<const AttachedBackup> FindAttachedBackup(ClientContext &context,
 //! catalog): what a file function named by it does with a table that is not consistent, after its own
 //! fuzzy := and before the setting (review of #591). [the catalog layer]
 std::string AttachedFuzzy(ClientContext &context, const std::string &name);
-//! The `geometry_as` ATTACH option of the backup attached as `name` (spec 093 T8), "" when `name` is none or
-//! it was not given. [the catalog layer]
-std::string AttachedGeometryAs(ClientContext &context, const std::string &name);
 //! The key a version of an attached backup's history is pinned by (BackupAt::key): its backups and their
 //! files. A caller that resolved numbers in one `history` (the catalog's versions it read) opens them by
 //! these keys, so a refresh between two opens cannot renumber one of them (review of #580's merge).

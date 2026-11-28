@@ -133,7 +133,9 @@ one pushed to the server whole is not affected. To read the whole range, set
 ATTACH option, a secret parameter, `Datetime2_7_As=timestamp` in a connection string or
 `datetime2_7_as=timestamp` in a URI):
 the catalog then reads such a column as `TIMESTAMP`, the 100 ns digit truncated, as it reads
-`time(7)` and `datetimeoffset(7)`. Read at ATTACH, for the catalog's life. What changes with it:
+`time(7)` and `datetimeoffset(7)`. Read at ATTACH, for the catalog's life. A backup is read the same way
+(`datetime2_7_as` on `ATTACH … (TYPE mssql_backup)` or `datetime2_7_as :=` on a call; see
+[Backups](backups.md)). What changes with it:
 
 - A filter on the column decides as DuckDB does over the values it reads (`= c` matches every
   stored value from `c` to the next microsecond); against another column it runs in DuckDB.

@@ -235,7 +235,11 @@ is NULL with one WARNING per column; `geometry_as := 'wkb'` (ISO WKB, the curves
 option does. A value whose stored bytes cannot be read as its type (a damaged page) is NULL with one
 WARNING per column too, its row read; `mssql_backup_transaction_records` keeps such a row image as its
 bytes. A `sql_variant` is a `VARIANT`, each value in its own base type, as `TYPE mssql` reads it (a
-string under a collation with no code page here, its bytes, with one WARNING per column). A type whose
+string under a collation with no code page here, its bytes, with one WARNING per column). A `datetime2(7)`
+is a `TIMESTAMP_NS`, as `TYPE mssql` reads it by default: a value outside 1677–2262 (a temporal table's
+period end, 9999-12-31, say) is NULL with one WARNING per column, its row read; `datetime2_7_as :=
+'timestamp'`, on the call, as an ATTACH option or as the `mssql_datetime2_7_as` setting, reads the column
+as a `TIMESTAMP` over 0001–9999, the 100 ns digit truncated. A type whose
 conversion comes in a later release -- `xml`, `vector`,
 `json` -- and a user CLR type are returned as their stored bytes, a `BLOB`; no column is refused for
 its type. Sparse columns are read like the others, from the row's sparse vector. A column the scan
@@ -476,6 +480,7 @@ It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, 
 | `history`, `snapshot_version`, `snapshot_time` | A history of backups ([below](#a-history-of-backups)) |
 | `fuzzy` | What a scan of its tables -- and the change listing or `mssql_backup_catalog` over its name -- does with one that is not consistent: `'warn'`, `'error'` or `'ignore'` ([above](#a-backup-taken-under-writes)); unset, the `mssql_backup_fuzzy` setting |
 | `geometry_as` | What its `geometry` / `geography` columns are read as: `'geometry'` (the default), `'wkb'` or `'native'`, as `TYPE mssql`'s option ([above](#rows)); a call's `geometry_as :=` wins over it |
+| `datetime2_7_as` | What its `datetime2(7)` columns are read as: `'timestamp_ns'` or `'timestamp'`, as `TYPE mssql`'s option ([above](#rows)); unset, the `mssql_datetime2_7_as` setting at ATTACH; a call's `datetime2_7_as :=` wins over it |
 
 The filters work as `TYPE mssql`'s. An object is kept when it passes the filter -- it matches it, or
 no filter is given -- and does not match the exclusion, so an exclusion alone keeps everything else:

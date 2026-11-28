@@ -16,13 +16,16 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR="$(cd "${1:?usage: compare_rows.sh DIR}" && pwd)"
 : "${VERSION:?set VERSION (2017, 2019, 2022 or 2025)}"
 DUCKDB="${DUCKDB:-build/release/duckdb}"
-QUIET="${QUIET:-full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full lob_full lob_xpress cd_full cd_xpress page_full page_xpress sparse_full names_full diffs_full clr_types_full variant_full}"
+QUIET="${QUIET:-full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full lob_full lob_xpress cd_full cd_xpress page_full page_xpress sparse_full names_full diffs_full clr_types_full variant_full datetime2_full}"
 # Spec 085 PR 4c: the full + differential pairs of overlays.txt (name|full set|differential set) compared
 # too: the full restored WITH NORECOVERY, the differential WITH RECOVERY, against
 # mssql_backup_scan(full, diff := differential).
-OVERLAYS="${OVERLAYS-diffs_over diffs_over_xpress page_over sparse_over clr_types_over variant_over}"
+OVERLAYS="${OVERLAYS-diffs_over diffs_over_xpress page_over sparse_over clr_types_over variant_over datetime2_over}"
 # The quiet sets also compared with geometry_as 'native' on both sides (spec 093 T8).
 GEOMETRY_NATIVE="${GEOMETRY_NATIVE-clr_types_full}"
+# The quiet sets also compared with datetime2_7_as 'timestamp' on both sides (spec 093 T8c).
+DATETIME2_TIMESTAMP="${DATETIME2_TIMESTAMP-datetime2_full}"
+DATETIME2_TIMESTAMP_OVER="${DATETIME2_TIMESTAMP_OVER-datetime2_over}"  # and these pairs of overlays.txt
 IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/gen/images.txt")"
 [ -n "${IMAGE}" ] || { echo "ERROR: no image for VERSION=${VERSION} in images.txt" >&2; exit 1; }
 CONTAINER="${CONTAINER:-mssql-bak-rows}"
@@ -103,6 +106,18 @@ while IFS='|' read -r name files; do
 		fi
 		;;
 	esac
+	# Spec 093 T8c: datetime2(7) compared again as TIMESTAMP on both sides, so the values TIMESTAMP_NS cannot
+	# hold -- NULL on both under the default -- are the server's own.
+	case " ${DATETIME2_TIMESTAMP} " in
+	*" ${name} "*)
+		echo ">> ${name} (datetime2_7_as 'timestamp')"
+		if python3 -I "${HERE}/compare_rows.py" --duckdb "${DUCKDB}" --datetime2-7-as timestamp "${local_files}"; then
+			compared=$((compared + 1))
+		else
+			failed=$((failed + 1))
+		fi
+		;;
+	esac
 	sql -Q "ALTER DATABASE cmp SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE cmp" >/dev/null
 	docker exec -u 0 "${CONTAINER}" sh -c "rm -f '${BAK}'/*"
 done <"${DIR}/sets.txt"
@@ -160,6 +175,17 @@ if [ -f "${DIR}/overlays.txt" ]; then
 		else
 			failed=$((failed + 1))
 		fi
+		case " ${DATETIME2_TIMESTAMP_OVER} " in
+		*" ${name} "*)
+			echo ">> ${name} (datetime2_7_as 'timestamp')"
+			if python3 -I "${HERE}/compare_rows.py" --duckdb "${DUCKDB}" --datetime2-7-as timestamp --diff "${diff_files}" \
+				"${full_files}"; then
+				compared=$((compared + 1))
+			else
+				failed=$((failed + 1))
+			fi
+			;;
+		esac
 		sql -Q "ALTER DATABASE cmp SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE cmp" >/dev/null
 		docker exec -u 0 "${CONTAINER}" sh -c "rm -f '${BAK}'/*"
 	done <"${DIR}/overlays.txt"

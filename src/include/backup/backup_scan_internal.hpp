@@ -49,10 +49,11 @@ struct ScanBindData : public TableFunctionData {
 	idx_t max_memory = 0;
 	//! D11's `fuzzy` as the call (or the attached catalog) gave it; "" = the setting mssql_backup_fuzzy.
 	std::string fuzzy;
-	//! Spec 093 T8: `geometry_as` as the call (or the attached catalog) gave it; "" = 'geometry'.
-	std::string geometry_as;
+	//! Spec 093 T8: `geometry_as` and (T8c) `datetime2_7_as` as the call (or the attached catalog, or for
+	//! the latter the setting, read at bind) gave them; "" = the default.
+	TypeFormOptions form_options;
 	TypeForms Forms() const {
-		return TypeFormsOf(geometry_as, (function + ": geometry_as").c_str());
+		return TypeFormsOf(form_options, function);
 	}
 	//! An attached backup's table entry the scan reads (task 23), for the binder, and that backup, read
 	//! through its catalog, never found again by name; none for a file's (and for a plan deserialized,
@@ -71,7 +72,7 @@ struct ScanBindData : public TableFunctionData {
 		copy->max_threads = max_threads;
 		copy->max_memory = max_memory;
 		copy->fuzzy = fuzzy;
-		copy->geometry_as = geometry_as;
+		copy->form_options = form_options;
 		copy->catalog = catalog;
 		copy->entry = entry;
 		copy->column_ids = column_ids;

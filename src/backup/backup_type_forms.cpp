@@ -5,6 +5,7 @@
 #include "backup/backup_system_tables.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -57,10 +58,47 @@ std::string GeometryAsGiven(const std::string &value, const char *source) {
 	return value;
 }
 
-TypeForms TypeFormsOf(const std::string &geometry_as, const char *source) {
+std::string Datetime2AsGiven(const std::string &value, const char *source) {
+	ParseDatetime2Read(value, source);
+	return value;
+}
+
+std::string Datetime2AsSetting(ClientContext &context) {
+	Value setting;
+	if (context.TryGetCurrentSetting("mssql_datetime2_7_as", setting) && !setting.IsNull()) {
+		return Datetime2AsGiven(setting.ToString(), "mssql_datetime2_7_as");
+	}
+	return std::string();
+}
+
+TypeFormOptions TypeFormOptionsOf(ClientContext &context, const named_argument_map_t &named,
+								  const vector<std::string> &paths, const std::string &function) {
+	TypeFormOptions options;
+	if (paths.size() == 1) {
+		options = AttachedTypeFormOptions(context, paths.front());
+	}
+	auto geometry_as = named.find("geometry_as");
+	if (geometry_as != named.end() && !geometry_as->second.IsNull()) {
+		options.geometry_as = GeometryAsGiven(geometry_as->second.ToString(), (function + ": geometry_as").c_str());
+	}
+	auto datetime2_7_as = named.find("datetime2_7_as");
+	if (datetime2_7_as != named.end() && !datetime2_7_as->second.IsNull()) {
+		options.datetime2_7_as =
+			Datetime2AsGiven(datetime2_7_as->second.ToString(), (function + ": datetime2_7_as").c_str());
+	} else if (options.datetime2_7_as.empty()) {
+		// Not attached, or attached with neither the option nor the setting then: the setting now.
+		options.datetime2_7_as = Datetime2AsSetting(context);
+	}
+	return options;
+}
+
+TypeForms TypeFormsOf(const TypeFormOptions &options, const std::string &where) {
 	TypeForms forms;
-	if (!geometry_as.empty()) {
-		forms.geometry_as = ParseGeometryAs(geometry_as, source);
+	if (!options.geometry_as.empty()) {
+		forms.geometry_as = ParseGeometryAs(options.geometry_as, (where + ": geometry_as").c_str());
+	}
+	if (!options.datetime2_7_as.empty()) {
+		forms.datetime2_read = ParseDatetime2Read(options.datetime2_7_as, where + ": datetime2_7_as");
 	}
 	return forms;
 }

@@ -1,0 +1,243 @@
+# name: test/sql/backup/mssql_backup_datetime2.test
+# description: Spec 093 T8c -- datetime2(7) read from a backup as TYPE mssql reads it: TIMESTAMP_NS, or TIMESTAMP under datetime2_7_as 'timestamp'
+# group: [mssql]
+#
+# test/data/backup/datetime2 (test/backup/gen/datetime2.sql and datetime2_changes.sql, SQL Server 2025):
+# datetime2(7) at TIMESTAMP_NS's edges and datetime2's, the other scales beside it, a temporal table, generated
+# values over the whole range, a heap, ROW / PAGE compression, a datetime2(7) clustered key, and a differential
+# over the full. The oracle lane compares every table with a RESTORE through TYPE mssql on 2017-2025, also with
+# datetime2_7_as 'timestamp' on both sides; this pins the committed backup's values and the option's order (the
+# call, then the ATTACH, then the setting). No SQL Server is needed.
+
+require mssql
+
+statement ok
+SET VARIABLE f = 'test/data/backup/datetime2/datetime2_full.bak';
+
+statement ok
+SET VARIABLE d = 'test/data/backup/datetime2/datetime2_diff.bak';
+
+# The default, TYPE mssql's: datetime2(7) is TIMESTAMP_NS; the other scales keep their own TIMESTAMP variant
+# whatever the option.
+query TTT
+SELECT table_name, column_name, duckdb_type FROM mssql_backup_columns(getvariable('f'), 'dbo')
+WHERE column_name IN ('d7', 'd5', 'd3', 'd0', 'valid_to') ORDER BY 1, 2;
+----
+d_edges	d0	TIMESTAMP_S
+d_edges	d3	TIMESTAMP_MS
+d_edges	d7	TIMESTAMP_NS
+d_heap	d7	TIMESTAMP_NS
+d_mixed	d5	TIMESTAMP
+d_mixed	d7	TIMESTAMP_NS
+d_page	d7	TIMESTAMP_NS
+d_row	d7	TIMESTAMP_NS
+d_temporal	valid_to	TIMESTAMP_NS
+d_temporal_history	valid_to	TIMESTAMP_NS
+
+# A value outside 1677-2262 is NULL, its row read, and a WARNING names the column once a scan. The kernel
+# checks the lower edge by whole days (row 4's 1677-09-21 00:12:43.1452242 too), the upper to the tick.
+statement ok
+SET enable_logging = true;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query ITTT
+SELECT id, d7::VARCHAR, d3::VARCHAR, d0::VARCHAR FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_edges') ORDER BY id;
+----
+1	NULL	0001-01-01 00:00:00	0001-01-01 00:00:00
+2	NULL	0001-01-01 00:00:00.001	0001-01-01 00:00:01
+3	NULL	1677-09-21 00:12:43.145	1677-09-21 00:12:43
+4	NULL	1677-09-21 00:12:43.146	1677-09-21 00:12:44
+5	1969-12-31 23:59:59.9999999	1969-12-31 23:59:59.999	1969-12-31 23:59:59
+6	1970-01-01 00:00:00	1970-01-01 00:00:00	1970-01-01 00:00:00
+7	2000-02-29 12:34:56.1234567	2000-02-29 12:34:56.123	2000-02-29 12:34:56
+8	2262-04-11 23:47:16.8547758	2262-04-11 23:47:16.854	2262-04-11 23:47:16
+9	NULL	2262-04-11 23:47:16.855	2262-04-11 23:47:17
+10	NULL	9999-12-31 23:59:59.999	9999-12-31 23:59:59
+11	NULL	NULL	NULL
+12	NULL	1500-06-15 08:00:00.5	1500-06-15 08:00:00
+13	NULL	3000-01-01 00:00:00.999	3000-01-01 00:00:00
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE log_level = 'WARNING' AND message LIKE '%column dbo.d_edges.d7 (datetime2(7)) holds values outside 1677-09-21 .. 2262-04-11%'
+AND message LIKE '%datetime2_7_as ''timestamp''%';
+----
+1
+
+# Only the datetime2(7) column: d3 and d0 fit TIMESTAMP_MS / TIMESTAMP_S, and nothing else is said.
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%holds values outside%';
+----
+1
+
+# A temporal table's period end, 9999-12-31 23:59:59.9999999, the value D8 is about: NULL in every current row.
+query III
+SELECT count(*), count(valid_from), count(valid_to) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_temporal');
+----
+283	283	0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# datetime2_7_as 'timestamp' (any case): TIMESTAMP over 0001-9999, the 100 ns digit truncated, no WARNING.
+query ITT
+SELECT id, typeof(d7), d7::VARCHAR FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_edges', datetime2_7_as := 'TimeStamp')
+ORDER BY id;
+----
+1	TIMESTAMP	0001-01-01 00:00:00
+2	TIMESTAMP	0001-01-01 00:00:00
+3	TIMESTAMP	1677-09-21 00:12:43.145224
+4	TIMESTAMP	1677-09-21 00:12:43.145224
+5	TIMESTAMP	1969-12-31 23:59:59.999999
+6	TIMESTAMP	1970-01-01 00:00:00
+7	TIMESTAMP	2000-02-29 12:34:56.123456
+8	TIMESTAMP	2262-04-11 23:47:16.854775
+9	TIMESTAMP	2262-04-11 23:47:16.854775
+10	TIMESTAMP	9999-12-31 23:59:59.999999
+11	TIMESTAMP	NULL
+12	TIMESTAMP	1500-06-15 08:00:00
+13	TIMESTAMP	3000-01-01 00:00:00.999999
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%holds values outside%';
+----
+0
+
+statement ok
+SET enable_logging = false;
+
+# Every storage form, as both: the generated values (NULL every 11th row) over the whole range, a heap, ROW
+# and PAGE compression, a clustered key outside the range (its uniquifier beside it).
+query TII
+SELECT 'mixed', count(*), count(d7) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_mixed')
+UNION ALL SELECT 'mixed timestamp', count(*), count(d7)
+FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_mixed', datetime2_7_as := 'timestamp')
+UNION ALL SELECT 'heap', count(*), count(d7) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_heap')
+UNION ALL SELECT 'row', count(*), count(d7) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_row')
+UNION ALL SELECT 'page', count(*), count(d7) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_page')
+UNION ALL SELECT 'key', count(*), count(k) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_key');
+----
+mixed	3000	159
+mixed timestamp	3000	2728
+heap	1000	159
+row	1513	163
+page	2013	671
+key	6	1
+
+query T
+SELECT list(k::VARCHAR ORDER BY n) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_key', datetime2_7_as := 'timestamp');
+----
+['0001-01-01 00:00:00', '0001-01-01 00:00:00', '2000-01-01 00:00:00', '9999-12-31 23:59:59.999999', '9999-12-31 23:59:59.999999', '1677-09-21 00:12:43.145224']
+
+# mssql_backup_catalog takes it as the scan does (its parameters are the scan's), and refuses a wrong one by name.
+query I
+SELECT count(*) > 0 FROM mssql_backup_catalog(getvariable('f'), 'sysschobjs', datetime2_7_as := 'timestamp');
+----
+true
+
+statement error
+SELECT * FROM mssql_backup_catalog(getvariable('f'), 'sysschobjs', datetime2_7_as := 'days');
+----
+mssql_backup_catalog: datetime2_7_as
+
+# A value the option does not take is refused by name, as TYPE mssql refuses it.
+statement error
+SELECT * FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_edges', datetime2_7_as := 'date');
+----
+datetime2_7_as
+
+# The setting, read at bind by a call over files.
+statement ok
+SET mssql_datetime2_7_as = 'timestamp';
+
+query T
+SELECT typeof(d7) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_edges') LIMIT 1;
+----
+TIMESTAMP
+
+query T
+SELECT duckdb_type FROM mssql_backup_columns(getvariable('f'), 'dbo', 'd_edges') WHERE column_name = 'd7';
+----
+TIMESTAMP
+
+# The call's option over the setting.
+query T
+SELECT typeof(d7) FROM mssql_backup_scan(getvariable('f'), 'dbo', 'd_edges', datetime2_7_as := 'timestamp_ns') LIMIT 1;
+----
+TIMESTAMP_NS
+
+# An ATTACH takes the setting at ATTACH, like TYPE mssql: a later SET changes nothing on it.
+statement ok
+ATTACH 'test/data/backup/datetime2/datetime2_full.bak' AS dt_set (TYPE mssql_backup);
+
+statement ok
+SET mssql_datetime2_7_as = 'timestamp_ns';
+
+query TT
+SELECT typeof(d7), max(d7)::VARCHAR FROM dt_set.dbo.d_edges GROUP BY 1;
+----
+TIMESTAMP	9999-12-31 23:59:59.999999
+
+statement ok
+RESET mssql_datetime2_7_as;
+
+# The ATTACH option, over the setting; its tables, listings and file functions on its name read with it.
+statement ok
+ATTACH 'test/data/backup/datetime2/datetime2_full.bak' AS dt_ts (TYPE mssql_backup, datetime2_7_as 'timestamp');
+
+statement ok
+ATTACH 'test/data/backup/datetime2/datetime2_full.bak' AS dt_ns (TYPE mssql_backup);
+
+query TTT
+SELECT (SELECT typeof(valid_to) FROM dt_ts.dbo.d_temporal LIMIT 1), (SELECT typeof(valid_to) FROM dt_ns.dbo.d_temporal LIMIT 1),
+	(SELECT max(valid_to)::VARCHAR FROM dt_ts.dbo.d_temporal);
+----
+TIMESTAMP	TIMESTAMP_NS	9999-12-31 23:59:59.999999
+
+query TT
+SELECT (SELECT duckdb_type FROM mssql_backup_columns('dt_ts', 'dbo', 'd_temporal') WHERE column_name = 'valid_to'),
+	(SELECT duckdb_type FROM mssql_backup_columns('dt_ns', 'dbo', 'd_temporal') WHERE column_name = 'valid_to');
+----
+TIMESTAMP	TIMESTAMP_NS
+
+query T
+SELECT typeof(d7) FROM mssql_backup_scan('dt_ts', 'dbo', 'd_edges') LIMIT 1;
+----
+TIMESTAMP
+
+# The call over the ATTACH.
+query T
+SELECT typeof(d7) FROM mssql_backup_scan('dt_ts', 'dbo', 'd_edges', datetime2_7_as := 'timestamp_ns') LIMIT 1;
+----
+TIMESTAMP_NS
+
+statement error
+ATTACH 'test/data/backup/datetime2/datetime2_full.bak' AS dt_bad (TYPE mssql_backup, datetime2_7_as 'seconds');
+----
+datetime2_7_as
+
+# The row changes between the full and the differential, both states read with the option: a value moved
+# across the edges reads as the change it is, not NULL against NULL.
+query ITT
+SELECT id, d7::VARCHAR, change_type FROM mssql_backup_table_changes(getvariable('f'), 'dbo', 'd_edges',
+	diff := getvariable('d'), datetime2_7_as := 'timestamp') ORDER BY id, change_type;
+----
+1	NULL	update_postimage
+1	0001-01-01 00:00:00	update_preimage
+7	9999-12-31 23:59:59.999999	update_postimage
+7	2000-02-29 12:34:56.123456	update_preimage
+10	2000-02-29 12:34:56.123456	update_postimage
+10	9999-12-31 23:59:59.999999	update_preimage
+11	0001-01-01 00:00:00	update_postimage
+11	NULL	update_preimage
+
+statement ok
+DETACH dt_set;
+
+statement ok
+DETACH dt_ts;
+
+statement ok
+DETACH dt_ns;

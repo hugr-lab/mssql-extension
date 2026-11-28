@@ -122,19 +122,10 @@ void ReadChangesArguments(ClientContext &context, TableChangesBindData &data, Ta
 	data.schema = input.inputs[1].ToString();
 	data.table = input.inputs[2].ToString();
 	data.fuzzy = FuzzyParameterOf(input.named_parameters, data.function);
-	// Spec 093 T8: the call's geometry_as, else the ATTACH's.
-	std::string geometry_as;
-	bool given = false;
-	for (const auto &kv : input.named_parameters) {
-		if (kv.first == "geometry_as" && !kv.second.IsNull()) {
-			geometry_as = GeometryAsGiven(kv.second.ToString(), (std::string(data.function) + ": geometry_as").c_str());
-			given = true;
-		}
-	}
-	if (!given && data.paths.size() == 1) {
-		geometry_as = AttachedGeometryAs(context, data.paths.front());
-	}
-	data.forms = TypeFormsOf(geometry_as, (std::string(data.function) + ": geometry_as").c_str());
+	// Spec 093 T8 / T8c: the call's geometry_as and datetime2_7_as, else the ATTACH's, else (datetime2_7_as)
+	// the setting.
+	data.forms =
+		TypeFormsOf(TypeFormOptionsOf(context, input.named_parameters, data.paths, data.function), data.function);
 	for (const auto &kv : input.named_parameters) {
 		if (kv.first == "start_version") {
 			data.start = kv.second;
@@ -800,8 +791,9 @@ TableFunction MakeTableChangesFunction(const char *name, const LogicalType &path
 	f.GetSignature().AddKeywordOnly("end_version", LogicalType::ANY, Value());
 	AddDiffParameter(f);
 	AddFuzzyParameter(f);
-	// Spec 093 T8: as mssql_backup_scan's.
+	// Spec 093 T8 / T8c: as mssql_backup_scan's.
 	f.GetSignature().AddKeywordOnly("geometry_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
+	f.GetSignature().AddKeywordOnly("datetime2_7_as", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	return f;
 }
 
