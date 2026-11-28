@@ -134,7 +134,7 @@ LogicalType FloatNType(const ColumnMetadata &column) {
 }
 
 // Decimal/Numeric
-LogicalType DecimalType(const ColumnMetadata &column) {
+LogicalType DecimalColumnType(const ColumnMetadata &column) {
 	return LogicalType::DECIMAL(column.precision, column.scale);
 }
 
@@ -175,7 +175,7 @@ LogicalType VariantType(const ColumnMetadata &) {
 // vector(n) as VECTORTYPE (spec 093 T3, D4): FLOAT[n], n from the TYPE_INFO. Its JSON form is a
 // varchar(max) and reads VARCHAR here, the server's text: no n is on the wire (D4); a catalog,
 // which knows n, reads it into FLOAT[n] (ResolveColumnOps).
-LogicalType VectorType(const ColumnMetadata &column) {
+LogicalType VectorColumnType(const ColumnMetadata &column) {
 	return mssql::codec::sql_vector::FloatArrayType(column.VectorDimensions());
 }
 
@@ -204,8 +204,8 @@ struct WireTypes {
 		Set(TDS_TYPE_FLOAT, "FLOAT", true, WireFamily::FLOAT, LogicalTypeId::DOUBLE);
 		Set(TDS_TYPE_FLOATN, "FLOATN", true, WireFamily::FLOAT, FloatNType);
 
-		Set(TDS_TYPE_DECIMAL, "DECIMAL", true, WireFamily::DECIMAL, DecimalType);
-		Set(TDS_TYPE_NUMERIC, "NUMERIC", true, WireFamily::DECIMAL, DecimalType);
+		Set(TDS_TYPE_DECIMAL, "DECIMAL", true, WireFamily::DECIMAL, DecimalColumnType);
+		Set(TDS_TYPE_NUMERIC, "NUMERIC", true, WireFamily::DECIMAL, DecimalColumnType);
 
 		Set(TDS_TYPE_MONEY, "MONEY", true, WireFamily::MONEY, MoneyType);
 		Set(TDS_TYPE_SMALLMONEY, "SMALLMONEY", true, WireFamily::MONEY, SmallMoneyType);
@@ -249,7 +249,7 @@ struct WireTypes {
 		Set(TDS_TYPE_UDT, "UDT", false, WireFamily::UDT, UdtType);
 		Set(TDS_TYPE_SQL_VARIANT, "SQL_VARIANT", true, WireFamily::VARIANT, VariantType);
 		// A VECTORTYPE value is read into FLOAT[n] before ConvertValue looks at the family.
-		Set(TDS_TYPE_VECTOR, "VECTOR", true, WireFamily::NONE, VectorType);
+		Set(TDS_TYPE_VECTOR, "VECTOR", true, WireFamily::NONE, VectorColumnType);
 	}
 
 	void Set(uint8_t type_id, const char *name, bool supported, WireFamily family, LogicalTypeId duckdb_type) {
