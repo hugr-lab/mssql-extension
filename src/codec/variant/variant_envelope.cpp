@@ -274,6 +274,39 @@ bool CheckValue(const WireVariant &out, const BaseShape &shape, std::string &why
 //! bit's xtype, its base type on disk (S1d); its TDS base type is TDS_TYPE_BIT (0x32).
 constexpr uint8_t DISK_BIT = 0x68;
 
+bool IsText(uint8_t base_type) {
+	using namespace tds;
+	return base_type == TDS_TYPE_BIGCHAR || base_type == TDS_TYPE_BIGVARCHAR || base_type == TDS_TYPE_NCHAR ||
+		   base_type == TDS_TYPE_NVARCHAR;
+}
+
+//! A string's TDS properties in `scratch`, from its disk ones at `out.properties`.
+void TdsStringProperties(WireVariant &out, DiskVariant &scratch) {
+	const uint8_t *props = out.properties;
+	// Disk: u16 maximum length, u32 CollationId; TDS: the 5-byte collation, then the length.
+	const int64_t id = static_cast<int32_t>(Load(props + 2, 4));
+	if (id != scratch.collation_id) {
+		const auto *row = code_page::FindCollationById(static_cast<int32_t>(id));
+		if (!row || !code_page::WireCollationForName(row->name, std::strlen(row->name), scratch.wire_collation)) {
+			std::memset(scratch.wire_collation, 0, sizeof(scratch.wire_collation));
+		}
+		scratch.collation_id = id;
+	}
+	std::memcpy(scratch.properties, scratch.wire_collation, 5);
+	std::memcpy(scratch.properties + 5, props, 2);
+	out.properties = scratch.properties;
+}
+
+//! A value of two halves of `half` bytes with its halves exchanged, in `scratch`; a value of another
+//! length is left where it is, for CheckValue to refuse.
+void ExchangeHalves(WireVariant &out, size_t half, DiskVariant &scratch) {
+	if (out.value_bytes == 2 * half) {
+		std::memcpy(scratch.value, out.value + half, half);
+		std::memcpy(scratch.value + half, out.value, half);
+		out.value = scratch.value;
+	}
+}
+
 }  // namespace
 
 bool SplitTdsVariant(const uint8_t *data, size_t size, WireVariant &out, std::string &why) {
@@ -326,60 +359,36 @@ bool SplitDiskVariant(const uint8_t *data, size_t size, WireVariant &out, DiskVa
 			  std::string(1, "0123456789ABCDEF"[data[0] & 15]) + ", which sql_variant cannot hold";
 		return false;
 	}
-	using namespace tds;
-	const bool text = out.base_type == TDS_TYPE_BIGCHAR || out.base_type == TDS_TYPE_BIGVARCHAR ||
-					  out.base_type == TDS_TYPE_NCHAR || out.base_type == TDS_TYPE_NVARCHAR;
 	// A string's properties are 6 bytes on disk (u16 length, u32 CollationId), 7 over TDS; every other
 	// base type's are the same.
-	const uint8_t disk_property_bytes = text ? 6 : shape.property_bytes;
+	const uint8_t disk_property_bytes = IsText(out.base_type) ? 6 : shape.property_bytes;
 	if (size < 2u + disk_property_bytes) {
 		why = "a sql_variant of " + std::to_string(size) + " bytes, shorter than its base type's " +
 			  std::to_string(disk_property_bytes) + " property bytes";
 		return false;
 	}
-	const uint8_t *props = data + 2;
 	out.property_bytes = shape.property_bytes;
-	out.properties = props;
+	out.properties = data + 2;
 	out.value = data + 2 + disk_property_bytes;
 	out.value_bytes = size - 2 - disk_property_bytes;
+	// What differs from the TDS form goes into the scratch.
+	using namespace tds;
 	switch (out.base_type) {
 	case TDS_TYPE_BIGCHAR:
 	case TDS_TYPE_BIGVARCHAR:
 	case TDS_TYPE_NCHAR:
-	case TDS_TYPE_NVARCHAR: {
-		// Disk: u16 maximum length, u32 CollationId; TDS: the 5-byte collation, then the length.
-		const int64_t id = static_cast<int32_t>(Load(props + 2, 4));
-		if (id != scratch.collation_id) {
-			const auto *row = code_page::FindCollationById(static_cast<int32_t>(id));
-			if (!row || !code_page::WireCollationForName(row->name, std::strlen(row->name), scratch.wire_collation)) {
-				std::memset(scratch.wire_collation, 0, sizeof(scratch.wire_collation));
-			}
-			scratch.collation_id = id;
-		}
-		std::memcpy(scratch.properties, scratch.wire_collation, 5);
-		std::memcpy(scratch.properties + 5, props, 2);
-		out.properties = scratch.properties;
+	case TDS_TYPE_NVARCHAR:
+		TdsStringProperties(out, scratch);
 		break;
-	}
 	case TDS_TYPE_MONEY:
 		// Disk: an int64 little-endian; TDS: its high half first.
-		if (out.value_bytes == 8) {
-			std::memcpy(scratch.value, out.value + 4, 4);
-			std::memcpy(scratch.value + 4, out.value, 4);
-			out.value = scratch.value;
-		}
+		ExchangeHalves(out, 4, scratch);
 		break;
 	case TDS_TYPE_DATETIME:
-	case TDS_TYPE_SMALLDATETIME: {
+	case TDS_TYPE_SMALLDATETIME:
 		// Disk: the time part, then the days; TDS: the days, then the time part (4 + 4, 2 + 2 bytes).
-		const size_t half = out.base_type == TDS_TYPE_DATETIME ? 4 : 2;
-		if (out.value_bytes == 2 * half) {
-			std::memcpy(scratch.value, out.value + half, half);
-			std::memcpy(scratch.value + half, out.value, half);
-			out.value = scratch.value;
-		}
+		ExchangeHalves(out, out.base_type == TDS_TYPE_DATETIME ? 4 : 2, scratch);
 		break;
-	}
 	default:
 		break;
 	}
@@ -416,8 +425,162 @@ bool CheckValue(const WireVariant &out, const BaseShape &shape, std::string &why
 	return true;
 }
 
+//! A value whose VARIANT payload is its TDS bytes (the integers and floats, little-endian in both).
+bool CopyValue(const uint8_t *p, size_t bytes, VariantTag as, std::string &blob, VariantTag &tag) {
+	tag = as;
+	blob.append(reinterpret_cast<const char *>(p), bytes);
+	return true;
+}
+
+//! A value's bytes as they are, a BLOB.
+bool EncodeBytes(const WireVariant &v, std::string &blob, VariantTag &tag) {
+	tag = VariantTag::BLOB;
+	PutString(blob, reinterpret_cast<const char *>(v.value), v.value_bytes);
+	return true;
+}
+
+//! `text` as a VARCHAR; a char / nchar's (`fixed`) trimmed of the padding it arrives with.
+bool EncodeText(std::string &text, bool fixed, std::string &blob, VariantTag &tag) {
+	if (fixed) {
+		TrimSpaces(text);
+	}
+	tag = VariantTag::VARCHAR;
+	PutString(blob, text.data(), text.size());
+	return true;
+}
+
+bool EncodeDecimalValue(const WireVariant &v, std::string &blob, VariantTag &tag, std::string &why) {
+	const uint8_t precision = v.properties[0], scale = v.properties[1];
+	if (precision < 1 || precision > 38 || scale > precision) {
+		why = "a sql_variant decimal(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
+		return false;
+	}
+	tag = VariantTag::DECIMAL;
+	return EncodeDecimal(precision, scale, v.value, v.value_bytes, blob, why);
+}
+
+bool EncodeTime(const WireVariant &v, std::string &blob, VariantTag &tag, std::string &why) {
+	const uint8_t scale = v.properties[0];
+	const int64_t nanos = TimeNanos(v.value, scale);
+	if (nanos >= SECONDS_PER_DAY * 1000000000) {
+		why = "a sql_variant time past 24:00";
+		return false;
+	}
+	if (scale == 7) {
+		tag = VariantTag::TIME_NANOS;
+		Put<int64_t>(blob, nanos);
+	} else {
+		tag = VariantTag::TIME_MICROS;
+		Put<int64_t>(blob, nanos / 1000);
+	}
+	return true;
+}
+
+//! A datetime2 or (`tz`) a datetimeoffset: the time part, then the date.
+bool EncodeDatetime2(const WireVariant &v, bool tz, std::string &blob, VariantTag &tag, std::string &why) {
+	const uint8_t scale = v.properties[0];
+	const size_t time_bytes = TimeBytes(scale);
+	const int64_t nanos = TimeNanos(v.value, scale);
+	if (nanos >= SECONDS_PER_DAY * 1000000000) {
+		why = "a sql_variant datetime2 whose time is past 24:00";
+		return false;
+	}
+	// A datetimeoffset holds UTC; its offset (the last two bytes) is not part of the instant.
+	EncodeInstant(UnixDays(v.value + time_bytes), nanos, scale, tz, blob, tag);
+	return true;
+}
+
+bool EncodeDatetime(const uint8_t *p, std::string &blob, VariantTag &tag, std::string &why) {
+	// days since 1900-01-01 (i32), then 1/300 s ticks since midnight (u32), read as the column is:
+	// ticks * 1000000 / 300, truncated.
+	const int64_t days = static_cast<int32_t>(Load(p, 4));
+	const int64_t ticks = static_cast<int64_t>(Load(p + 4, 4));
+	// datetime holds 1753-01-01 .. 9999-12-31, ticks within a day: anything else is not a datetime
+	// (and could overflow the microseconds).
+	if (days < -53690 || days > 2958463 || ticks >= 300 * SECONDS_PER_DAY) {
+		why = "a sql_variant datetime outside 1753-9999";
+		return false;
+	}
+	tag = VariantTag::TIMESTAMP_MICROS;
+	Put<int64_t>(blob, (days - DAYS_FROM_1900_TO_EPOCH) * MICROS_PER_DAY + ticks * 10000 / 3);
+	return true;
+}
+
+//! A smalldatetime: days since 1900-01-01 (u16), then minutes since midnight (u16).
+bool EncodeSmallDatetime(const uint8_t *p, std::string &blob, VariantTag &tag) {
+	const int64_t days = static_cast<int64_t>(Load(p, 2)), minutes = static_cast<int64_t>(Load(p + 2, 2));
+	tag = VariantTag::TIMESTAMP_MICROS;
+	Put<int64_t>(blob, (days - DAYS_FROM_1900_TO_EPOCH) * MICROS_PER_DAY + minutes * 60 * 1000000);
+	return true;
+}
+
+bool EncodeUuid(const uint8_t *p, std::string &blob, VariantTag &tag) {
+	// Data1..Data3 little-endian, Data4 as is; DuckDB's UUID is the canonical (big-endian) bytes as a
+	// hugeint, the top bit flipped (GuidEncoding::ConvertGuid).
+	const uint64_t upper = (Load(p, 4) << 32) | (Load(p + 4, 2) << 16) | Load(p + 6, 2);
+	uint64_t lower = 0;
+	for (size_t i = 8; i < 16; i++) {
+		lower = (lower << 8) | p[i];
+	}
+	tag = VariantTag::UUID;
+	Put<uint64_t>(blob, lower);
+	Put<uint64_t>(blob, upper ^ (uint64_t(1) << 63));
+	return true;
+}
+
+//! An nchar / nvarchar.
+bool EncodeUtf16Text(const WireVariant &v, std::string &blob, VariantTag &tag) {
+	std::string text;
+	Utf16ToUtf8(v.value, v.value_bytes, text);
+	return EncodeText(text, v.base_type == tds::TDS_TYPE_NCHAR, blob, tag);
+}
+
+//! The code page a char / varchar value's collation reads it in: CODE_PAGE_UTF8, a page's number, or
+//! one FindCodePage has no table for.
+int32_t CodePageOf(const WireVariant &v) {
+	// The 5-byte collation: LCID (20 bits) and flags in the first four, SortId in the fifth.
+	const uint32_t collation = static_cast<uint32_t>(Load(v.properties, 4));
+	const bool utf8 = (collation & 0x04000000u) != 0;
+	// UTF-8 by the collation's flag, as the column read decides it (ColumnMetadata::IsUtf8Collation);
+	// a code page by the lookup otherwise.
+	return utf8 ? code_page::CODE_PAGE_UTF8
+				: code_page::CodePageForWireCollation(collation & 0xFFFFFu, false, v.properties[4]);
+}
+
+//! A char / varchar value's bytes in `text` as UTF-8. False with the reason in `note` when they cannot
+//! be: bytes under a UTF-8 collation that are not UTF-8, or a collation with no code page table.
+bool DecodeCodePageText(const WireVariant &v, std::string &text, EncodeNote &note) {
+	const int32_t page_number = CodePageOf(v);
+	if (page_number == code_page::CODE_PAGE_UTF8) {
+		if (!simdutf::validate_utf8(reinterpret_cast<const char *>(v.value), v.value_bytes)) {
+			note.invalid_utf8 = true;
+			return false;
+		}
+		text.assign(reinterpret_cast<const char *>(v.value), v.value_bytes);
+		return true;
+	}
+	const auto *page = page_number > 0 ? code_page::FindCodePage(page_number) : nullptr;
+	if (!page) {
+		note.unknown_collation = true;
+		return false;
+	}
+	text.resize(code_page::Utf8Bound(v.value_bytes));
+	text.resize(code_page::DecodeToUtf8(*page, v.value, v.value_bytes, &text[0]));
+	return true;
+}
+
+//! A char / varchar: its text, or its bytes as a BLOB when they cannot be read as text.
+bool EncodeCodePageText(const WireVariant &v, std::string &blob, VariantTag &tag, EncodeNote &note) {
+	std::string text;
+	if (!DecodeCodePageText(v, text, note)) {
+		return EncodeBytes(v, blob, tag);
+	}
+	return EncodeText(text, v.base_type == tds::TDS_TYPE_BIGCHAR, blob, tag);
+}
+
 }  // namespace
 
+// One arm per base type, each a call: the switch is the list of what sql_variant holds (ShapeOf's).
 bool EncodeVariant(const WireVariant &v, std::string &blob, VariantTag &tag, EncodeNote &note, std::string &why) {
 	using namespace tds;
 	const uint8_t *p = v.value;
@@ -430,35 +593,18 @@ bool EncodeVariant(const WireVariant &v, std::string &blob, VariantTag &tag, Enc
 		blob.push_back(static_cast<char>(p[0]));
 		return true;
 	case TDS_TYPE_SMALLINT:
-		tag = VariantTag::INT16;
-		blob.append(reinterpret_cast<const char *>(p), 2);
-		return true;
+		return CopyValue(p, 2, VariantTag::INT16, blob, tag);
 	case TDS_TYPE_INT:
-		tag = VariantTag::INT32;
-		blob.append(reinterpret_cast<const char *>(p), 4);
-		return true;
+		return CopyValue(p, 4, VariantTag::INT32, blob, tag);
 	case TDS_TYPE_BIGINT:
-		tag = VariantTag::INT64;
-		blob.append(reinterpret_cast<const char *>(p), 8);
-		return true;
+		return CopyValue(p, 8, VariantTag::INT64, blob, tag);
 	case TDS_TYPE_REAL:
-		tag = VariantTag::FLOAT;
-		blob.append(reinterpret_cast<const char *>(p), 4);
-		return true;
+		return CopyValue(p, 4, VariantTag::FLOAT, blob, tag);
 	case TDS_TYPE_FLOAT:
-		tag = VariantTag::DOUBLE;
-		blob.append(reinterpret_cast<const char *>(p), 8);
-		return true;
+		return CopyValue(p, 8, VariantTag::DOUBLE, blob, tag);
 	case TDS_TYPE_DECIMAL:
-	case TDS_TYPE_NUMERIC: {
-		const uint8_t precision = v.properties[0], scale = v.properties[1];
-		if (precision < 1 || precision > 38 || scale > precision) {
-			why = "a sql_variant decimal(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
-			return false;
-		}
-		tag = VariantTag::DECIMAL;
-		return EncodeDecimal(precision, scale, p, v.value_bytes, blob, why);
-	}
+	case TDS_TYPE_NUMERIC:
+		return EncodeDecimalValue(v, blob, tag, why);
 	case TDS_TYPE_MONEY:
 	case TDS_TYPE_SMALLMONEY:
 		tag = VariantTag::DECIMAL;
@@ -468,122 +614,26 @@ bool EncodeVariant(const WireVariant &v, std::string &blob, VariantTag &tag, Enc
 		tag = VariantTag::DATE;
 		Put<int32_t>(blob, static_cast<int32_t>(UnixDays(p)));
 		return true;
-	case TDS_TYPE_TIME: {
-		const uint8_t scale = v.properties[0];
-		const int64_t nanos = TimeNanos(p, scale);
-		if (nanos >= SECONDS_PER_DAY * 1000000000) {
-			why = "a sql_variant time past 24:00";
-			return false;
-		}
-		if (scale == 7) {
-			tag = VariantTag::TIME_NANOS;
-			Put<int64_t>(blob, nanos);
-		} else {
-			tag = VariantTag::TIME_MICROS;
-			Put<int64_t>(blob, nanos / 1000);
-		}
-		return true;
-	}
+	case TDS_TYPE_TIME:
+		return EncodeTime(v, blob, tag, why);
 	case TDS_TYPE_DATETIME2:
-	case TDS_TYPE_DATETIMEOFFSET: {
-		const uint8_t scale = v.properties[0];
-		const size_t time_bytes = TimeBytes(scale);
-		const int64_t nanos = TimeNanos(p, scale);
-		if (nanos >= SECONDS_PER_DAY * 1000000000) {
-			why = "a sql_variant datetime2 whose time is past 24:00";
-			return false;
-		}
-		// A datetimeoffset holds UTC; its offset (the last two bytes) is not part of the instant.
-		EncodeInstant(UnixDays(p + time_bytes), nanos, scale, v.base_type == TDS_TYPE_DATETIMEOFFSET, blob, tag);
-		return true;
-	}
-	case TDS_TYPE_DATETIME: {
-		// days since 1900-01-01 (i32), then 1/300 s ticks since midnight (u32), read as the column is:
-		// ticks * 1000000 / 300, truncated.
-		const int64_t days = static_cast<int32_t>(Load(p, 4));
-		const int64_t ticks = static_cast<int64_t>(Load(p + 4, 4));
-		// datetime holds 1753-01-01 .. 9999-12-31, ticks within a day: anything else is not a datetime
-		// (and could overflow the microseconds).
-		if (days < -53690 || days > 2958463 || ticks >= 300 * SECONDS_PER_DAY) {
-			why = "a sql_variant datetime outside 1753-9999";
-			return false;
-		}
-		tag = VariantTag::TIMESTAMP_MICROS;
-		Put<int64_t>(blob, (days - DAYS_FROM_1900_TO_EPOCH) * MICROS_PER_DAY + ticks * 10000 / 3);
-		return true;
-	}
-	case TDS_TYPE_SMALLDATETIME: {
-		const int64_t days = static_cast<int64_t>(Load(p, 2)), minutes = static_cast<int64_t>(Load(p + 2, 2));
-		tag = VariantTag::TIMESTAMP_MICROS;
-		Put<int64_t>(blob, (days - DAYS_FROM_1900_TO_EPOCH) * MICROS_PER_DAY + minutes * 60 * 1000000);
-		return true;
-	}
-	case TDS_TYPE_UNIQUEIDENTIFIER: {
-		// Data1..Data3 little-endian, Data4 as is; DuckDB's UUID is the canonical (big-endian) bytes as a
-		// hugeint, the top bit flipped (GuidEncoding::ConvertGuid).
-		const uint64_t upper = (Load(p, 4) << 32) | (Load(p + 4, 2) << 16) | Load(p + 6, 2);
-		uint64_t lower = 0;
-		for (size_t i = 8; i < 16; i++) {
-			lower = (lower << 8) | p[i];
-		}
-		tag = VariantTag::UUID;
-		Put<uint64_t>(blob, lower);
-		Put<uint64_t>(blob, upper ^ (uint64_t(1) << 63));
-		return true;
-	}
+	case TDS_TYPE_DATETIMEOFFSET:
+		return EncodeDatetime2(v, v.base_type == TDS_TYPE_DATETIMEOFFSET, blob, tag, why);
+	case TDS_TYPE_DATETIME:
+		return EncodeDatetime(p, blob, tag, why);
+	case TDS_TYPE_SMALLDATETIME:
+		return EncodeSmallDatetime(p, blob, tag);
+	case TDS_TYPE_UNIQUEIDENTIFIER:
+		return EncodeUuid(p, blob, tag);
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
-		tag = VariantTag::BLOB;
-		PutString(blob, reinterpret_cast<const char *>(p), v.value_bytes);
-		return true;
+		return EncodeBytes(v, blob, tag);
 	case TDS_TYPE_NCHAR:
-	case TDS_TYPE_NVARCHAR: {
-		std::string text;
-		Utf16ToUtf8(p, v.value_bytes, text);
-		if (v.base_type == TDS_TYPE_NCHAR) {
-			TrimSpaces(text);
-		}
-		tag = VariantTag::VARCHAR;
-		PutString(blob, text.data(), text.size());
-		return true;
-	}
+	case TDS_TYPE_NVARCHAR:
+		return EncodeUtf16Text(v, blob, tag);
 	case TDS_TYPE_BIGCHAR:
-	case TDS_TYPE_BIGVARCHAR: {
-		// The 5-byte collation: LCID (20 bits) and flags in the first four, SortId in the fifth.
-		const uint32_t collation = static_cast<uint32_t>(Load(v.properties, 4));
-		const bool utf8 = (collation & 0x04000000u) != 0;
-		// UTF-8 by the collation's flag, as the column read decides it (ColumnMetadata::IsUtf8Collation);
-		// a code page by the lookup otherwise.
-		const int32_t page_number =
-			utf8 ? code_page::CODE_PAGE_UTF8
-				 : code_page::CodePageForWireCollation(collation & 0xFFFFFu, false, v.properties[4]);
-		std::string text;
-		if (page_number == code_page::CODE_PAGE_UTF8) {
-			if (!simdutf::validate_utf8(reinterpret_cast<const char *>(p), v.value_bytes)) {
-				note.invalid_utf8 = true;
-				tag = VariantTag::BLOB;
-				PutString(blob, reinterpret_cast<const char *>(p), v.value_bytes);
-				return true;
-			}
-			text.assign(reinterpret_cast<const char *>(p), v.value_bytes);
-		} else {
-			const auto *page = page_number > 0 ? code_page::FindCodePage(page_number) : nullptr;
-			if (!page) {
-				note.unknown_collation = true;
-				tag = VariantTag::BLOB;
-				PutString(blob, reinterpret_cast<const char *>(p), v.value_bytes);
-				return true;
-			}
-			text.resize(code_page::Utf8Bound(v.value_bytes));
-			text.resize(code_page::DecodeToUtf8(*page, p, v.value_bytes, &text[0]));
-		}
-		if (v.base_type == TDS_TYPE_BIGCHAR) {
-			TrimSpaces(text);
-		}
-		tag = VariantTag::VARCHAR;
-		PutString(blob, text.data(), text.size());
-		return true;
-	}
+	case TDS_TYPE_BIGVARCHAR:
+		return EncodeCodePageText(v, blob, tag, note);
 	default:
 		why = "a sql_variant of a base type it cannot hold";
 		return false;
