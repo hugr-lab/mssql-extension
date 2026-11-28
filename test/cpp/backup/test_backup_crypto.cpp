@@ -17,6 +17,11 @@
 #include "backup/backup_xpress.hpp"
 #include "backup/backup_zstd.hpp"
 
+#include <openssl/evp.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
+
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -83,6 +88,177 @@ int main() {
 		pvk[16] = 200;	// a salt longer than the file
 		Check(ErrorOf([&]() { ReadPrivateKey(pvk, "", "x"); }).find("does not fit") != std::string::npos,
 			  "a PVK whose salt does not fit its file is refused");
+		// An unencrypted PVK whose key blob is 8 bytes, its BLOBHEADER alone (review of #670: the "RSA2" compare read
+		// four bytes past it, ASan's heap-buffer-overflow). The same bytes are
+		// fuzz/corpus/backup_pvk/key_size_8_review_670.
+		std::vector<uint8_t> short_key(24, 0);
+		std::memcpy(short_key.data(), &magic, 4);
+		short_key[8] = 1;	// key type
+		short_key[20] = 8;	// key length
+		const uint8_t blob_header[] = {7, 2, 0, 0, 0, 0xA4, 0, 0};
+		short_key.insert(short_key.end(), blob_header, blob_header + sizeof(blob_header));
+		Check(ErrorOf([&]() { ReadPrivateKey(short_key, "", "x"); }).find("does not fit") != std::string::npos,
+			  "a PVK whose key blob is shorter than a BLOBHEADER and its RSA magic is refused");
+	}
+	std::cout << "[S] the committed samples (test/data/backup/encryption; run on every PR, review of #670)"
+			  << std::endl;
+	{
+		const std::string dir = "test/data/backup/encryption";
+		const auto password_bytes = Load(dir + "/pvk_password");
+		const std::string password = Trim(std::string(password_bytes.begin(), password_bytes.end()));
+		const Certificate enc_cert = ReadCertificate(Load(dir + "/sample_enc_cert.cer"), "sample_enc_cert.cer");
+		const Certificate tde_cert = ReadCertificate(Load(dir + "/sample_tde_cert.cer"), "sample_tde_cert.cer");
+		PrivateKey enc_key = ReadPrivateKey(Load(dir + "/sample_enc_cert.pvk"), password, "sample_enc_cert.pvk");
+		PrivateKey tde_key = ReadPrivateKey(Load(dir + "/sample_tde_cert.pvk"), password, "sample_tde_cert.pvk");
+		Check(enc_key.Matches(enc_cert.der) && tde_key.Matches(tde_cert.der) && !enc_key.Matches(tde_cert.der),
+			  "the samples' PVKs open and match their certificates");
+		const BlockDecoder xpress = [](const uint8_t *in, size_t in_size, uint8_t *out, size_t out_size) {
+			XpressHuffmanDecode(in, in_size, out, out_size);
+		};
+		{
+			// enc_sample: WITH ENCRYPTION, its key unwrapped, its chain walked, its data set decrypted to the SSET.
+			const auto bytes = Load(dir + "/enc_sample.bak");
+			MemoryAccess file("enc_sample", bytes.data(), bytes.size());
+			const ContainerHeader header = ReadContainerHeader(file);
+			Check(header.encrypted && header.encryptor_thumbprint == enc_cert.thumbprint,
+				  "enc_sample's header names its certificate");
+			ContainerKeys keys;
+			keys.backup = std::make_shared<ContentKey>(
+				UnwrapContentKey(enc_key, header.wrapped_key.data(), header.wrapped_key.size(), "enc_sample"));
+			BlockChain chain = WalkChain(file, ChainStart(header));
+			ContainerStream stream(file, chain, header.compressed ? xpress : BlockDecoder(), keys);
+			uint8_t magic[4];
+			stream.ReadAt(0, magic, 4);
+			const BackupSetHeader set = ReadBackupSet(stream, WalkMtfDataSet(stream));
+			Check(std::memcmp(magic, "SSET", 4) == 0 && !set.database_name.empty(),
+				  std::string("enc_sample: ") + KeyAlgorithmName(keys.backup->algorithm) + ", " +
+					  std::to_string(chain.block_count) + " blocks decrypted, the data set's SSET names " +
+					  set.database_name);
+			Check(ErrorOf([&]() {
+					  UnwrapContentKey(tde_key, header.wrapped_key.data(), header.wrapped_key.size(), "x");
+				  }).find("does not unwrap") != std::string::npos,
+				  "another certificate's key does not unwrap it: one message, no garbage");
+		}
+		{
+			// SQL Server 2019 / 2022's wrap (EncryptorType CERTIFICATE, review of #670): a PLAINTEXTKEYBLOB under
+			// PKCS#1 v1.5 with the certificate's public key, reversed as CryptoAPI writes it -- unwrapped under
+			// OpenSSL's implicit rejection; and a blob of random bytes gives the one message, whichever path it took.
+			uint8_t blob[44] = {8, 2, 0, 0, 0x10, 0x66, 0, 0, 32, 0, 0, 0};
+			for (int i = 0; i < 32; i++) {
+				blob[12 + i] = static_cast<uint8_t>(0xA0 + i);
+			}
+			const unsigned char *der = enc_cert.der.data();
+			X509 *x509 = d2i_X509(nullptr, &der, static_cast<long>(enc_cert.der.size()));
+			EVP_PKEY *pub = x509 ? X509_get_pubkey(x509) : nullptr;
+			EVP_PKEY_CTX *ctx = pub ? EVP_PKEY_CTX_new(pub, nullptr) : nullptr;
+			std::vector<uint8_t> wrapped(enc_key.ModulusBytes());
+			size_t wrapped_size = wrapped.size();
+			const bool encrypted = ctx && EVP_PKEY_encrypt_init(ctx) == 1 &&
+								   EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) == 1 &&
+								   EVP_PKEY_encrypt(ctx, wrapped.data(), &wrapped_size, blob, sizeof(blob)) == 1 &&
+								   wrapped_size == wrapped.size();
+			EVP_PKEY_CTX_free(ctx);
+			EVP_PKEY_free(pub);
+			X509_free(x509);
+			std::reverse(wrapped.begin(), wrapped.end());
+			bool same = false;
+			if (encrypted) {
+				const ContentKey key = UnwrapContentKey(enc_key, wrapped.data(), wrapped.size(), "v1.5");
+				same = key.algorithm == KeyAlgorithm::Aes256 && key.key.size() == 32 &&
+					   std::memcmp(key.key.data(), blob + 12, 32) == 0;
+			}
+			Check(same, "a key wrapped under PKCS#1 v1.5 (2019 / 2022) unwraps, implicit rejection on");
+			std::vector<uint8_t> noise(enc_key.ModulusBytes());
+			for (size_t i = 0; i < noise.size(); i++) {
+				noise[i] = static_cast<uint8_t>(i * 131 + 7);
+			}
+			noise.back() = 0x01;  // below the modulus once reversed
+			Check(ErrorOf([&]() {
+					  UnwrapContentKey(enc_key, noise.data(), noise.size(), "x");
+				  }).find("x: the key does not unwrap with the secret's private key") != std::string::npos,
+				  "a blob of no wrap at all gives the one message, as a wrong key does");
+		}
+		{
+			// tde_sample: uncompressed TDE, the DEK from the boot page (FCBFileDEK at 912), every live page decrypted
+			// and its checksum verified (PageStore::Read throws UnreadablePageError for one that does not).
+			const auto bytes = Load(dir + "/tde_sample.bak");
+			MemoryAccess file("tde_sample", bytes.data(), bytes.size());
+			PageIndex index = BuildPageIndex(file, WalkMtf(file), true);
+			std::vector<uint8_t> boot;
+			const bool found = index.ReadPage(1, 9, boot, true);
+			uint32_t thumb_length = 0;
+			uint32_t wrapped_length = 0;
+			Thumbprint thumb{};
+			if (found && boot.size() == PAGE_SIZE) {
+				std::memcpy(&thumb_length, boot.data() + 912, 4);
+				std::memcpy(&wrapped_length, boot.data() + 936, 4);
+				std::memcpy(thumb.data(), boot.data() + 916, 20);
+			}
+			if (!found || thumb_length != 20 || thumb != tde_cert.thumbprint ||
+				wrapped_length != tde_key.ModulusBytes()) {
+				Check(false, "tde_sample: FCBFileDEK at 912 of the boot page names its certificate");
+			} else {
+				auto dek = std::make_shared<ContentKey>(
+					UnwrapContentKey(tde_key, boot.data() + 940, wrapped_length, "tde_sample"));
+				index.SetPageKey(dek);
+				AllocationMap allocation(index, {1});
+				PageStore store(index, allocation);
+				size_t live = 0;
+				size_t failed = 0;
+				for (uint32_t page = 0; page < allocation.FileSize(1); page++) {
+					Page out;
+					try {
+						live += store.Read(1, page, out);
+					} catch (UnreadablePageError &) {
+						failed++;
+					}
+				}
+				Check(live > 50 && failed == 0,
+					  "tde_sample: " + std::to_string(live) + " live pages decrypted, every checksum verified");
+				// The same page under another key: CBC takes it, its checksum does not (review of #670).
+				auto other = std::make_shared<ContentKey>();
+				other->algorithm = dek->algorithm;
+				other->key = SecretBytes(dek->key.data(), dek->key.size());
+				other->key.data()[0] ^= 0x5A;
+				PageIndex wrong = BuildPageIndex(file, WalkMtf(file), true);
+				wrong.SetPageKey(other);
+				AllocationMap wrong_allocation(index, {1});
+				PageStore wrong_store(wrong, wrong_allocation);
+				size_t refused = 0;
+				size_t data_pages = 0;
+				for (uint32_t page = 0; page < allocation.FileSize(1); page++) {
+					Page out;
+					if (!allocation.IsLive(1, page) || page == 9 || page < 2) {
+						continue;
+					}
+					data_pages++;
+					try {
+						wrong_store.Read(1, page, out);
+					} catch (UnreadablePageError &) {
+						refused++;
+					}
+				}
+				Check(data_pages > 0 && refused == data_pages,
+					  "under a wrong DEK every encrypted page is refused by its checksum (" + std::to_string(refused) +
+						  " of " + std::to_string(data_pages) + "), none read as garbage");
+			}
+		}
+		{
+			// tde_sample_xpress: a TDE database's compressed backup, the DEK in its container header (E4c).
+			const auto bytes = Load(dir + "/tde_sample_xpress.bak");
+			MemoryAccess file("tde_sample_xpress", bytes.data(), bytes.size());
+			const ContainerHeader header = ReadContainerHeader(file);
+			Check(header.tde && header.tde_thumbprint == tde_cert.thumbprint,
+				  "tde_sample_xpress names its DEK's certificate");
+			ContainerKeys keys;
+			keys.dek = std::make_shared<ContentKey>(
+				UnwrapContentKey(tde_key, header.wrapped_dek.data(), header.wrapped_dek.size(), "tde_sample_xpress"));
+			BlockChain chain = WalkChain(file, ChainStart(header));
+			ContainerStream stream(file, chain, xpress, keys);
+			const BackupSetHeader set = ReadBackupSet(stream, WalkMtfDataSet(stream));
+			Check(!set.database_name.empty(),
+				  "tde_sample_xpress: its blocks decrypt under the DEK, the SSET names " + set.database_name);
+		}
 	}
 	const char *dir_env = std::getenv("MSSQL_BACKUP_087_FIXTURES");
 	const char *password_env = std::getenv("MSSQL_BACKUP_087_PASSWORD_FILE");

@@ -452,7 +452,11 @@ bool RecordStager::UnlessPending(WALK &&walk) {
 		if (!pending_as_null_) {
 			throw PendingValueError(e.what(), e.store);
 		}
-		if (pending_values_++ == 0) {
+		if (dynamic_cast<UnreadablePageError *>(&e)) {
+			if (unreadable_values_++ == 0) {
+				first_unreadable_ = e.what();
+			}
+		} else if (pending_values_++ == 0) {
 			first_pending_ = e.what();
 		}
 		return false;

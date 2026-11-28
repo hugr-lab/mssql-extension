@@ -158,8 +158,11 @@ Every form measured is read: `WITH ENCRYPTION` under any algorithm, uncompressed
 compressed; a TDE database's backup `WITH ENCRYPTION` too, under `MS_XPRESS` (two keys: one secret for each
 certificate; the same under `ZSTD` has not been seen and is refused by name); a database encryption key
 rotated to another certificate (the new certificate's secret reads it). The backup's key is unwrapped with
-RSA-OAEP, as every version measured wraps it; one wrapped with PKCS#1 v1.5 (`EncryptorType` `CERTIFICATE`)
-is refused by name.
+RSA-OAEP / SHA-256 (`EncryptorType` `CERTIFICATE_OAEP_256`, SQL Server 2025) or PKCS#1 v1.5 (`CERTIFICATE`,
+2019 and 2022, a TDE database's key too), the latter only under OpenSSL's implicit rejection, so that a crafted
+backup learns nothing from the error. Measured on SQL Server 2019, 2022 and 2025; 2017 is not measured. A TDE
+page is checked against its checksum once decrypted: a page that does not verify (under another key, or damaged)
+is not read, with a WARNING, and the table's other pages are.
 
 **Without the key**, `mssql_backup_info` still answers, with what the file says in clear: for an encrypted
 or a compressed TDE backup, `compressed`, `compression_algorithm`, `encrypted`, `encryptor_thumbprint`,

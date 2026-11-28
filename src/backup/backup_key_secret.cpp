@@ -136,11 +136,14 @@ unique_ptr<BaseSecret> CreateBackupKeySecret(ClientContext &context, CreateSecre
 	return std::move(result);
 }
 
+//! A matching secret as the selection needs it: its name, storage, thumbprint and score -- never its material
+//! (review of #670: every candidate was cloned, password included, even for a thumbprint compare). The chosen
+//! one's material is fetched by name from its storage when a key is unwrapped (SelectContentKey).
 struct Candidate {
 	std::string name;
+	std::string storage;
 	std::string thumbprint;
 	int64_t score = 0;
-	std::unique_ptr<const BaseSecret> secret;
 };
 
 }  // namespace
@@ -194,8 +197,8 @@ static void FindCandidates(ClientContext &context, const std::string &path, std:
 		Candidate c;
 		c.name = entry.secret->GetName().GetIdentifierName();
 		c.score = score;
+		c.storage = entry.storage_mode;
 		c.thumbprint = thumbprint;
-		c.secret = entry.secret->Clone();
 		candidates.push_back(std::move(c));
 	}
 }
@@ -259,9 +262,32 @@ std::shared_ptr<const ContentKey> SelectContentKey(ClientContext &context, const
 	if (!chosen) {
 		RefuseNoKey(path, what, wanted, candidates, matching, names);
 	}
-	const auto &kv = dynamic_cast<const KeyValueSecret &>(*chosen->secret);
-	std::vector<uint8_t> container = FromBase64(kv.TryGetValue(PRIVATE_KEY).ToString(), PRIVATE_KEY);
-	std::string password = kv.TryGetValue(PASSWORD).IsNull() ? std::string() : kv.TryGetValue(PASSWORD).ToString();
+	// The chosen secret alone, from its own storage (one name may be in two), its values read where the secret
+	// keeps them: no Value or string copy of ours but the two wiped below (the SecretEntry the lookup returns is
+	// DuckDB's own copy, as AllSecrets' are).
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	auto entry = SecretManager::Get(context).GetSecretByName(transaction, chosen->name, chosen->storage);
+	if (!entry || !entry->secret) {
+		throw InvalidInputException("mssql backup: the %s secret %s of storage %s is gone", TYPE, chosen->name,
+									chosen->storage);
+	}
+	const auto &kv = dynamic_cast<const KeyValueSecret &>(*entry->secret);
+	// Dropped and created again under the same name since the selection (review of #670): another key, named.
+	if (kv.TryGetValue(THUMBPRINT).ToString() != chosen->thumbprint) {
+		throw InvalidInputException(
+			"mssql backup: the %s secret %s changed since it was selected (its thumbprint is "
+			"no longer %s): run the statement again",
+			TYPE, chosen->name, chosen->thumbprint);
+	}
+	auto container_value = kv.secret_map.find(PRIVATE_KEY);
+	auto password_value = kv.secret_map.find(PASSWORD);
+	if (container_value == kv.secret_map.end() || container_value->second.IsNull()) {
+		throw InvalidInputException("mssql backup: the %s secret %s holds no private key", TYPE, chosen->name);
+	}
+	std::vector<uint8_t> container = FromBase64(StringValue::Get(container_value->second), PRIVATE_KEY);
+	std::string password = password_value == kv.secret_map.end() || password_value->second.IsNull()
+							   ? std::string()
+							   : StringValue::Get(password_value->second);
 	WipeOnExit wipe(&container, &password);
 	try {
 		PrivateKey key = ReadPrivateKey(container, password, "secret " + chosen->name + "'s private key");

@@ -34,10 +34,7 @@ salt length 16, key length 1,748 (an RSA-3072 `PRIVATEKEYBLOB`); the 8-byte `BLO
 00 a4 00 00`) stays in clear, the rest is **RC4** with key `SHA1(salt ‖ ASCII password)[:16]`.
 `FORMAT = 'PFX'` was refused by this build's `BACKUP CERTIFICATE`.
 
-Not established: AES-128 / 192 and TRIPLE_DES_3KEY; the `CERTIFICATE` (non-OAEP) encryptor type of
-older versions (refused, its message naming it: no PKCS#1 v1.5 fallback -- the review of the build found that one
-would be a Bleichenbacher oracle on the user's key; a fixture that needs it brings it back with implicit
-rejection on); ZSTD with encryption; the exact offset of `FCBFileDEK` (the prototype finds it by its
+Not established: AES-128 / 192 and TRIPLE_DES_3KEY; ZSTD with encryption; the exact offset of `FCBFileDEK` (the prototype finds it by its
 pattern in boot-page bytes 600–1200); the 4 KB region at 0x1000 of an uncompressed encrypted
 container; TDE page type 21; a database mid-way through an encryption scan or a DEK rotation; the
 **log tail of a TDE backup** (the log is encrypted per VLF, W§5; E4 did not look); EKM keys, which can
@@ -148,8 +145,10 @@ SQL Server source), structure only. **(2025)** throughout.
   DuckDB's `LookupSecret` returns only the single longest match, so the reader iterates
   `SecretManager::AllSecrets`, filters the type, and applies the scope match itself
   (`main/secret/secret_manager.hpp:132,142`). Two candidates equal in scope and thumbprint (a
-  duplicate) are ordered by DuckDB's storage priority (temporary first). The stripes of one media set
-  must all select the same secret; a full and its overlaid differential select one each.
+  duplicate) are ordered by DuckDB's storage priority (temporary first). Each stripe of a media set
+  selects its own (review of #670: the rule that all select the same secret was dropped. Every stripe names the
+  same certificate, so two secrets holding its key read the set alike, and refusing would read less); a full and
+  its overlaid differential select one each.
 
 - **D4 — selection runs on every call, even on a cached backup.** A cached decrypted backup (085 D9)
   keeps its unwrapped key while the entry lives; re-running D3 before using it makes a `DROP SECRET`
@@ -169,11 +168,23 @@ SQL Server source), structure only. **(2025)** throughout.
   vcpkg build need not carry. A PFX protected by a cipher that needs the legacy provider (RC2, RC4:
   common in old Windows exports; PBE-SHA1-3DES stays in the default provider) is refused by name with the re-export hint (`openssl pkcs12 -export -keypbe AES-256-CBC`).
 
-- **D7 — the unwrap is validated twice.** OAEP-SHA256 first; if it fails, PKCS#1 v1.5 (the older
-  `CERTIFICATE` encryptor type is assumed, unverified); either result must be a well-formed
-  `PLAINTEXTKEYBLOB` (bType 8, version 2, a known `aiKeyAlg`, a length that matches it), and for an
-  encrypted backup the first decrypted block must start with a valid SSET DBLK (checksum included).
-  A wrong key is therefore a named error, never garbage pages.
+- **D7 — the unwrap is validated twice.**
+  - **The unwrap.** OAEP-SHA256 first. If it fails, PKCS#1 v1.5, only with OpenSSL's implicit rejection on: a
+    padding that does not check gives a deterministic pseudo-random result, not an error, so no step's failure
+    is told apart. Without implicit rejection (OpenSSL before 3.2) v1.5 is not tried.
+  - **Measured on 2019 and 2022** (review of #670, the `encrypted` matrix). `EncryptorType` `CERTIFICATE`
+    wraps the backup's key and a TDE database's DEK under v1.5: `00 02 …`, then the 44-byte key blob.
+  - **Either result** must be a well-formed `PLAINTEXTKEYBLOB` (bType 8, version 2, a known `aiKeyAlg`, a
+    length that matches it), else the one message "does not unwrap".
+  - **Then the content.** For an encrypted backup, the first decrypted block must start with a valid SSET DBLK
+    (checksum included). A decrypted TDE page with a checksum (`m_flagBits` 0x0200) must match it: one that does
+    not (under another DEK, a backup taken mid-rotation, or damaged) is not read. Its rows are passed over with a
+    WARNING, the table's other pages are read, and `fuzzy := 'error'` refuses (owner, 2026-11-28: read the
+    utmost). A value stored off row on such a page is NULL, with a WARNING of its own. D11's status takes the page
+    as a copy the backup lacks (`CopyOf` reads it as Pending), so a tail record on it makes the table `dirty` or
+    `stale` as a missing copy would.
+
+  A wrong key is therefore a named error or a page passed over by name, never garbage pages.
 
 - **D8 — algorithms.** AES-128 (0x660E), AES-192 (0x660F) and AES-256 (0x6610), and TRIPLE_DES_3KEY
   (0x6603: 3DES-CBC, IV the header's `[4:12]`), every one measured by E4b. (Revised 2026-11-27: 3DES was
@@ -270,8 +281,9 @@ Rules:
 
 - `backup_crypto` (DuckDB-free): RC4; PVK (RC4 under SHA1(salt || password)[:16]) and its `PRIVATEKEYBLOB`
   as an OpenSSL RSA key; PFX (PKCS#12) and PEM through OpenSSL; a certificate's thumbprint; the unwrap
-  (OAEP-SHA256 over the reversed blob, then PKCS#1 v1.5 with OpenSSL's implicit rejection turned off, either
-  result held to a well-formed `PLAINTEXTKEYBLOB`, else "does not unwrap"); AES / 3DES CBC; `SecretBytes`,
+  (OAEP-SHA256 over the reversed blob, then PKCS#1 v1.5 with OpenSSL's implicit rejection on -- review of #670,
+  after a first cut with it off and then OAEP alone --, either result held to a well-formed `PLAINTEXTKEYBLOB`,
+  every failure "does not unwrap"); AES / 3DES CBC; `SecretBytes`,
   zeroised.
 - `backup_container`: flags `0x87` accepted; E4c's `0x2B` / `0xAB` / `0x2F` read, their DEK from the header
   (`ContainerKeys`: the backup's key and the DEK, a block's layers its kind's bits 0x10 / 0x40), `0xAF` (not
@@ -284,7 +296,7 @@ Rules:
 - `backup_key_secret` [DuckDB]: the secret type (D1, D2: checked at CREATE SECRET -- the certificate, the
   key opened with the password, its modulus the certificate's -- the container and the password kept,
   both redacted, the thumbprint shown) and D3's selection (`SelectContentKey`); `OpenFamily` selects for an
-  encrypted family, and a cached entry selects again on every call (D4, `SelectKeysAgain`).
+  encrypted family, and a cached entry selects again on every call (D4, `OpenedBackup::RequireKeysHeld`).
 - TDE: `OpenBackupPages` reads `FCBFileDEK` from the boot page (9, 1) at 912 before the allocation map is
   built; the DEK (`OpenPagesOptions::tde_key`, D3 from `EnsureTables`) is set on the page index, whose
   `ReadPage` decrypts every page whose `m_flagBits` carries 0x0800 (E4c) and then writes its header as the
@@ -323,7 +335,7 @@ Fixtures:
 
 Secret tests (server-free): longest scope wins; a tie decided by the thumbprint; the mismatch error's
 wording (path, thumbprint, count); a secret without a scope matches everything but loses to a scoped
-one; other secret types ignored; stripes selecting different secrets refused; full and differential
+one; other secret types ignored; stripes selecting their secrets each; full and differential
 selecting their own; `DROP SECRET` makes the next call on a cached backup fail; a wrong password fails
 at `CREATE SECRET`.
 
@@ -369,8 +381,15 @@ the secret type, the selection rule, the CI fixtures and the docs are the rest.
 
 - **The TDE log tail (D9)** is the one gap that touches the owner's "no dirt" rule: until E10, a TDE
   backup cannot be shown consistent or recovered.
-- **Older versions' encryptor type**: if 2017 / 2019 wrap with PKCS#1 v1.5 or SHA-1 OAEP, D7's
-  fallback covers it only if the guess is right; the matrix decides.
+- **Older versions' encryptor type** (measured, review of #670): 2019 and 2022 wrap with PKCS#1 v1.5, read
+  under implicit rejection (D7). The whole `encrypted` matrix is read on both:
+  - `mssql_backup_info` equals RESTORE's three answers: 31 sets, 0 differences each. Before 2022 RESTORE says
+    `Compressed = 1` for an encrypted backup with no compression and has no `CompressionAlgorithm` column, so
+    `compare_info` leaves that field alone there.
+  - Every table of every full set equals `plain_full`'s, with no page passed over.
+  - The differentials, the rotated DEK's included, read over their fulls.
+
+  2017 is not measured: its image does not start under Rosetta, and the oracle lane holds no encrypted set yet.
 - **Partially encrypted databases** (an encryption or decryption scan in progress, a DEK rotation): a page
   says whether it is encrypted (E4c: `m_flagBits` 0x0800, 374 of 374), and the reader decrypts by it, so a
   half-encrypted database reads page by page; not yet measured on a backup taken mid-scan.

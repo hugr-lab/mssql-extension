@@ -260,10 +260,12 @@ def compare_set(c, name, files, info, file_rows, header, label, filelist):
                           ("backup_start_date", "BackupStartDate"), ("backup_finish_date", "BackupFinishDate")]:
         expect(field, date(h[theirs]))
     expect("compressed", boolean(h["Compressed"]))
-    # CompressionAlgorithm is a column from 2022; before it, a compressed backup is MS_XPRESS.
+    # CompressionAlgorithm is a column from 2022; before it, a compressed backup is MS_XPRESS. An encrypted
+    # backup is in a container whatever its compression, and before 2022 HEADERONLY says Compressed 1 for it
+    # with no algorithm to tell stored from MS_XPRESS (2019, review of #670): not compared there.
     if "CompressionAlgorithm" in h:
         expect("compression_algorithm", h["CompressionAlgorithm"])
-    else:
+    elif h.get("KeyAlgorithm") is None:
         expect("compression_algorithm", "MS_XPRESS" if h["Compressed"] == "1" else None)
     expect("encrypted", "false" if h.get("KeyAlgorithm") is None else "true")
     c.check(where, "encryptor_thumbprint", blob_hex(ours("encryptor_thumbprint")), h.get("EncryptorThumbprint"))

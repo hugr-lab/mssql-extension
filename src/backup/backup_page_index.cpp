@@ -28,6 +28,7 @@ static constexpr size_t PAGE_FLAG_BITS_HIGH = 5;
 static constexpr uint8_t PAGE_FLAG_ENCRYPTED_HIGH = 0x08;
 static constexpr size_t PAGE_CHECKSUM_AT = 60;
 static constexpr size_t PAGE_CLEAR_CHECKSUM_AT = 64;
+static constexpr uint8_t PAGE_FLAG_CHECKSUM_HIGH = 0x02;  // m_flagBits 0x0200: PAGE_VERIFY CHECKSUM's
 // The fields of a page header the map reads: version @0, m_type @1, m_pageId @32, m_fileId @36.
 static constexpr size_t HEADER_READ = 40;
 // Bits per directory entry: one count per 8 words (512 extents).
@@ -1653,6 +1654,41 @@ void PageIndex::DecryptPage(std::vector<uint8_t> &page) const {
 	page[PAGE_FLAG_BITS_HIGH] &= static_cast<uint8_t>(~PAGE_FLAG_ENCRYPTED_HIGH);
 	std::memcpy(page.data() + PAGE_CHECKSUM_AT, page.data() + PAGE_CLEAR_CHECKSUM_AT, 4);
 	std::memset(page.data() + PAGE_CLEAR_CHECKSUM_AT, 0, 4);
+	// CBC under no padding takes any key: a page under another DEK decrypts to bytes all the same. Its checksum
+	// tells (review of #670, D7: a wrong key is never garbage pages). A page with no checksum (PAGE_VERIFY NONE
+	// or TORN_PAGE_DETECTION) is taken as decrypted: nothing in it to check.
+	if (page[PAGE_FLAG_BITS_HIGH] & PAGE_FLAG_CHECKSUM_HIGH) {
+		const uint32_t stored = static_cast<uint32_t>(page[60]) | static_cast<uint32_t>(page[61]) << 8 |
+								static_cast<uint32_t>(page[62]) << 16 | static_cast<uint32_t>(page[63]) << 24;
+		if (PageChecksum(page.data()) != stored) {
+			const uint32_t id = static_cast<uint32_t>(page[32]) | static_cast<uint32_t>(page[33]) << 8 |
+								static_cast<uint32_t>(page[34]) << 16 | static_cast<uint32_t>(page[35]) << 24;
+			const uint16_t file = static_cast<uint16_t>(page[36] | page[37] << 8);
+			throw PageVerifyError("backup: page (" + std::to_string(file) + ":" + std::to_string(id) +
+									  ") is encrypted (TDE) and does not decrypt under the backup's DEK: its "
+									  "checksum is not the decrypted page's (a page under another DEK, or damaged)",
+								  file, id);
+		}
+	}
+}
+
+uint32_t PageChecksum(const uint8_t *page) {
+	uint32_t checksum = 0;
+	for (uint32_t sector = 0; sector < PAGE_SIZE / 512; sector++) {
+		const uint8_t *p = page + static_cast<size_t>(sector) * 512;
+		uint32_t overall = 0;
+		for (size_t word = 0; word < 128; word++) {
+			if (sector == 0 && word == PAGE_CHECKSUM_AT / 4) {
+				continue;  // the checksum's own word
+			}
+			const uint8_t *w = p + word * 4;
+			overall ^= static_cast<uint32_t>(w[0]) | static_cast<uint32_t>(w[1]) << 8 |
+					   static_cast<uint32_t>(w[2]) << 16 | static_cast<uint32_t>(w[3]) << 24;
+		}
+		const uint32_t r = 15 - sector;	 // 15 .. 0
+		checksum ^= r ? (overall << r) | (overall >> (32 - r)) : overall;
+	}
+	return checksum;
 }
 
 size_t PageIndex::MemoryBytes() const {

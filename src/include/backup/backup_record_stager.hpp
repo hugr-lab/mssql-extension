@@ -104,6 +104,14 @@ public:
 	const std::string &FirstPending() const {
 		return first_pending_;
 	}
+	//! Of them apart: values on a TDE page that did not verify (UnreadablePageError, review of #670) -- no
+	//! fuzziness, so said whatever the policy, in their own words.
+	idx_t UnreadableValues() const {
+		return unreadable_values_;
+	}
+	const std::string &FirstUnreadable() const {
+		return first_unreadable_;
+	}
 	//! The map of the row Append staged last (backup_lob_map's bytes); empty when the row has no value
 	//! stored off row (the column is NULL) or MapOffRow is off.
 	const std::string &LastRowLobMap() const {
@@ -292,6 +300,8 @@ private:
 	bool pending_as_null_ = false;
 	idx_t pending_values_ = 0;
 	std::string first_pending_;
+	idx_t unreadable_values_ = 0;
+	std::string first_unreadable_;
 	//! BeginChunk ran and FinalizeChunk has not: Append and FinalizeChunk need it.
 	bool begun_ = false;
 };

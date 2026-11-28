@@ -92,7 +92,7 @@ container. No key byte or password is printed by any probe.
 - A block's layers are bits of its kind: 0x10 is the backup key's layer and 0x40 the DEK's. The backup's
   layer is decrypted first.
 - `OpenFamily` selects the DEK's secret by the header's thumbprint (D3), as it does for an encrypted backup,
-  and on every call for a cached entry (D4, `SelectKeysAgain`).
+  and on every call for a cached entry (D4, `OpenedBackup::RequireKeysHeld`).
 - `PageIndex::DecryptPage` now decides by the page's flag 0x0800, where it used to decide by its type.
   - After decrypting, it writes the header as the server does for a page in clear: the flag cleared, the
     clear checksum moved to @60, and @64 zeroed.

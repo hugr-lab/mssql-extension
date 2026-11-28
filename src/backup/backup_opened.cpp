@@ -241,6 +241,7 @@ BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::s
 	constexpr size_t BATCH = 64;
 	const auto expanded = ByteSource::Expand(context, vector<std::string>(paths.begin(), paths.end()));
 	std::vector<HistoryFamily> families;
+	std::vector<HistorySkipped> keyless;
 	for (size_t from = 0; from < expanded.size(); from += BATCH) {
 		const vector<std::string> batch(expanded.begin() + from,
 										expanded.begin() + std::min(expanded.size(), from + BATCH));
@@ -271,6 +272,11 @@ BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::s
 				family.version_tag = opened.files[i].version;
 				family.set = OpenFamily(context, opened, i)->set;
 				families.push_back(std::move(family));
+			} catch (MissingBackupKey &e) {
+				// An encrypted file no secret holds the key of is left out, as a log is, and named (review of #670,
+				// owner 2026-11-28: read the utmost -- the rest of the history is read). A refresh that finds the
+				// secret created since takes it: a file is read again unless it was read whole before.
+				keyless.push_back({opened.Path(i), e.what()});
 			} catch (FormatError &e) {
 				const std::string &path = opened.Path(i);
 				if (std::string(e.what()).find(path) != std::string::npos) {
@@ -280,7 +286,9 @@ BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::s
 			}
 		}
 	}
-	return BuildHistory(std::move(families));
+	BackupHistory history = BuildHistory(std::move(families));
+	history.skipped.insert(history.skipped.end(), keyless.begin(), keyless.end());
+	return history;
 }
 
 bool OpenedHeaders::Tde(Thumbprint *thumbprint) const {

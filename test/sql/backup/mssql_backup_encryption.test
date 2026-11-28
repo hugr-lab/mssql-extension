@@ -63,6 +63,13 @@ ATTACH 'test/data/backup/encryption/enc_sample.bak' AS es_nokey (TYPE mssql_back
 ----
 no mssql_backup_key secret
 
+# A history over files some of which no secret holds the key of: those are left out, as a log is, and the rest
+# is read (review of #670; owner 2026-11-28: read the utmost). Here only tde_sample.bak, whose headers are in clear.
+query II
+SELECT count(*), list(backup_type) FROM mssql_backup_snapshots('test/data/backup/encryption/*.bak');
+----
+1	[full]
+
 # --- the secret (D1 / D2) --------------------------------------------------------------------------------
 
 # A wrong password fails at CREATE SECRET, before any backup is touched.

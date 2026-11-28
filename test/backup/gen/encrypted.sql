@@ -142,6 +142,9 @@ BACKUP DATABASE bak_tde128 TO DISK = '$(DIR)/tde128_full.bak' WITH FORMAT, INIT,
 BACKUP DATABASE bak_tde128 TO DISK = '$(DIR)/tde128_full_xpress.bak' WITH FORMAT, INIT, CHECKSUM, COMPRESSION, NAME = 'tde128_full_xpress';
 BACKUP DATABASE bak_tde256 TO DISK = '$(DIR)/tde256_enc_full.bak'
 	WITH FORMAT, INIT, CHECKSUM, COMPRESSION, NAME = 'tde256_enc_full', ENCRYPTION (ALGORITHM = AES_256, SERVER CERTIFICATE = enc_cert);
+-- The same, stored (review of #670, its question 2): the backup's encryption over a TDE database's pages, no compression.
+BACKUP DATABASE bak_tde256 TO DISK = '$(DIR)/tde256_enc_stored.bak'
+	WITH FORMAT, INIT, CHECKSUM, NO_COMPRESSION, NAME = 'tde256_enc_stored', ENCRYPTION (ALGORITHM = AES_256, SERVER CERTIFICATE = enc_cert);
 GO
 BEGIN TRY
 	EXEC (N'BACKUP DATABASE bak_tde256 TO DISK = ''$(DIR)/tde256_full_zstd.bak'' WITH FORMAT, INIT, CHECKSUM, COMPRESSION (ALGORITHM = ZSTD), NAME = ''tde256_full_zstd''');

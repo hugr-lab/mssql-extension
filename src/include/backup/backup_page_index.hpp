@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include "backup/backup_bytes.hpp"
 #include "backup/backup_container.hpp"
 #include "backup/backup_crypto.hpp"
 #include "backup/backup_mtf.hpp"
@@ -237,6 +238,24 @@ bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t le
 //! given, counts the groups it read.
 bool CheckDifferentialRanks(const RandomAccess &stream, const PassMap &first, const std::vector<const PassMap *> &later,
 							uint64_t *groups_read = nullptr);
+
+//! SQL Server's page checksum (PAGE_VERIFY CHECKSUM, m_flagBits 0x0200, stored at +60) of an 8 KB page: per
+//! 512-byte sector the XOR of its 32-bit little-endian words (the checksum's own word taken as 0), rotated left
+//! by 15 minus the sector's number, the sectors XORed together. Checked on the committed samples' pages
+//! (514 of 514). DuckDB-free.
+uint32_t PageChecksum(const uint8_t *page);
+
+//! A TDE page whose plaintext does not verify after its decryption: its checksum (when its header says it has
+//! one) is not the decrypted page's -- a page under another DEK (a backup taken while the key was regenerated),
+//! or a damaged or crafted one (review of #670). Its rows are not read: PageStore makes it an
+//! UnreadablePageError, which the readers pass over as they do a Pending page.
+class PageVerifyError : public FormatError {
+public:
+	PageVerifyError(const std::string &message, uint16_t file_, uint32_t page_)
+		: FormatError(message), file(file_), page(page_) {}
+	uint16_t file;
+	uint32_t page;
+};
 
 //! Where a page's latest copy lies.
 struct PageLocation {

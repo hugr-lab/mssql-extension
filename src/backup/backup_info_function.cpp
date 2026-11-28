@@ -367,6 +367,7 @@ struct BackupInfoBindData : public TableFunctionData {
 		copy->reread = reread;
 		copy->has_tail = has_tail;
 		copy->set_guid = set_guid;
+		copy->keyed = keyed;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -377,9 +378,13 @@ struct BackupInfoBindData : public TableFunctionData {
 	//! a file rewritten under an open backup is invalid anyway while the rewrite runs. `reread := true`
 	//! binds again on every EXECUTE (a device overwritten nightly, read by a statement prepared once). An
 	//! attached name's version is pinned again at every EXECUTE too, so it follows a refresh (review of #581).
+	//! A row that needed a key, or was cut to the clear headers for want of one, is bound again on every EXECUTE
+	//! as well: spec 087 D4 asks the secret per statement (review of #670: a prepared statement kept the
+	//! decrypted row after DROP SECRET, and the NULLs after CREATE SECRET).
 	bool SupportStatementCache() const override {
-		return !reread && at.key.empty();
+		return !reread && at.key.empty() && !keyed;
 	}
+	bool keyed = false;
 };
 
 struct BackupInfoState : public GlobalTableFunctionState {
@@ -449,12 +454,16 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 							   "..., PASSWORD ..., SCOPE ...) with it reads the rest",
 							   clear.front().path, list);
 			data->row = ClearRow(clear.front());
+			data->keyed = true;
 			return std::move(data);
 		}
 		// D11's database level from the log tail (stage 5): a data backup's only, read at init.
 		data->has_tail = opened.backup->Headers().Set().kind != BackupKind::Log;
 		data->set_guid = opened.backup->Headers().Set().backup_set_guid.ToString();
 		data->row = InfoRow(opened.backup->Headers());
+		for (const auto &f : opened.backup->Headers().families) {
+			data->keyed = data->keyed || f->keys.backup || f->keys.dek;
+		}
 	} catch (FormatError &e) {
 		throw InvalidInputException("mssql_backup_info: %s", e.what());
 	}

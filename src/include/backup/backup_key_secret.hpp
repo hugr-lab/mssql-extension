@@ -36,8 +36,10 @@ public:
 //! / `private_key_data`, `password` (redacted), and the secret's scope. D2: the files are read and checked
 //! at CREATE SECRET -- the certificate parsed, its thumbprint computed, the private key opened with the
 //! password and its modulus matched to the certificate's -- so a wrong password fails there, before any
-//! backup is touched. The secret keeps the certificate, the still password-protected key container and the
-//! password (both redacted), and shows the thumbprint.
+//! backup is touched. The secret keeps the certificate, the key container as it was given -- password-protected
+//! for an encrypted PVK, a PFX or an encrypted PEM, the plain key for an unencrypted PVK or PEM (review of #670)
+//! -- and the password (both redacted in display, in clear in a PERSISTENT secret's file), and shows the
+//! thumbprint.
 void RegisterBackupKeySecret(ExtensionLoader &loader);
 
 //! D3 / D4, on every call: the content key of the encrypted backup file `path` -- or of a TDE database, its

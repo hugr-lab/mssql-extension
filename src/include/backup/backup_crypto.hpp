@@ -5,12 +5,16 @@
 //
 // Spec 087: the cryptography an encrypted or TDE backup needs, through the statically linked OpenSSL
 // (D6): a certificate's thumbprint, its private key from a PVK (RC4 of our own, D6), a PFX or a PEM,
-// the backup's wrapped key unwrapped (RSA-OAEP / SHA-256 / MGF1-SHA-256 over the reversed blob, E4; no PKCS#1
-// v1.5, review of 087) into a CryptoAPI PLAINTEXTKEYBLOB, and a block or a page decrypted (AES-CBC or 3DES-CBC,
+// the backup's wrapped key unwrapped (RSA-OAEP / SHA-256 / MGF1-SHA-256 over the reversed blob, 2025's, E4; else
+// PKCS#1 v1.5, 2019's and 2022's, under OpenSSL's implicit rejection only, review of #670) into a CryptoAPI
+// PLAINTEXTKEYBLOB, and a block or a page decrypted (AES-CBC or 3DES-CBC,
 // padding off). An unwrapped key lives in a holder that zeroises it (OPENSSL_cleanse), and the copies made on
 // the way -- the key container, its password, OpenSSL's RSA parameters -- are wiped when dropped (WipeOnExit);
-// the secret itself is DuckDB's, held in its secret map in clear. Nothing here logs, prints or puts a key, an
-// IV or a password in an error. DuckDB-free.
+// the secret itself is DuckDB's, held in its secret map in clear, and the copies DuckDB's secret manager makes of
+// it (a listing, a lookup by name) are its own, not wiped here. Decrypted data is not key material and is not
+// wiped: a container's per-thread scratch buffers (backup_container's Decode, backup_pass_search) keep up to
+// 64 KiB of the last block's plaintext for the thread's life (review of #670). Nothing here logs, prints or puts
+// a key, an IV or a password in an error. DuckDB-free.
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -146,9 +150,10 @@ PrivateKey ReadPrivateKey(const std::vector<uint8_t> &bytes, const std::string &
 void Rc4(const uint8_t *key, size_t key_size, uint8_t *data, size_t size);
 
 //! A backup's or a database's wrapped key (`blob`, `blob_size` = the modulus' size) unwrapped with `key`:
-//! RSA-OAEP / SHA-256 / MGF1-SHA-256 over the reversed blob, else PKCS#1 v1.5 (D7), into a PLAINTEXTKEYBLOB
-//! that must be well formed (bType 8, version 2, a known aiKeyAlg, its key length). `what` names the backup
-//! in an error ("the key does not unwrap ..." -- the wrong certificate's key, say).
+//! RSA-OAEP / SHA-256 / MGF1-SHA-256 over the reversed blob (SQL Server 2025), else PKCS#1 v1.5 with OpenSSL's
+//! implicit rejection (2019 / 2022; not tried without it), into a PLAINTEXTKEYBLOB that must be well formed
+//! (bType 8, version 2, a known aiKeyAlg, its key length). Every failure is one message naming `what` ("the key
+//! does not unwrap ..."), never which step failed: no padding oracle on the user's key (review of #670).
 ContentKey UnwrapContentKey(const PrivateKey &key, const uint8_t *blob, size_t blob_size, const std::string &what);
 
 //! The content key a PLAINTEXTKEYBLOB holds (what an unwrap decrypts to): bType 8, version 2, a known aiKeyAlg

@@ -25,11 +25,13 @@ namespace backup {
 namespace {
 
 constexpr uint32_t PVK_MAGIC = 0xB0B5F11E;
-constexpr uint32_t CALG_RSA_KEYX = 0xA400;
-constexpr uint32_t CALG_AES_128 = 0x660E;
-constexpr uint32_t CALG_AES_192 = 0x660F;
-constexpr uint32_t CALG_AES_256 = 0x6610;
-constexpr uint32_t CALG_3DES = 0x6603;
+// The CryptoAPI ALG_IDs, under names of their own: wincrypt.h defines CALG_* as macros (review of #670), and
+// the first include of windows.h here would turn the declarations into syntax errors.
+constexpr uint32_t CAPI_ALG_RSA_KEYX = 0xA400;
+constexpr uint32_t CAPI_ALG_AES_128 = 0x660E;
+constexpr uint32_t CAPI_ALG_AES_192 = 0x660F;
+constexpr uint32_t CAPI_ALG_AES_256 = 0x6610;
+constexpr uint32_t CAPI_ALG_3DES = 0x6603;
 
 uint32_t U32(const uint8_t *p) {
 	return static_cast<uint32_t>(p[0]) | static_cast<uint32_t>(p[1]) << 8 | static_cast<uint32_t>(p[2]) << 16 |
@@ -136,15 +138,17 @@ PrivateKey ReadPvk(const std::vector<uint8_t> &bytes, const std::string &passwor
 	const uint32_t salt_size = U32(bytes.data() + 16);
 	const uint32_t key_size = U32(bytes.data() + 20);
 	if (encrypted > 1 || (encrypted == 1 && salt_size == 0) || salt_size > 64 ||
-		key_size > bytes.size() - 24 - std::min<size_t>(salt_size, bytes.size() - 24) || key_size < 8) {
+		key_size > bytes.size() - 24 - std::min<size_t>(salt_size, bytes.size() - 24) || key_size < 12) {
 		throw FormatError(what + ": a PVK whose salt (" + std::to_string(salt_size) + ") or key (" +
 						  std::to_string(key_size) + ") length does not fit its " + std::to_string(bytes.size()) +
 						  " bytes");
 	}
+	// 12 bytes at least: the 8-byte BLOBHEADER, then the RSAPUBKEY's "RSA2" magic, compared below (review of
+	// #670: 8 to 11 bytes read past the blob).
 	const uint8_t *salt = bytes.data() + 24;
 	SecretBytes blob(salt + salt_size, key_size);
-	// The BLOBHEADER stays in clear: bType 7 (PRIVATEKEYBLOB), version 2, aiKeyAlg CALG_RSA_KEYX.
-	if (blob.data()[0] != 7 || blob.data()[1] != 2 || U32(blob.data() + 4) != CALG_RSA_KEYX) {
+	// The BLOBHEADER stays in clear: bType 7 (PRIVATEKEYBLOB), version 2, aiKeyAlg CAPI_ALG_RSA_KEYX.
+	if (blob.data()[0] != 7 || blob.data()[1] != 2 || U32(blob.data() + 4) != CAPI_ALG_RSA_KEYX) {
 		throw FormatError(what + ": a PVK whose key is not an RSA key-exchange PRIVATEKEYBLOB");
 	}
 	if (encrypted) {
@@ -433,17 +437,28 @@ ContentKey UnwrapContentKey(const PrivateKey &key, const uint8_t *blob, size_t b
 	std::vector<uint8_t> reversed(blob, blob + blob_size);
 	std::reverse(reversed.begin(), reversed.end());	 // CryptoAPI is little-endian (E4)
 	auto *pkey = static_cast<EVP_PKEY *>(key.Native());
-	// RSA-OAEP with SHA-256 / MGF1-SHA-256 only: every encryptor E4 / E4b measured wraps so (SQL Server's
-	// CERTIFICATE_OAEP_256). No PKCS#1 v1.5 fallback (review of 087): with implicit rejection off and distinct
-	// failures after it, a crafted backup naming a user's certificate under a matching scope would make the
-	// error text a Bleichenbacher oracle on the user's RSA key.
-	SecretBytes plain;
-	{
+	// Two wraps, by version (measured, review of #670): SQL Server 2025's CERTIFICATE_OAEP_256 is RSA-OAEP with
+	// SHA-256 / MGF1-SHA-256 (E4 / E4b); 2019 and 2022 (EncryptorType CERTIFICATE, the backup's key and a TDE
+	// database's DEK alike) wrap under PKCS#1 v1.5, `00 02 ... 00` then the 44-byte key blob. OAEP is tried first,
+	// then v1.5, and only with OpenSSL's implicit rejection on: a padding that does not check gives a
+	// deterministic pseudo-random result instead of an error (the Marvin / Bleichenbacher defence). So whatever a
+	// crafted backup sends, the one message below is all that comes out -- for a wrong padding, a wrong key and a
+	// blob that is not a key alike, never which of them it was. Without implicit rejection (an OpenSSL before 3.2)
+	// v1.5 is not tried at all.
+	const std::string does_not_unwrap = what +
+										": the key does not unwrap with the secret's private key (not the "
+										"certificate the backup was encrypted with)";
+	auto decrypt = [&](bool oaep, SecretBytes &plain) {
 		EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, nullptr);
-		bool ok = ctx && EVP_PKEY_decrypt_init(ctx) == 1 &&
-				  EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) == 1 &&
-				  EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) == 1 &&
-				  EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) == 1;
+		bool ok = ctx && EVP_PKEY_decrypt_init(ctx) == 1;
+		if (oaep) {
+			ok = ok && EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) == 1 &&
+				 EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) == 1 &&
+				 EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) == 1;
+		} else {
+			ok = ok && EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) == 1 &&
+				 EVP_PKEY_CTX_ctrl_str(ctx, "rsa_pkcs1_implicit_rejection", "1") > 0;
+		}
 		size_t out_size = 0;
 		ok = ok && EVP_PKEY_decrypt(ctx, nullptr, &out_size, reversed.data(), reversed.size()) == 1;
 		if (ok) {
@@ -454,14 +469,20 @@ ContentKey UnwrapContentKey(const PrivateKey &key, const uint8_t *blob, size_t b
 		}
 		EVP_PKEY_CTX_free(ctx);
 		DropErrors();
+	};
+	SecretBytes plain;
+	decrypt(true, plain);
+	if (plain.empty()) {
+		decrypt(false, plain);
 	}
 	if (plain.empty()) {
-		throw FormatError(what +
-						  ": the key does not unwrap with the secret's private key under RSA-OAEP / SHA-256 (not "
-						  "the certificate the backup was encrypted with, or a backup whose EncryptorType is "
-						  "CERTIFICATE -- PKCS#1 v1.5, not read)");
+		throw FormatError(does_not_unwrap);
 	}
-	return ReadPlaintextKeyBlob(plain.data(), plain.size(), what);
+	try {
+		return ReadPlaintextKeyBlob(plain.data(), plain.size(), what);
+	} catch (FormatError &) {
+		throw FormatError(does_not_unwrap);	 // under v1.5 a padding that did not check reads as no key blob
+	}
 }
 
 ContentKey ReadPlaintextKeyBlob(const uint8_t *p, size_t size, const std::string &what) {
@@ -480,19 +501,19 @@ ContentKey ReadPlaintextKeyBlob(const uint8_t *p, size_t size, const std::string
 	ContentKey content;
 	uint32_t expected = 0;
 	switch (alg) {
-	case CALG_AES_128:
+	case CAPI_ALG_AES_128:
 		content.algorithm = KeyAlgorithm::Aes128;
 		expected = 16;
 		break;
-	case CALG_AES_192:
+	case CAPI_ALG_AES_192:
 		content.algorithm = KeyAlgorithm::Aes192;
 		expected = 24;
 		break;
-	case CALG_AES_256:
+	case CAPI_ALG_AES_256:
 		content.algorithm = KeyAlgorithm::Aes256;
 		expected = 32;
 		break;
-	case CALG_3DES:
+	case CAPI_ALG_3DES:
 		content.algorithm = KeyAlgorithm::TripleDes;
 		expected = 24;
 		break;
