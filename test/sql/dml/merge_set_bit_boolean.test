@@ -6,9 +6,10 @@
 #   MSSQL_TESTDB_DSN - Connection string to test database
 #
 # T-SQL has no boolean value: a predicate where a value is assigned -- `SET b = (t.n < 0)` -- is error 102 / 156.
-# The MERGE's SET / INSERT values wrote the encoder's condition there, so the statement failed and wrote
-# nothing; the same value in an UPDATE works. Such a value is now written as the bit DuckDB gives it,
-# `CASE WHEN c THEN 1 WHEN NOT (c) THEN 0 END`, so an UNKNOWN stays NULL. Found by #633's property tests.
+# The MERGE's SET values wrote the encoder's condition there, so the statement failed and wrote nothing; the
+# same value in an UPDATE works. A condition at the top of the value is now written as the bit DuckDB gives it,
+# `CASE WHEN c THEN CAST(1 AS bit) WHEN (NOT c) THEN CAST(0 AS bit) END`, so an UNKNOWN stays NULL; one nested
+# below it (COALESCE(t.n < 0, false)) is still refused by name. Found by #633's property tests.
 
 require mssql
 
@@ -57,7 +58,8 @@ SELECT k, n, b FROM mb.dbo.mb_t ORDER BY k;
 1	NULL	true
 2	-3	false
 
-# NOT, an OR with a source value, and an INSERT of a condition over the source.
+# NOT, an OR with a source value, and an INSERT of a condition over the source (that one reads the source alone,
+# so DuckDB computes it as a #src column -- it worked before; kept as coverage).
 statement ok
 MERGE INTO mb.dbo.mb_t AS t USING mb_src AS s ON (t.k = s.k)
 WHEN MATCHED THEN UPDATE SET b = NOT (t.n > 0), c = (t.n > 0 OR s.k = 1)
