@@ -1,7 +1,9 @@
 # Spec 094: pushdown for joins and the new types
 
 Status: draft, 2026-11-24, revised 2026-11-26 on the third review of #622 (D0, the superset mechanism; float32
-only; the TOP N path's parameters; the EMPTY / degenerate spatial constants; off switches). DQ-1 and DQ-2
+only; the TOP N path's parameters; the EMPTY / degenerate spatial constants; off switches) and 2026-11-28 on
+the fourth (P0 without D0, an optional wrapper anywhere in a conjunction, #642 merged, D0's allow-list, a distance
+as an approximate value, NULL shapes). DQ-1 and DQ-2
 were decided by the owner on 2026-11-24 for cosine. Both were revisited after X1b (euclidean and dot are
 not exact either) and still await the owner's confirmation for those two. DQ-2's 079 path (no TopN: the
 server's order and values) is the owner's of 2026-11-25. DQ-3 is open. From #515 (the umbrella): its runtime join filters (level 0),
@@ -13,7 +15,9 @@ the pin, `4569c0a1eeb`).
 The rule every decision below keeps:
 - **A filter pushed into a scan is DuckDB's answer or a superset of it**, and DuckDB re-checks it. A
   narrower one loses rows silently, because the rows it drops never reach the re-check. A superset is
-  its own kind of encoded filter (D0), never one taken as exact.
+  its own kind of encoded filter (D0), never one taken as exact. The one exception is under an `optional` /
+  `selectivity_optional` wrapper, a join's filter that the join re-checks on every row: there a plain
+  comparison may be wider than the filter it stands for, with no D0 (D1's dense bounds, P0).
 - **A value or a condition in a statement pushed whole** (079's writer) has no re-check, so it must be
   DuckDB's.
 
@@ -25,7 +29,7 @@ DuckDB's in its last bits, recorded.
 - A join of a DuckDB / Parquet / DuckLake table with an SQL Server table goes through the catalog scan,
   which drops the keys DuckDB hands it: with 3 or 40 build keys the scan streams all 150k rows; only a
   one-key join reaches the server (#515, measured 2026-10-23).
-- `ORDER BY array_cosine_distance(v, $q) LIMIT k` reads the whole table into DuckDB; SQL Server 2025
+- `ORDER BY array_cosine_distance(v, [0.1, 0.2, …]::FLOAT[n]) LIMIT k`, with a constant q, reads the whole table into DuckDB; SQL Server 2025
   answers the same kNN from `TOP (k) … ORDER BY VECTOR_DISTANCE(…)`.
 - A spatial filter or join reads the whole table: only `IS NULL` of a spatial column is pushed.
 
@@ -55,16 +59,21 @@ also take an encoded filter as exact:
 - `BuildWhereClause` at init, for the TableFilters, the dynamic ones a join pushes included.
 
 So the "superset, re-checked by DuckDB" rule needs a mechanism of its own. It is relied on by D2's
-distance conditions, D3's spatial predicates, D4's hint and D1's `LookupRange` bounds.
+distance conditions, D3's spatial predicates and D4's hint.
 
-- **A third encode result, `superset`,** next to exact and refused. Only the D2 / D3 arms and D1's dense
-  bounds return it.
+D1's `LookupRange` bounds (P0) do not need it (fourth review of #622). They are rendered only under an
+optional wrapper, a join's filter that the join re-checks on every row. There a plain comparison may be wider
+than the filter it stands for and lose nothing: DuckDB evaluates `optional` as all-true and may skip
+`selectivity_optional`. So P0 renders them as ordinary comparisons, with no superset kind, and lands before D0.
+
+- **A third encode result, `superset`,** next to exact and refused. Only the D2 / D3 arms return it.
 - **How it combines** (`FilterEncoder`'s arms; today a partial AND already returns its rendered part
   with `supported = false`, and every caller drops it):
   - an AND of exact and superset children is a superset;
   - an OR with a superset child is a superset (an OR with a refused child stays refused);
-  - NOT, a CASE, or a comparison of a boolean over a superset is refused, because NOT of a superset is
-    narrower and loses rows;
+  - **only AND and OR propagate a superset; every other parent refuses it** (an allow-list, fourth review of
+    #622). That covers NOT (NOT of a superset is narrower and loses rows), a CASE, a comparison of a boolean,
+    `IS NULL`, `IS DISTINCT FROM`, a cast to boolean and any function over the predicate;
   - the partial-AND shape stays as it is: refused for the expression paths, its conjuncts taken one by
     one where the caller splits them.
 - **Where a superset is rendered:**
@@ -72,13 +81,17 @@ distance conditions, D3's spatial predicates, D4's hint and D1's `LookupRange` b
     DuckDB calls `ComplexFilterPushdown` more than once per scan, each time with the filters left.
     Since #623 the extension appends each pass to `complex_filter_where_clause` instead of replacing it.
     Supersets therefore go in a bind-data slot of their own (`superset_where_clause` and its parameters),
-    de-duplicated per expression, so a second pass does not add them again. The slot is serialised with
+    de-duplicated by the bound expression (`Expression::Equals`), not by its rendered text, whose `@pN`
+    renumber between passes, so a second pass does not add them again. The slot is serialised with
     the rest of the bind data, as `complex_filter_where_clause` is (load-bearing, `table_scan.cpp`).
     - The cardinality callback's `DEFAULT_SELECTIVITY` is not applied to that slot, because DuckDB
       applies its own selectivity to the kept filter.
   - **In `BuildWhereClause`** (the TableFilter path), only under an `optional` /
-    `selectivity_optional` root: a join's filter (D1, D4), which the join re-checks. Anywhere else a
-    superset there is unhandled and armed in the client-side net.
+    `selectivity_optional` wrapper, **wherever it sits in a conjunction**: a column's static filter and the
+    join's arrive as one `AND(static, optional(…))` (D1), whose root is the AND. The wrapped part is a join's
+    filter (D4's hint), which the join re-checks. A superset anywhere else there is unhandled and armed in the
+    client-side net.
+    - A P3 test puts a static filter and D4's hint on one column.
 - **Every caller that takes a result as exact treats a superset as refused:**
   - `MSSQLPushdownExpression` answers no, so a superset never becomes a mandatory TableFilter;
   - the staged MERGE refuses the condition by name.
@@ -115,16 +128,21 @@ scan keeps `INITIALIZE_ON_EXECUTE`).
 - An IN list on any type the encoder takes: it can only widen the result, and the join re-checks every
   match. A `>=` / `<=` bound only where `OrdersLikeDuckDB()` holds.
 - **A non-equality filter from a join is rendered only where `OrdersLikeDuckDB()` holds,** wrapped or
-  not (review of #622). `FilterEncoder` has no ordering gate of its own: it renders `<` / `<=` / `>` /
-  `>=` for any column that is not `comparison_differs`. `OrdersLikeDuckDB()` excludes more than strings
-  under a non-binary collation: uniqueidentifier, binary / varbinary and datetime2(7) as well.
+  not (review of #622). `FilterEncoder` renders `<` / `<=` / `>` / `>=` for any column that is not
+  `comparison_differs` or one of #642's types (`ServerComparesLike`, below). `OrdersLikeDuckDB()`
+  excludes more than strings under a non-binary collation: uniqueidentifier, binary / varbinary and
+  datetime2(7) as well.
   - The unwrapped min == max filter a range join pushes is such a filter.
-  - The static case, a written `WHERE`, is #639: uniqueidentifier ranges and binary comparisons returned
-    other rows than DuckDB, and DML on a keyless table touched extra rows. Fixed in #642 (open), which
-    runs a uniqueidentifier's ranges in DuckDB and sends a binary's comparisons with the lengths
-    deciding a tie.
-  - X6 is the regression test of the join case. If it shows rows lost today, that is shipped code and
-    gets its own issue ahead of P0.
+  - The static case, a written `WHERE`, was #639: uniqueidentifier ranges and binary comparisons returned
+    other rows than DuckDB, and DML on a keyless table touched extra rows. #642 (merged 2026-11-27) fixed
+    it in `FilterEncoder` itself (`ServerComparesLike`):
+    - a uniqueidentifier sends equality only, and its ranges run in DuckDB;
+    - a binary's comparisons are length-pinned, the lengths deciding a tie.
+
+    A join's filter goes through the same arms, so for those two types the join gate adds nothing. It is
+    left with the strings under a non-binary collation and `datetime2(7)`.
+  - X6's uniqueidentifier and binary cases are now regression tests of #642. If X6 shows rows lost on the
+    remaining types today, that is shipped code and gets its own issue ahead of P0.
 - Anything the encoder does not take (bloom, prefix range, a string range, an IN of an unencodable
   type) is dropped, never armed client-side. Dropping is correct for both wrappers: DuckDB evaluates
   `optional` as all-true, and `selectivity_optional` it may skip itself.
@@ -149,8 +167,8 @@ scan keeps `INITIALIZE_ON_EXECUTE`).
     P0's tests pin which branch each case exercises, with one test per branch and a two-key case.
   - **The bounds.** `PrefixRangeFilter` has no accessor for them, but `LookupRange(lo, hi)` answers
     `FILTER_ALWAYS_FALSE` when no key can lie in `[lo, hi]`. A binary search over the key type's range
-    (about 64 calls a bound) gives a lower and an upper bound, a `>=` / `<=` superset, rendered where
-    `OrdersLikeDuckDB()` holds.
+    (about 64 calls a bound) gives a lower and an upper bound, rendered where `OrdersLikeDuckDB()` holds. They
+    are plain comparisons under the optional wrapper, which the join re-checks, not a D0 superset.
   - **The key type.** `LookupRange` reads its values as the filter's key type, which is the build-side
     condition's type. After an integral cast that type can be wider than the column. So the probes are
     built in that key type, and the bounds are clamped to the column's range before they are rendered.
@@ -292,6 +310,18 @@ the two runs that measured them.
     TopN: the rows come in the server's order with the server's distances, so the result is ordered by
     the values it returns (owner, 2026-11-25). The writer's veto of an approximate ORDER BY key is lifted
     for a distance by DQ-1.
+- **A distance is an `approximate` value in the 079 writer** (fourth review of #622). So its existing vetoes
+  apply unchanged:
+  - a pushed DML's SET / INSERT value (`mssql_node_writer_dml.cpp`);
+  - DISTINCT, GROUP BY and set operations;
+  - a predicate.
+
+  DQ-1 lifts the veto for two places only: the top-level ORDER BY key and a result column. It follows that:
+  - **A window's `ORDER BY distance`** (a kNN per group through QUALIFY) stays vetoed, and DuckDB runs the
+    window.
+  - **Cosine's NULL-plus-hidden-bit result** (restored over the vehicle) cannot be built inside a pushed
+    `INSERT … SELECT`, which has no vehicle projection. There the approximate veto keeps the distance off
+    the server.
 
 ### D3 (P2): spatial predicates with a constant, a superset DuckDB re-checks
 
@@ -330,9 +360,15 @@ predicate that implies the two shapes meet, and it does not depend on the server
 the constant being valid:
 
 ```
+g IS NOT NULL AND
 CASE WHEN G.STIsValid() = 1
      THEN G.STEnvelope().STIntersects(geometry::STGeomFromWKB(@env, G.STSrid)) ELSE 1 END = 1
 ```
+
+`g IS NOT NULL` first (fourth review of #622, run on 2022): `STIsValid()` of a NULL is NULL, so the ELSE arm
+let every NULL row through. That was still a superset, since DuckDB drops those rows, but a sparse spatial
+column then streamed all its NULL rows. Every predicate in the list below is NULL for a NULL shape, so the test
+is exact for each of them.
 
 - **`G`** is the row's geometry:
   - for a `geometry` column, `g` itself;
@@ -481,7 +517,7 @@ The candidates are `ST_X` / `ST_Y` (`.STX` / `.STY`), `ST_NumPoints`, `ST_IsEmpt
 
 | PR | content |
 |---|---|
-| P0 | D1: FilterEncoder unwraps the optional join filters, per conjunct; IN on any type, non-equality filters from a join only where `OrdersLikeDuckDB`; the dense keys' bounds; X6; tests with a local table ⋈ a server table (sparse keys: 1, 3, 40, 100; consecutive ids, each dense branch, a two-key join) |
+| P0 | D1: FilterEncoder unwraps the optional join filters, per conjunct; IN on any type, non-equality filters from a join only where `OrdersLikeDuckDB`; the dense keys' bounds (plain comparisons under the optional wrapper: no D0); X6; tests with a local table ⋈ a server table (sparse keys: 1, 3, 40, 100; consecutive ids, each dense branch, a two-key join) |
 | P1 | D0 and D2: the superset result; VECTOR_DISTANCE in the 079 vocabulary (cast to `real`) and the TOP N path with its own parameters; NULL / NaN emulation, the zero vector in conditions and result columns; float32 only; the prepared `$q` pinned as not pushed; X1c, X1d, X8 |
 | P2 | D3: spatial predicates with a constant as supersets (D0), SRID-blind, geography in its planar form, the EMPTY / degenerate / non-finite cases not pushed; X4; DQ-3 (and `sys.spatial_indexes` only with its option b) |
 | P3 | D4: the bbox hint operator, cleared each execution; X7, with a LEFT and an ANTI spatial join left unhinted |
