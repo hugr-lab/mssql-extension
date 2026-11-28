@@ -78,6 +78,10 @@ public:
 	//! A BOOLEAN value is not a T-SQL predicate: `WHERE [b]` errors 4145,
 	//! `WHERE ([b] = 1)` is the condition. A condition is returned as is.
 	static std::string AsCondition(const SqlOperand &operand);
+	//! AsCondition's inverse (issue #636): a condition as the bit value DuckDB gives it, three-valued --
+	//! `CASE WHEN c THEN CAST(1 AS bit) WHEN NOT (c) THEN CAST(0 AS bit) END`, NULL where c is UNKNOWN. A
+	//! value is returned as is. Where a value is assigned (a staged MERGE's SET and INSERT values).
+	static std::string AsValue(const SqlOperand &operand);
 
 	//===--------------------------------------------------------------------===//
 	// Operators

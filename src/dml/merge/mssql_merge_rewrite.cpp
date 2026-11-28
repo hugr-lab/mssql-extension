@@ -577,7 +577,8 @@ string MergeRewriter::ValueSql(const Expression &value, MergeScope scope, const 
 		}
 	}
 	Split(expr, scope);
-	const auto result = FilterEncoder::EncodeExpression(*expr, ctx_);
+	// #636: a value, so a condition assigned to a bit column is written as its bit (EncodeValue).
+	const auto result = FilterEncoder::EncodeValue(*expr, ctx_);
 	if (!result.supported) {
 		Refuse(what + " cannot be written in T-SQL: " + text);
 	}
