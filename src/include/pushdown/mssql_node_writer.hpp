@@ -41,6 +41,7 @@
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 
 namespace duckdb {
@@ -513,6 +514,52 @@ private:
 		return columns_[index];
 	}
 	bool WriteFrom(const TableRef &ref, std::string &sql);
+	//! The steps of FindColumn / ResolveColumn. FindRelation: the relation the
+	//! query names `name`, INVALID_INDEX for none. IsOutOfScope: a relation not
+	//! joined yet where an ON is written, or a SEMI / ANTI join's table outside
+	//! its own condition. IsMergeForbidden: the side a MERGE action's rows do
+	//! not have. ColumnAnswers: whether flat column `index` is one a reference
+	//! to `name` -- of `relation`, or INVALID_INDEX for an unqualified one --
+	//! can mean. VetoUnanswered words FindColumn's -1.
+	idx_t FindRelation(const std::string &name) const;
+	bool IsOutOfScope(idx_t relation) const;
+	bool IsMergeForbidden(idx_t relation) const;
+	bool FindUsingColumn(const std::string &name, idx_t &out) const;
+	bool ColumnAnswers(idx_t index, idx_t relation, const std::string &name) const;
+	int FindColumnIn(idx_t relation, const std::string &name, idx_t &out) const;
+	bool IsSelectAliasOrRowid(const ColumnRefExpression &ref) const;
+	bool VetoUnanswered(const ColumnRefExpression &ref);
+	//! The steps of CollectRelations, by what the FROM holds: a table (or the
+	//! CTE its name means, inlined as a derived table) and a join.
+	bool CheckRelationName(const std::string &name);
+	bool CollectBaseTable(const BaseTableRef &base, std::vector<idx_t> &members);
+	bool CollectTable(const BaseTableRef &base, std::vector<idx_t> &members);
+	bool IsEvaluatedPerRow(const NodeWriter *owner) const;
+	bool CollectCteReference(const BaseTableRef &base, CteEntry &cte, NodeWriter *owner, idx_t index,
+							 std::vector<idx_t> &members);
+	bool CheckJoinShape(const JoinRef &join);
+	bool AnySemi(const std::vector<idx_t> &members) const;
+	void MarkNullable(const std::vector<idx_t> &members);
+	bool CollectJoin(const JoinRef &join, std::vector<idx_t> &members);
+	//! The steps of CollectDerivedNode: the inner writer set up and run, then
+	//! its results as a relation and its columns.
+	void PrepareDerivedWriter(NodeWriter &inner, bool synthetic, NodeWriter *cte_owner, idx_t cte_index,
+							  bool per_row) const;
+	bool WriteDerivedBody(NodeWriter &inner, const QueryNode &node, bool synthetic) const;
+	static std::vector<std::string> GroupKeyNames(const NodeWriter &inner);
+	static std::vector<std::string> DerivedUniqueKey(const NodeWriter &inner);
+	void NoteDerivedFacts(const NodeWriter &inner, const WrittenQuery &inner_out);
+	static Relation DerivedRelation(const std::string &name, const NodeWriter &inner, const WrittenQuery &inner_out);
+	void AppendDerivedColumn(const NodeWriter &inner, const OutputColumn &output);
+	//! The steps of WriteFrom's join: its condition (USING or ON) and the gain
+	//! check's question, whether the link equates a unique key of one side.
+	bool WriteJoin(const JoinRef &join, std::string &sql);
+	bool WriteJoinCondition(const JoinRef &join, idx_t left_first, idx_t right_relation, std::string &condition);
+	bool WriteUsing(const JoinRef &join, idx_t left_first, idx_t right_relation, std::string &condition);
+	bool FindUsingSides(const std::string &name, idx_t left_first, idx_t right_relation, idx_t &left_column,
+						idx_t &right_column);
+	Operand ColumnOperand(idx_t index) const;
+	bool LinkIsBounded(idx_t left_first, idx_t right_relation) const;
 	//! The columns of `relation` that a `*` over the whole FROM lists: all, but
 	//! a USING column of the right side only once (on the left).
 	bool IsHiddenUsingColumn(idx_t index) const;
