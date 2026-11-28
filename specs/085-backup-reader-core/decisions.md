@@ -40,7 +40,7 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | DQ-04 | minimum SQL Server version | 2017 | 085 PR 1 |
 | DQ-05 | phase-A lakes have no LOB maps | move the plain `_mssql_lob` output into 085 PR 3 | 022 phase A |
 | DQ-06 | a stale page the next file neither carries nor frees | a named error | 023 I4, 090 |
-| DQ-07 | a columnstore table whose loaded tail recovery cannot cover | refuse the file | 023 I5, 088, 090 |
+| DQ-07 | a columnstore table whose loaded tail recovery cannot cover | **superseded 2026-11-28**: no refusal; read and flag it like any table | 023 I5, 088, 090 |
 | DQ-08 | users' writes to imported tables | refuse the import by default | 023 |
 | DQ-09 | where pending page images (uncommitted rows) live | in the lake, `__mssql_sys.pending_pages` | 022 D11, 023 I4 |
 | DQ-10 | partition values, file layout and SWITCH in the lake | **decided** (owner, 2026-11-05): follow DuckLake's rules | — |
@@ -232,6 +232,24 @@ segments), recovery cannot cover it until 090's columnstore guard extension exis
 dirt-free only if no open transaction touched the table and the tuple mover's state is not torn (a
 rowgroup compressed while its delta store still holds the rows would show them twice). Neither is
 measured (E5 §6.6), and the owner allows no dirt.
+
+**Superseded (owner, 2026-11-28; PR #680).** The owner's words: "прочитать максимально что можем прочитать из
+бекапа, включая те что под нагрузкой, а согласованность и правила импорта будут там". That is, read the
+utmost a backup holds, under load too; consistency and the rules of import belong to the importer, and that
+covers broken and partial backups as well. So:
+
+- the reader reads a columnstore table under load and reports it, D11's `dirty` / `stale`, as it does any
+  table;
+- 090 recovers what it covers of a CCI as of any table, with no columnstore-specific refusal: delta stores and
+  the delete bitmap are rowstore records, and the tuple mover's records are redone if the tail carries their
+  pages (088 task 9 measures it);
+- what stays uncovered falls under 090 D7's rule, the same for every table, and the importer's policy decides.
+  Since the same day (owner: "не отказывал во всем файле, возможно режим strict когда отказываем") that policy
+  never refuses the file by default. Its options are `unrecoverable := 'skip'` (default: the table is not
+  advanced by the file and is reported), `'as_read'` and `'strict'` (refuse the file).
+
+E11 measured what the recommendation lacked: a TOMBSTONE keeps its delta store, so the tuple mover's rows
+are in the backup twice until a REORGANIZE, and only the rowgroup state tells which to read.
 
 ### DQ-08 — What if users write to imported tables?
 

@@ -244,8 +244,15 @@ A CCI on 2025 accepts `json`, `vector` and every `(max)` type, and refuses `sql_
     read a row twice or lose one, and D11's status is what tells the importer. Task 9 places a hold within the
     table's pages.
 
-  Recovery stays 090's. Its columnstore extension redoes delta-store and delete-bitmap records as rowstore;
-  the tuple mover's records are not redone (E5§6.6).
+  The principle (owner, 2026-11-28) is to read the utmost a backup holds, under load too; consistency and the
+  import rules are the importer's. So nothing here refuses a CCI, and a torn tuple-mover step is read as far
+  as it can be. A rowgroup whose segment fails its invariants is a candidate to be read from the TOMBSTONE's
+  delta store: E11 found it kept until a REORGANIZE, the same rows. To be checked in task 9, with a hold
+  inside the table's pages.
+
+  Recovery is 090's, which treats a CCI as any table (DQ-07 superseded). Its columnstore extension redoes
+  delta-store and delete-bitmap records as rowstore, and the tuple mover's records if the tail carries their
+  pages as images. Task 9 measures that, as tail_window found for a TABLOCK load.
 
 - **D7 — the differential evidence (E11, measured on 2022).** A full backup and its differential, overlaid in
   restore order, equal the server after each of 21 steps (19 run, 2 refused by the server), so 085's overlay reads a CCI as it is; nothing
@@ -391,7 +398,9 @@ Costs follow E5§7, without its NCCI share.
    - a tail that holds only a REORGANIZE, and D11's count of it (D6);
    - a hold placed within the table's pages, the tuple mover running there (D6);
    - E11 on 2019, so far measured on 2022 only;
-   - the REBUILD event (acceptance 8).
+   - the REBUILD event (acceptance 8);
+   - whether the tail carries the tuple mover's segment pages as images (090's redo), and reading a torn
+     rowgroup from its TOMBSTONE's delta store (D6).
 10. Docs (README, `DATAMODEL.md` columnstore layer, CLAUDE.md, CHANGELOG) — 1 d
 
 **Total ≈ 35.5 days, 6–8 weeks** (E5§7: ≈ 34 days, 5–8 weeks; plus E11's remainder, minus the NCCI work). R§8
@@ -415,12 +424,11 @@ phase 3 gave 5–8 weeks at medium risk after E5.
 - **A fuzzy copy that mixes a tuple-mover step's before and after** was not produced (D6); D11's status covers
   it.
 - **Order and DQ-07**, from [decisions.md](../085-backup-reader-core/decisions.md):
-  - The order is settled: DQ-03's "090 before 088" was superseded by the owner's order of 2026-11-19 (088
-    before 089 and 090, series.md).
-  - DQ-07 is **open for the owner**. It said "a columnstore table whose tail the recovery cannot cover refuses
-    the file". That predates D11's `mssql_backup_fuzzy` policy and the no-read-refusal rule.
-  - Proposed: the reader reads a CCI and reports it like any table, as D6 here, and a refusal is the
-    importer's (`fuzzy := 'error'`), whatever 090 can redo.
+  - Order: DQ-03's "090 before 088" was superseded by the owner's order of 2026-11-19 (088 before 089 and 090,
+    series.md).
+  - DQ-07, "a columnstore table whose tail the recovery cannot cover refuses the file", was **superseded on
+    2026-11-28** (owner): read the utmost, under load too, and leave consistency and the import rules to the
+    importer. A CCI is read, flagged and recovered like any table (D6).
 
 ## References
 

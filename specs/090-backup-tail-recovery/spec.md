@@ -58,7 +58,8 @@ log backups (R§8 phase 4 stays out).
 - **D3 — recovery is on by default.** `mssql_backup_scan(…, recovery := true)` returns what RESTORE
   returns; `recovery := false` returns 085's page state with its fuzzy status. A table recovery cannot
   cover (D7, the guards) falls back to 085's page state under the `fuzzy` policy: rows and a warning
-  under `'warn'`, refused under `'error'` (the importer always passes `'error'`). Reason: the owner's
+  under `'warn'`, refused under `'error'`. The importer passes `'error'`, so that such a table comes back
+  `unrecoverable`, never silently read; what is then done with it is D7's `unrecoverable :=` policy. Reason: the owner's
   rule, and an oracle that is RESTORE. Browsing takes the same default, `recovery := true` with 085
   D11's `fuzzy := 'warn'` (DQ-13, accepted).
 
@@ -74,12 +75,26 @@ log backups (R§8 phase 4 stays out).
 
 - **D6 — files are ordered by `CheckpointLSN`** (E6§6.5), enforced by 089's chain check.
 
-- **D7 — refuse what the engine does not cover, by name, per table.** Recovery either makes a table
-  exact (restore mode, a lake-mode full) or dirt-free (a loaded differential), or the table is
-  `unrecoverable` with the reason, and the importer refuses the file, naming the table (one snapshot
-  per file leaves no way to apply the rest without it). Never dirt with a warning. A columnstore
-  table whose loaded tail recovery cannot cover is refused the same way, until this spec's
-  columnstore extension and E11 exist (DQ-07, accepted).
+- **D7 — what the engine does not cover is judged per table, never by refusing the file by default (owner,
+  2026-11-28).** Recovery either makes a table exact (restore mode, a lake-mode full) or dirt-free (a loaded
+  differential), or the table is `unrecoverable`, with the reason. A columnstore table follows the same rule as
+  any table, with no refusal of its own: what the engine covers of it is recovered (the extension below), and
+  the rest is `unrecoverable` like an uncovered rowstore table.
+
+  The owner's words: "не отказывал во всем файле, возможно режим strict когда отказываем". The importer's
+  option, `unrecoverable :=` (mssql-ducklake 023, passed through like `loaded_diff`), decides what happens to
+  such a table:
+  - **`'skip'` (default).** The file is imported, and the table is not advanced by it. It keeps its previous
+    state in the lake, is absent on a first import, and is named with its reason in the import's report. A
+    later file that recovers it heals it. Nothing is dirty. The cost is that the snapshot holds that table one
+    file behind the others, which the report says.
+  - **`'as_read'`.** The table is imported as the copy holds it (085's page state, D11's `dirty` / `stale`)
+    and marked so in the report: dirt the user asked for.
+  - **`'strict'`.** The importer refuses the file, naming every such table. That was the rule before
+    2026-11-28.
+
+  DQ-07's columnstore refusal was superseded the same day: read the utmost, the importer judges. Browsing
+  (`recovery := false`) reads every table whatever its state, with D11's status.
 
 - **D8 — the page-state model is the reader's.** A page under recovery is its 96-byte header plus a
   slot list of record bytes (E6 `PageState`); its serialisation (versioned, checksummed) is the pending
@@ -211,8 +226,9 @@ dropping images as 089 says) and passes back as the next `base/allocation.parque
   image's owner for a baseless page, its copy's header AU for a page a skipped transaction touched,
   both usually the extent's owner already;
 - a page whose owner the images cannot express (its extent is another AU's in the recovered images,
-  and it is not in a mixed extent) makes its table `unrecoverable` (D7), naming the page and both AUs,
-  so the importer refuses the file.
+  and it is not in a mixed extent) makes its table `unrecoverable` (D7), naming the page and both AUs. The
+  importer's `unrecoverable :=` policy decides, as for any such table. Under `'skip'` no later differential
+  can heal it, since it could not attribute that page either; a full reloads it.
 
 E6 never met the last case, and E6's lake (E1's) deleted every page from every table, so none of this
 was measured. **To verify** (tasks 7 and 10): a loaded differential whose skipped transactions free and
@@ -261,8 +277,8 @@ lake, in `__mssql_sys.pending_pages` (DQ-09, accepted).
 | ADR, RCSI, snapshot isolation | in-row version tags change record lengths; ADR reverts logically from the version store | version tags (statusA 0x40) in records the tail touches; a boot-page flag to locate | 3–4 wk |
 | DDL in the tail | catalog pages would need redo | row operations on catalog base tables beyond the counters plain DML writes (which ones it writes is measured first, task 9) | 1–2 wk |
 | TDE | the log tail is encrypted (087 D9) | 087 | after E10 |
-| columnstore delta stores and delete bitmaps | rowstore records (the bitmap is CD) | 088's rowset roles | 1 wk, after 086 PR 1 and 088 (the file is refused until then: DQ-07, accepted) |
-| the tuple mover or a compression in the tail | new segments and rowgroup rows | 088 D6 | open |
+| columnstore delta stores and delete bitmaps | rowstore records (the bitmap is CD) | 088's rowset roles | 1 wk, after 088 (until then such a table is `unrecoverable` under D7, like any uncovered table) |
+| the tuple mover or a compression in the tail | new segments and rowgroup rows | 088 D6; whether the tail carries the segments' pages as images (088 task 9) | redo of images if so; a TOMBSTONE keeps its delta store and its rows (E11) |
 | an operation outside the seven and the ignored list, on a data or LOB context | unknown effect | opcode | — |
 | a record that cannot apply (slot out of range, modify past the record) | the state is not what the log assumes | the engine | — (E6: 0 in every run) |
 
@@ -353,9 +369,11 @@ week. R§8 phase 1c: 9–12 weeks. The guard extensions are on top.
 - **Undo by key** for the key shapes E6 lacked.
 - **Guards will refuse real tables** (ROW / PAGE compression is common). The guard extensions come
   ROW / PAGE first, then DDL in the tail, then ADR / RCSI, then columnstore (DQ-03, accepted).
-- Decided ([decisions.md](../085-backup-reader-core/decisions.md)): 090 before 088 (R§10.4; DQ-03);
+- Decided ([decisions.md](../085-backup-reader-core/decisions.md)): 088 before 089 and 090 (owner,
+  2026-11-19, superseding DQ-03's 090 before 088);
   `recovery := true` as the browsing default too (D3; DQ-13); an unhealed stale page is a named error
-  (DQ-06); a columnstore table recovery cannot cover refuses the file (D7; DQ-07); `'partial'` is
+  (DQ-06); a columnstore table is recovered and judged like any table (D7; DQ-07 superseded
+  2026-11-28); `'partial'` is
   offered as a non-default option (D4; DQ-17); pending images live in the lake (DQ-09).
 
 ## References
