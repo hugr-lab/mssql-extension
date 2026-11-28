@@ -5,6 +5,7 @@
 #include "backup/backup_system_tables.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -57,12 +58,6 @@ bool IsVectorColumn(const CatalogColumn &c) {
 		   StringUtil::Lower(c.type_name) == "vector";
 }
 
-// The most dimensions of a vector of `element_type`: its values fill at most 8000 - 8 bytes (1998 float32,
-// 3996 float16; measured on SQL Server 2025, #644).
-static int32_t MaxVectorDimensions(uint8_t element_type) {
-	return (8000 - tds::VECTOR_HEADER_BYTES) / tds::VectorElementBytes(element_type);
-}
-
 uint16_t VectorDeclaration(const CatalogColumn &c, std::string &why) {
 	if (c.scale != tds::VECTOR_ELEMENT_FLOAT32 && c.scale != tds::VECTOR_ELEMENT_FLOAT16) {
 		why = "a vector of element type " + std::to_string(c.scale) + ", which no vector has (0 float32, 1 float16)";
@@ -71,10 +66,10 @@ uint16_t VectorDeclaration(const CatalogColumn &c, std::string &why) {
 	const int32_t element = tds::VectorElementBytes(c.scale);
 	const int32_t values = static_cast<int32_t>(c.max_length) - tds::VECTOR_HEADER_BYTES;
 	const int32_t dimensions = values > 0 && values % element == 0 ? values / element : 0;
-	if (dimensions < 1 || dimensions > MaxVectorDimensions(c.scale)) {
+	if (dimensions < 1 || dimensions > tds::VectorMaxDimensions(c.scale)) {
 		why = "a vector declared " + std::to_string(c.max_length) + " bytes long, which no " +
 			  (c.scale == tds::VECTOR_ELEMENT_FLOAT16 ? "float16" : "float32") + " vector(1.." +
-			  std::to_string(MaxVectorDimensions(c.scale)) + ") is";
+			  std::to_string(tds::VectorMaxDimensions(c.scale)) + ") is";
 		return 0;
 	}
 	return static_cast<uint16_t>(dimensions);
@@ -92,10 +87,47 @@ std::string GeometryAsGiven(const std::string &value, const char *source) {
 	return value;
 }
 
-TypeForms TypeFormsOf(const std::string &geometry_as, const char *source) {
+std::string Datetime2AsGiven(const std::string &value, const char *source) {
+	ParseDatetime2Read(value, source);
+	return value;
+}
+
+std::string Datetime2AsSetting(ClientContext &context) {
+	Value setting;
+	if (context.TryGetCurrentSetting("mssql_datetime2_7_as", setting) && !setting.IsNull()) {
+		return Datetime2AsGiven(setting.ToString(), "mssql_datetime2_7_as");
+	}
+	return std::string();
+}
+
+TypeFormOptions TypeFormOptionsOf(ClientContext &context, const named_argument_map_t &named,
+								  const vector<std::string> &paths, const std::string &function) {
+	TypeFormOptions options;
+	if (paths.size() == 1) {
+		options = AttachedTypeFormOptions(context, paths.front());
+	}
+	auto geometry_as = named.find("geometry_as");
+	if (geometry_as != named.end() && !geometry_as->second.IsNull()) {
+		options.geometry_as = GeometryAsGiven(geometry_as->second.ToString(), (function + ": geometry_as").c_str());
+	}
+	auto datetime2_7_as = named.find("datetime2_7_as");
+	if (datetime2_7_as != named.end() && !datetime2_7_as->second.IsNull()) {
+		options.datetime2_7_as =
+			Datetime2AsGiven(datetime2_7_as->second.ToString(), (function + ": datetime2_7_as").c_str());
+	} else if (options.datetime2_7_as.empty()) {
+		// Not attached, or attached with neither the option nor the setting then: the setting now.
+		options.datetime2_7_as = Datetime2AsSetting(context);
+	}
+	return options;
+}
+
+TypeForms TypeFormsOf(const TypeFormOptions &options, const std::string &where) {
 	TypeForms forms;
-	if (!geometry_as.empty()) {
-		forms.geometry_as = ParseGeometryAs(geometry_as, source);
+	if (!options.geometry_as.empty()) {
+		forms.geometry_as = ParseGeometryAs(options.geometry_as, (where + ": geometry_as").c_str());
+	}
+	if (!options.datetime2_7_as.empty()) {
+		forms.datetime2_read = ParseDatetime2Read(options.datetime2_7_as, where + ": datetime2_7_as");
 	}
 	return forms;
 }
