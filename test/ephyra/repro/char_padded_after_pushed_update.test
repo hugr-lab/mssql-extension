@@ -1,0 +1,35 @@
+# name: test/ephyra/repro/char_padded_after_pushed_update.test
+# description: after an UPDATE of every row (pushed whole), a UTF-8 char(n) column is read back padded with spaces in the same session (found with ephyra, property dmldiff)
+# group: [dml]
+
+# Expected: a char(n) is read trimmed (docs/type-mapping.md: "CHAR ... trailing spaces trimmed"),
+# before and after a write, so the value written compares equal to the value read.
+# Actual (6ddbcea5): the reads after the UPDATE return 'b    ', length 5, and c0 = 'b' is false.
+# A new session reads 'b'.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ephp (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('ephp', 'DROP TABLE IF EXISTS dbo.eph_ch; CREATE TABLE dbo.eph_ch (k int NOT NULL PRIMARY KEY, c0 char(5) COLLATE Latin1_General_100_BIN2_UTF8); INSERT INTO dbo.eph_ch VALUES (0, ''x''), (1, NULL)');
+
+statement ok
+UPDATE ephp.dbo.eph_ch SET c0 = 'b';
+
+query ITI
+SELECT k, c0 || '|', length(c0) FROM ephp.dbo.eph_ch ORDER BY k;
+----
+0	b|	1
+1	b|	1
+
+query I
+SELECT count(*) FROM ephp.dbo.eph_ch WHERE c0 = 'b';
+----
+2
+
+statement ok
+SELECT mssql_exec('ephp', 'DROP TABLE dbo.eph_ch');

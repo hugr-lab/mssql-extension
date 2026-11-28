@@ -1,0 +1,62 @@
+# name: test/ephyra/repro/merge_set_bit_boolean_expression.test
+# description: MERGE ... UPDATE SET bitcol = <boolean expression over the target> fails with SQL Server error 102 (found with ephyra, property dmldiff)
+# group: [dml]
+
+# Expected: a MERGE that DuckDB binds either runs or is refused by name with
+# "Nothing was sent" (CLAUDE.md, DML: "every other MERGE is staged"; "Refused by name,
+# nothing sent"). The same value in an UPDATE works.
+# Actual (4128e1ac): "MSSQL MERGE INTO 'dbo.eph_m0' failed: SQL Server error 102:
+# Incorrect syntax near '>'." -- the predicate is written where T-SQL needs a value.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ephm (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('ephm', 'DROP TABLE IF EXISTS dbo.eph_m0; CREATE TABLE dbo.eph_m0 (k int NOT NULL PRIMARY KEY, n int, b bit); INSERT INTO dbo.eph_m0 VALUES (0, 5, NULL), (1, NULL, NULL), (2, -3, 1)');
+
+statement ok
+CREATE TABLE eph_src AS SELECT * FROM (VALUES (0), (1), (2)) t(k);
+
+# the reference: an UPDATE takes the value
+statement ok
+UPDATE ephm.dbo.eph_m0 SET b = (n > 0);
+
+query IIT
+SELECT * FROM ephm.dbo.eph_m0 ORDER BY k;
+----
+0	5	true
+1	NULL	NULL
+2	-3	false
+
+# staged MERGE (local source), a comparison
+statement ok
+MERGE INTO ephm.dbo.eph_m0 AS t USING eph_src AS s ON (t.k = s.k) WHEN MATCHED THEN UPDATE SET b = (t.n < 0);
+
+query IIT
+SELECT * FROM ephm.dbo.eph_m0 ORDER BY k;
+----
+0	5	false
+1	NULL	NULL
+2	-3	true
+
+# staged MERGE, IS NULL as a value (error 156 near 'IS')
+statement ok
+MERGE INTO ephm.dbo.eph_m0 AS t USING eph_src AS s ON (t.k = s.k) WHEN MATCHED THEN UPDATE SET b = (t.n IS NULL);
+
+query IIT
+SELECT * FROM ephm.dbo.eph_m0 ORDER BY k;
+----
+0	5	false
+1	NULL	true
+2	-3	false
+
+# pushed MERGE (source in the catalog), AND of two bit columns (error 102 near '=')
+statement ok
+MERGE INTO ephm.dbo.eph_m0 AS t USING ephm.dbo.eph_m0 AS s ON (t.k = s.k) WHEN MATCHED THEN UPDATE SET b = (t.b AND s.b);
+
+statement ok
+SELECT mssql_exec('ephm', 'DROP TABLE dbo.eph_m0');
