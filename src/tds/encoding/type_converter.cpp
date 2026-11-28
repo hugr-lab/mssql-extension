@@ -296,6 +296,14 @@ void DecodeRareForm(WireFamily family, const std::vector<uint8_t> &value, const 
 					idx_t row_idx, mssql::codec::variant::VariantColumnNotes *variant_notes,
 					mssql::codec::spatial::SpatialColumnNotes *spatial_notes) {
 	if (family == WireFamily::VARIANT) {
+		// Issue #683: the codec builds a VARIANT and copies it into the target, and a copy into a vector of
+		// another type reads past its buffers. A VARCHAR target took the string fallback before this; any
+		// other is a bind and a stream that disagree, refused by name.
+		if (vector.GetType().id() != LogicalTypeId::VARIANT) {
+			throw InvalidInputException(
+				"MSSQL Error: column '%s' streams a sql_variant, which is read as VARIANT, but the result expects %s.",
+				column.name.c_str(), vector.GetType().ToString().c_str());
+		}
 		mssql::codec::variant::DecodeFromTds(value, column, vector, row_idx, variant_notes);
 		return;
 	}
