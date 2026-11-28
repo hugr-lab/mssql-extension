@@ -276,6 +276,10 @@ private:
 	// Similar to DrainAfterCancel but without sending ATTENTION signal
 	void DrainRemainingTokens();
 
+	//! The next token of a drain. False when the response cannot be parsed (the row reader threw): the
+	//! connection is then closed and the stream in Error, and the drain is over (issue #682).
+	bool DrainNextToken(tds::ParsedTokenType &token);
+
 	// Connection (shared with pool)
 	std::shared_ptr<tds::TdsConnection> connection_;
 
