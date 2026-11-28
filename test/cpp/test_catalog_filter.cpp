@@ -3,6 +3,9 @@
 
 #include <cassert>
 #include <iostream>
+#include <regex>
+#include <string>
+#include <vector>
 
 #include "catalog/mssql_catalog_filter.hpp"
 
@@ -363,6 +366,181 @@ static void TestSQLLikeInjectionSafety() {
 //==============================================================================
 // Main
 //==============================================================================
+//==============================================================================
+// Test: TryRegexToSQLLike — never narrower than the regex (issue #663)
+//==============================================================================
+// The predicate is ANDed into the metadata queries, so a name the regex accepts
+// and the predicate rejects is a schema or table the catalog loses.
+static void TestSQLLikeNeverNarrower() {
+	std::cout << "  TestSQLLikeNeverNarrower..." << std::endl;
+
+	// An empty alternative matches every name: the alternatives before it are not
+	// the pattern, and nothing is converted.
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("a|b|", "c"), "");
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("|a", "c"), "");
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^(a|b|)", "c"), "");
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^(a|b||c)$", "c"), "");
+
+	// An anchor inside an alternative is an anchor, not text for the IN list.
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^(a$|b)$", "c"), "(c LIKE 'a' OR c LIKE 'b')");
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^(a|^b)$", "c"), "(c LIKE 'a' OR c LIKE 'b')");
+
+	// An anchor that is not the pattern's first / last character is still an
+	// assertion (`^^foo$` matches foo): not convertible, never the character.
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^^foo$", "c"), "");
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^foo$$", "c"), "");
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("a$b", "c"), "");
+	// Escaped, it IS the character.
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^foo\\$$", "c"), "c LIKE 'foo$'");
+
+	// What converted before still does.
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^(a|b|c)$", "c"), "c IN ('a', 'b', 'c')");
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^a$|^b$", "c"), "c IN ('a', 'b')");
+	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("foo|bar", "c"), "(c LIKE '%foo%' OR c LIKE '%bar%')");
+
+	std::cout << "    PASSED" << std::endl;
+}
+
+//==============================================================================
+// Test: TryRegexToSQLLike — the predicate accepts every name the regex accepts
+//==============================================================================
+// The rule behind the cases above, checked for every pattern of up to four
+// characters over the regex's own alphabet: where a pattern converts, no name
+// the regex matches may be rejected by the predicate. LIKE is evaluated here as
+// T-SQL does under a case-insensitive collation (% a run, _ one character, [x]
+// the character x); the predicate is one of the three shapes the converter
+// writes. Issue #663's patterns were 1,742 of the 96,676 that converted at
+// five characters.
+namespace {
+
+char LowerAscii(char c) {
+	return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+}
+
+bool LikeMatches(const std::string &pattern, size_t i, const std::string &name, size_t j) {
+	while (i < pattern.size()) {
+		if (pattern[i] == '%') {
+			for (size_t k = j; k <= name.size(); k++) {
+				if (LikeMatches(pattern, i + 1, name, k)) {
+					return true;
+				}
+			}
+			return false;
+		}
+		if (j >= name.size()) {
+			return false;
+		}
+		if (pattern[i] == '[' && i + 2 < pattern.size() && pattern[i + 2] == ']') {
+			if (LowerAscii(pattern[i + 1]) != LowerAscii(name[j])) {
+				return false;
+			}
+			i += 3;
+			j++;
+			continue;
+		}
+		if (pattern[i] != '_' && LowerAscii(pattern[i]) != LowerAscii(name[j])) {
+			return false;
+		}
+		i++;
+		j++;
+	}
+	return j == name.size();
+}
+
+bool EqualsIgnoringCase(const std::string &a, const std::string &b) {
+	if (a.size() != b.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < a.size(); i++) {
+		if (LowerAscii(a[i]) != LowerAscii(b[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! The quoted values of a predicate the converter wrote, '' read back as '.
+std::vector<std::string> QuotedValues(const std::string &sql) {
+	std::vector<std::string> values;
+	size_t i = 0;
+	while ((i = sql.find('\'', i)) != std::string::npos) {
+		std::string value;
+		for (i++; i < sql.size(); i++) {
+			if (sql[i] == '\'') {
+				if (i + 1 < sql.size() && sql[i + 1] == '\'') {
+					i++;
+				} else {
+					break;
+				}
+			}
+			value += sql[i];
+		}
+		values.push_back(value);
+		i++;
+	}
+	return values;
+}
+
+bool PredicateAccepts(const std::string &sql, const std::string &name) {
+	const bool in_list = sql.find(" LIKE '") == std::string::npos;
+	for (const auto &value : QuotedValues(sql)) {
+		if (in_list ? EqualsIgnoringCase(value, name) : LikeMatches(value, 0, name, 0)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Every string of 1..max_length characters of `alphabet`.
+std::vector<std::string> AllStrings(const std::string &alphabet, size_t max_length) {
+	std::vector<std::string> all;
+	std::vector<std::string> last(1, "");
+	for (size_t length = 1; length <= max_length; length++) {
+		std::vector<std::string> next;
+		for (const auto &prefix : last) {
+			for (char c : alphabet) {
+				next.push_back(prefix + c);
+			}
+		}
+		all.insert(all.end(), next.begin(), next.end());
+		last = std::move(next);
+	}
+	return all;
+}
+
+}  // namespace
+
+static void TestSQLLikeAcceptsWhatTheRegexAccepts() {
+	std::cout << "  TestSQLLikeAcceptsWhatTheRegexAccepts..." << std::endl;
+
+	const std::vector<std::string> names = AllStrings("ab$^%_(", 3);
+	size_t converted = 0;
+	for (const auto &pattern : AllStrings("ab^$|().*\\%", 4)) {
+		std::regex regex;
+		try {
+			regex = std::regex(pattern, std::regex::icase);
+		} catch (const std::regex_error &) {
+			continue;  // not a filter ATTACH would take
+		}
+		const std::string predicate = MSSQLCatalogFilter::TryRegexToSQLLike(pattern, "c");
+		if (predicate.empty()) {
+			continue;
+		}
+		converted++;
+		for (const auto &name : names) {
+			if (std::regex_search(name, regex) && !PredicateAccepts(predicate, name)) {
+				std::cerr << "ASSERTION FAILED: the filter '" << pattern << "' matches the name '" << name
+						  << "', and its predicate rejects it: " << predicate << std::endl;
+				assert(false);
+			}
+		}
+	}
+	// The check is of converted patterns: it must have had some to look at.
+	ASSERT_TRUE(converted > 1000);
+
+	std::cout << "    PASSED" << std::endl;
+}
+
 int main() {
 	std::cout << "Running MSSQLCatalogFilter unit tests..." << std::endl;
 
@@ -381,6 +559,8 @@ int main() {
 	TestSQLLikeAlternationOR();
 	TestSQLLikeNonConvertible();
 	TestSQLLikeInjectionSafety();
+	TestSQLLikeNeverNarrower();
+	TestSQLLikeAcceptsWhatTheRegexAccepts();
 
 	std::cout << "All MSSQLCatalogFilter tests PASSED!" << std::endl;
 	return 0;

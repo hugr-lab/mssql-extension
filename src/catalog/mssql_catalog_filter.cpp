@@ -178,8 +178,11 @@ static size_t ConvertConstruct(const string &pattern, size_t i, string &like_pat
 	if (c == '\\' && i + 1 < pattern.size()) {
 		return ConvertEscape(pattern, i, like_pattern);
 	}
-	// Non-convertible regex constructs
-	if (IsOneOf(c, "[({|?+*")) {
+	// Non-convertible regex constructs. `^` and `$` among them: the caller has taken
+	// the pattern's first `^` and last `$` as its anchors, so one that gets here
+	// stands inside the pattern, where it is still an assertion and not the
+	// character -- `^^foo$` matches foo, and LIKE '^foo' does not (issue #663).
+	if (IsOneOf(c, "[({|?+*^$")) {
 		return 0;
 	}
 	// Escape LIKE special chars in literal text
@@ -237,9 +240,14 @@ static string ConvertSinglePatternToLike(const string &pattern, const string &co
 }
 
 // Split a string on '|' at parenthesis depth 0, respecting escape sequences.
-// Returns true if 2+ alternatives found (and populates out), false otherwise.
+// Returns true if 2+ alternatives found (and populates out); false otherwise,
+// with out EMPTY. An empty alternative (`a|b|`) matches every name, so the
+// alternatives collected before it are not the pattern: a caller that went on
+// with them wrote `LIKE '%a%' OR LIKE '%b%'` for a filter that hides nothing
+// (issue #663).
 static bool SplitAlternatives(const string &s, vector<string> &out) {
 	out.clear();
+	vector<string> alternatives;
 	string current;
 	int depth = 0;
 	for (size_t i = 0; i < s.size(); i++) {
@@ -257,7 +265,7 @@ static bool SplitAlternatives(const string &s, vector<string> &out) {
 			if (current.empty()) {
 				return false;  // Empty alternative
 			}
-			out.push_back(current);
+			alternatives.push_back(current);
 			current.clear();
 			continue;
 		}
@@ -266,14 +274,20 @@ static bool SplitAlternatives(const string &s, vector<string> &out) {
 	if (current.empty() || depth != 0) {
 		return false;
 	}
-	out.push_back(current);
-	return out.size() >= 2;
+	alternatives.push_back(current);
+	if (alternatives.size() < 2) {
+		return false;
+	}
+	out = std::move(alternatives);
+	return true;
 }
 
-// Check if string contains only literal characters (no regex metacharacters)
+// Check if string contains only literal characters (no regex metacharacters).
+// `^` and `$` are metacharacters too: in `^(a$|b)$` the alternative `a$` is the
+// name a, not the text "a$" (issue #663).
 static bool IsPlainLiteral(const string &s) {
 	for (char c : s) {
-		if (IsOneOf(c, ".*+?[](){}|\\")) {
+		if (IsOneOf(c, ".*+?[](){}|\\^$")) {
 			return false;
 		}
 	}
@@ -293,7 +307,7 @@ struct RegexAlternation {
 }  // namespace
 
 // Case A: ^(alt1|alt2|...)$ — anchored group
-// The alternatives are whatever SplitAlternatives collected, also when it answered false.
+// No alternatives when the group's inside is not an alternation SplitAlternatives takes.
 static void SplitAnchoredGroup(const string &pattern, RegexAlternation &alternation) {
 	size_t start = 0;
 	size_t end = pattern.size();
